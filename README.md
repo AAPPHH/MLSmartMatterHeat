@@ -37,9 +37,16 @@ git submodule update --init
 
 Das Skript baut zuerst das RCP-Image (`ot_rcp`, ESP32-H2), dann den Border Router (ESP32-S3), packt das RCP-Image hinein und flasht. Beim ersten Boot schreibt der S3 das RCP-Image selbst auf den H2.
 
-**WLAN-Variante:** Der Border Router öffnet beim ersten Start den Hotspot `ESP-ThreadBR-XXXX`. Verbinde dich mit dem Handy, öffne `http://192.168.4.1` und trag dein 2,4-GHz-WLAN ein. Die Daten landen nur im NVS des Boards. Danach bildet er automatisch ein Thread-Netz mit zufälligem Netzwerkschlüssel.
+**WLAN-Variante (aktiv):** Die Zugangsdaten stehen in `firmware/br/sdkconfig.wifi.local`; die Datei ist gitignored:
 
-**Ethernet-Variante:** Kabel in die Fritzbox, fertig. Ohne Link startet Thread nicht.
+```
+CONFIG_EXAMPLE_WIFI_SSID="FRITZ!Box 1234 AB"
+CONFIG_EXAMPLE_WIFI_PASSWORD="..."
+```
+
+Beim Boot verbindet sich der Border Router mit dem 2,4-GHz-WLAN und bildet automatisch ein Thread-Netz mit zufälligem Netzwerkschlüssel. Das Netz heißt `thread-net-1`, Kanal 26. Der Leader-Status kommt etwa 45 s nach dem Boot.
+
+**Ethernet-Variante:** `-Variant ethernet`, Kabel in die Fritzbox. Ohne Link startet Thread nicht.
 
 Dataset sichern; es geht nie ins Repo:
 
@@ -47,7 +54,7 @@ Dataset sichern; es geht nie ins Repo:
 cargo run --release -p heatd -- thread dataset COM7   # schreibt secrets/thread_dataset.hex
 ```
 
-Prüfen in der seriellen Konsole: `state` → `leader`.
+OpenThread-Befehle brauchen in dieser Konsole das Präfix `ot`, zum Beispiel `ot state` → `leader` und `ot br state` → `running`. Beim Öffnen des COM-Ports nicht DTR/RTS setzen, sonst startet das Board neu; `heatd` macht das richtig.
 
 ## 2 · Minix einrichten (Ubuntu 24.04)
 

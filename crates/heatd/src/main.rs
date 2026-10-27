@@ -44,8 +44,13 @@ fn strip_ansi(text: &str) -> String {
 pub fn classify_line(raw: &str, command: &str) -> ConsoleLine {
     let clean = strip_ansi(raw);
     let clean = clean.trim();
-    let text = clean.rsplit_once("> ").map_or(clean, |(_, rest)| rest).trim_end_matches('>').trim();
-    if text.is_empty() || text == command || ["I (", "W (", "E (", "D (", "V ("].iter().any(|p| text.starts_with(p)) {
+    let mut text = clean;
+    while let Some((_, rest)) = text.split_once("> ").filter(|(p, _)| !p.contains(' ')) {
+        text = rest.trim_start();
+    }
+    let text = if text.ends_with('>') && !text.contains(' ') { "" } else { text.trim() };
+    let is_log = matches!(text.as_bytes(), [b'I' | b'W' | b'E' | b'D' | b'V', b' ', b'(', ..] | [b'I' | b'W' | b'E' | b'D' | b'V', b'(', ..]);
+    if text.is_empty() || text == command || is_log {
         ConsoleLine::Skip
     } else if text == "Done" {
         ConsoleLine::Done
@@ -103,7 +108,10 @@ impl<P: Read + Write> OtCli<P> {
     }
 
     pub fn active_dataset(&mut self) -> Result<String> {
-        self.exec("dataset active -x", OT_COMMAND_TIMEOUT)?.into_iter().next().ok_or_else(|| anyhow!("empty dataset"))
+        self.exec("dataset active -x", OT_COMMAND_TIMEOUT)?
+            .into_iter()
+            .find(|l| l.len() >= 4 && l.len() % 2 == 0 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| anyhow!("no dataset hex in console output"))
     }
 
     pub fn form_network(&mut self, leader_timeout: Duration, poll: Duration) -> Result<String> {
@@ -122,7 +130,7 @@ impl<P: Read + Write> OtCli<P> {
 }
 
 fn open_cli(port: &str, config: &Config) -> Result<OtCli<Box<dyn serialport::SerialPort>>> {
-    let port = serialport::new(port, 115_200).timeout(Duration::from_millis(200)).open().with_context(|| format!("open {port}"))?;
+    let port = serialport::new(port, 115_200).timeout(Duration::from_millis(200)).dtr_on_open(false).open().with_context(|| format!("open {port}"))?;
     Ok(OtCli::new(port, &config.thread_cli_prefix))
 }
 
@@ -259,6 +267,13 @@ mod tests {
             ("I (12345) OPENTHREAD: radio tx", ConsoleLine::Skip),
             ("\x1b[0;32mI (12345) wifi: connected\x1b[0m", ConsoleLine::Skip),
             ("W (99) esp_netif: something", ConsoleLine::Skip),
+            ("I(44143) OPENTHREAD:[N] Mle-----------: Role detached -> leader", ConsoleLine::Skip),
+            ("E(1396) OPENTHREAD:[C] P-SpinelDrive-: Software reset co-processor successfully", ConsoleLine::Skip),
+            ("esp32s3> I (11423) example_connect: Got IPv6 event", ConsoleLine::Skip),
+            ("Error 35: InvalidCommand", ConsoleLine::Error("Error 35: InvalidCommand".into())),
+            ("esp32s3>", ConsoleLine::Skip),
+            ("esp32s3> ", ConsoleLine::Skip),
+            ("> > Done", ConsoleLine::Done),
             ("", ConsoleLine::Skip),
             ("> ", ConsoleLine::Skip),
             ("state", ConsoleLine::Skip),
@@ -279,6 +294,12 @@ mod tests {
         let mut cli = cli("state\r\nI (100) OT: noise\r\nleader\r\nW (101) OT: more\r\nDone\r\n");
         assert_eq!(cli.exec("state", Duration::from_secs(1)).unwrap(), vec!["leader"]);
         assert_eq!(cli.port.written, b"state\r\n");
+    }
+
+    #[test]
+    fn reads_dataset_from_real_console_output() {
+        let console = "dataset active -x\r\nesp32s3>\r\nI(44143) OPENTHREAD:[N] Mle-----------: Role detached -> leader\r\nesp32s3> I (5) wifi: x\r\n0e08000000000001\r\nDone\r\n";
+        assert_eq!(cli(console).active_dataset().unwrap(), "0e08000000000001");
     }
 
     #[test]

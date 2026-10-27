@@ -22,3 +22,4 @@ __pycache__/
 /.claude/
 wear/keystore.properties
 *.keystore
+/firmware/br/sdkconfig.*.local

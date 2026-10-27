@@ -8,7 +8,7 @@ idf.py build; Step "ot_rcp build"
 Pop-Location
 Push-Location "$PSScriptRoot\br"
 $Build = "build-$Variant"
-$IdfArgs = @("-B", $Build, "-DSDKCONFIG=$Build/sdkconfig", "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.$Variant")
+$IdfArgs = @("-B", $Build, "-DSDKCONFIG=$Build/sdkconfig", "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.$Variant$(if (Test-Path "sdkconfig.$Variant.local") { ";sdkconfig.$Variant.local" })")
 if (Test-Path $Build) { Remove-Item -Recurse -Force $Build }
 idf.py @IdfArgs set-target esp32s3; Step "br set-target"
 idf.py @IdfArgs build; Step "br build"

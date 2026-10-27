@@ -97,7 +97,7 @@ impl Default for Config {
             model_path: "models/room_model.onnx".into(),
             controller: ControllerKind::ChipTool,
             chip_tool: ChipToolSection::default(),
-            thread_cli_prefix: String::new(),
+            thread_cli_prefix: "ot ".to_string(),
             default_setpoint: 18.0,
             eco_setpoint: 16.0,
             presence_boost: 1.0,
