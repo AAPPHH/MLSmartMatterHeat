@@ -1,8 +1,11 @@
 package de.aapphh.heatscan
 
+import android.Manifest
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -10,6 +13,12 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
@@ -21,6 +30,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -36,7 +46,28 @@ class ScanService : Service() {
     private lateinit var cm: ConnectivityManager
     private var wake: PowerManager.WakeLock? = null
     @Volatile private var network: Network? = null
+    private lateinit var alarms: AlarmManager
+    private lateinit var sensors: SensorManager
+    private lateinit var policy: ScanPolicy
+    private lateinit var alarmIntent: PendingIntent
+    private var significant: Sensor? = null
     private var active = false
+
+    private val stepListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            motion()
+        }
+
+        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+    }
+
+    private val significantListener = object : TriggerEventListener() {
+        override fun onTrigger(e: TriggerEvent) {
+            armed = false
+            motion()
+        }
+    }
+    private var armed = false
 
     private val netCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(n: Network) {
@@ -54,12 +85,7 @@ class ScanService : Service() {
         }
     }
 
-    private val tick = object : Runnable {
-        override fun run() {
-            scan()
-            handler.postDelayed(this, PERIOD_MS)
-        }
-    }
+    private val tick = Runnable { tick() }
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -68,11 +94,24 @@ class ScanService : Service() {
         store = Store(this)
         wifi = applicationContext.getSystemService(WifiManager::class.java)
         cm = getSystemService(ConnectivityManager::class.java)
+        alarms = getSystemService(AlarmManager::class.java)
+        sensors = getSystemService(SensorManager::class.java)
+        alarmIntent = PendingIntent.getService(
+            this, 0, Intent(this, ScanService::class.java).setAction(ACTION_TICK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_TICK) {
+            if (active) {
+                hold(true)
+                tick()
+            }
             return START_NOT_STICKY
         }
         if (!active) {
@@ -86,7 +125,8 @@ class ScanService : Service() {
                 return START_NOT_STICKY
             }
             active = true
-            wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:scan").also { it.acquire() }
+            wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:scan").also { it.setReferenceCounted(false) }
+            hold(false)
             try {
                 cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), netCallback)
             } catch (e: Exception) {
@@ -94,7 +134,12 @@ class ScanService : Service() {
             }
             registerReceiver(receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), RECEIVER_NOT_EXPORTED)
             store.running = true
-            handler.post(tick)
+            val step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            val adaptive = step != null && checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED &&
+                sensors.registerListener(stepListener, step, SensorManager.SENSOR_DELAY_NORMAL)
+            significant = sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+            policy = ScanPolicy(adaptive, SystemClock.elapsedRealtime())
+            tick()
         }
         return START_NOT_STICKY
     }
@@ -102,14 +147,50 @@ class ScanService : Service() {
     override fun onDestroy() {
         handler.removeCallbacks(tick)
         if (active) {
+            alarms.cancel(alarmIntent)
+            sensors.unregisterListener(stepListener)
+            significant?.let { sensors.cancelTriggerSensor(significantListener, it) }
             try { unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregister", e) }
             try { cm.unregisterNetworkCallback(netCallback) } catch (e: Exception) { Log.w(TAG, "unregister net", e) }
             wake?.let { if (it.isHeld) it.release() }
         }
         active = false
+        store.mode = ""
         store.running = false
         io.shutdown()
         super.onDestroy()
+    }
+
+    private fun hold(timed: Boolean) {
+        wake?.let { if (timed) it.acquire(ScanConfig.SCAN_HOLD_MS) else it.acquire() }
+    }
+
+    private fun motion() {
+        val now = SystemClock.elapsedRealtime()
+        if (policy.onMotion(now)) scan()
+        schedule(now)
+    }
+
+    private fun tick() {
+        val now = SystemClock.elapsedRealtime()
+        if (policy.onTick(now)) scan()
+        schedule(now)
+    }
+
+    private fun schedule(now: Long) {
+        handler.removeCallbacks(tick)
+        alarms.cancel(alarmIntent)
+        val delay = policy.delay(now)
+        if (store.mode != policy.mode.label) store.mode = policy.mode.label
+        if (policy.mode == Mode.STILL) {
+            hold(true)
+            alarms.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, now + delay, alarmIntent)
+            val sig = significant
+            if (sig != null && !armed) armed = sensors.requestTriggerSensor(significantListener, sig)
+        } else {
+            hold(false)
+            handler.postDelayed(tick, delay)
+        }
     }
 
     private fun scan() {
@@ -166,7 +247,7 @@ class ScanService : Service() {
     companion object {
         const val ACTION_STOP = "de.aapphh.heatscan.STOP"
         private const val CHANNEL = "scan"
-        private const val PERIOD_MS = 30_000L
+        const val ACTION_TICK = "de.aapphh.heatscan.TICK"
         @Volatile var running = false
     }
 }

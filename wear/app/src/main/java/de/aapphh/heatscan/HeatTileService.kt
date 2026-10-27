@@ -29,7 +29,7 @@ class HeatTileService : TileService() {
         val layout = LayoutElementBuilders.Column.Builder()
             .setModifiers(ModifiersBuilders.Modifiers.Builder().setClickable(open).build())
             .addContent(text(store.label ?: "kein Label", 26f))
-            .addContent(text(if (store.running) "Scan aktiv" else "Scan aus", 14f))
+            .addContent(text(if (store.running) "Scan aktiv" + store.mode.let { if (it.isEmpty()) "" else " | $it" } else "Scan aus", 14f))
             .addContent(text(store.status, 11f))
             .build()
         val tile = TileBuilders.Tile.Builder()
