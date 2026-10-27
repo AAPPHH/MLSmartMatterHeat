@@ -9,7 +9,9 @@ CREATE TABLE IF NOT EXISTS scans (scan_id BIGINT, ts TIMESTAMP, received_at TIME
 CREATE TABLE IF NOT EXISTS readings (ts TIMESTAMP, node UBIGINT, endpoint USMALLINT, attribute VARCHAR, value DOUBLE);
 CREATE TABLE IF NOT EXISTS setpoints (ts TIMESTAMP, node UBIGINT, room VARCHAR, value DOUBLE, reason VARCHAR);
 CREATE TABLE IF NOT EXISTS predictions (ts TIMESTAMP, device VARCHAR, room VARCHAR, probability DOUBLE);
-CREATE TABLE IF NOT EXISTS device_state (ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, motion VARCHAR, power VARCHAR, queued BOOLEAN, n_aps INTEGER, away BOOLEAN);
+CREATE TABLE IF NOT EXISTS device_state (ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, motion VARCHAR, power VARCHAR, queued BOOLEAN, n_aps INTEGER, away BOOLEAN, id VARCHAR);
+CREATE TABLE IF NOT EXISTS ingest_ids (device VARCHAR, id VARCHAR, PRIMARY KEY (device, id));
+ALTER TABLE device_state ADD COLUMN IF NOT EXISTS id VARCHAR;
 ";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -68,6 +70,8 @@ pub struct ScanBody {
     pub ts: i64,
     pub device: String,
     #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
     pub aps: Vec<AccessPoint>,
@@ -84,6 +88,12 @@ pub struct ScanBody {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchBody {
     pub scans: Vec<ScanBody>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ingested {
+    pub stored: usize,
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,28 +149,33 @@ impl Storage {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
-    pub fn insert_scan(&self, scan: &ScanBody, received_ms: i64) -> Result<usize> {
+    pub fn ingest(&self, scan: &ScanBody, received_ms: i64, prediction: Option<(&str, f64)>) -> Result<Ingested> {
         let conn = self.conn.lock().unwrap();
-        let scan_id: i64 = conn.query_row("SELECT coalesce(max(scan_id), 0) + 1 FROM scans", [], |r| r.get(0))?;
         conn.execute_batch("BEGIN")?;
-        let result = (|| -> Result<()> {
-            let mut stmt = conn.prepare("INSERT INTO scans VALUES (?, epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?)")?;
-            for ap in &scan.aps {
-                stmt.execute(params![scan_id, scan.ts, received_ms, scan.device, scan.label, ap.bssid.to_lowercase(), ap.rssi, ap.freq])?;
-            }
-            Ok(())
-        })();
+        let result = Self::ingest_in_tx(&conn, scan, received_ms, prediction);
         conn.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
-        result?;
-        Ok(scan.aps.len())
+        result
     }
 
-    pub fn insert_device_state(&self, scan: &ScanBody, received_ms: i64) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT INTO device_state VALUES (epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?, ?)",
-            params![scan.ts, received_ms, scan.device, scan.motion.map(Motion::as_str), scan.power.map(Power::as_str), scan.queued, scan.aps.len() as i32, scan.away],
+    fn ingest_in_tx(conn: &Connection, scan: &ScanBody, received_ms: i64, prediction: Option<(&str, f64)>) -> Result<Ingested> {
+        if let Some(id) = &scan.id {
+            if conn.execute("INSERT INTO ingest_ids VALUES (?, ?) ON CONFLICT DO NOTHING", params![scan.device, id])? == 0 {
+                return Ok(Ingested { stored: 0, duplicate: true });
+            }
+        }
+        let scan_id: i64 = conn.query_row("SELECT coalesce(max(scan_id), 0) + 1 FROM scans", [], |r| r.get(0))?;
+        let mut stmt = conn.prepare("INSERT INTO scans VALUES (?, epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?)")?;
+        for ap in &scan.aps {
+            stmt.execute(params![scan_id, scan.ts, received_ms, scan.device, scan.label, ap.bssid.to_lowercase(), ap.rssi, ap.freq])?;
+        }
+        conn.execute(
+            "INSERT INTO device_state VALUES (epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?, ?, ?)",
+            params![scan.ts, received_ms, scan.device, scan.motion.map(Motion::as_str), scan.power.map(Power::as_str), scan.queued, scan.aps.len() as i32, scan.away, scan.id],
         )?;
-        Ok(())
+        if let Some((room, probability)) = prediction {
+            conn.execute("INSERT INTO predictions VALUES (epoch_ms(?), ?, ?, ?)", params![scan.ts, scan.device, room, probability])?;
+        }
+        Ok(Ingested { stored: scan.aps.len(), duplicate: false })
     }
 
     pub fn device_statuses(&self) -> Result<Vec<DeviceStatus>> {
@@ -194,6 +209,7 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn insert_prediction(&self, ts_ms: i64, device: &str, room: &str, probability: f64) -> Result<()> {
         self.conn.lock().unwrap().execute("INSERT INTO predictions VALUES (epoch_ms(?), ?, ?, ?)", params![ts_ms, device, room, probability])?;
         Ok(())
@@ -254,7 +270,8 @@ mod tests {
     pub fn sample_scan(label: Option<&str>) -> ScanBody {
         ScanBody {
             ts: 1_761_580_800_000,
-            device: "pixel-watch".into(),
+            device: "scan-watch".into(),
+            id: None,
             label: label.map(String::from),
             motion: None,
             queued: false,
@@ -272,8 +289,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("live.duckdb");
         let storage = Storage::open(db.to_str().unwrap()).unwrap();
-        assert_eq!(storage.insert_scan(&sample_scan(Some("bad")), 1_761_580_801_000).unwrap(), 2);
-        assert_eq!(storage.insert_scan(&sample_scan(None), 1_761_580_802_000).unwrap(), 2);
+        assert_eq!(storage.ingest(&sample_scan(Some("bad")), 1_761_580_801_000, None).unwrap().stored, 2);
+        assert_eq!(storage.ingest(&sample_scan(None), 1_761_580_802_000, None).unwrap().stored, 2);
         storage.insert_reading(1_000, 5, 1, "local_temperature", 21.5).unwrap();
         storage.insert_reading(2_000, 5, 1, "local_temperature", 21.7).unwrap();
         storage.insert_setpoint(3_000, 5, "wohnzimmer", 21.0, "schedule").unwrap();
@@ -290,14 +307,15 @@ mod tests {
         hb.motion = Some(Motion::Still);
         hb.power = Some(Power::Doze);
         hb.away = true;
-        storage.insert_device_state(&hb, 9_000).unwrap();
+        hb.device = "pixel-watch".into();
+        storage.ingest(&hb, 9_000, None).unwrap();
         hb.ts = 1_000;
         hb.queued = true;
         hb.motion = Some(Motion::Moving);
-        storage.insert_device_state(&hb, 12_000).unwrap();
+        storage.ingest(&hb, 12_000, None).unwrap();
         assert_eq!(
-            storage.device_statuses().unwrap(),
-            vec![DeviceStatus { device: "pixel-watch".into(), motion: Some(Motion::Still), power: Some(Power::Doze), away: true, state_ts: 2_000, contact_ms: 12_000 }]
+            storage.device_statuses().unwrap()[0],
+            DeviceStatus { device: "pixel-watch".into(), motion: Some(Motion::Still), power: Some(Power::Doze), away: true, state_ts: 2_000, contact_ms: 12_000 }
         );
         let snap = dir.path().join("snap").join("snapshot.duckdb");
         storage.snapshot(snap.to_str().unwrap()).unwrap();
