@@ -62,6 +62,7 @@ OpenThread-Befehle brauchen in dieser Konsole das Präfix `ot`, zum Beispiel `ot
 sudo apt install -y build-essential pkg-config libssl-dev bluez
 curl https://sh.rustup.rs -sSf | sh
 sudo snap install chip-tool && sudo snap connect chip-tool:process-control
+sh deploy/install-paa.sh                  # Produktions-PAA-Zertifikate, sonst scheitert die Attestierung
 sudo cp deploy/99-thread-ra.conf /etc/sysctl.d/ && sudo sysctl --system   # Routen ins Thread-Netz annehmen
 git clone https://github.com/AAPPHH/MLSmartMatterHeat.git ~/MLSmartMatterHeat && cd ~/MLSmartMatterHeat
 cargo build --release -p heatd
@@ -69,7 +70,9 @@ cp heatd.example.toml heatd.toml          # Räume, Node-IDs, Zeitpläne anpasse
 mkdir -p secrets && scp <pc>:.../secrets/thread_dataset.hex secrets/
 ```
 
-In `heatd.toml` setzt du `[chip_tool] storage_dir = "/home/aapphh/snap/chip-tool/common"`, weil der Snap nur dort schreiben darf.
+`[chip_tool]` in `heatd.toml`: `storage_dir` bleibt leer, dann nimmt der Snap seinen eigenen Ordner `~/snap/chip-tool/common`. `paa_trust_store` zeigt auf die Zertifikate von `install-paa.sh`. `bypass_attestation = true` ist nur der Notausgang, falls die Attestierung trotzdem scheitert.
+
+Im Betrieb hält `heatd` **einen** dauerhaften `chip-tool interactive`-Prozess. Darüber laufen eine Subscription pro Thermostat (Ist-Temperatur, Sollwert, Modus) und alle Schreibbefehle; stirbt der Prozess, startet er mit Backoff neu.
 
 ```bash
 sudo cp deploy/heatd.service /etc/systemd/system/ && sudo systemctl enable --now heatd
@@ -81,14 +84,16 @@ curl http://localhost:8080/health
 Pro Thermostat, Node-IDs wie in `heatd.toml` (Beispiel: 5 Wohnzimmer, 6 Schlafzimmer, 7 Bad):
 
 ```bash
-sudo systemctl stop heatd                                # chip-tool-Speicher nicht parallel nutzen
+sudo systemctl stop heatd                                # Pflicht: sonst "stop heatd first" (Lock auf dem chip-tool-Speicher)
 ./target/release/heatd commission 5 34970112332          # 11-stelliger Code oder "MT:..." vom Thermostat
 ./target/release/heatd read 5                            # Ist- und Solltemperatur
 ./target/release/heatd set 5 21.5
 sudo systemctl start heatd
 ```
 
-Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen.
+Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen. Das Commissioning darf bis zu 180 s dauern (`commission_timeout_s`).
+
+Nach dem ersten Thermostat startest du `heatd` und prüfst mit `journalctl -u heatd -f` und `curl localhost:8080/api/state`, ob Temperaturen ankommen. Das ist der erste echte Test des dauerhaften chip-tool-Prozesses.
 
 ## 4 · Uhr & Training ⌚
 
@@ -97,7 +102,7 @@ sh wear/build.sh                                         # Tests + signierte Rel
 adb connect <uhr-ip>:<port> && adb install -r wear/app/build/outputs/apk/release/app-release.apk
 ```
 
-Die APK liegt auch im GitHub-Release. In der App gibst du die Standortberechtigung frei, prüfst die Server-URL (`http://192.168.178.29:8080`) und tippst auf Start. Dann fügst du die Kachel **HeatScan** hinzu.
+Die APK liegt auch im GitHub-Release. In der App erlaubst du **genauen Standort** (für WLAN-Scans) und **Geräte in der Nähe / LAN-Zugriff** (Android 17, sonst erreicht die Uhr den Minix nicht). Dann prüfst du die Server-URL (`http://192.168.178.29:8080`), tippst auf Start und fügst die Kachel **HeatScan** hinzu. Die Statuszeile meldet Probleme direkt, etwa „Standort aus“, „WLAN aus“ oder „LAN-Zugriff fehlt“.
 
 **Training:**
 1. In jedem Raum ein paar Mal 10–20 min verbringen und vorher auf der Uhr den Raum antippen; danach „kein Label“.
