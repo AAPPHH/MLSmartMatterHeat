@@ -38,6 +38,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val store = Store(this)
+        intent.getStringExtra("server")?.let { store.server = it }
+        intent.getStringExtra("device")?.let { store.device = it }
         setContent { MaterialTheme { Screen(store) } }
     }
 
