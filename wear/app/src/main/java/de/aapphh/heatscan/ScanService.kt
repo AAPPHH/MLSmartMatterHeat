@@ -50,24 +50,28 @@ class ScanService : Service() {
     private lateinit var sensors: SensorManager
     private lateinit var policy: ScanPolicy
     private lateinit var alarmIntent: PendingIntent
-    private var significant: Sensor? = null
+    private var step: Sensor? = null
+    private var wakeStep: Sensor? = null
+    private var triggers: List<Sensor> = emptyList()
+    private var sensorState = 0
+    private var alarmSet = false
     private var active = false
 
     private val stepListener = object : SensorEventListener {
         override fun onSensorChanged(e: SensorEvent) {
-            motion()
+            motion(e.timestamp / 1_000_000)
         }
 
         override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
 
-    private val significantListener = object : TriggerEventListener() {
+    private val triggerListener = object : TriggerEventListener() {
         override fun onTrigger(e: TriggerEvent) {
-            armed = false
-            motion()
+            sensorState = 0
+            motion(e.timestamp / 1_000_000)
+            applySensors()
         }
     }
-    private var armed = false
 
     private val netCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(n: Network) {
@@ -96,22 +100,13 @@ class ScanService : Service() {
         cm = getSystemService(ConnectivityManager::class.java)
         alarms = getSystemService(AlarmManager::class.java)
         sensors = getSystemService(SensorManager::class.java)
-        alarmIntent = PendingIntent.getService(
-            this, 0, Intent(this, ScanService::class.java).setAction(ACTION_TICK),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        alarmIntent = alarmIntent(this)
+        instance = this
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
-            return START_NOT_STICKY
-        }
-        if (intent?.action == ACTION_TICK) {
-            if (active) {
-                hold(true)
-                tick()
-            }
             return START_NOT_STICKY
         }
         if (!active) {
@@ -134,10 +129,11 @@ class ScanService : Service() {
             }
             registerReceiver(receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), RECEIVER_NOT_EXPORTED)
             store.running = true
-            val step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
-            val adaptive = step != null && checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED &&
-                sensors.registerListener(stepListener, step, SensorManager.SENSOR_DELAY_NORMAL)
-            significant = sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+            step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            wakeStep = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
+            triggers = listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_MOTION_DETECT, true), sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION))
+            val adaptive = step != null && (wakeStep != null || triggers.isNotEmpty()) &&
+                checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
             policy = ScanPolicy(adaptive, SystemClock.elapsedRealtime())
             tick()
         }
@@ -148,13 +144,13 @@ class ScanService : Service() {
         handler.removeCallbacks(tick)
         if (active) {
             alarms.cancel(alarmIntent)
-            sensors.unregisterListener(stepListener)
-            significant?.let { sensors.cancelTriggerSensor(significantListener, it) }
+            releaseSensors()
             try { unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregister", e) }
             try { cm.unregisterNetworkCallback(netCallback) } catch (e: Exception) { Log.w(TAG, "unregister net", e) }
             wake?.let { if (it.isHeld) it.release() }
         }
         active = false
+        if (instance === this) instance = null
         store.mode = ""
         store.running = false
         io.shutdown()
@@ -165,10 +161,22 @@ class ScanService : Service() {
         wake?.let { if (timed) it.acquire(ScanConfig.SCAN_HOLD_MS) else it.acquire() }
     }
 
-    private fun motion() {
+    fun onAlarm() {
+        if (!active) {
+            alarms.cancel(alarmIntent)
+            stopSelf()
+            return
+        }
+        hold(true)
+        tick()
+    }
+
+    private fun motion(at: Long) {
         val now = SystemClock.elapsedRealtime()
-        if (policy.onMotion(now)) scan()
-        schedule(now)
+        val before = policy.mode
+        val scanDue = policy.onMotion(now, at)
+        if (scanDue) scan()
+        if (scanDue || policy.mode != before) schedule(now)
     }
 
     private fun tick() {
@@ -179,17 +187,43 @@ class ScanService : Service() {
 
     private fun schedule(now: Long) {
         handler.removeCallbacks(tick)
-        alarms.cancel(alarmIntent)
         val delay = policy.delay(now)
         if (store.mode != policy.mode.label) store.mode = policy.mode.label
-        if (policy.mode == Mode.STILL) {
+        applySensors()
+        if (policy.mode.sleeps) {
             hold(true)
             alarms.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, now + delay, alarmIntent)
-            val sig = significant
-            if (sig != null && !armed) armed = sensors.requestTriggerSensor(significantListener, sig)
+            alarmSet = true
         } else {
+            if (alarmSet) {
+                alarms.cancel(alarmIntent)
+                alarmSet = false
+            }
             hold(false)
             handler.postDelayed(tick, delay)
+        }
+    }
+
+    private fun releaseSensors() {
+        sensors.unregisterListener(stepListener)
+        triggers.forEach { sensors.cancelTriggerSensor(triggerListener, it) }
+    }
+
+    private fun applySensors() {
+        val want = when (policy.mode) {
+            Mode.STILL -> 1
+            Mode.MOVING, Mode.SETTLING -> 2
+            else -> 0
+        }
+        if (want == sensorState) return
+        sensorState = want
+        releaseSensors()
+        when (want) {
+            1 -> {
+                (wakeStep ?: step)?.let { sensors.registerListener(stepListener, it, SensorManager.SENSOR_DELAY_NORMAL) }
+                triggers.forEach { sensors.requestTriggerSensor(triggerListener, it) }
+            }
+            2 -> step?.let { sensors.registerListener(stepListener, it, SensorManager.SENSOR_DELAY_NORMAL) }
         }
     }
 
@@ -211,6 +245,15 @@ class ScanService : Service() {
                 return
             }
             if (!dedup.accept(results.maxOf { it.timestamp })) return
+            val home = Home.isHome(results.map { it.SSID }, store.homeList)
+            val before = policy.mode
+            val now = SystemClock.elapsedRealtime()
+            policy.onScan(home, now)
+            if (policy.mode != before) schedule(now)
+            if (!home) {
+                store.status = stamp() + " Unterwegs, kein POST"
+                return
+            }
             val body = Payload.build(
                 System.currentTimeMillis(), store.device, store.label,
                 results.map { Ap(it.BSSID, it.level, it.frequency) }
@@ -246,8 +289,21 @@ class ScanService : Service() {
 
     companion object {
         const val ACTION_STOP = "de.aapphh.heatscan.STOP"
-        private const val CHANNEL = "scan"
         const val ACTION_TICK = "de.aapphh.heatscan.TICK"
+        private const val CHANNEL = "scan"
         @Volatile var running = false
+        @Volatile var instance: ScanService? = null
+
+        fun alarmIntent(c: Context): PendingIntent = PendingIntent.getBroadcast(
+            c, 0, Intent(c, TickReceiver::class.java).setAction(ACTION_TICK),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+    }
+}
+
+class TickReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        val svc = ScanService.instance
+        if (svc != null) svc.onAlarm() else c.getSystemService(AlarmManager::class.java).cancel(ScanService.alarmIntent(c))
     }
 }
