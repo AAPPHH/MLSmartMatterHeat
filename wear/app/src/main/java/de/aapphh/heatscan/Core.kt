@@ -71,6 +71,9 @@ class Store(private val ctx: Context) {
     var status: String
         get() = sp.getString("status", "-") ?: "-"
         set(v) = put("status", v)
+    var mode: String
+        get() = sp.getString("mode", "") ?: ""
+        set(v) = put("mode", v)
     var running: Boolean
         get() = ScanService.running
         set(v) {
@@ -81,7 +84,7 @@ class Store(private val ctx: Context) {
 
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
-        if (key == "label" || key == "status") refreshTile()
+        if (key == "label" || key == "status" || key == "mode") refreshTile()
     }
 
     private fun refreshTile() {
@@ -111,6 +114,72 @@ object Poster {
         } finally {
             conn.disconnect()
         }
+    }
+}
+
+object ScanConfig {
+    const val MOVING_PERIOD_MS = 30_000L
+    const val MOVE_WINDOW_MS = 60_000L
+    const val STILL_AFTER_MS = 120_000L
+    const val HEARTBEAT_MS = 600_000L
+    const val SCAN_HOLD_MS = 30_000L
+}
+
+enum class Mode(val label: String) {
+    MOVING("Bewegung"), SETTLING("Bewegung"), STILL("Ruhe"), FIXED("Fest 30 s, Aktivitaet fehlt")
+}
+
+class ScanPolicy(adaptive: Boolean, start: Long) {
+    var mode = if (adaptive) Mode.MOVING else Mode.FIXED
+        private set
+    private var lastMotion = start
+    private var nextAt = start
+
+    fun onMotion(now: Long): Boolean {
+        if (mode == Mode.FIXED) return false
+        lastMotion = now
+        return when (mode) {
+            Mode.STILL -> {
+                mode = Mode.MOVING
+                nextAt = now + ScanConfig.MOVING_PERIOD_MS
+                true
+            }
+            Mode.SETTLING -> {
+                mode = Mode.MOVING
+                nextAt = now + ScanConfig.MOVING_PERIOD_MS
+                false
+            }
+            else -> false
+        }
+    }
+
+    fun onTick(now: Long): Boolean = when (mode) {
+        Mode.FIXED -> due(now, ScanConfig.MOVING_PERIOD_MS)
+        Mode.MOVING ->
+            if (now - lastMotion >= ScanConfig.MOVE_WINDOW_MS) {
+                mode = Mode.SETTLING
+                true
+            } else due(now, ScanConfig.MOVING_PERIOD_MS)
+        Mode.SETTLING -> {
+            if (now - lastMotion >= ScanConfig.STILL_AFTER_MS) {
+                mode = Mode.STILL
+                nextAt = now + ScanConfig.HEARTBEAT_MS
+            }
+            false
+        }
+        Mode.STILL -> due(now, ScanConfig.HEARTBEAT_MS)
+    }
+
+    fun delay(now: Long): Long = maxOf(0L, when (mode) {
+        Mode.FIXED, Mode.STILL -> nextAt
+        Mode.MOVING -> minOf(nextAt, lastMotion + ScanConfig.MOVE_WINDOW_MS)
+        Mode.SETTLING -> lastMotion + ScanConfig.STILL_AFTER_MS
+    } - now)
+
+    private fun due(now: Long, period: Long): Boolean {
+        if (now < nextAt) return false
+        nextAt = now + period
+        return true
     }
 }
 

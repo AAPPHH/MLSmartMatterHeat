@@ -77,7 +77,7 @@ class MainActivity : ComponentActivity() {
                     Chip(
                         onClick = {
                             if (store.running) toggle(store)
-                            else perms.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.POST_NOTIFICATIONS, Diag.LOCAL_NETWORK))
+                            else perms.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACTIVITY_RECOGNITION, Diag.LOCAL_NETWORK))
                         },
                         label = { Text(if (store.running) "Stop" else "Start") },
                         secondaryLabel = { Text("Label: ${label ?: "kein Label"}") },
@@ -85,7 +85,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-                item { Text(store.status, fontSize = 11.sp) }
+                item { Text((if (store.running && store.mode.isNotEmpty()) store.mode + " | " else "") + store.status, fontSize = 11.sp) }
                 (Defaults.ROOMS + null).forEach { room ->
                     item {
                         Chip(

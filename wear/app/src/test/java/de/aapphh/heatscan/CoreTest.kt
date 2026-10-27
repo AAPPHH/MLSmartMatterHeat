@@ -67,4 +67,81 @@ class CoreTest {
         assertEquals("ERR X (LAN-Zugriff fehlt)", Diag.postError("X", true))
         assertEquals("ERR X", Diag.postError("X", false))
     }
+
+    private val s = 1000L
+
+    @Test
+    fun startScansImmediatelyThenEvery30sWhileMoving() {
+        val p = ScanPolicy(true, 0)
+        assertTrue(p.onTick(0))
+        assertEquals(30 * s, p.delay(0))
+        assertFalse(p.onTick(10 * s))
+        p.onMotion(25 * s)
+        assertTrue(p.onTick(30 * s))
+        assertEquals(Mode.MOVING, p.mode)
+    }
+
+    @Test
+    fun settlesWithOneExtraScanThenStillAfterTwoMinutes() {
+        val p = ScanPolicy(true, 0)
+        p.onTick(0)
+        p.onMotion(50 * s)
+        assertTrue(p.onTick(30 * s))
+        assertEquals(20 * s, p.delay(40 * s))
+        assertFalse(p.onTick(55 * s))
+        assertTrue(p.onTick(110 * s))
+        assertEquals(Mode.SETTLING, p.mode)
+        assertEquals(60 * s, p.delay(110 * s))
+        assertFalse(p.onTick(120 * s))
+        assertEquals(Mode.SETTLING, p.mode)
+        assertFalse(p.onTick(170 * s))
+        assertEquals(Mode.STILL, p.mode)
+        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(170 * s))
+    }
+
+    @Test
+    fun stillScansOnlyOnHeartbeat() {
+        val p = still()
+        assertFalse(p.onTick(170 * s + 599 * s))
+        assertTrue(p.onTick(170 * s + 600 * s))
+        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(770 * s))
+        assertEquals(Mode.STILL, p.mode)
+    }
+
+    @Test
+    fun motionWakesFromStillWithImmediateScan() {
+        val p = still()
+        assertTrue(p.onMotion(300 * s))
+        assertEquals(Mode.MOVING, p.mode)
+        assertEquals(30 * s, p.delay(300 * s))
+        assertFalse(p.onMotion(301 * s))
+    }
+
+    @Test
+    fun motionWhileSettlingReturnsToMovingWithoutExtraScan() {
+        val p = ScanPolicy(true, 0)
+        p.onTick(0)
+        assertTrue(p.onTick(60 * s))
+        assertFalse(p.onMotion(80 * s))
+        assertEquals(Mode.MOVING, p.mode)
+        assertEquals(30 * s, p.delay(80 * s))
+    }
+
+    @Test
+    fun fixedFallbackIgnoresMotionAndScansEvery30s() {
+        val p = ScanPolicy(false, 0)
+        assertEquals(Mode.FIXED, p.mode)
+        assertTrue(p.onTick(0))
+        assertFalse(p.onMotion(5 * s))
+        assertFalse(p.onTick(29 * s))
+        assertTrue(p.onTick(30 * s))
+        assertEquals(30 * s, p.delay(30 * s))
+        assertEquals(Mode.FIXED, p.mode)
+    }
+
+    private fun still(): ScanPolicy = ScanPolicy(true, 0).also {
+        it.onTick(0)
+        it.onTick(60 * s)
+        it.onTick(170 * s)
+    }
 }
