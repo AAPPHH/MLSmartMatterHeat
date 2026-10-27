@@ -1,0 +1,2 @@
+[1651234567.100] [1234:5678] CHIP:TOO: Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0012 DataVersion: 1234
+[1651234567.100] [1234:5678] CHIP:TOO:   OccupiedHeatingSetpoint: 2000

@@ -1,0 +1,300 @@
+mod config;
+mod http;
+mod infer;
+mod rules;
+mod storage;
+
+use anyhow::{anyhow, bail, Context, Result};
+use config::{Config, ControllerKind};
+use matter_controller::{ChipToolController, MatterController, MockController};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | thread form <serial-port> | thread dataset <serial-port>";
+const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq)]
+pub enum ConsoleLine {
+    Skip,
+    Done,
+    Error(String),
+    Data(String),
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn classify_line(raw: &str, command: &str) -> ConsoleLine {
+    let clean = strip_ansi(raw);
+    let clean = clean.trim();
+    let text = clean.rsplit_once("> ").map_or(clean, |(_, rest)| rest).trim_end_matches('>').trim();
+    if text.is_empty() || text == command || ["I (", "W (", "E (", "D (", "V ("].iter().any(|p| text.starts_with(p)) {
+        ConsoleLine::Skip
+    } else if text == "Done" {
+        ConsoleLine::Done
+    } else if text.starts_with("Error") {
+        ConsoleLine::Error(text.to_string())
+    } else {
+        ConsoleLine::Data(text.to_string())
+    }
+}
+
+pub struct OtCli<P: Read + Write> {
+    port: P,
+    prefix: String,
+    pending: Vec<u8>,
+}
+
+impl<P: Read + Write> OtCli<P> {
+    pub fn new(port: P, prefix: &str) -> Self {
+        Self { port, prefix: prefix.to_string(), pending: Vec::new() }
+    }
+
+    fn read_line(&mut self, deadline: Instant) -> Result<String> {
+        let mut byte = [0u8; 1];
+        loop {
+            if let Some(i) = self.pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=i).collect();
+                return Ok(String::from_utf8_lossy(&line).into_owned());
+            }
+            if Instant::now() > deadline {
+                bail!("console timeout");
+            }
+            match self.port.read(&mut byte) {
+                Ok(0) => bail!("console closed"),
+                Ok(_) => self.pending.push(byte[0]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    pub fn exec(&mut self, command: &str, timeout: Duration) -> Result<Vec<String>> {
+        self.pending.clear();
+        self.port.write_all(format!("{}{}\r\n", self.prefix, command).as_bytes())?;
+        self.port.flush()?;
+        let deadline = Instant::now() + timeout;
+        let mut data = Vec::new();
+        loop {
+            match classify_line(&self.read_line(deadline)?, &format!("{}{}", self.prefix, command)) {
+                ConsoleLine::Skip => {}
+                ConsoleLine::Done => return Ok(data),
+                ConsoleLine::Error(e) => bail!("{command}: {e}"),
+                ConsoleLine::Data(d) => data.push(d),
+            }
+        }
+    }
+
+    pub fn active_dataset(&mut self) -> Result<String> {
+        self.exec("dataset active -x", OT_COMMAND_TIMEOUT)?.into_iter().next().ok_or_else(|| anyhow!("empty dataset"))
+    }
+
+    pub fn form_network(&mut self, leader_timeout: Duration, poll: Duration) -> Result<String> {
+        for command in ["dataset init new", "dataset commit active", "ifconfig up", "thread start"] {
+            self.exec(command, OT_COMMAND_TIMEOUT)?;
+        }
+        let deadline = Instant::now() + leader_timeout;
+        while self.exec("state", OT_COMMAND_TIMEOUT)?.last().map(String::as_str) != Some("leader") {
+            if Instant::now() > deadline {
+                bail!("thread did not become leader");
+            }
+            std::thread::sleep(poll);
+        }
+        self.active_dataset()
+    }
+}
+
+fn open_cli(port: &str, config: &Config) -> Result<OtCli<Box<dyn serialport::SerialPort>>> {
+    let port = serialport::new(port, 115_200).timeout(Duration::from_millis(200)).open().with_context(|| format!("open {port}"))?;
+    Ok(OtCli::new(port, &config.thread_cli_prefix))
+}
+
+fn save_dataset(config: &Config, hex: &str) -> Result<()> {
+    if let Some(parent) = Path::new(&config.dataset_path).parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config.dataset_path, format!("{hex}\n"))?;
+    println!("dataset written to {}", config.dataset_path);
+    Ok(())
+}
+
+fn build_controller(config: &Config) -> (Arc<dyn MatterController>, Option<Arc<MockController>>) {
+    match config.controller {
+        ControllerKind::ChipTool => (Arc::new(ChipToolController::new(config.chip_tool.to_controller_config())), None),
+        ControllerKind::Mock => {
+            let mock = Arc::new(MockController::new(config.chip_tool.endpoint));
+            config.all_nodes().into_iter().for_each(|n| mock.add_node(n, 18.0, 18.0));
+            (mock.clone(), Some(mock))
+        }
+    }
+}
+
+async fn serve(config: Config) -> Result<()> {
+    let (controller, mock) = build_controller(&config);
+    if let Some(mock) = mock {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                mock.tick();
+            }
+        });
+    }
+    let model = if Path::new(&config.model_path).exists() {
+        Some(Arc::new(infer::RoomModel::load(Path::new(&config.model_path))?))
+    } else {
+        None
+    };
+    let state = http::AppState {
+        storage: Arc::new(storage::Storage::open(&config.db_path)?),
+        model,
+        controller,
+        windows: Default::default(),
+        commanded: Default::default(),
+        config: Arc::new(config),
+    };
+    rules::spawn_background(state.clone());
+    let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
+    println!("heatd listening on {}", state.config.listen);
+    axum::serve(listener, http::router(state)).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
+    Ok(())
+}
+
+async fn controller_command(config: Config, args: &[String]) -> Result<()> {
+    let (controller, _) = build_controller(&config);
+    match args {
+        [cmd, node, code] if cmd == "commission" => {
+            let dataset = std::fs::read_to_string(&config.dataset_path).with_context(|| format!("read {}", config.dataset_path))?;
+            controller.commission(node.parse()?, code, dataset.trim()).await?;
+            println!("commissioned node {node}");
+        }
+        [cmd, node] if cmd == "read" => {
+            let state = controller.read_thermostat(node.parse()?).await?;
+            println!("{state:#?}");
+        }
+        [cmd, node, celsius] if cmd == "set" => {
+            controller.write_heating_setpoint(node.parse()?, celsius.parse()?).await?;
+            println!("setpoint {celsius} written to node {node}");
+        }
+        _ => bail!(USAGE),
+    }
+    Ok(())
+}
+
+fn run(args: Vec<String>) -> Result<()> {
+    let config = Config::load(Path::new(&std::env::var("HEATD_CONFIG").unwrap_or_else(|_| "heatd.toml".into())))?;
+    let runtime = || tokio::runtime::Builder::new_multi_thread().enable_all().build();
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        [] | ["serve"] => runtime()?.block_on(serve(config)),
+        ["thread", "form", port] => {
+            let dataset = open_cli(port, &config)?.form_network(OT_LEADER_TIMEOUT, Duration::from_secs(2))?;
+            save_dataset(&config, &dataset)
+        }
+        ["thread", "dataset", port] => {
+            let dataset = open_cli(port, &config)?.active_dataset()?;
+            save_dataset(&config, &dataset)
+        }
+        ["commission" | "read" | "set", ..] => runtime()?.block_on(controller_command(config, &args)),
+        _ => bail!(USAGE),
+    }
+}
+
+fn main() {
+    if let Err(e) = run(std::env::args().skip(1).collect()) {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct FakePort {
+        input: Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl Read for FakePort {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+
+    impl Write for FakePort {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cli(console: &str) -> OtCli<FakePort> {
+        OtCli::new(FakePort { input: Cursor::new(console.as_bytes().to_vec()), written: Vec::new() }, "")
+    }
+
+    #[test]
+    fn classifies_lines() {
+        let cases = [
+            ("I (12345) OPENTHREAD: radio tx", ConsoleLine::Skip),
+            ("\x1b[0;32mI (12345) wifi: connected\x1b[0m", ConsoleLine::Skip),
+            ("W (99) esp_netif: something", ConsoleLine::Skip),
+            ("", ConsoleLine::Skip),
+            ("> ", ConsoleLine::Skip),
+            ("state", ConsoleLine::Skip),
+            ("esp32s3> state", ConsoleLine::Skip),
+            ("Done", ConsoleLine::Done),
+            ("> Done", ConsoleLine::Done),
+            ("Error 7: InvalidState", ConsoleLine::Error("Error 7: InvalidState".into())),
+            ("leader", ConsoleLine::Data("leader".into())),
+            ("0e080000000000010000", ConsoleLine::Data("0e080000000000010000".into())),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(classify_line(raw, "state"), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn exec_collects_data_and_skips_logs() {
+        let mut cli = cli("state\r\nI (100) OT: noise\r\nleader\r\nW (101) OT: more\r\nDone\r\n");
+        assert_eq!(cli.exec("state", Duration::from_secs(1)).unwrap(), vec!["leader"]);
+        assert_eq!(cli.port.written, b"state\r\n");
+    }
+
+    #[test]
+    fn exec_reports_errors_and_timeouts() {
+        let err = cli("dataset commit active\r\nError 13: InvalidArgs\r\n").exec("dataset commit active", Duration::from_secs(1)).unwrap_err();
+        assert!(err.to_string().contains("InvalidArgs"));
+        assert!(cli("I (1) x: only logs\r\n").exec("state", Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn forms_network_and_reads_dataset() {
+        let console = "Done\r\nDone\r\nDone\r\nDone\r\ndetached\r\nDone\r\nleader\r\nDone\r\nI (5) OT: x\r\n0e0800000000\r\nDone\r\n";
+        let mut cli = cli(console);
+        let dataset = cli.form_network(Duration::from_secs(5), Duration::from_millis(1)).unwrap();
+        assert_eq!(dataset, "0e0800000000");
+        let written = String::from_utf8(cli.port.written.clone()).unwrap();
+        assert_eq!(written, "dataset init new\r\ndataset commit active\r\nifconfig up\r\nthread start\r\nstate\r\nstate\r\ndataset active -x\r\n");
+    }
+}

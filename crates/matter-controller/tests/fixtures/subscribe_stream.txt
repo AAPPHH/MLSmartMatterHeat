@@ -1,0 +1,7 @@
+[1761580801.000] [4821:4825] [TOO] Subscription established with SubscriptionID = 0x6f2a1c10 MinInterval = 5s MaxInterval = 60s Peer = 01:0000000000000005
+[1761580801.001] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0000 DataVersion: 3037862386
+[1761580801.001] [4821:4825] [TOO]   LocalTemperature: 2175
+[1761580861.201] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0012 DataVersion: 3037862387
+[1761580861.201] [4821:4825] [TOO]   OccupiedHeatingSetpoint: 2100
+[1761580861.202] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_001C DataVersion: 3037862388
+[1761580861.202] [4821:4825] [TOO]   SystemMode: 4
