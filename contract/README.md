@@ -11,3 +11,14 @@ Feste BSSID-Reihenfolge `bssids` aus dem Training. Für BSSID `i`: `x_i = clamp(
 ## Modell
 
 `room_model.onnx` + Sidecar `room_model.json`: `{"version": 1, "input_name": "input", "bssids": [...], "labels": [...], "rssi_floor": -100.0, "rssi_span": 70.0}`. Ausgaben: `label` (`int64 [N]`, Index in `labels`) und `probabilities` (`float32 [N, C]`), ohne ZipMap. Testmodell: `crates/heatd/tests/fixtures/room_model.{onnx,json}`, sagt für `scan_example.json` `wohnzimmer` voraus.
+
+## DuckDB (`heatd`)
+
+```sql
+CREATE TABLE scans (scan_id BIGINT, ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, label VARCHAR, bssid VARCHAR, rssi INTEGER, freq INTEGER);
+CREATE TABLE readings (ts TIMESTAMP, node UBIGINT, endpoint USMALLINT, attribute VARCHAR, value DOUBLE);
+CREATE TABLE setpoints (ts TIMESTAMP, node UBIGINT, room VARCHAR, value DOUBLE, reason VARCHAR);
+CREATE TABLE predictions (ts TIMESTAMP, device VARCHAR, room VARCHAR, probability DOUBLE);
+```
+
+`scans` im Langformat: eine Zeile pro AP, `scan_id` gruppiert einen Scan, `ts` aus dem Body (UTC), `label` NULL außerhalb der Trainingsphase. `readings.attribute` ist der Name aus dem Thermostat-Cluster (`local_temperature`, `occupied_heating_setpoint`, `system_mode`, …), Temperaturen in °C. Python liest nie die Live-Datei, sondern den Snapshot, den `POST /api/snapshot` per `COPY FROM DATABASE` nach `data/snapshot.duckdb` schreibt.
