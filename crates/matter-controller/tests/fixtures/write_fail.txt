@@ -1,2 +1,15 @@
-[1761580900.501] [4821:4825] [TOO] Received Command Status for Endpoint=1 Cluster=0x0000_0201 Attribute=0x0000_0012 Status=0x87
-[1761580900.502] [4821:4825] [TOO] Run command failure: IM Error 0x00000587: General error: 0x87 (CONSTRAINT_ERROR)
+[0;34m[1761580800.075] [4821:4825] [DMG] WriteResponseMessage =[0m
+[0;34m[1761580800.076] [4821:4825] [DMG] {[0m
+[0;34m[1761580800.077] [4821:4825] [DMG] 	AttributeStatusIBs =[0m
+[0;34m[1761580800.078] [4821:4825] [DMG] 	[[0m
+[0;34m[1761580800.079] [4821:4825] [DMG] 		AttributeStatusIB =[0m
+[0;34m[1761580800.080] [4821:4825] [DMG] 		{[0m
+[0;34m[1761580800.081] [4821:4825] [DMG] 			StatusIB =[0m
+[0;34m[1761580800.082] [4821:4825] [DMG] 			{[0m
+[0;34m[1761580800.083] [4821:4825] [DMG] 				status = 0x87 (CONSTRAINT_ERROR),[0m
+[0;34m[1761580800.084] [4821:4825] [DMG] 			},[0m
+[0;34m[1761580800.085] [4821:4825] [DMG] 		},[0m
+[0;34m[1761580800.086] [4821:4825] [DMG] 	],[0m
+[0;34m[1761580800.087] [4821:4825] [DMG] }[0m
+[0;31m[1761580800.088] [4821:4825] [TOO] Response Failure: IM Error 0x00000587: General error: 0x87 (CONSTRAINT_ERROR)[0m
+[0;31m[1761580800.089] [4821:4825] [TOO] Run command failure: IM Error 0x00000587: General error: 0x87 (CONSTRAINT_ERROR)[0m

@@ -1,0 +1,12 @@
+[0;32m[1761580800.041] [4821:4825] [EM] >>> [E:51234r S:3411 M:187654321 (Ack:12345)] (S) Msg RX from 1:0000000000000005 [B2C3] --- Type 0001:05 (IM:ReportData) (B:96)[0m
+[0;32m[1761580800.042] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0000 DataVersion: 11[0m
+[0;32m[1761580800.043] [4821:4825] [TOO]   LocalTemperature: 2175[0m
+[0;32m[1761580800.044] [4821:4825] [EM] >>> [E:51234r S:3411 M:187654321 (Ack:12345)] (S) Msg RX from 1:0000000000000006 [B2C3] --- Type 0001:01 (IM:StatusResponse) (B:96)[0m
+[0;32m[1761580800.045] [4821:4825] [EM] >>> [E:51234r S:3411 M:187654321 (Ack:12345)] (S) Msg RX from 1:0000000000000006 [B2C3] --- Type 0001:05 (IM:ReportData) (B:96)[0m
+[0;32m[1761580800.046] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0000 DataVersion: 22[0m
+[0;32m[1761580800.047] [4821:4825] [TOO]   LocalTemperature: 1950[0m
+[0;32m[1761580800.048] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0012 DataVersion: 23[0m
+[0;32m[1761580800.049] [4821:4825] [TOO]   OccupiedHeatingSetpoint: 1900[0m
+[0;32m[1761580800.050] [4821:4825] [EM] >>> [E:51234r S:3411 M:187654321 (Ack:12345)] (S) Msg RX from 1:0000000000000005 [B2C3] --- Type 0001:05 (IM:ReportData) (B:96)[0m
+[0;32m[1761580800.051] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_001C DataVersion: 12[0m
+[0;32m[1761580800.052] [4821:4825] [TOO]   SystemMode: 4[0m

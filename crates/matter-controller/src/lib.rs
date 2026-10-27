@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::Receiver;
 
-pub use chip_tool::{ChipToolConfig, ChipToolController, ReportParser};
+pub use chip_tool::{strip_ansi, ChipToolConfig, ChipToolController, ReportParser, StorageLock};
 pub use mock::MockController;
 
 pub type NodeId = u64;
