@@ -27,6 +27,27 @@ object Payload {
         })
 }
 
+object Diag {
+    const val LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
+    const val LOCAL_NETWORK_SDK = 37
+
+    fun emptyScan(locationOn: Boolean, wifiOn: Boolean): String = when {
+        !locationOn -> "Standort aus"
+        !wifiOn -> "WLAN aus"
+        else -> "keine Scanergebnisse"
+    }
+
+    fun permissionIssue(fine: Boolean, coarse: Boolean): String? = when {
+        fine -> null
+        coarse -> "Nur ungefährer Standort, genauer nötig"
+        else -> "Standort verweigert"
+    }
+
+    fun needsLocalNetwork(sdk: Int, granted: Boolean): Boolean = sdk >= LOCAL_NETWORK_SDK && !granted
+
+    fun postError(error: String, lanMissing: Boolean): String = "ERR $error" + if (lanMissing) " (LAN-Zugriff fehlt)" else ""
+}
+
 class Dedup {
     private var last = Long.MIN_VALUE
     fun accept(newest: Long): Boolean {
@@ -51,9 +72,10 @@ class Store(private val ctx: Context) {
         get() = sp.getString("status", "-") ?: "-"
         set(v) = put("status", v)
     var running: Boolean
-        get() = sp.getBoolean("running", false)
+        get() = ScanService.running
         set(v) {
-            sp.edit().putBoolean("running", v).apply()
+            ScanService.running = v
+            sp.edit().putLong("rev", System.nanoTime()).apply()
             refreshTile()
         }
 

@@ -52,4 +52,19 @@ class CoreTest {
         assertFalse(d.accept(50))
         assertTrue(d.accept(101))
     }
+
+    @Test
+    fun diagnosticsPickCause() {
+        assertEquals("Standort aus", Diag.emptyScan(false, false))
+        assertEquals("WLAN aus", Diag.emptyScan(true, false))
+        assertEquals("keine Scanergebnisse", Diag.emptyScan(true, true))
+        assertEquals(null, Diag.permissionIssue(true, false))
+        assertEquals("Nur ungefährer Standort, genauer nötig", Diag.permissionIssue(false, true))
+        assertEquals("Standort verweigert", Diag.permissionIssue(false, false))
+        assertTrue(Diag.needsLocalNetwork(37, false))
+        assertFalse(Diag.needsLocalNetwork(37, true))
+        assertFalse(Diag.needsLocalNetwork(36, false))
+        assertEquals("ERR X (LAN-Zugriff fehlt)", Diag.postError("X", true))
+        assertEquals("ERR X", Diag.postError("X", false))
+    }
 }
