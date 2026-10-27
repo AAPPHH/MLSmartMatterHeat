@@ -14,6 +14,12 @@ CONFIG = {
         "layout_seed": 7, "rooms": ["wohnzimmer", "schlafzimmer", "bad", "kueche"], "n_aps": 12,
         "scans_per_room": 150, "dropout": 0.08, "sensitivity": -92, "noisy_fraction": 0.15,
         "transient_prob": 0.3, "interval_s": 10.0,
+        "trajectory": {
+            "rooms": ["wohnzimmer", "schlafzimmer", "bad", "kueche", "flur"], "extra": ["keller"], "walk_place": "flur",
+            "adjacent": [["wohnzimmer", "kueche"]], "adjacent_aps": 5, "adjacent_offset": 18.0,
+            "days": 5, "stays_per_day": 12, "day_start_h": 7, "dwell_min": [20, 90], "walk_scans": [6, 12],
+            "dwell_interval_s": 600.0, "walk_interval_s": 30.0, "labelled_per_room": 4, "extra_weight": 0.35,
+        },
         "temperature": {"n": 240, "interval_s": 30.0, "base": 21.0, "noise": 0.03, "drop_per_min": 0.6},
     },
     "window": {"window_s": 300.0, "min_points": 5},
