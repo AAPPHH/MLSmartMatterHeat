@@ -1,0 +1,25 @@
+[project]
+name = "heatml"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "AAPPHH", email = "147189916+AAPPHH@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=2.0.0",
+    "numpy>=2.5.4",
+    "onnx>=1.23.2",
+    "onnxruntime>=1.31.1",
+    "scikit-learn>=1.9.1",
+    "skl2onnx>=1.20.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
