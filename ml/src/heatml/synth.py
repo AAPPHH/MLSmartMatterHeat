@@ -54,7 +54,13 @@ class SynthGenerator:
         c = self.cfg["trajectory"]
         rng = np.random.default_rng(self.cfg["layout_seed"] + 1)
         places = c["rooms"] + c["extra"]
-        means = {p: rng.uniform(-90, -40, self.cfg["n_aps"]) for p in places}
+        means = {}
+        for p in places:
+            for _ in range(1000):
+                m = rng.uniform(-90, -40, self.cfg["n_aps"])
+                if all(np.abs(m - o).mean() >= c["min_separation"] for o in means.values()):
+                    break
+            means[p] = m
         for a, b in c["adjacent"]:
             means[b] = means[a].copy()
             idx = rng.choice(self.cfg["n_aps"], c["adjacent_aps"], replace=False)
@@ -74,7 +80,7 @@ class SynthGenerator:
             sid += 1
 
         for day in range(c["days"]):
-            t, prev = START_TS + day * 86400.0 + c["day_start_h"] * 3600.0, None
+            t, prev = START_TS - START_TS % 86400.0 + day * 86400.0 + c["day_start_h"] * 3600.0, None
             for _ in range(c["stays_per_day"]):
                 weights = np.array([c["extra_weight"] if p in c["extra"] else 1.0 for p in dwell_places])
                 weights = np.array([0.0 if p == prev else w for p, w in zip(dwell_places, weights)])
