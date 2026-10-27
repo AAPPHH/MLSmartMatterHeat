@@ -1,0 +1,15 @@
+[Unit]
+Description=heatd smart heating service
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+User=aapphh
+WorkingDirectory=/home/aapphh/MLSmartMatterHeat
+Environment=HEATD_CONFIG=/home/aapphh/MLSmartMatterHeat/heatd.toml
+ExecStart=/home/aapphh/MLSmartMatterHeat/target/release/heatd serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

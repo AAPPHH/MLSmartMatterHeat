@@ -14,7 +14,7 @@ __pycache__/
 *.egg-info/
 /models/
 /data/
-/firmware/br/build/
+/firmware/br/build*/
 /firmware/br/sdkconfig
 /firmware/br/sdkconfig.old
 /firmware/br/managed_components/
