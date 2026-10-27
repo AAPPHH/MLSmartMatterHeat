@@ -2,7 +2,8 @@ import json
 import numpy as np
 import onnxruntime as ort
 import pytest
-from heatml.__main__ import CONFIG
+from heatml.__main__ import CONFIG, cluster, fit_model, train
+from heatml.cluster import UNKNOWN, SemiSupervisedRoom
 from heatml.data import REPO_ROOT, Snapshot
 from heatml.room import RoomClassifier, vectorize
 from heatml.synth import START_TS, SynthGenerator
@@ -78,3 +79,58 @@ def test_window_baseline_detects_drop(tmp_path):
     assert pred[falling].mean() > 0.9 and pred[calm].mean() < 0.05
     with pytest.raises(NotImplementedError):
         ThresholdWindowDetector().export_onnx("x.onnx")
+
+
+
+@pytest.fixture(scope="module", params=[1, 2])
+def semi(request, tmp_path_factory):
+    d = tmp_path_factory.mktemp("c")
+    gen = SynthGenerator(CONFIG["synth"])
+    db = gen.write(d / "traj.duckdb", seed=request.param, trajectory=True)
+    scans = Snapshot(db).scans(labelled_only=False)
+    model = SemiSupervisedRoom(CONFIG).fit(scans)
+    onnx_path, json_path = model.classifier.export(d / "m" / "room_model.onnx")
+    truth = {s["scan_id"]: s["truth"] for s in gen.trajectory(request.param)}
+    return gen, scans, model, onnx_path, json_path, db, truth
+
+
+def test_semi_supervised_accuracy(semi):
+    gen, scans, model, onnx_path, json_path, _, _ = semi
+    assert sum(s.label is not None for s in scans) == 5 * CONFIG["synth"]["trajectory"]["labelled_per_room"]
+    side = json.loads(json_path.read_text())
+    assert sorted(side["labels"]) == sorted(CONFIG["synth"]["trajectory"]["rooms"])
+    held = gen.held_out(seed=9)
+    X = np.stack([vectorize(s["aps"], side["bssids"], side["rssi_floor"], side["rssi_span"]) for s in held])
+    label, _ = ort.InferenceSession(str(onnx_path)).run(["label", "probabilities"], {"input": X})
+    truth = np.array([side["labels"].index(s["label"]) for s in held])
+    assert (label == truth).mean() > 0.9
+
+
+def test_unlabelled_place_stays_unknown(semi):
+    scans, model, truth = semi[1], semi[2], semi[6]
+    keller = [s for s in scans if truth[s.scan_id] == "keller"]
+    assert keller
+    assert np.mean([model.clusterer.names[s.scan_id] == UNKNOWN for s in keller]) > 0.9
+    assert "keller" not in model.classifier.labels
+    kept = {s.scan_id for s in model.clusterer.named(scans)}
+    assert all(model.clusterer.names[s.scan_id] == UNKNOWN for s in scans if s.scan_id not in kept)
+
+
+def test_adjacent_rooms_not_merged(semi):
+    scans, model, truth = semi[1], semi[2], semi[6]
+    for a, b in CONFIG["synth"]["trajectory"]["adjacent"]:
+        names_a = {model.clusterer.names[s.scan_id] for s in scans if truth[s.scan_id] == a}
+        names_b = {model.clusterer.names[s.scan_id] for s in scans if truth[s.scan_id] == b}
+        assert a in names_a and b in names_b and b not in names_a and a not in names_b
+
+
+def test_cli_dispatch_and_fallback(semi, capsys):
+    db = semi[5]
+    cfg = {**CONFIG, "snapshot": db, "model_dir": db.parent / "out"}
+    train(cfg)
+    assert UNKNOWN in capsys.readouterr().out and (db.parent / "out" / "room_model.onnx").exists()
+    cluster(cfg)
+    assert "clusters" in capsys.readouterr().out
+    sup = SynthGenerator(CONFIG["synth"]).write(db.parent / "sup.duckdb", seed=1)
+    clf, clusterer = fit_model({**cfg, "snapshot": sup})
+    assert clusterer is None and len(clf.labels) == 4
