@@ -129,8 +129,8 @@ class ScanService : Service() {
             }
             registerReceiver(receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), RECEIVER_NOT_EXPORTED)
             store.running = true
-            step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
             wakeStep = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
+            step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) ?: wakeStep
             triggers = listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_MOTION_DETECT, true), sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION))
             val adaptive = step != null && (wakeStep != null || triggers.isNotEmpty()) &&
                 checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED

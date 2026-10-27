@@ -186,6 +186,8 @@ class CoreTest {
         val p = ScanPolicy(true, 0)
         assertTrue(p.onTick(0))
         p.onScan(false, 1 * s)
+        assertEquals(Mode.MOVING, p.mode)
+        repeat(ScanConfig.AWAY_AFTER_MISSES - 1) { p.onScan(false, 1 * s) }
         assertEquals(Mode.AWAY, p.mode)
         assertEquals("Unterwegs", p.mode.label)
         assertFalse(p.onMotion(100 * s, 100 * s))
@@ -201,7 +203,7 @@ class CoreTest {
     fun homeSsidSeenReturnsToAdaptiveBehaviour() {
         val p = ScanPolicy(true, 0)
         p.onTick(0)
-        p.onScan(false, 1 * s)
+        repeat(ScanConfig.AWAY_AFTER_MISSES) { p.onScan(false, 1 * s) }
         val back = ScanConfig.AWAY_MS + 1 * s
         p.onTick(back)
         p.onScan(true, back)

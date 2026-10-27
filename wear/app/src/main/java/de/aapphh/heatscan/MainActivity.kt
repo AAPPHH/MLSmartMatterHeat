@@ -159,17 +159,20 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun SettingsPage(rev: Int, store: Store, toggle: () -> Unit) {
+        val running = store.running
+        val label = store.label
+        val status = TileClick.statusLine(running, store.mode, store.status)
         ScalingLazyColumn(Modifier.fillMaxWidth()) {
             item {
                 Chip(
                     onClick = toggle,
-                    label = { Text(if (store.running) "Stop" else "Start") },
-                    secondaryLabel = { Text("Label: ${store.label ?: "kein Label"}") },
-                    colors = if (store.running) ChipDefaults.secondaryChipColors() else ChipDefaults.primaryChipColors(),
+                    label = { Text(if (running) "Stop" else "Start") },
+                    secondaryLabel = { Text("Label: ${label ?: "kein Label"}") },
+                    colors = if (running) ChipDefaults.secondaryChipColors() else ChipDefaults.primaryChipColors(),
                     modifier = Modifier.fillMaxWidth()
                 )
             }
-            item { Text(TileClick.statusLine(store.running, store.mode, store.status), fontSize = 11.sp) }
+            item { Text(status, fontSize = 11.sp) }
             item { Field("Server", store.server) { store.server = it } }
             item { Field("Gerät", store.device) { store.device = it } }
             item { Field("Heim-WLANs (Komma)", store.home) { store.home = it } }
@@ -179,21 +182,23 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun Field(title: String, value: String, onChange: (String) -> Unit) {
         var text by remember(value) { mutableStateOf(value) }
-        Text(title, fontSize = 11.sp)
-        BasicTextField(
-            value = text,
-            onValueChange = {
-                text = it
-                onChange(it)
-            },
-            singleLine = true,
-            textStyle = TextStyle(color = Color.White, fontSize = 12.sp),
-            cursorBrush = SolidColor(Color.White),
-            modifier = Modifier
-                .fillMaxWidth()
-                .border(1.dp, Color.Gray, RoundedCornerShape(8.dp))
-                .padding(8.dp)
-        )
+        Column {
+            Text(title, fontSize = 11.sp)
+            BasicTextField(
+                value = text,
+                onValueChange = {
+                    text = it
+                    onChange(it)
+                },
+                singleLine = true,
+                textStyle = TextStyle(color = Color.White, fontSize = 12.sp),
+                cursorBrush = SolidColor(Color.White),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, Color.Gray, RoundedCornerShape(8.dp))
+                    .padding(8.dp)
+            )
+        }
     }
 
     companion object {

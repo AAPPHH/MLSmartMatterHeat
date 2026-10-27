@@ -106,7 +106,7 @@ class Store(private val ctx: Context) {
         get() = sp.getString("device", Defaults.DEVICE) ?: Defaults.DEVICE
         set(v) = put("device", v)
     var label: String?
-        get() = sp.getString("label", null)
+        get() = sp.getString("label", null)?.takeIf { it in Defaults.ROOMS }
         set(v) = put("label", v)
     var status: String
         get() = sp.getString("status", "-") ?: "-"
@@ -178,6 +178,7 @@ object ScanConfig {
     const val MIN_GAP_MS = 20_000L
     const val STALE_MS = 20_000L
     const val AWAY_MS = 900_000L
+    const val AWAY_AFTER_MISSES = 3
 }
 
 enum class Mode(val label: String, val sleeps: Boolean) {
@@ -192,6 +193,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
     private var lastMotion = start
     private var nextAt = start
     private var lastScanAt = Long.MIN_VALUE / 4
+    private var misses = 0
 
     fun onMotion(now: Long, at: Long): Boolean {
         if (mode == Mode.FIXED || mode == Mode.AWAY || now - at > ScanConfig.STALE_MS) return false
@@ -213,10 +215,11 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
     }
 
     fun onScan(home: Boolean, now: Long) {
-        if (!home) {
+        misses = if (home) 0 else misses + 1
+        if (!home && (mode == Mode.AWAY || misses >= ScanConfig.AWAY_AFTER_MISSES)) {
             mode = Mode.AWAY
             nextAt = now + ScanConfig.AWAY_MS
-        } else if (mode == Mode.AWAY) {
+        } else if (home && mode == Mode.AWAY) {
             mode = base
             lastMotion = now
             nextAt = now + ScanConfig.MOVING_PERIOD_MS
