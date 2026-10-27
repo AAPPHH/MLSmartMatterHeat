@@ -13,11 +13,14 @@ frost_setpoint = 7.0
 
 [chip_tool]
 binary = "chip-tool"
-storage_dir = "data/chip-tool"
+# storage_dir = "/home/aapphh/snap/chip-tool/common"
+paa_trust_store = "/home/aapphh/snap/chip-tool/common/paa-root-certs"
+bypass_attestation = false
 endpoint = 1
 subscribe_min_s = 5
 subscribe_max_s = 300
 timeout_s = 90
+commission_timeout_s = 180
 
 [[rooms]]
 name = "wohnzimmer"
