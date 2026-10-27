@@ -1,0 +1,3 @@
+[submodule "firmware/esp-thread-br"]
+	path = firmware/esp-thread-br
+	url = https://github.com/espressif/esp-thread-br.git
