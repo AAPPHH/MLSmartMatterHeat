@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "input_name": "input",
+  "bssids": [
+    "aa:bb:cc:00:00:01",
+    "aa:bb:cc:00:00:02",
+    "aa:bb:cc:00:00:03",
+    "aa:bb:cc:00:00:04"
+  ],
+  "labels": [
+    "wohnzimmer",
+    "schlafzimmer",
+    "bad"
+  ],
+  "rssi_floor": -100.0,
+  "rssi_span": 70.0
+}

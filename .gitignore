@@ -5,7 +5,6 @@
 *.onnx
 !/crates/heatd/tests/fixtures/*.onnx
 /firmware/build/
-/firmware/esp-thread-br/
 /wear/.gradle/
 /wear/build/
 /wear/app/build/
