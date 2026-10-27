@@ -1,6 +1,7 @@
 package de.aapphh.heatscan
 
 import org.json.JSONObject
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -21,8 +22,9 @@ class CoreTest {
     @Test
     fun payloadMatchesContract() {
         val built = Payload.build(example.getLong("ts"), "pixel-watch", "wohnzimmer", aps)
-        assertEquals(example.keys().asSequence().toSet(), built.keys().asSequence().toSet())
-        assertEquals(shape(example), shape(built))
+        assertTrue(built.keys().asSequence().toSet().containsAll(example.keys().asSequence().toSet()))
+        assertEquals(shape(example), shape(built).filterKeys { it in example.keys().asSequence().toSet() })
+        assertEquals(setOf("motion", "power", "away"), built.keys().asSequence().toSet() - example.keys().asSequence().toSet())
         assertEquals(example.getLong("ts"), built.getLong("ts"))
         assertEquals("wohnzimmer", built.getString("label"))
         val exAps = example.getJSONArray("aps")
@@ -101,9 +103,9 @@ class CoreTest {
     @Test
     fun stillScansOnlyOnHeartbeat() {
         val p = still()
-        assertFalse(p.onTick(150 * s + 599 * s))
-        assertTrue(p.onTick(150 * s + 600 * s))
-        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(750 * s))
+        assertFalse(p.onTick(150 * s + 719 * s))
+        assertTrue(p.onTick(150 * s + 720 * s))
+        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(870 * s))
         assertEquals(Mode.STILL, p.mode)
     }
 
@@ -140,11 +142,11 @@ class CoreTest {
     @Test
     fun noExtraScanWithin20sOfPreviousOne() {
         val p = still()
-        assertTrue(p.onTick(750 * s))
-        assertFalse(p.onMotion(760 * s, 760 * s))
+        assertTrue(p.onTick(870 * s))
+        assertFalse(p.onMotion(880 * s, 880 * s))
         assertEquals(Mode.MOVING, p.mode)
-        assertEquals(10 * s, p.delay(760 * s))
-        assertTrue(p.onTick(770 * s))
+        assertEquals(10 * s, p.delay(880 * s))
+        assertTrue(p.onTick(890 * s))
     }
 
     @Test
@@ -285,5 +287,177 @@ class CoreTest {
         assertTrue(Diag.postOk("200 12 APs"))
         assertFalse(Diag.postOk("500 12 APs"))
         assertFalse(Diag.postOk("ERR SocketTimeoutException"))
+    }
+
+    private fun entry(ts: Long, label: String? = null) = Payload.build(ts, "d", label, emptyList())
+
+    @Test
+    fun extendedPayloadCarriesMotionPowerAway() {
+        val b = Payload.build(5, "d", null, aps, "still", "doze", true)
+        assertEquals("still", b.getString("motion"))
+        assertEquals("doze", b.getString("power"))
+        assertTrue(b.getBoolean("away"))
+        val n = Payload.build(5, "d", null, emptyList())
+        assertTrue(n.isNull("motion") && n.isNull("power"))
+        assertFalse(n.getBoolean("away"))
+        assertEquals(0, n.getJSONArray("aps").length())
+    }
+
+    @Test
+    fun powerStatePriority() {
+        assertEquals(null, PowerState.of(null, null, null))
+        assertEquals("normal", PowerState.of(false, false, null))
+        assertEquals("saver", PowerState.of(true, false, false))
+        assertEquals("doze", PowerState.of(true, true, null))
+        assertEquals("offbody", PowerState.of(false, true, true))
+    }
+
+    @Test
+    fun modeMotionAndAwayFlag() {
+        val p = ScanPolicy(true, 0)
+        assertEquals("moving", p.mode.motion)
+        assertEquals("still", still().mode.motion)
+        assertEquals(null, ScanPolicy(false, 0).mode.motion)
+        assertFalse(p.away)
+        repeat(ScanConfig.AWAY_AFTER_MISSES - 1) { p.onScan(false, 1 * s) }
+        assertFalse(p.away)
+        p.onScan(false, 2 * s)
+        assertTrue(p.away)
+        p.onScan(true, 3 * s)
+        assertFalse(p.away)
+    }
+
+    @Test
+    fun heartbeatIsTwelveMinutes() {
+        assertEquals(12 * 60_000L, ScanConfig.HEARTBEAT_MS)
+        assertTrue(3_600_000L / ScanConfig.HEARTBEAT_MS <= 7)
+    }
+
+    @Test
+    fun captureTimestampFromScanAge() {
+        assertEquals(1_000_000L - 30_000, Capture.wallMs(1_000_000, 100_000, 70_000_000))
+        assertEquals(1_000_000L, Capture.wallMs(1_000_000, 100_000, 100_000_000))
+        assertEquals(1_000_000L, Capture.wallMs(1_000_000, 100_000, 120_000_000))
+    }
+
+    @Test
+    fun queueDropsOldestAtCapAndKeepsOrder() {
+        val q = ScanQueue(null, 3, 1_000_000)
+        assertEquals(0, q.add(entry(10), 10))
+        q.add(entry(11), 11)
+        q.add(entry(12), 12)
+        assertEquals(1, q.add(entry(13), 13))
+        assertEquals(3, q.size)
+        assertEquals(listOf(11L, 12L, 13L), q.peek(10, 13).map { it.getLong("ts") })
+    }
+
+    @Test
+    fun queueDropsEntriesOlderThanMaxAge() {
+        val q = ScanQueue(null, 10, 100)
+        q.add(entry(0), 0)
+        q.add(entry(50), 50)
+        assertEquals(1, q.add(entry(150), 150))
+        assertEquals(listOf(50L, 150L), q.peek(10, 150).map { it.getLong("ts") })
+    }
+
+    @Test
+    fun queueMarksOnlyOldEntriesQueued() {
+        val q = ScanQueue(null, 10, 10_000_000)
+        q.add(entry(0), 0)
+        q.add(entry(100_000), 100_000)
+        val out = q.peek(10, 100_000 + ScanConfig.QUEUED_AFTER_MS)
+        assertTrue(out[0].optBoolean("queued"))
+        assertFalse(out[1].has("queued"))
+        assertFalse(q.peek(10, 100_000 + ScanConfig.QUEUED_AFTER_MS - 100_000)[0].has("queued"))
+    }
+
+    @Test
+    fun queuePersistsAppendsAndRemovals() {
+        val f = File.createTempFile("queue", ".jsonl")
+        try {
+            val q = ScanQueue(f, 5, 1_000_000)
+            for (t in 1L..3L) q.add(entry(t), t)
+            assertEquals(3, ScanQueue(f, 5, 1_000_000).size)
+            q.remove(2)
+            val again = ScanQueue(f, 5, 1_000_000)
+            assertEquals(listOf(3L), again.peek(5, 3).map { it.getLong("ts") })
+            f.appendText("garbage\n")
+            assertEquals(1, ScanQueue(f, 5, 1_000_000).size)
+            for (t in 4L..9L) q.add(entry(t), t)
+            assertEquals(5, ScanQueue(f, 5, 1_000_000).size)
+        } finally {
+            f.delete()
+        }
+    }
+
+    @Test
+    fun flushBatchesInOrderAndEmptiesQueue() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        for (t in 1L..5L) q.add(entry(t), t)
+        val sizes = mutableListOf<Int>()
+        val seen = mutableListOf<Long>()
+        val r = Flusher(2).run(q, 5, { a ->
+            sizes.add(a.length())
+            for (i in 0 until a.length()) seen.add(a.getJSONObject(i).getLong("ts"))
+            200
+        }, { 500 })
+        assertEquals(listOf(2, 2, 1), sizes)
+        assertEquals(listOf(1L, 2L, 3L, 4L, 5L), seen)
+        assertEquals(5, r.sent)
+        assertEquals(0, q.size)
+    }
+
+    @Test
+    fun flushKeepsQueueOnFailureAndStops() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        for (t in 1L..4L) q.add(entry(t), t)
+        var calls = 0
+        val r = Flusher(2).run(q, 4, { calls++; if (calls == 1) 200 else 503 }, { 200 })
+        assertEquals(2, r.sent)
+        assertEquals(503, r.code)
+        assertEquals(2, q.size)
+        assertEquals(2, calls)
+        assertEquals(-1, Flusher(2).run(q, 4, { -1 }, { -1 }).code)
+        assertEquals(2, q.size)
+    }
+
+    @Test
+    fun flushFallsBackToSingleOn404AndRemembers() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        for (t in 1L..3L) q.add(entry(t), t)
+        val f = Flusher(10)
+        var batchCalls = 0
+        val singles = mutableListOf<Long>()
+        val r = f.run(q, 3, { batchCalls++; 404 }, { singles.add(it.getLong("ts")); 200 })
+        assertEquals(1, batchCalls)
+        assertEquals(listOf(1L, 2L, 3L), singles)
+        assertEquals(3, r.sent)
+        assertTrue(f.singleOnly)
+        q.add(entry(4), 4)
+        f.run(q, 4, { batchCalls++; 404 }, { singles.add(it.getLong("ts")); 200 })
+        assertEquals(1, batchCalls)
+        assertEquals(4, singles.size)
+    }
+
+    @Test
+    fun flushDropsPermanentlyRejectedBatchButNotTransientOnes() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        q.add(entry(1), 1)
+        val r = Flusher(10).run(q, 1, { 400 }, { 200 })
+        assertEquals(0, r.sent)
+        assertEquals(0, q.size)
+        q.add(entry(2), 2)
+        Flusher(10).run(q, 2, { 429 }, { 200 })
+        assertEquals(1, q.size)
+    }
+
+    @Test
+    fun flushMarksStaleEntriesQueuedInBatch() {
+        val q = ScanQueue(null, 100, 10_000_000)
+        q.add(entry(0), 0)
+        q.add(entry(200_000), 200_000)
+        val flags = mutableListOf<Boolean>()
+        Flusher(10).run(q, 200_000, { a -> for (i in 0 until a.length()) flags.add(a.getJSONObject(i).optBoolean("queued")); 200 }, { 200 })
+        assertEquals(listOf(true, false), flags)
     }
 }
