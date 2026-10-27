@@ -130,6 +130,14 @@ class MainActivity : ComponentActivity() {
         ScalingLazyColumn(Modifier.fillMaxWidth()) {
             item { Text(status, fontSize = 11.sp) }
             item { Text("OK ${store.postsOk} / Fehler ${store.postsFailed}", fontSize = 10.sp) }
+            item { Text(ScanStarter.extra(this@MainActivity).filter { it.first != "startError" }.joinToString(" ") { "${it.first}=${it.second}" }, fontSize = 9.sp) }
+            item {
+                Text(
+                    if (store.paused) "Fortsetzen" else "Pausieren",
+                    Modifier.border(1.dp, Color.Gray, RoundedCornerShape(8.dp)).clickable { ScanStarter.setPaused(this@MainActivity, !store.paused) }.padding(8.dp),
+                    fontSize = 12.sp
+                )
+            }
             item { Field("Server", store.server) { store.server = it } }
             item { Field("Gerät", store.device) { store.device = it } }
             item { Field("Heim-WLANs (Komma)", store.home) { store.home = it } }
