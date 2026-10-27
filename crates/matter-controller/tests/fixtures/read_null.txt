@@ -1,0 +1,2 @@
+[1761580800.102] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0000 DataVersion: 3037862385
+[1761580800.102] [4821:4825] [TOO]   LocalTemperature: null
