@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::infer::RoomModel;
-use crate::storage::{now_ms, ScanBody, Storage};
+use crate::storage::{now_ms, BatchBody, ScanBody, Storage};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -48,22 +48,42 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/api/scan", post(scan))
+        .route("/api/scans", post(scans))
         .route("/api/state", get(api_state))
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
         .with_state(state)
 }
 
-async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiResult {
-    let received = now_ms();
-    let stored = state.storage.insert_scan(&body, received)?;
+fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<(usize, Option<(String, i64)>), ApiError> {
+    let stored = state.storage.insert_scan(body, received)?;
+    state.storage.insert_device_state(body, received)?;
     let mut room = None;
-    if let Some(model) = &state.model {
+    if let Some(model) = state.model.as_ref().filter(|_| !body.aps.is_empty()) {
         let (label, probability) = model.predict(&body.aps)?;
-        state.storage.insert_prediction(received, &body.device, &label, probability)?;
-        room = Some(label);
+        state.storage.insert_prediction(body.ts, &body.device, &label, probability)?;
+        room = Some((label, body.ts));
     }
-    Ok(Json(json!({"stored": stored, "room": room})))
+    Ok((stored, room))
+}
+
+async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiResult {
+    let (stored, room) = ingest(&state, &body, now_ms())?;
+    Ok(Json(json!({"stored": stored, "room": room.map(|r| r.0)})))
+}
+
+async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> ApiResult {
+    let received = now_ms();
+    let mut stored = 0;
+    let mut latest: Option<(String, i64)> = None;
+    for scan in &body.scans {
+        let (n, room) = ingest(&state, scan, received)?;
+        stored += n;
+        if let Some(room) = room.filter(|r| latest.as_ref().is_none_or(|l| r.1 >= l.1)) {
+            latest = Some(room);
+        }
+    }
+    Ok(Json(json!({"stored": stored, "accepted": body.scans.len(), "room": latest.map(|r| r.0)})))
 }
 
 async fn api_state(State(state): State<AppState>) -> ApiResult {
@@ -173,6 +193,75 @@ mod tests {
         std::fs::read_to_string(format!("{CONTRACT}/scan_example.json")).unwrap()
     }
 
+    fn scan_at(ts: i64, extra: Value) -> String {
+        let mut v: Value = serde_json::from_str(&scan_body()).unwrap();
+        v["ts"] = json!(ts);
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v.to_string()
+    }
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!("{CONTRACT}/{name}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stores_state_without_prediction() {
+        let h = harness(true);
+        let (status, body) = call(&h.state, "POST", "/api/scan", Some(fixture("heartbeat_example.json"))).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"stored": 0, "room": null})));
+        assert_eq!((h.state.storage.count("scans").unwrap(), h.state.storage.count("predictions").unwrap(), h.state.storage.count("device_state").unwrap()), (0, 0, 1));
+        let st = &h.state.storage.device_statuses().unwrap()[0];
+        assert_eq!((st.motion, st.power, st.away), (Some(crate::storage::Motion::Still), Some(crate::storage::Power::Doze), false));
+        let (status, _) = call(&h.state, "POST", "/api/scan", Some("{\"ts\":1,\"device\":\"w\",\"motion\":\"sideways\"}".into())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, body) = call(&h.state, "POST", "/api/scan", Some("{\"ts\":1,\"device\":\"w\"}".into())).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"stored": 0, "room": null})));
+    }
+
+    #[tokio::test]
+    async fn batch_with_mixed_queued_scans() {
+        let h = harness(true);
+        let (status, body) = call(&h.state, "POST", "/api/scans", Some(fixture("batch_example.json"))).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"stored": 4, "accepted": 2, "room": "wohnzimmer"})));
+        assert_eq!((h.state.storage.count("scans").unwrap(), h.state.storage.count("predictions").unwrap(), h.state.storage.count("device_state").unwrap()), (4, 1, 2));
+        let predictions = h.state.storage.last_predictions().unwrap();
+        assert_eq!(predictions[0].ts, 1_761_580_800_000);
+        let st = &h.state.storage.device_statuses().unwrap()[0];
+        assert_eq!((st.state_ts, st.motion), (1_761_582_600_000, Some(crate::storage::Motion::Still)));
+        let (status, body) = call(&h.state, "POST", "/api/scans", Some("{\"scans\":[]}".into())).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"stored": 0, "accepted": 0, "room": null})));
+    }
+
+    #[tokio::test]
+    async fn out_of_order_batch_keeps_latest_ts() {
+        let h = harness(true);
+        let newer = serde_json::from_str::<Value>(&scan_at(2_000, json!({"queued": true, "motion": "still"}))).unwrap();
+        let older = serde_json::from_str::<Value>(&scan_at(1_000, json!({"queued": true, "motion": "moving"}))).unwrap();
+        let (_, body) = call(&h.state, "POST", "/api/scans", Some(json!({"scans": [newer, older]}).to_string())).await;
+        assert_eq!((body["stored"].clone(), body["room"].clone()), (json!(8), json!("wohnzimmer")));
+        call(&h.state, "POST", "/api/scan", Some(scan_at(500, json!({"queued": true, "motion": "moving"})))).await;
+        assert_eq!(h.state.storage.last_predictions().unwrap()[0].ts, 2_000);
+        let st = &h.state.storage.device_statuses().unwrap()[0];
+        assert_eq!((st.state_ts, st.motion), (2_000, Some(crate::storage::Motion::Still)));
+    }
+
+    #[tokio::test]
+    async fn still_heartbeat_keeps_presence_and_away_goes_eco() {
+        let h = harness(true);
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let now = now_ms();
+        let old = now - 3 * 3_600_000;
+        call(&h.state, "POST", "/api/scan", Some(scan_at(old, json!({"motion": "still"})))).await;
+        call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "pixel-watch", "motion": "still", "power": "doze"}).to_string())).await;
+        let boosted = control_step(&h.state, noon, now).await.unwrap();
+        assert_eq!((boosted[0].setpoint, boosted[0].reason), (19.0, "presence_boost"));
+        call(&h.state, "POST", "/api/scan", Some(json!({"ts": now + 1, "device": "pixel-watch", "motion": "moving", "away": true}).to_string())).await;
+        let eco = control_step(&h.state, noon, now + 1).await.unwrap();
+        assert_eq!((eco[0].setpoint, eco[0].reason), (16.0, "away_eco"));
+    }
+
     #[tokio::test]
     async fn scan_ingest_end_to_end() {
         let h = harness(true);
@@ -212,7 +301,7 @@ mod tests {
         assert_eq!((frost[0].setpoint, frost[0].reason), (7.0, "window_open"));
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 7.0)]);
         assert_eq!(h.state.storage.last_setpoints().unwrap()[0].reason, "window_open");
-        call(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        call(&h.state, "POST", "/api/scan", Some(scan_at(now_ms(), json!({})))).await;
         call(&h.state, "POST", "/api/window", Some("{\"room\":\"wohnzimmer\",\"open\":false}".into())).await;
         let boosted = control_step(&h.state, noon, now_ms()).await.unwrap();
         assert_eq!((boosted[0].setpoint, boosted[0].reason), (19.0, "presence_boost"));

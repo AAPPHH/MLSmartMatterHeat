@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS scans (scan_id BIGINT, ts TIMESTAMP, received_at TIME
 CREATE TABLE IF NOT EXISTS readings (ts TIMESTAMP, node UBIGINT, endpoint USMALLINT, attribute VARCHAR, value DOUBLE);
 CREATE TABLE IF NOT EXISTS setpoints (ts TIMESTAMP, node UBIGINT, room VARCHAR, value DOUBLE, reason VARCHAR);
 CREATE TABLE IF NOT EXISTS predictions (ts TIMESTAMP, device VARCHAR, room VARCHAR, probability DOUBLE);
+CREATE TABLE IF NOT EXISTS device_state (ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, motion VARCHAR, power VARCHAR, queued BOOLEAN, n_aps INTEGER, away BOOLEAN);
 ";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -18,12 +19,81 @@ pub struct AccessPoint {
     pub freq: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Motion {
+    Moving,
+    Still,
+}
+
+impl Motion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Motion::Moving => "moving",
+            Motion::Still => "still",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        [Motion::Moving, Motion::Still].into_iter().find(|m| m.as_str() == s)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Power {
+    Normal,
+    Saver,
+    Offbody,
+    Doze,
+}
+
+impl Power {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Power::Normal => "normal",
+            Power::Saver => "saver",
+            Power::Offbody => "offbody",
+            Power::Doze => "doze",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        [Power::Normal, Power::Saver, Power::Offbody, Power::Doze].into_iter().find(|p| p.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScanBody {
     pub ts: i64,
     pub device: String,
+    #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
     pub aps: Vec<AccessPoint>,
+    #[serde(default)]
+    pub motion: Option<Motion>,
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default)]
+    pub power: Option<Power>,
+    #[serde(default)]
+    pub away: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchBody {
+    pub scans: Vec<ScanBody>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceStatus {
+    pub device: String,
+    pub motion: Option<Motion>,
+    pub power: Option<Power>,
+    pub away: bool,
+    pub state_ts: i64,
+    pub contact_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -85,6 +155,35 @@ impl Storage {
         Ok(scan.aps.len())
     }
 
+    pub fn insert_device_state(&self, scan: &ScanBody, received_ms: i64) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO device_state VALUES (epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?, ?)",
+            params![scan.ts, received_ms, scan.device, scan.motion.map(Motion::as_str), scan.power.map(Power::as_str), scan.queued, scan.aps.len() as i32, scan.away],
+        )?;
+        Ok(())
+    }
+
+    pub fn device_statuses(&self) -> Result<Vec<DeviceStatus>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT device, motion, power, coalesce(away, false), epoch_ms(ts), (SELECT epoch_ms(max(received_at)) FROM device_state d2 WHERE d2.device = d.device) \
+             FROM device_state d QUALIFY row_number() OVER (PARTITION BY device ORDER BY ts DESC, received_at DESC) = 1 ORDER BY device",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let motion: Option<String> = r.get(1)?;
+            let power: Option<String> = r.get(2)?;
+            Ok(DeviceStatus {
+                device: r.get(0)?,
+                motion: motion.as_deref().and_then(Motion::parse),
+                power: power.as_deref().and_then(Power::parse),
+                away: r.get(3)?,
+                state_ts: r.get(4)?,
+                contact_ms: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn insert_reading(&self, ts_ms: i64, node: u64, endpoint: u16, attribute: &str, value: f64) -> Result<()> {
         self.conn.lock().unwrap().execute("INSERT INTO readings VALUES (epoch_ms(?), ?, ?, ?, ?)", params![ts_ms, node, endpoint, attribute, value])?;
         Ok(())
@@ -127,10 +226,6 @@ impl Storage {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    pub fn latest_presence(&self) -> Result<Option<(String, i64)>> {
-        Ok(self.last_predictions()?.into_iter().max_by_key(|p| p.ts).map(|p| (p.room, p.ts)))
-    }
-
     #[cfg(test)]
     pub fn count(&self, table: &str) -> Result<i64> {
         Ok(self.conn.lock().unwrap().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
@@ -161,6 +256,10 @@ mod tests {
             ts: 1_761_580_800_000,
             device: "pixel-watch".into(),
             label: label.map(String::from),
+            motion: None,
+            queued: false,
+            power: None,
+            away: false,
             aps: vec![
                 AccessPoint { bssid: "AA:BB:CC:00:00:01".into(), rssi: -45, freq: 2412 },
                 AccessPoint { bssid: "aa:bb:cc:00:00:02".into(), rssi: -67, freq: 5180 },
@@ -184,7 +283,22 @@ mod tests {
         let last = storage.last_readings().unwrap();
         assert_eq!(last, vec![Reading { node: 5, attribute: "local_temperature".into(), value: 21.7, ts: 2_000 }]);
         assert_eq!(storage.last_setpoints().unwrap()[0].reason, "schedule");
-        assert_eq!(storage.latest_presence().unwrap(), Some(("wohnzimmer".into(), 5_000)));
+        assert_eq!(storage.last_predictions().unwrap()[0].room, "wohnzimmer");
+        let mut hb = sample_scan(None);
+        hb.aps.clear();
+        hb.ts = 2_000;
+        hb.motion = Some(Motion::Still);
+        hb.power = Some(Power::Doze);
+        hb.away = true;
+        storage.insert_device_state(&hb, 9_000).unwrap();
+        hb.ts = 1_000;
+        hb.queued = true;
+        hb.motion = Some(Motion::Moving);
+        storage.insert_device_state(&hb, 12_000).unwrap();
+        assert_eq!(
+            storage.device_statuses().unwrap(),
+            vec![DeviceStatus { device: "pixel-watch".into(), motion: Some(Motion::Still), power: Some(Power::Doze), away: true, state_ts: 2_000, contact_ms: 12_000 }]
+        );
         let snap = dir.path().join("snap").join("snapshot.duckdb");
         storage.snapshot(snap.to_str().unwrap()).unwrap();
         storage.snapshot(snap.to_str().unwrap()).unwrap();

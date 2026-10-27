@@ -9,6 +9,7 @@ default_setpoint = 18.0
 eco_setpoint = 16.0
 presence_boost = 1.0
 presence_timeout_minutes = 30
+still_contact_timeout_minutes = 180
 frost_setpoint = 7.0
 
 [chip_tool]

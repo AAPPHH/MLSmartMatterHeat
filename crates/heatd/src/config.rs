@@ -89,6 +89,7 @@ pub struct Config {
     pub eco_setpoint: f64,
     pub presence_boost: f64,
     pub presence_timeout_minutes: f64,
+    pub still_contact_timeout_minutes: f64,
     pub frost_setpoint: f64,
     pub rooms: Vec<Room>,
 }
@@ -108,6 +109,7 @@ impl Default for Config {
             eco_setpoint: 16.0,
             presence_boost: 1.0,
             presence_timeout_minutes: 30.0,
+            still_contact_timeout_minutes: 180.0,
             frost_setpoint: 7.0,
             rooms: Vec::new(),
         }
