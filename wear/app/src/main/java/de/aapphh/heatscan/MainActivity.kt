@@ -1,15 +1,9 @@
 package de.aapphh.heatscan
 
-import android.Manifest
-import android.content.Intent
 import android.content.SharedPreferences
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -32,7 +26,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -50,8 +43,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
-import androidx.wear.compose.material.Chip
-import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
@@ -59,13 +50,8 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
-    private val needed: List<String> by lazy {
-        listOfNotNull(
-            Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION,
-            Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACTIVITY_RECOGNITION,
-            Diag.LOCAL_NETWORK.takeIf { Build.VERSION.SDK_INT >= Diag.LOCAL_NETWORK_SDK }
-        )
-    }
+    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { ScanStarter.start(this, "permissions") }
+    private var asked = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,28 +62,13 @@ class MainActivity : ComponentActivity() {
         setContent { MaterialTheme { Screen(store) } }
     }
 
-    private fun granted(p: String) = checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
-
-    private fun launchScan(store: Store, perms: ActivityResultLauncher<Array<String>>) {
-        store.stopped = false
-        val missing = needed.filter { !granted(it) }
-        if (missing.isEmpty()) beginScan(store) else perms.launch(missing.toTypedArray())
-    }
-
-    private fun beginScan(store: Store) {
-        val issue = Diag.permissionIssue(granted(Manifest.permission.ACCESS_FINE_LOCATION), granted(Manifest.permission.ACCESS_COARSE_LOCATION))
-        if (issue != null) {
-            store.status = issue
-            return
-        }
-        if (Diag.needsLocalNetwork(Build.VERSION.SDK_INT, granted(Diag.LOCAL_NETWORK))) store.status = "LAN-Zugriff fehlt"
-        if (!store.running) startForegroundService(Intent(this, ScanService::class.java))
-    }
-
-    private fun stopScan(store: Store) {
-        store.stopped = true
-        stopService(Intent(this, ScanService::class.java))
-        store.running = false
+    override fun onResume() {
+        super.onResume()
+        val missing = ScanStarter.missing(this)
+        if (missing.isNotEmpty() && !asked) {
+            asked = true
+            perms.launch(missing.toTypedArray())
+        } else ScanStarter.start(this, "resume")
     }
 
     @Composable
@@ -108,15 +79,11 @@ class MainActivity : ComponentActivity() {
             store.sp.registerOnSharedPreferenceChangeListener(l)
             onDispose { store.sp.unregisterOnSharedPreferenceChangeListener(l) }
         }
-        val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { beginScan(store) }
-        LaunchedEffect(Unit) {
-            if (!store.running && !store.stopped) launchScan(store, perms)
-        }
         val pager = rememberPagerState { 2 }
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 if (page == 0) RoomsPage(version, store, store.label, TileClick.statusLine(store.running, store.mode, store.status))
-                else SettingsPage(version, store, { if (store.running) stopScan(store) else launchScan(store, perms) })
+                else SettingsPage(version, store)
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 repeat(2) {
@@ -158,21 +125,11 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun SettingsPage(rev: Int, store: Store, toggle: () -> Unit) {
-        val running = store.running
-        val label = store.label
-        val status = TileClick.statusLine(running, store.mode, store.status)
+    private fun SettingsPage(rev: Int, store: Store) {
+        val status = TileClick.statusLine(store.running, store.mode, store.status)
         ScalingLazyColumn(Modifier.fillMaxWidth()) {
-            item {
-                Chip(
-                    onClick = toggle,
-                    label = { Text(if (running) "Stop" else "Start") },
-                    secondaryLabel = { Text("Label: ${label ?: "kein Label"}") },
-                    colors = if (running) ChipDefaults.secondaryChipColors() else ChipDefaults.primaryChipColors(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
             item { Text(status, fontSize = 11.sp) }
+            item { Text("OK ${store.postsOk} / Fehler ${store.postsFailed}", fontSize = 10.sp) }
             item { Field("Server", store.server) { store.server = it } }
             item { Field("Gerät", store.device) { store.device = it } }
             item { Field("Heim-WLANs (Komma)", store.home) { store.home = it } }

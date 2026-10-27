@@ -57,6 +57,29 @@ object TileClick {
         (if (running && mode.isNotEmpty()) "$mode | " else if (!running) "Scan aus | " else "") + status
 }
 
+object Trace {
+    fun fmt(event: String, vararg pairs: Pair<String, Any?>): String =
+        (listOf(event) + pairs.map { "${it.first}=${it.second.toString().replace(' ', '_')}" }).joinToString(" ")
+
+    fun i(event: String, vararg pairs: Pair<String, Any?>) {
+        Log.i(TAG, fmt(event, *pairs))
+    }
+
+    fun w(event: String, e: Throwable, vararg pairs: Pair<String, Any?>) {
+        Log.w(TAG, fmt(event, *pairs, "ex" to e.toString()), e)
+    }
+}
+
+object Summary {
+    fun line(
+        running: Boolean, paused: Boolean, mode: String, label: String?, server: String, home: String, atHome: Boolean?,
+        lastPost: String, ok: Long, failed: Long, lastError: String
+    ): String = Trace.fmt(
+        "status", "running" to running, "paused" to paused, "mode" to mode.ifEmpty { "-" }, "label" to (label ?: "-"), "server" to server,
+        "home" to home.ifEmpty { "-" }, "atHome" to (atHome ?: "-"), "lastPost" to lastPost, "ok" to ok, "failed" to failed, "lastError" to lastError
+    )
+}
+
 object Payload {
     fun build(ts: Long, device: String, label: String?, aps: List<Ap>): JSONObject = JSONObject()
         .put("ts", ts)
@@ -84,6 +107,8 @@ object Diag {
     }
 
     fun needsLocalNetwork(sdk: Int, granted: Boolean): Boolean = sdk >= LOCAL_NETWORK_SDK && !granted
+
+    fun postOk(status: String): Boolean = status.startsWith("2")
 
     fun postError(error: String, lanMissing: Boolean): String = "ERR $error" + if (lanMissing) " (LAN-Zugriff fehlt)" else ""
 }
@@ -114,9 +139,21 @@ class Store(private val ctx: Context) {
     var home: String
         get() = sp.getString("home", Defaults.HOME) ?: Defaults.HOME
         set(v) = put("home", v)
-    var stopped: Boolean
-        get() = sp.getBoolean("stopped", false)
-        set(v) = sp.edit().putBoolean("stopped", v).apply()
+    var lastPost: String
+        get() = sp.getString("lastPost", "-") ?: "-"
+        set(v) = put("lastPost", v)
+    var lastError: String
+        get() = sp.getString("lastError", "-") ?: "-"
+        set(v) = put("lastError", v)
+    var postsOk: Long
+        get() = sp.getLong("postsOk", 0L)
+        set(v) = sp.edit().putLong("postsOk", v).apply()
+    var postsFailed: Long
+        get() = sp.getLong("postsFailed", 0L)
+        set(v) = sp.edit().putLong("postsFailed", v).apply()
+    var atHome: Boolean?
+        get() = if (sp.contains("atHome")) sp.getBoolean("atHome", true) else null
+        set(v) = sp.edit().also { if (v == null) it.remove("atHome") else it.putBoolean("atHome", v) }.apply()
     val homeList: List<String> get() = Home.parse(home)
     var nonce: Long
         get() = sp.getLong("nonce", 0L)
@@ -136,7 +173,7 @@ class Store(private val ctx: Context) {
 
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
-        if (key == "label" || key == "status" || key == "mode") refreshTile()
+        if (key == "label" || key == "status" || key == "mode" || key == "lastPost") refreshTile()
     }
 
     private fun refreshTile() {
