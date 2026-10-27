@@ -1,0 +1,11 @@
+{
+  "ts": 1761580800000,
+  "device": "pixel-watch",
+  "label": "wohnzimmer",
+  "aps": [
+    {"bssid": "aa:bb:cc:00:00:01", "rssi": -45, "freq": 2412},
+    {"bssid": "aa:bb:cc:00:00:02", "rssi": -67, "freq": 5180},
+    {"bssid": "aa:bb:cc:00:00:03", "rssi": -82, "freq": 2437},
+    {"bssid": "aa:bb:cc:00:00:99", "rssi": -90, "freq": 2462}
+  ]
+}
