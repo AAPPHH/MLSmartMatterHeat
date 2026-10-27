@@ -2,6 +2,8 @@ package de.aapphh.heatscan
 
 import android.content.Context
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import android.net.Network
 import android.util.Log
 import androidx.wear.tiles.TileService
@@ -83,10 +85,11 @@ object Summary {
 object Payload {
     fun build(
         ts: Long, device: String, label: String?, aps: List<Ap>,
-        motion: String? = null, power: String? = null, away: Boolean = false
+        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
+        .also { if (id != null) it.put("id", id) }
         .put("label", label ?: JSONObject.NULL)
         .put("motion", motion ?: JSONObject.NULL)
         .put("power", power ?: JSONObject.NULL)
@@ -94,6 +97,10 @@ object Payload {
         .put("aps", JSONArray().also { arr ->
             aps.forEach { arr.put(JSONObject().put("bssid", it.bssid.lowercase()).put("rssi", it.rssi).put("freq", it.freq)) }
         })
+}
+
+object EntryId {
+    fun format(device: String, n: Long) = "$device-%06d".format(n)
 }
 
 object PowerState {
@@ -110,47 +117,77 @@ object Capture {
     fun wallMs(nowWall: Long, nowElapsedMs: Long, scanMicros: Long): Long = minOf(nowWall, nowWall - (nowElapsedMs - scanMicros / 1000))
 }
 
+class Queued(val seq: Long, val json: JSONObject)
+
 class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE_MAX, private val maxAgeMs: Long = ScanConfig.QUEUE_AGE_MS) {
-    private class Item(val ts: Long, val line: String)
+    private class Item(val seq: Long, val ts: Long, val line: String)
 
     private val items = ArrayDeque<Item>()
+    private var nextSeq = 1L
+    private var dirty = false
+
+    @Volatile var size = 0
+        private set
 
     init {
-        file?.takeIf { it.exists() }?.useLines { lines ->
-            lines.forEach { l ->
-                try { items.addLast(Item(JSONObject(l).getLong("ts"), l)) } catch (e: Exception) { Log.w(TAG, "queue line dropped", e) }
+        try {
+            file?.takeIf { it.exists() }?.useLines { lines ->
+                lines.forEach { l ->
+                    try { items.addLast(Item(nextSeq, JSONObject(l).getLong("ts"), l)); nextSeq++ } catch (e: Exception) { Log.w(TAG, "queue line dropped", e) }
+                }
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "queue load failed", e)
         }
+        val trimmed = items.size > max
         while (items.size > max) items.removeFirst()
+        size = items.size
+        if (trimmed) rewrite()
     }
-
-    val size: Int get() = synchronized(this) { items.size }
 
     fun add(entry: JSONObject, now: Long): Int = synchronized(this) {
         val line = entry.toString()
-        items.addLast(Item(entry.getLong("ts"), line))
+        items.addLast(Item(nextSeq++, entry.getLong("ts"), line))
         var dropped = 0
         while (items.size > max || (items.isNotEmpty() && items.first().ts < now - maxAgeMs)) {
             items.removeFirst()
             dropped++
         }
-        if (dropped > 0) rewrite() else file?.appendText(line + "\n")
+        size = items.size
+        if (dropped > 0 || dirty) rewrite()
+        else try { file?.appendText(line + "\n") } catch (e: Exception) { Log.w(TAG, "queue append failed", e) }
         dropped
     }
 
-    fun peek(n: Int, now: Long): List<JSONObject> = synchronized(this) {
+    fun peek(n: Int, now: Long): List<Queued> = synchronized(this) {
         items.take(n).map { i ->
-            JSONObject(i.line).also { if (now - i.ts > ScanConfig.QUEUED_AFTER_MS) it.put("queued", true) }
+            Queued(i.seq, JSONObject(i.line).also { if (now - i.ts > ScanConfig.QUEUED_AFTER_MS) it.put("queued", true) })
         }
     }
 
-    fun remove(n: Int) = synchronized(this) {
-        repeat(minOf(n, items.size)) { items.removeFirst() }
-        rewrite()
+    fun remove(upToSeq: Long, commit: Boolean = true) = synchronized(this) {
+        while (items.isNotEmpty() && items.first().seq <= upToSeq) {
+            items.removeFirst()
+            dirty = true
+        }
+        size = items.size
+        if (commit) commit()
+    }
+
+    fun commit() = synchronized(this) {
+        if (dirty) rewrite()
     }
 
     private fun rewrite() {
-        file?.writeText(items.joinToString("") { it.line + "\n" })
+        val f = file ?: return
+        try {
+            val tmp = File(f.path + ".tmp")
+            tmp.writeText(items.joinToString("") { it.line + "\n" })
+            Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            dirty = false
+        } catch (e: Exception) {
+            Log.w(TAG, "queue rewrite failed", e)
+        }
     }
 
     companion object {
@@ -164,37 +201,52 @@ class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE
 
 data class FlushResult(val sent: Int, val code: Int)
 
-class Flusher(private val batch: Int = ScanConfig.BATCH) {
+class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
+    private var batch = maxBatch
+
     var singleOnly = false
         private set
 
+    val batchSize: Int get() = batch
+
     private fun accepted(c: Int) = c in 200..299
 
-    private fun settled(c: Int) = accepted(c) || (c in 400..499 && c != 404 && c != 408 && c != 429)
+    private fun rejected(c: Int) = c in 400..499 && c != 404 && c != 408 && c != 429
+
+    private fun settled(c: Int) = accepted(c) || rejected(c)
 
     fun run(queue: ScanQueue, now: Long, sendBatch: (JSONArray) -> Int, sendOne: (JSONObject) -> Int): FlushResult {
         var sent = 0
         var code = 0
-        while (true) {
-            val items = queue.peek(batch, now)
-            if (items.isEmpty()) break
-            if (!singleOnly) {
-                code = sendBatch(JSONArray().also { a -> items.forEach { a.put(it) } })
-                if (code == 404) singleOnly = true
-                else {
+        try {
+            while (true) {
+                val items = queue.peek(batch, now)
+                if (items.isEmpty()) break
+                if (!singleOnly) {
+                    code = sendBatch(JSONArray().also { a -> items.forEach { a.put(it.json) } })
+                    if (accepted(code)) {
+                        queue.remove(items.last().seq)
+                        sent += items.size
+                        continue
+                    }
+                    if (code == 413 && items.size > 1) {
+                        batch = maxOf(1, items.size / 2)
+                        continue
+                    }
+                    if (code == 404) singleOnly = true
+                    else if (!rejected(code)) return FlushResult(sent, code)
+                }
+                for (e in items) {
+                    code = sendOne(e.json)
                     if (!settled(code)) return FlushResult(sent, code)
-                    queue.remove(items.size)
-                    if (accepted(code)) sent += items.size
-                    continue
+                    queue.remove(e.seq, false)
+                    if (accepted(code)) sent++
                 }
             }
-            for (e in items) {
-                code = sendOne(e)
-                if (!settled(code)) return FlushResult(sent, code)
-                queue.remove(1)
-                if (accepted(code)) sent++
-            }
+        } finally {
+            queue.commit()
         }
+        batch = maxBatch
         return FlushResult(sent, code)
     }
 }
@@ -270,6 +322,11 @@ class Store(private val ctx: Context) {
     var mode: String
         get() = sp.getString("mode", "") ?: ""
         set(v) = put("mode", v)
+    fun nextId(): String = synchronized(Store::class.java) {
+        val n = sp.getLong("idSeq", 0L) + 1
+        sp.edit().putLong("idSeq", n).commit()
+        EntryId.format(device, n)
+    }
     var paused: Boolean
         get() = sp.getBoolean("paused", false)
         set(v) = sp.edit().putBoolean("paused", v).apply()
@@ -331,6 +388,9 @@ object ScanConfig {
     const val HEARTBEAT_MS = 720_000L
     const val SCAN_HOLD_MS = 30_000L
     const val MIN_GAP_MS = 20_000L
+    const val SCAN_WINDOW_MS = 120_000L
+    const val SCAN_WINDOW_MAX = 4
+    const val FLUSH_HOLD_MS = 300_000L
     const val STALE_MS = 20_000L
     const val AWAY_MS = 900_000L
     const val AWAY_AFTER_MISSES = 3
@@ -353,6 +413,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
     private var lastMotion = start
     private var nextAt = start
     private var lastScanAt = Long.MIN_VALUE / 4
+    private val recent = ArrayDeque<Long>()
     private var misses = 0
     val away: Boolean get() = mode == Mode.AWAY || misses >= ScanConfig.AWAY_AFTER_MISSES
 
@@ -363,7 +424,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
             Mode.STILL -> {
                 mode = Mode.MOVING
                 val scan = claim(now)
-                nextAt = if (scan) now + ScanConfig.MOVING_PERIOD_MS else lastScanAt + ScanConfig.MIN_GAP_MS
+                nextAt = if (scan) now + ScanConfig.MOVING_PERIOD_MS else retryAt()
                 scan
             }
             Mode.SETTLING -> {
@@ -413,14 +474,22 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
 
     private fun claim(now: Long): Boolean {
         if (now - lastScanAt < ScanConfig.MIN_GAP_MS) return false
+        while (recent.isNotEmpty() && now - recent.first() >= ScanConfig.SCAN_WINDOW_MS) recent.removeFirst()
+        if (recent.size >= ScanConfig.SCAN_WINDOW_MAX) return false
+        recent.addLast(now)
         lastScanAt = now
         return true
     }
 
+    private fun retryAt(): Long = maxOf(
+        lastScanAt + ScanConfig.MIN_GAP_MS,
+        if (recent.size >= ScanConfig.SCAN_WINDOW_MAX) recent.first() + ScanConfig.SCAN_WINDOW_MS else Long.MIN_VALUE
+    )
+
     private fun due(now: Long, period: Long): Boolean {
         if (now < nextAt) return false
         if (!claim(now)) {
-            nextAt = lastScanAt + ScanConfig.MIN_GAP_MS
+            nextAt = retryAt()
             return false
         }
         nextAt = now + period

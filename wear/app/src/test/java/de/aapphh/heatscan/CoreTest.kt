@@ -348,7 +348,7 @@ class CoreTest {
         q.add(entry(12), 12)
         assertEquals(1, q.add(entry(13), 13))
         assertEquals(3, q.size)
-        assertEquals(listOf(11L, 12L, 13L), q.peek(10, 13).map { it.getLong("ts") })
+        assertEquals(listOf(11L, 12L, 13L), q.peek(10, 13).map { it.json.getLong("ts") })
     }
 
     @Test
@@ -357,7 +357,7 @@ class CoreTest {
         q.add(entry(0), 0)
         q.add(entry(50), 50)
         assertEquals(1, q.add(entry(150), 150))
-        assertEquals(listOf(50L, 150L), q.peek(10, 150).map { it.getLong("ts") })
+        assertEquals(listOf(50L, 150L), q.peek(10, 150).map { it.json.getLong("ts") })
     }
 
     @Test
@@ -365,10 +365,10 @@ class CoreTest {
         val q = ScanQueue(null, 10, 10_000_000)
         q.add(entry(0), 0)
         q.add(entry(100_000), 100_000)
-        val out = q.peek(10, 100_000 + ScanConfig.QUEUED_AFTER_MS)
+        val out = q.peek(10, 100_000 + ScanConfig.QUEUED_AFTER_MS).map { it.json }
         assertTrue(out[0].optBoolean("queued"))
         assertFalse(out[1].has("queued"))
-        assertFalse(q.peek(10, 100_000 + ScanConfig.QUEUED_AFTER_MS - 100_000)[0].has("queued"))
+        assertFalse(q.peek(10, 100_000 + ScanConfig.QUEUED_AFTER_MS - 100_000)[0].json.has("queued"))
     }
 
     @Test
@@ -378,9 +378,9 @@ class CoreTest {
             val q = ScanQueue(f, 5, 1_000_000)
             for (t in 1L..3L) q.add(entry(t), t)
             assertEquals(3, ScanQueue(f, 5, 1_000_000).size)
-            q.remove(2)
+            q.remove(q.peek(2, 3)[1].seq)
             val again = ScanQueue(f, 5, 1_000_000)
-            assertEquals(listOf(3L), again.peek(5, 3).map { it.getLong("ts") })
+            assertEquals(listOf(3L), again.peek(5, 3).map { it.json.getLong("ts") })
             f.appendText("garbage\n")
             assertEquals(1, ScanQueue(f, 5, 1_000_000).size)
             for (t in 4L..9L) q.add(entry(t), t)
@@ -443,7 +443,7 @@ class CoreTest {
     fun flushDropsPermanentlyRejectedBatchButNotTransientOnes() {
         val q = ScanQueue(null, 100, 1_000_000)
         q.add(entry(1), 1)
-        val r = Flusher(10).run(q, 1, { 400 }, { 200 })
+        val r = Flusher(10).run(q, 1, { 400 }, { 400 })
         assertEquals(0, r.sent)
         assertEquals(0, q.size)
         q.add(entry(2), 2)
@@ -459,5 +459,111 @@ class CoreTest {
         val flags = mutableListOf<Boolean>()
         Flusher(10).run(q, 200_000, { a -> for (i in 0 until a.length()) flags.add(a.getJSONObject(i).optBoolean("queued")); 200 }, { 200 })
         assertEquals(listOf(true, false), flags)
+    }
+
+    @Test
+    fun removeBySeqSurvivesHeadDroppedDuringFlush() {
+        val q = ScanQueue(null, 3, 1_000_000)
+        for (t in 1L..3L) q.add(entry(t), t)
+        val sent = q.peek(2, 3)
+        q.add(entry(4), 4)
+        q.add(entry(5), 5)
+        q.remove(sent.last().seq)
+        assertEquals(listOf(3L, 4L, 5L), q.peek(10, 5).map { it.json.getLong("ts") })
+    }
+
+    @Test
+    fun removeBySeqPersistsAtomicallyAndLazily() {
+        val f = File.createTempFile("queue", ".jsonl")
+        try {
+            val q = ScanQueue(f, 10, 1_000_000)
+            for (t in 1L..4L) q.add(entry(t), t)
+            val seqs = q.peek(4, 4).map { it.seq }
+            q.remove(seqs[0], false)
+            q.remove(seqs[1], false)
+            assertEquals(4, ScanQueue(f, 10, 1_000_000).size)
+            q.commit()
+            assertEquals(listOf(3L, 4L), ScanQueue(f, 10, 1_000_000).peek(10, 4).map { it.json.getLong("ts") })
+            assertFalse(File(f.path + ".tmp").exists())
+        } finally {
+            f.delete()
+        }
+    }
+
+    @Test
+    fun entryIdIsStableAcrossPeeksAndReload() {
+        val f = File.createTempFile("queue", ".jsonl")
+        try {
+            val q = ScanQueue(f, 10, 1_000_000)
+            q.add(Payload.build(1, "pixel-watch", null, emptyList(), id = EntryId.format("pixel-watch", 123)), 1)
+            val first = q.peek(1, 1)[0].json.getString("id")
+            assertEquals("pixel-watch-000123", first)
+            assertEquals(first, q.peek(1, 1)[0].json.getString("id"))
+            assertEquals(first, ScanQueue(f, 10, 1_000_000).peek(1, 1)[0].json.getString("id"))
+            assertFalse(Payload.build(1, "d", null, emptyList()).has("id"))
+        } finally {
+            f.delete()
+        }
+    }
+
+    @Test
+    fun retriedFlushResendsSameIds() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        for (t in 1L..3L) q.add(Payload.build(t, "d", null, emptyList(), id = EntryId.format("d", t)), t)
+        val ids = mutableListOf<List<String>>()
+        val f = Flusher(10)
+        f.run(q, 3, { a -> ids.add((0 until a.length()).map { a.getJSONObject(it).getString("id") }); -1 }, { -1 })
+        f.run(q, 3, { a -> ids.add((0 until a.length()).map { a.getJSONObject(it).getString("id") }); 200 }, { 200 })
+        assertEquals(ids[0], ids[1])
+        assertEquals(0, q.size)
+    }
+
+    @Test
+    fun scanRateWindowAllowsFourPerTwoMinutes() {
+        val s = 1000L
+        val p = ScanPolicy(false, 0)
+        val fired = (0..13).map { i -> p.onTick(i * 10 * s) to i * 10 * s }.filter { it.first }.map { it.second / s }
+        assertEquals(listOf(0L, 30L, 60L, 90L, 120L), fired.take(5))
+        val q = ScanPolicy(true, 0)
+        var n = 0
+        for (t in 0L..119L step 20) if (q.onMotion(t * s, t * s)) n++
+        assertTrue(n <= ScanConfig.SCAN_WINDOW_MAX)
+    }
+
+    @Test
+    fun rateWindowDefersFifthScanUntilOldestExpires() {
+        val s = 1000L
+        val p = ScanPolicy(true, 0)
+        val fired = mutableListOf<Long>()
+        for (t in 0L..300L) {
+            p.onMotion(t * s, t * s)
+            if (p.onTick(t * s)) fired.add(t)
+        }
+        for (i in 4 until fired.size) assertTrue(fired[i] - fired[i - 4] >= 120)
+    }
+
+    @Test
+    fun batchRejectionFallsBackToSingleSends() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        for (t in 1L..3L) q.add(entry(t), t)
+        val f = Flusher(10)
+        val singles = mutableListOf<Long>()
+        val r = f.run(q, 3, { 422 }, { e -> singles.add(e.getLong("ts")); if (e.getLong("ts") == 2L) 400 else 200 })
+        assertEquals(listOf(1L, 2L, 3L), singles)
+        assertEquals(2, r.sent)
+        assertEquals(0, q.size)
+        assertFalse(f.singleOnly)
+    }
+
+    @Test
+    fun batchTooLargeHalvesBatchSize() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        for (t in 1L..8L) q.add(entry(t), t)
+        val sizes = mutableListOf<Int>()
+        val f = Flusher(8)
+        val r = f.run(q, 8, { a -> sizes.add(a.length()); if (a.length() > 2) 413 else 200 }, { 500 })
+        assertEquals(listOf(8, 4, 2, 2, 2, 2), sizes.take(6))
+        assertEquals(8, r.sent)
+        assertEquals(0, q.size)
     }
 }
