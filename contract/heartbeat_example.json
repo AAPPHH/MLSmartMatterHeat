@@ -1,0 +1,10 @@
+{
+  "ts": 1761584400000,
+  "device": "pixel-watch",
+  "label": null,
+  "aps": [],
+  "motion": "still",
+  "queued": false,
+  "power": "doze",
+  "away": false
+}

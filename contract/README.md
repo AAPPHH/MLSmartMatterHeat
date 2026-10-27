@@ -4,6 +4,16 @@
 
 Body wie `scan_example.json`: `ts` Millisekunden seit Epoch (Uhrzeit der Uhr), `device` frei wählbarer Name, `label` Raumlabel während der Trainingsphase oder `null`, `aps` alle sichtbaren WLANs (`bssid` klein geschrieben mit `:`, `rssi` dBm, `freq` MHz, 2,4 und 5 GHz ungefiltert). Antwort `200` mit `{"stored": <anzahl aps>, "room": <vorhergesagter raum oder null>}`.
 
+Optionale Felder (abwärtskompatibel): `motion` (`"moving"` | `"still"` | `null`), `queued` (`true`, wenn der Scan später aus dem Puffer hochgeladen wird; `ts` bleibt der Originalzeitpunkt), `power` (`"normal"` | `"saver"` | `"offbody"` | `"doze"` | `null`), `away` (`true`, wenn das Heim-WLAN nicht sichtbar ist). `aps` darf leer sein oder fehlen: das ist ein Heartbeat (`heartbeat_example.json`); er erzeugt keine Vorhersage, Antwort `{"stored": 0, "room": null}`. Unbekannte Werte für `motion`/`power` werden mit `422` abgelehnt.
+
+## `POST /api/scans`
+
+Batch für gepufferte Scans: `{"scans": [...]}`, Elemente wie bei `/api/scan` (`batch_example.json`). Antwort `200` mit `{"stored": <aps gesamt>, "accepted": <anzahl scans>, "room": <raum der Vorhersage mit dem größten ts im Batch oder null>}`. Die Reihenfolge der Elemente ist beliebig.
+
+## Präsenz
+
+Jeder Scan und Heartbeat schreibt eine Zeile in `device_state`. Vorhersagen tragen den Scan-`ts` (nicht die Eingangszeit), spät hochgeladene Scans werden also nie "frisch". Der belegte Raum ist die Vorhersage mit dem größten `ts` des Geräts und gilt, solange (i) der jüngste `device_state` (größter `ts`) `motion = still` meldet und der letzte Kontakt (`received_at`) jünger als `still_contact_timeout_minutes` (180) ist oder (ii) die Vorhersage jünger als `presence_timeout_minutes` (30) ist. Ist `power` `saver`/`offbody` oder der Kontakt älter als `still_contact_timeout_minutes`, ist die Präsenz unbekannt: Zeitplan ohne Boost, kein Eco. Eco gilt nur, wenn der jüngste Zustand `away = true` meldet.
+
 ## Feature-Vektor
 
 Feste BSSID-Reihenfolge `bssids` aus dem Training. Für BSSID `i`: `x_i = clamp((rssi - rssi_floor) / rssi_span, 0, 1)` falls sichtbar, sonst `0`; Maske `m_i = 1` falls sichtbar, sonst `0`. Eingabe `float32 [1, 2F] = concat(x, m)`. Unbekannte BSSIDs werden ignoriert. Beispiel: `features_example.json` angewendet auf `scan_example.json`.
@@ -19,6 +29,7 @@ CREATE TABLE scans (scan_id BIGINT, ts TIMESTAMP, received_at TIMESTAMP, device 
 CREATE TABLE readings (ts TIMESTAMP, node UBIGINT, endpoint USMALLINT, attribute VARCHAR, value DOUBLE);
 CREATE TABLE setpoints (ts TIMESTAMP, node UBIGINT, room VARCHAR, value DOUBLE, reason VARCHAR);
 CREATE TABLE predictions (ts TIMESTAMP, device VARCHAR, room VARCHAR, probability DOUBLE);
+CREATE TABLE device_state (ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, motion VARCHAR, power VARCHAR, queued BOOLEAN, n_aps INTEGER, away BOOLEAN);
 ```
 
 `scans` im Langformat: eine Zeile pro AP, `scan_id` gruppiert einen Scan, `ts` aus dem Body (UTC), `label` NULL außerhalb der Trainingsphase. `readings.attribute` ist der Name aus dem Thermostat-Cluster (`local_temperature`, `occupied_heating_setpoint`, `system_mode`, …), Temperaturen in °C. Python liest nie die Live-Datei, sondern den Snapshot, den `POST /api/snapshot` per `COPY FROM DATABASE` nach `data/snapshot.duckdb` schreibt.
