@@ -4,7 +4,6 @@
 *.duckdb.wal
 *.onnx
 !/crates/heatd/tests/fixtures/*.onnx
-/firmware/build/
 /wear/.gradle/
 /wear/build/
 /wear/app/build/
@@ -15,3 +14,9 @@ __pycache__/
 *.egg-info/
 /models/
 /data/
+/firmware/br/build/
+/firmware/br/sdkconfig
+/firmware/br/sdkconfig.old
+/firmware/br/managed_components/
+/firmware/br/dependencies.lock
+/.claude/
