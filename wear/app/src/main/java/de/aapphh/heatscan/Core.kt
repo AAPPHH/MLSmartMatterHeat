@@ -19,6 +19,13 @@ object Defaults {
     val CAPTIONS = mapOf("wohnzimmer" to "Wohnen", "schlafzimmer" to "Schlafen", "bad" to "Bad", "kueche" to "Küche", "flur" to "Flur")
 }
 
+object RoomIcons {
+    val RES = mapOf(
+        "wohnzimmer" to R.drawable.ic_wohnzimmer, "schlafzimmer" to R.drawable.ic_schlafzimmer, "bad" to R.drawable.ic_bad,
+        "kueche" to R.drawable.ic_kueche, "flur" to R.drawable.ic_flur
+    )
+}
+
 object Labels {
     fun toggle(current: String?, tapped: String): String? = if (current == tapped) null else tapped
 }
@@ -124,6 +131,8 @@ class Store(private val ctx: Context) {
             sp.edit().putLong("rev", System.nanoTime()).apply()
             refreshTile()
         }
+
+    fun setLabelQuietly(v: String?) = sp.edit().putString("label", v).apply()
 
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
