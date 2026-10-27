@@ -1,6 +1,7 @@
 package de.aapphh.heatscan
 
 import android.Manifest
+import android.app.Activity
 import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -56,6 +57,7 @@ class ScanService : Service() {
     private var sensorState = 0
     private var alarmSet = false
     private var active = false
+    private var loggedMode: Mode? = null
 
     private val stepListener = object : SensorEventListener {
         override fun onSensorChanged(e: SensorEvent) {
@@ -105,17 +107,15 @@ class ScanService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
         if (!active) {
             try {
                 startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
             } catch (e: Exception) {
-                Log.w(TAG, "startForeground failed", e)
+                Trace.w("start_refused", e, "source" to "service")
                 store.status = "Start nicht erlaubt"
+                store.lastError = "startForeground " + e.javaClass.simpleName
                 store.running = false
+                ScanStarter.nudge(this)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -129,12 +129,14 @@ class ScanService : Service() {
             }
             registerReceiver(receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), RECEIVER_NOT_EXPORTED)
             store.running = true
+            Trace.i("service_started")
             wakeStep = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
             step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) ?: wakeStep
             triggers = listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_MOTION_DETECT, true), sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION))
             val adaptive = step != null && (wakeStep != null || triggers.isNotEmpty()) &&
                 checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
             policy = ScanPolicy(adaptive, SystemClock.elapsedRealtime())
+            Trace.i("policy", "adaptive" to adaptive, "step" to (step != null), "wakeStep" to (wakeStep != null), "triggers" to triggers.size)
             tick()
         }
         return START_NOT_STICKY
@@ -149,6 +151,7 @@ class ScanService : Service() {
             try { cm.unregisterNetworkCallback(netCallback) } catch (e: Exception) { Log.w(TAG, "unregister net", e) }
             wake?.let { if (it.isHeld) it.release() }
         }
+        if (active) Trace.i("service_stopped", "paused" to paused)
         active = false
         if (instance === this) instance = null
         store.mode = ""
@@ -188,6 +191,10 @@ class ScanService : Service() {
     private fun schedule(now: Long) {
         handler.removeCallbacks(tick)
         val delay = policy.delay(now)
+        if (loggedMode != policy.mode) {
+            loggedMode = policy.mode
+            Trace.i("mode", "mode" to policy.mode.name, "label" to policy.mode.label, "nextInMs" to delay)
+        }
         if (store.mode != policy.mode.label) store.mode = policy.mode.label
         applySensors()
         if (policy.mode.sleeps) {
@@ -229,9 +236,11 @@ class ScanService : Service() {
 
     private fun scan() {
         try {
-            if (!wifi.startScan()) collect()
+            val ok = wifi.startScan()
+            Trace.i("scan_requested", "accepted" to ok)
+            if (!ok) collect()
         } catch (e: Exception) {
-            Log.w(TAG, "startScan failed", e)
+            Trace.w("scan_requested", e, "accepted" to false)
             collect()
         }
     }
@@ -241,17 +250,26 @@ class ScanService : Service() {
             val results = wifi.scanResults
             if (results.isEmpty()) {
                 val lm = getSystemService(LocationManager::class.java)
-                store.status = stamp() + " " + Diag.emptyScan(lm.isLocationEnabled, wifi.isWifiEnabled)
+                val cause = Diag.emptyScan(lm.isLocationEnabled, wifi.isWifiEnabled)
+                Trace.i("scan_result", "count" to 0, "cause" to cause)
+                store.status = stamp() + " " + cause
                 return
             }
-            if (!dedup.accept(results.maxOf { it.timestamp })) return
+            if (!dedup.accept(results.maxOf { it.timestamp })) {
+                Trace.i("scan_result", "count" to results.size, "dedup" to true)
+                return
+            }
             val home = Home.isHome(results.map { it.SSID }, store.homeList)
+            Trace.i("scan_result", "count" to results.size, "home" to home)
+            if (store.atHome != home) Trace.i("home_change", "home" to home)
+            store.atHome = home
             val before = policy.mode
             val now = SystemClock.elapsedRealtime()
             policy.onScan(home, now)
             if (policy.mode != before) schedule(now)
             if (!home) {
                 store.status = stamp() + " Unterwegs, kein POST"
+                store.lastPost = store.status
                 return
             }
             val body = Payload.build(
@@ -264,10 +282,16 @@ class ScanService : Service() {
                 val status = try {
                     Poster.post(server, body, net)
                 } catch (e: Exception) {
-                    Log.w(TAG, "post failed", e)
+                    Trace.w("post", e, "ok" to false)
+                    store.lastError = e.toString()
                     Diag.postError(e.javaClass.simpleName, Diag.needsLocalNetwork(Build.VERSION.SDK_INT, checkSelfPermission(Diag.LOCAL_NETWORK) == PackageManager.PERMISSION_GRANTED))
                 }
+                val ok = Diag.postOk(status)
+                if (ok) store.postsOk += 1 else store.postsFailed += 1
+                if (!ok && !status.startsWith("ERR")) store.lastError = "HTTP $status"
+                Trace.i("post", "result" to status, "ok" to ok, "label" to (body.opt("label")?.takeIf { it != org.json.JSONObject.NULL } ?: "-"), "okTotal" to store.postsOk, "failedTotal" to store.postsFailed)
                 store.status = stamp() + " " + status
+                store.lastPost = store.status
             }
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
@@ -288,10 +312,10 @@ class ScanService : Service() {
     }
 
     companion object {
-        const val ACTION_STOP = "de.aapphh.heatscan.STOP"
         const val ACTION_TICK = "de.aapphh.heatscan.TICK"
         private const val CHANNEL = "scan"
         @Volatile var running = false
+        @Volatile var paused = false
         @Volatile var instance: ScanService? = null
 
         fun alarmIntent(c: Context): PendingIntent = PendingIntent.getBroadcast(
@@ -305,5 +329,116 @@ class TickReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         val svc = ScanService.instance
         if (svc != null) svc.onAlarm() else c.getSystemService(AlarmManager::class.java).cancel(ScanService.alarmIntent(c))
+    }
+}
+
+object ScanStarter {
+    private const val NUDGE_CHANNEL = "nudge"
+
+    fun missing(c: Context): List<String> = listOfNotNull(
+        Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION,
+        Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACTIVITY_RECOGNITION,
+        Diag.LOCAL_NETWORK.takeIf { Build.VERSION.SDK_INT >= Diag.LOCAL_NETWORK_SDK }
+    ).filter { c.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+
+    fun start(c: Context, source: String, nudge: Boolean = false): Boolean {
+        val store = Store(c)
+        if (ScanService.paused) {
+            Trace.i("start_skipped", "source" to source, "reason" to "paused")
+            return false
+        }
+        if (ScanService.running) return true
+        val issue = Diag.permissionIssue(
+            c.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED,
+            c.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        )
+        if (issue != null) {
+            store.status = issue
+            store.lastError = issue
+            Trace.i("start_skipped", "source" to source, "reason" to issue)
+            if (nudge) nudge(c)
+            return false
+        }
+        if (Diag.needsLocalNetwork(Build.VERSION.SDK_INT, c.checkSelfPermission(Diag.LOCAL_NETWORK) == PackageManager.PERMISSION_GRANTED)) store.status = "LAN-Zugriff fehlt"
+        return try {
+            c.startForegroundService(Intent(c, ScanService::class.java))
+            Trace.i("start_requested", "source" to source)
+            true
+        } catch (e: Exception) {
+            Trace.w("start_refused", e, "source" to source)
+            store.lastError = "start($source) " + e.javaClass.simpleName
+            if (nudge) nudge(c)
+            false
+        }
+    }
+
+    fun nudge(c: Context) {
+        try {
+            val nm = c.getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(NotificationChannel(NUDGE_CHANNEL, "HeatScan Start", NotificationManager.IMPORTANCE_DEFAULT))
+            val tap = PendingIntent.getActivity(c, 1, Intent(c, StartActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            nm.notify(2, Notification.Builder(c, NUDGE_CHANNEL)
+                .setContentTitle("HeatScan")
+                .setContentText("Scan aus, tippen zum Starten")
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setContentIntent(tap)
+                .setAutoCancel(true)
+                .build())
+            Trace.i("nudge_posted")
+        } catch (e: Exception) {
+            Trace.w("nudge_failed", e)
+        }
+    }
+}
+
+class StartActivity : Activity() {
+    override fun onResume() {
+        super.onResume()
+        if (ScanStarter.missing(this).isEmpty()) ScanStarter.start(this, "trampoline")
+        else startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        finish()
+    }
+}
+
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        Trace.i("boot", "action" to i.action)
+        ScanStarter.start(c, "boot:" + i.action, true)
+    }
+}
+
+class DebugReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        val store = Store(c)
+        when (i.action) {
+            ACTION_CONFIG -> {
+                i.getStringExtra("server")?.let { store.server = it }
+                i.getStringExtra("home")?.let { store.home = it }
+                i.getStringExtra("device")?.let { store.device = it }
+                Trace.i("config", "server" to store.server, "home" to store.home, "device" to store.device)
+            }
+            ACTION_START -> {
+                ScanService.paused = false
+                ScanStarter.start(c, "adb")
+            }
+            ACTION_PAUSE -> {
+                ScanService.paused = i.getBooleanExtra("on", true)
+                if (ScanService.paused) ScanService.instance?.stopSelf()
+                Trace.i("pause", "on" to ScanService.paused)
+            }
+        }
+        val line = Summary.line(
+            ScanService.running, ScanService.paused, store.mode, store.label, store.server, store.home, store.atHome,
+            store.lastPost, store.postsOk, store.postsFailed, store.lastError
+        )
+        Log.i(TAG, line)
+        if (isOrderedBroadcast) setResultData(line)
+    }
+
+    companion object {
+        const val ACTION_STATUS = "de.aapphh.heatscan.STATUS"
+        const val ACTION_START = "de.aapphh.heatscan.START"
+        const val ACTION_CONFIG = "de.aapphh.heatscan.CONFIG"
+        const val ACTION_PAUSE = "de.aapphh.heatscan.PAUSE"
     }
 }

@@ -8,12 +8,17 @@ import androidx.wear.protolayout.LayoutElementBuilders
 import androidx.wear.protolayout.ModifiersBuilders
 import androidx.wear.protolayout.ResourceBuilders
 import androidx.wear.protolayout.TimelineBuilders
+import androidx.wear.tiles.EventBuilders
 import androidx.wear.tiles.RequestBuilders
 import androidx.wear.tiles.TileBuilders
 import androidx.wear.tiles.TileService
 import com.google.common.util.concurrent.ListenableFuture
 
 class HeatTileService : TileService() {
+    override fun onTileEnterEvent(requestParams: EventBuilders.TileEnterEvent) {
+        ScanStarter.start(this, "tile_enter")
+    }
+
     override fun onTileRequest(requestParams: RequestBuilders.TileRequest): ListenableFuture<TileBuilders.Tile> {
         val store = Store(this)
         val clicked = TileClick.room(requestParams.currentState.lastClickableId, store.nonce)
@@ -33,6 +38,7 @@ class HeatTileService : TileService() {
                 LayoutElementBuilders.Text.Builder()
                     .setText(TileClick.statusLine(store.running, store.mode, store.status))
                     .setMaxLines(2)
+                    .setModifiers(ModifiersBuilders.Modifiers.Builder().setClickable(startClick()).build())
                     .setFontStyle(LayoutElementBuilders.FontStyle.Builder().setSize(DimensionBuilders.sp(10f)).build())
                     .build()
             )
@@ -58,6 +64,15 @@ class HeatTileService : TileService() {
             }
             it.set(res.build())
         }
+
+    private fun startClick() = ModifiersBuilders.Clickable.Builder()
+        .setId("start")
+        .setOnClick(
+            ActionBuilders.LaunchAction.Builder()
+                .setAndroidActivity(ActionBuilders.AndroidActivity.Builder().setPackageName(packageName).setClassName(StartActivity::class.java.name).build())
+                .build()
+        )
+        .build()
 
     private fun row(rooms: List<String>, label: String?, nonce: Long): LayoutElementBuilders.Row {
         val row = LayoutElementBuilders.Row.Builder().setVerticalAlignment(LayoutElementBuilders.VERTICAL_ALIGN_CENTER)

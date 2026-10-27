@@ -269,4 +269,21 @@ class CoreTest {
         it.onTick(60 * s)
         it.onTick(150 * s)
     }
+
+    @Test
+    fun summaryLineAndTraceFormat() {
+        assertEquals("ev a=1 b=x_y", Trace.fmt("ev", "a" to 1, "b" to "x y"))
+        assertEquals(
+            "status running=true paused=false mode=Ruhe label=- server=http://s home=- atHome=true lastPost=12:00:00_200 ok=3 failed=1 lastError=-",
+            Summary.line(true, false, "Ruhe", null, "http://s", "", true, "12:00:00 200", 3, 1, "-")
+        )
+        assertTrue(Summary.line(false, true, "", "bad", "s", "h", null, "-", 0, 0, "-").contains("atHome=- "))
+    }
+
+    @Test
+    fun postOkOnlyFor2xx() {
+        assertTrue(Diag.postOk("200 12 APs"))
+        assertFalse(Diag.postOk("500 12 APs"))
+        assertFalse(Diag.postOk("ERR SocketTimeoutException"))
+    }
 }
