@@ -1,0 +1,1 @@
+[0;34m[1761580800.091] [4821:4825] [DMG] Received Command Response Status for Endpoint=1 Cluster=0x0000_0201 Command=0x0000_0000 Status=0x81[0m

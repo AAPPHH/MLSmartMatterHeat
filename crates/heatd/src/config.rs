@@ -15,12 +15,14 @@ pub enum ControllerKind {
 #[serde(default)]
 pub struct ChipToolSection {
     pub binary: String,
-    pub storage_dir: String,
+    pub storage_dir: Option<String>,
     pub paa_trust_store: Option<String>,
+    pub bypass_attestation: bool,
     pub endpoint: u16,
     pub subscribe_min_s: u32,
     pub subscribe_max_s: u32,
     pub timeout_s: u64,
+    pub commission_timeout_s: u64,
 }
 
 impl Default for ChipToolSection {
@@ -29,11 +31,13 @@ impl Default for ChipToolSection {
         Self {
             binary: base.binary,
             storage_dir: base.storage_dir,
-            paa_trust_store: None,
+            paa_trust_store: base.paa_trust_store,
+            bypass_attestation: base.bypass_attestation,
             endpoint: base.endpoint,
             subscribe_min_s: base.subscribe_min_s,
             subscribe_max_s: base.subscribe_max_s,
             timeout_s: base.timeout_s,
+            commission_timeout_s: base.commission_timeout_s,
         }
     }
 }
@@ -42,12 +46,14 @@ impl ChipToolSection {
     pub fn to_controller_config(&self) -> matter_controller::ChipToolConfig {
         matter_controller::ChipToolConfig {
             binary: self.binary.clone(),
-            storage_dir: self.storage_dir.clone(),
-            paa_trust_store: self.paa_trust_store.clone(),
+            storage_dir: self.storage_dir.clone().filter(|s| !s.is_empty()),
+            paa_trust_store: self.paa_trust_store.clone().filter(|s| !s.is_empty()),
+            bypass_attestation: self.bypass_attestation,
             endpoint: self.endpoint,
             subscribe_min_s: self.subscribe_min_s,
             subscribe_max_s: self.subscribe_max_s,
             timeout_s: self.timeout_s,
+            commission_timeout_s: self.commission_timeout_s,
         }
     }
 }
@@ -183,6 +189,14 @@ mod tests {
         let config = Config::parse("").unwrap();
         assert_eq!(config.db_path, "data/heatd.duckdb");
         assert_eq!(config.controller, ControllerKind::ChipTool);
+        let chip = config.chip_tool.to_controller_config();
+        assert_eq!((chip.storage_dir, chip.bypass_attestation, chip.commission_timeout_s), (None, false, 180));
+        assert_eq!(chip.paa_trust_store.as_deref(), Some("/home/aapphh/snap/chip-tool/common/paa-root-certs"));
+        let custom = Config::parse("[chip_tool]
+storage_dir = ''
+paa_trust_store = ''
+bypass_attestation = true").unwrap().chip_tool.to_controller_config();
+        assert_eq!((custom.storage_dir, custom.paa_trust_store, custom.bypass_attestation), (None, None, true));
         assert!(Config::parse("[[rooms]]\nname='a'\nnodes=[1]\n[[rooms.schedules]]\ndays=['Funday']\nfrom='06:00'\nto='07:00'\nsetpoint=20").is_err());
         assert!(Config::parse("[[rooms]]\nname='a'\nnodes=[1]\n[[rooms.schedules]]\ndays=['weekend']\nfrom='6am'\nto='07:00'\nsetpoint=20").is_err());
     }

@@ -6,7 +6,7 @@ mod storage;
 
 use anyhow::{anyhow, bail, Context, Result};
 use config::{Config, ControllerKind};
-use matter_controller::{ChipToolController, MatterController, MockController};
+use matter_controller::{ChipToolController, MatterController, MockController, StorageLock};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -24,25 +24,8 @@ pub enum ConsoleLine {
     Data(String),
 }
 
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::new();
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for n in chars.by_ref() {
-                if n.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 pub fn classify_line(raw: &str, command: &str) -> ConsoleLine {
-    let clean = strip_ansi(raw);
+    let clean = matter_controller::strip_ansi(raw);
     let clean = clean.trim();
     let mut text = clean;
     while let Some((_, rest)) = text.split_once("> ").filter(|(p, _)| !p.contains(' ')) {
@@ -143,9 +126,20 @@ fn save_dataset(config: &Config, hex: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_controller(config: &Config) -> (Arc<dyn MatterController>, Option<Arc<MockController>>) {
+fn lock_storage(config: &Config) -> Result<Option<StorageLock>> {
     match config.controller {
-        ControllerKind::ChipTool => (Arc::new(ChipToolController::new(config.chip_tool.to_controller_config())), None),
+        ControllerKind::ChipTool => Ok(Some(config.chip_tool.to_controller_config().lock_storage()?)),
+        ControllerKind::Mock => Ok(None),
+    }
+}
+
+fn build_controller(config: &Config, serving: bool) -> (Arc<dyn MatterController>, Option<Arc<MockController>>) {
+    match config.controller {
+        ControllerKind::ChipTool => {
+            let chip_tool = config.chip_tool.to_controller_config();
+            let controller = if serving { ChipToolController::serving(chip_tool) } else { ChipToolController::new(chip_tool) };
+            (Arc::new(controller), None)
+        }
         ControllerKind::Mock => {
             let mock = Arc::new(MockController::new(config.chip_tool.endpoint));
             config.all_nodes().into_iter().for_each(|n| mock.add_node(n, 18.0, 18.0));
@@ -155,7 +149,8 @@ fn build_controller(config: &Config) -> (Arc<dyn MatterController>, Option<Arc<M
 }
 
 async fn serve(config: Config) -> Result<()> {
-    let (controller, mock) = build_controller(&config);
+    let _lock = lock_storage(&config)?;
+    let (controller, mock) = build_controller(&config, true);
     if let Some(mock) = mock {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -186,7 +181,8 @@ async fn serve(config: Config) -> Result<()> {
 }
 
 async fn controller_command(config: Config, args: &[String]) -> Result<()> {
-    let (controller, _) = build_controller(&config);
+    let _lock = lock_storage(&config)?;
+    let (controller, _) = build_controller(&config, false);
     match args {
         [cmd, node, code] if cmd == "commission" => {
             let dataset = std::fs::read_to_string(&config.dataset_path).with_context(|| format!("read {}", config.dataset_path))?;

@@ -1,2 +1,2 @@
-[1761580700.100] [4821:4825] [CTL] Discovery timed out
-[1761580700.200] [4821:4825] [TOO] Device commissioning Failure: Error 0x00000032: Timeout
+[0;31m[1761580800.095] [4821:4825] [CTL] Discovery timed out[0m
+[0;31m[1761580800.096] [4821:4825] [TOO] Device commissioning Failure: Error 0x00000032: Timeout[0m
