@@ -51,7 +51,7 @@ class ScanService : Service() {
     private lateinit var power: PowerManager
     private lateinit var queue: ScanQueue
     private var wake: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+    private var flushWake: PowerManager.WakeLock? = null
     @Volatile private var network: Network? = null
     private lateinit var alarms: AlarmManager
     private lateinit var sensors: SensorManager
@@ -164,12 +164,13 @@ class ScanService : Service() {
                 store.status = "Start nicht erlaubt"
                 store.startError = "startForeground " + e.javaClass.simpleName
                 store.running = false
-                if (intent?.getBooleanExtra(ScanStarter.EXTRA_NUDGE, false) == true) ScanStarter.nudge(this)
+                if (intent == null || intent.getBooleanExtra(ScanStarter.EXTRA_NUDGE, false)) ScanStarter.nudge(this)
                 stopSelf()
                 return START_NOT_STICKY
             }
             active = true
             wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:scan").also { it.setReferenceCounted(false) }
+            flushWake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:flush").also { it.setReferenceCounted(false) }
             hold(false)
             try {
                 cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), netCallback)
@@ -177,7 +178,6 @@ class ScanService : Service() {
             } catch (e: Exception) {
                 Trace.w("net_request", e, "ok" to false)
             }
-            wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "heatscan:wifi").also { it.setReferenceCounted(false) }
             wakeStep = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
             step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) ?: wakeStep
             triggers = listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_MOTION_DETECT, true), sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION))
@@ -214,10 +214,10 @@ class ScanService : Service() {
             alarms.cancel(alarmIntent)
             releaseSensors()
             sensors.unregisterListener(offBodyListener)
-            wifiLock?.let { if (it.isHeld) it.release() }
             try { unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregister", e) }
             try { cm.unregisterNetworkCallback(netCallback) } catch (e: Exception) { Log.w(TAG, "unregister net", e) }
             wake?.let { if (it.isHeld) it.release() }
+            flushWake?.let { if (it.isHeld) it.release() }
         }
         if (active) Trace.i("service_stopped", "paused" to store.paused, "queue" to queue.size)
         active = false
@@ -269,7 +269,6 @@ class ScanService : Service() {
         }
         if (store.mode != policy.mode.label) store.mode = policy.mode.label
         applySensors()
-        applyWifiLock()
         if (policy.mode.sleeps) {
             hold(true)
             val exact = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarms.canScheduleExactAlarms()
@@ -285,14 +284,6 @@ class ScanService : Service() {
             hold(false)
             handler.postDelayed(tick, delay)
         }
-    }
-
-    private fun applyWifiLock() {
-        val lock = wifiLock ?: return
-        val want = policy.mode == Mode.MOVING
-        if (want == lock.isHeld) return
-        if (want) lock.acquire() else lock.release()
-        Trace.i("wifilock", "held" to want, "mode" to policy.mode.name)
     }
 
     private fun releaseSensors() {
@@ -368,11 +359,19 @@ class ScanService : Service() {
 
     private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String) {
         val state = powerState()
-        val body = Payload.build(ts, store.device, store.label, aps, policy.mode.motion, state, away)
-        val dropped = queue.add(body, System.currentTimeMillis())
-        Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to policy.mode.motion, "power" to state, "away" to away, "label" to (store.label ?: "-"))
-        store.status = stamp() + " " + kind + " q" + queue.size
-        flush(kind)
+        val motion = policy.mode.motion
+        val label = store.label
+        try {
+            io.execute {
+                val body = Payload.build(ts, store.device, label, aps, motion, state, away, store.nextId())
+                val dropped = queue.add(body, System.currentTimeMillis())
+                Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (label ?: "-"))
+                store.status = stamp() + " " + kind + " q" + queue.size
+                flush(kind)
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "enqueue rejected", e)
+        }
     }
 
     fun flush(reason: String) {
@@ -403,11 +402,16 @@ class ScanService : Service() {
         val net = network
         val before = queue.size
         if (before == 0) return
-        val r = flusher.run(
-            queue, System.currentTimeMillis(),
-            { a -> send(server, "/api/scans", JSONObject().put("scans", a).toString(), net) },
-            { e -> send(server, "/api/scan", e.toString(), net) }
-        )
+        val lock = flushWake?.also { it.acquire(ScanConfig.FLUSH_HOLD_MS) }
+        val r = try {
+            flusher.run(
+                queue, System.currentTimeMillis(),
+                { a -> send(server, "/api/scans", JSONObject().put("scans", a).toString(), net) },
+                { e -> send(server, "/api/scan", e.toString(), net) }
+            )
+        } finally {
+            lock?.let { if (it.isHeld) it.release() }
+        }
         val ok = r.code in 200..299
         val status = when {
             ok -> "${r.code} ${r.sent} sent" + (if (lastRoom.isNotEmpty()) " $lastRoom" else "")
@@ -453,7 +457,9 @@ class ScanService : Service() {
 class TickReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         val svc = ScanService.instance
-        if (svc != null) svc.onAlarm() else c.getSystemService(AlarmManager::class.java).cancel(ScanService.alarmIntent(c))
+        if (svc != null) svc.onAlarm()
+        else if (Store(c).paused) c.getSystemService(AlarmManager::class.java).cancel(ScanService.alarmIntent(c))
+        else ScanStarter.start(c, "alarm", true)
     }
 }
 
@@ -469,6 +475,10 @@ object ScanStarter {
     ).filter { c.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
 
     fun bgLocation(c: Context): Boolean = c.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    fun exempt(c: Context, source: String): Boolean = source in VISIBLE || source.startsWith("boot:") ||
+        (source == "alarm" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && c.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()) ||
+        c.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(c.packageName)
 
     fun extra(c: Context): List<Pair<String, Any?>> = listOf(
         "startError" to Store(c).startError,
@@ -504,9 +514,9 @@ object ScanStarter {
             if (nudge) nudge(c)
             return false
         }
-        if (source !in VISIBLE && !bgLocation(c)) {
-            store.startError = "ACCESS_BACKGROUND_LOCATION fehlt ($source)"
-            Trace.i("start_skipped", "source" to source, "reason" to "no_bg_location")
+        if (!exempt(c, source)) {
+            store.startError = "Hintergrundstart nicht erlaubt: Akku-Optimierung an, kein Boot/Alarm ($source)"
+            Trace.i("start_skipped", "source" to source, "reason" to "no_bg_exemption")
             if (nudge) nudge(c)
             return false
         }
@@ -545,7 +555,10 @@ object ScanStarter {
 class StartActivity : Activity() {
     override fun onResume() {
         super.onResume()
-        Store(this).paused = false
+        if (Store(this).paused) {
+            finish()
+            return
+        }
         val fine = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val coarse = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (Diag.permissionIssue(fine, coarse) == null) ScanStarter.start(this, "trampoline")
