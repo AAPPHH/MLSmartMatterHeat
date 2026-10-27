@@ -14,7 +14,47 @@ data class Ap(val bssid: String, val rssi: Int, val freq: Int)
 object Defaults {
     const val SERVER = "http://192.168.178.29:8080"
     const val DEVICE = "pixel-watch"
-    val ROOMS = listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "buero", "flur")
+    const val HOME = "FRITZ!Box 1234 AB"
+    val ROOMS = listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur")
+    val CAPTIONS = mapOf("wohnzimmer" to "Wohnen", "schlafzimmer" to "Schlafen", "bad" to "Bad", "kueche" to "Küche", "flur" to "Flur")
+}
+
+object RoomIcons {
+    val RES = mapOf(
+        "wohnzimmer" to R.drawable.ic_wohnzimmer, "schlafzimmer" to R.drawable.ic_schlafzimmer, "bad" to R.drawable.ic_bad,
+        "kueche" to R.drawable.ic_kueche, "flur" to R.drawable.ic_flur
+    )
+}
+
+object Labels {
+    fun toggle(current: String?, tapped: String): String? = if (current == tapped) null else tapped
+}
+
+object Home {
+    fun parse(csv: String): List<String> = csv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+
+    private fun norm(s: String) = s.trim().trim('"').lowercase()
+
+    fun isHome(seen: Collection<String>, home: Collection<String>): Boolean {
+        val wanted = home.map(::norm).filter { it.isNotEmpty() }.toSet()
+        return wanted.isEmpty() || seen.any { norm(it) in wanted }
+    }
+}
+
+object TileClick {
+    const val PREFIX = "room:"
+
+    fun id(room: String, nonce: Long) = "$PREFIX$room:$nonce"
+
+    fun room(id: String, nonce: Long): String? {
+        if (!id.startsWith(PREFIX)) return null
+        val parts = id.removePrefix(PREFIX).split(':')
+        if (parts.size != 2 || parts[1] != nonce.toString()) return null
+        return parts[0].takeIf { it in Defaults.ROOMS }
+    }
+
+    fun statusLine(running: Boolean, mode: String, status: String): String =
+        (if (running && mode.isNotEmpty()) "$mode | " else if (!running) "Scan aus | " else "") + status
 }
 
 object Payload {
@@ -66,11 +106,21 @@ class Store(private val ctx: Context) {
         get() = sp.getString("device", Defaults.DEVICE) ?: Defaults.DEVICE
         set(v) = put("device", v)
     var label: String?
-        get() = sp.getString("label", null)
+        get() = sp.getString("label", null)?.takeIf { it in Defaults.ROOMS }
         set(v) = put("label", v)
     var status: String
         get() = sp.getString("status", "-") ?: "-"
         set(v) = put("status", v)
+    var home: String
+        get() = sp.getString("home", Defaults.HOME) ?: Defaults.HOME
+        set(v) = put("home", v)
+    var stopped: Boolean
+        get() = sp.getBoolean("stopped", false)
+        set(v) = sp.edit().putBoolean("stopped", v).apply()
+    val homeList: List<String> get() = Home.parse(home)
+    var nonce: Long
+        get() = sp.getLong("nonce", 0L)
+        set(v) = sp.edit().putLong("nonce", v).apply()
     var mode: String
         get() = sp.getString("mode", "") ?: ""
         set(v) = put("mode", v)
@@ -81,6 +131,8 @@ class Store(private val ctx: Context) {
             sp.edit().putLong("rev", System.nanoTime()).apply()
             refreshTile()
         }
+
+    fun setLabelQuietly(v: String?) = sp.edit().putString("label", v).apply()
 
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
@@ -123,26 +175,35 @@ object ScanConfig {
     const val STILL_AFTER_MS = 120_000L
     const val HEARTBEAT_MS = 600_000L
     const val SCAN_HOLD_MS = 30_000L
+    const val MIN_GAP_MS = 20_000L
+    const val STALE_MS = 20_000L
+    const val AWAY_MS = 900_000L
+    const val AWAY_AFTER_MISSES = 3
 }
 
-enum class Mode(val label: String) {
-    MOVING("Bewegung"), SETTLING("Bewegung"), STILL("Ruhe"), FIXED("Fest 30 s, Aktivitaet fehlt")
+enum class Mode(val label: String, val sleeps: Boolean) {
+    MOVING("Bewegung", false), SETTLING("Bewegung", false), STILL("Ruhe", true),
+    FIXED("Fest 30 s, Aktivitaet fehlt", false), AWAY("Unterwegs", true)
 }
 
-class ScanPolicy(adaptive: Boolean, start: Long) {
-    var mode = if (adaptive) Mode.MOVING else Mode.FIXED
+class ScanPolicy(private val adaptive: Boolean, start: Long) {
+    private val base get() = if (adaptive) Mode.MOVING else Mode.FIXED
+    var mode = base
         private set
     private var lastMotion = start
     private var nextAt = start
+    private var lastScanAt = Long.MIN_VALUE / 4
+    private var misses = 0
 
-    fun onMotion(now: Long): Boolean {
-        if (mode == Mode.FIXED) return false
-        lastMotion = now
+    fun onMotion(now: Long, at: Long): Boolean {
+        if (mode == Mode.FIXED || mode == Mode.AWAY || now - at > ScanConfig.STALE_MS) return false
+        lastMotion = maxOf(lastMotion, at)
         return when (mode) {
             Mode.STILL -> {
                 mode = Mode.MOVING
-                nextAt = now + ScanConfig.MOVING_PERIOD_MS
-                true
+                val scan = claim(now)
+                nextAt = if (scan) now + ScanConfig.MOVING_PERIOD_MS else lastScanAt + ScanConfig.MIN_GAP_MS
+                scan
             }
             Mode.SETTLING -> {
                 mode = Mode.MOVING
@@ -153,12 +214,24 @@ class ScanPolicy(adaptive: Boolean, start: Long) {
         }
     }
 
+    fun onScan(home: Boolean, now: Long) {
+        misses = if (home) 0 else misses + 1
+        if (!home && (mode == Mode.AWAY || misses >= ScanConfig.AWAY_AFTER_MISSES)) {
+            mode = Mode.AWAY
+            nextAt = now + ScanConfig.AWAY_MS
+        } else if (home && mode == Mode.AWAY) {
+            mode = base
+            lastMotion = now
+            nextAt = now + ScanConfig.MOVING_PERIOD_MS
+        }
+    }
+
     fun onTick(now: Long): Boolean = when (mode) {
         Mode.FIXED -> due(now, ScanConfig.MOVING_PERIOD_MS)
         Mode.MOVING ->
             if (now - lastMotion >= ScanConfig.MOVE_WINDOW_MS) {
                 mode = Mode.SETTLING
-                true
+                claim(now)
             } else due(now, ScanConfig.MOVING_PERIOD_MS)
         Mode.SETTLING -> {
             if (now - lastMotion >= ScanConfig.STILL_AFTER_MS) {
@@ -168,16 +241,27 @@ class ScanPolicy(adaptive: Boolean, start: Long) {
             false
         }
         Mode.STILL -> due(now, ScanConfig.HEARTBEAT_MS)
+        Mode.AWAY -> due(now, ScanConfig.AWAY_MS)
     }
 
     fun delay(now: Long): Long = maxOf(0L, when (mode) {
-        Mode.FIXED, Mode.STILL -> nextAt
+        Mode.FIXED, Mode.STILL, Mode.AWAY -> nextAt
         Mode.MOVING -> minOf(nextAt, lastMotion + ScanConfig.MOVE_WINDOW_MS)
         Mode.SETTLING -> lastMotion + ScanConfig.STILL_AFTER_MS
     } - now)
 
+    private fun claim(now: Long): Boolean {
+        if (now - lastScanAt < ScanConfig.MIN_GAP_MS) return false
+        lastScanAt = now
+        return true
+    }
+
     private fun due(now: Long, period: Long): Boolean {
         if (now < nextAt) return false
+        if (!claim(now)) {
+            nextAt = lastScanAt + ScanConfig.MIN_GAP_MS
+            return false
+        }
         nextAt = now + period
         return true
     }

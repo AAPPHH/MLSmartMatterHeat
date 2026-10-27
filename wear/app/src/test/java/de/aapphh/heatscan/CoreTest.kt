@@ -76,7 +76,7 @@ class CoreTest {
         assertTrue(p.onTick(0))
         assertEquals(30 * s, p.delay(0))
         assertFalse(p.onTick(10 * s))
-        p.onMotion(25 * s)
+        p.onMotion(25 * s, 25 * s)
         assertTrue(p.onTick(30 * s))
         assertEquals(Mode.MOVING, p.mode)
     }
@@ -85,36 +85,78 @@ class CoreTest {
     fun settlesWithOneExtraScanThenStillAfterTwoMinutes() {
         val p = ScanPolicy(true, 0)
         p.onTick(0)
-        p.onMotion(50 * s)
+        p.onMotion(30 * s, 30 * s)
         assertTrue(p.onTick(30 * s))
-        assertEquals(20 * s, p.delay(40 * s))
         assertFalse(p.onTick(55 * s))
-        assertTrue(p.onTick(110 * s))
+        assertTrue(p.onTick(90 * s))
         assertEquals(Mode.SETTLING, p.mode)
-        assertEquals(60 * s, p.delay(110 * s))
+        assertEquals(60 * s, p.delay(90 * s))
         assertFalse(p.onTick(120 * s))
         assertEquals(Mode.SETTLING, p.mode)
-        assertFalse(p.onTick(170 * s))
+        assertFalse(p.onTick(150 * s))
         assertEquals(Mode.STILL, p.mode)
-        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(170 * s))
+        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(150 * s))
     }
 
     @Test
     fun stillScansOnlyOnHeartbeat() {
         val p = still()
-        assertFalse(p.onTick(170 * s + 599 * s))
-        assertTrue(p.onTick(170 * s + 600 * s))
-        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(770 * s))
+        assertFalse(p.onTick(150 * s + 599 * s))
+        assertTrue(p.onTick(150 * s + 600 * s))
+        assertEquals(ScanConfig.HEARTBEAT_MS, p.delay(750 * s))
         assertEquals(Mode.STILL, p.mode)
     }
 
     @Test
-    fun motionWakesFromStillWithImmediateScan() {
+    fun freshMotionWakesFromStillWithImmediateScan() {
         val p = still()
-        assertTrue(p.onMotion(300 * s))
+        assertTrue(p.onMotion(300 * s, 299 * s))
         assertEquals(Mode.MOVING, p.mode)
         assertEquals(30 * s, p.delay(300 * s))
-        assertFalse(p.onMotion(301 * s))
+        assertFalse(p.onMotion(301 * s, 301 * s))
+    }
+
+    @Test
+    fun staleBufferedMotionIsIgnoredInStill() {
+        val p = still()
+        assertFalse(p.onMotion(300 * s, 270 * s))
+        assertEquals(Mode.STILL, p.mode)
+        assertFalse(p.onMotion(300 * s, 279 * s))
+        assertEquals(Mode.STILL, p.mode)
+        assertTrue(p.onMotion(300 * s, 280 * s))
+    }
+
+    @Test
+    fun motionTimeComesFromEventNotDelivery() {
+        val p = ScanPolicy(true, 0)
+        p.onTick(0)
+        p.onMotion(40 * s, 30 * s)
+        p.onTick(30 * s)
+        p.onTick(60 * s)
+        assertTrue(p.onTick(90 * s))
+        assertEquals(Mode.SETTLING, p.mode)
+    }
+
+    @Test
+    fun noExtraScanWithin20sOfPreviousOne() {
+        val p = still()
+        assertTrue(p.onTick(750 * s))
+        assertFalse(p.onMotion(760 * s, 760 * s))
+        assertEquals(Mode.MOVING, p.mode)
+        assertEquals(10 * s, p.delay(760 * s))
+        assertTrue(p.onTick(770 * s))
+    }
+
+    @Test
+    fun settlingTransitionScanSkippedRightAfterPeriodicScan() {
+        val p = ScanPolicy(true, 0)
+        assertTrue(p.onTick(0))
+        assertTrue(p.onTick(30 * s))
+        p.onMotion(40 * s, 40 * s)
+        assertTrue(p.onTick(60 * s))
+        assertTrue(p.onTick(90 * s))
+        assertFalse(p.onTick(100 * s))
+        assertEquals(Mode.SETTLING, p.mode)
     }
 
     @Test
@@ -122,7 +164,7 @@ class CoreTest {
         val p = ScanPolicy(true, 0)
         p.onTick(0)
         assertTrue(p.onTick(60 * s))
-        assertFalse(p.onMotion(80 * s))
+        assertFalse(p.onMotion(80 * s, 80 * s))
         assertEquals(Mode.MOVING, p.mode)
         assertEquals(30 * s, p.delay(80 * s))
     }
@@ -132,16 +174,99 @@ class CoreTest {
         val p = ScanPolicy(false, 0)
         assertEquals(Mode.FIXED, p.mode)
         assertTrue(p.onTick(0))
-        assertFalse(p.onMotion(5 * s))
+        assertFalse(p.onMotion(5 * s, 5 * s))
         assertFalse(p.onTick(29 * s))
         assertTrue(p.onTick(30 * s))
         assertEquals(30 * s, p.delay(30 * s))
         assertEquals(Mode.FIXED, p.mode)
     }
 
+    @Test
+    fun awayWhenNoHomeSsidChecksEvery15MinAndIgnoresSteps() {
+        val p = ScanPolicy(true, 0)
+        assertTrue(p.onTick(0))
+        p.onScan(false, 1 * s)
+        assertEquals(Mode.MOVING, p.mode)
+        repeat(ScanConfig.AWAY_AFTER_MISSES - 1) { p.onScan(false, 1 * s) }
+        assertEquals(Mode.AWAY, p.mode)
+        assertEquals("Unterwegs", p.mode.label)
+        assertFalse(p.onMotion(100 * s, 100 * s))
+        assertEquals(Mode.AWAY, p.mode)
+        assertEquals(ScanConfig.AWAY_MS, p.delay(1 * s))
+        assertFalse(p.onTick(500 * s))
+        assertTrue(p.onTick(1 * s + ScanConfig.AWAY_MS))
+        p.onScan(false, 2 * s + ScanConfig.AWAY_MS)
+        assertEquals(Mode.AWAY, p.mode)
+    }
+
+    @Test
+    fun homeSsidSeenReturnsToAdaptiveBehaviour() {
+        val p = ScanPolicy(true, 0)
+        p.onTick(0)
+        repeat(ScanConfig.AWAY_AFTER_MISSES) { p.onScan(false, 1 * s) }
+        val back = ScanConfig.AWAY_MS + 1 * s
+        p.onTick(back)
+        p.onScan(true, back)
+        assertEquals(Mode.MOVING, p.mode)
+        assertEquals(30 * s, p.delay(back))
+        assertFalse(p.onMotion(back + s, back + s))
+        val f = ScanPolicy(false, 0)
+        f.onScan(false, 0)
+        f.onScan(true, 5 * s)
+        assertEquals(Mode.FIXED, f.mode)
+    }
+
+    @Test
+    fun homeScanKeepsModeWhenAlreadyHome() {
+        val p = still()
+        p.onScan(true, 200 * s)
+        assertEquals(Mode.STILL, p.mode)
+    }
+
+    @Test
+    fun homeSsidMatching() {
+        val home = Home.parse("FRITZ!Box 1234 AB, Other")
+        assertEquals(listOf("FRITZ!Box 1234 AB", "Other"), home)
+        assertTrue(Home.isHome(listOf("x", "FRITZ!Box 1234 AB"), home))
+        assertTrue(Home.isHome(listOf("\"Other\""), home))
+        assertFalse(Home.isHome(listOf("x", "", "FRITZ!Box 1234 AB"), home))
+        assertFalse(Home.isHome(emptyList(), home))
+        assertTrue(Home.isHome(listOf("x"), Home.parse(" , ")))
+        assertEquals(listOf(Defaults.HOME), Home.parse(Defaults.HOME))
+    }
+
+    @Test
+    fun roomsAreTheFiveFixedOnes() {
+        assertEquals(listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur"), Defaults.ROOMS)
+        assertEquals(Defaults.ROOMS.toSet(), Defaults.CAPTIONS.keys)
+    }
+
+    @Test
+    fun labelToggle() {
+        assertEquals("bad", Labels.toggle(null, "bad"))
+        assertEquals("bad", Labels.toggle("flur", "bad"))
+        assertEquals(null, Labels.toggle("bad", "bad"))
+    }
+
+    @Test
+    fun tileClickOnlyAcceptsCurrentNonce() {
+        assertEquals("bad", TileClick.room(TileClick.id("bad", 3), 3))
+        assertEquals(null, TileClick.room(TileClick.id("bad", 3), 4))
+        assertEquals(null, TileClick.room(TileClick.id("buero", 3), 3))
+        assertEquals(null, TileClick.room("open", 3))
+        assertEquals(null, TileClick.room("", 0))
+    }
+
+    @Test
+    fun tileStatusLine() {
+        assertEquals("Ruhe | 12:00:00 200", TileClick.statusLine(true, "Ruhe", "12:00:00 200"))
+        assertEquals("Scan aus | -", TileClick.statusLine(false, "Ruhe", "-"))
+        assertEquals("-", TileClick.statusLine(true, "", "-"))
+    }
+
     private fun still(): ScanPolicy = ScanPolicy(true, 0).also {
         it.onTick(0)
         it.onTick(60 * s)
-        it.onTick(170 * s)
+        it.onTick(150 * s)
     }
 }
