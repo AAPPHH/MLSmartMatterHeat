@@ -3,6 +3,7 @@ package de.aapphh.heatscan
 import android.Manifest
 import android.content.Intent
 import android.content.SharedPreferences
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -44,6 +45,7 @@ class MainActivity : ComponentActivity() {
         val svc = Intent(this, ScanService::class.java)
         if (store.running) {
             stopService(svc)
+            store.running = false
         } else {
             startForegroundService(svc)
         }
@@ -58,7 +60,12 @@ class MainActivity : ComponentActivity() {
             onDispose { store.sp.unregisterOnSharedPreferenceChangeListener(l) }
         }
         val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-            if (granted[Manifest.permission.ACCESS_FINE_LOCATION] == true) toggle(store)
+            val issue = Diag.permissionIssue(granted[Manifest.permission.ACCESS_FINE_LOCATION] == true, granted[Manifest.permission.ACCESS_COARSE_LOCATION] == true)
+            if (issue != null) store.status = issue
+            else {
+                if (Diag.needsLocalNetwork(Build.VERSION.SDK_INT, granted[Diag.LOCAL_NETWORK] == true)) store.status = "LAN-Zugriff fehlt"
+                toggle(store)
+            }
         }
         val v = version
         val label = store.label
@@ -68,7 +75,7 @@ class MainActivity : ComponentActivity() {
                     Chip(
                         onClick = {
                             if (store.running) toggle(store)
-                            else perms.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.POST_NOTIFICATIONS))
+                            else perms.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.POST_NOTIFICATIONS, Diag.LOCAL_NETWORK))
                         },
                         label = { Text(if (store.running) "Stop" else "Start") },
                         secondaryLabel = { Text("Label: ${label ?: "kein Label"}") },

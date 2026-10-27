@@ -8,12 +8,15 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -73,15 +76,27 @@ class ScanService : Service() {
             return START_NOT_STICKY
         }
         if (!active) {
+            try {
+                startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            } catch (e: Exception) {
+                Log.w(TAG, "startForeground failed", e)
+                store.status = "Start nicht erlaubt"
+                store.running = false
+                stopSelf()
+                return START_NOT_STICKY
+            }
             active = true
-            startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
             wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:scan").also { it.acquire() }
-            cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), netCallback)
+            try {
+                cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), netCallback)
+            } catch (e: Exception) {
+                Log.w(TAG, "requestNetwork failed, using default network", e)
+            }
             registerReceiver(receiver, IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION), RECEIVER_NOT_EXPORTED)
             store.running = true
             handler.post(tick)
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -109,7 +124,11 @@ class ScanService : Service() {
     private fun collect() {
         try {
             val results = wifi.scanResults
-            if (results.isEmpty()) return
+            if (results.isEmpty()) {
+                val lm = getSystemService(LocationManager::class.java)
+                store.status = stamp() + " " + Diag.emptyScan(lm.isLocationEnabled, wifi.isWifiEnabled)
+                return
+            }
             if (!dedup.accept(results.maxOf { it.timestamp })) return
             val body = Payload.build(
                 System.currentTimeMillis(), store.device, store.label,
@@ -122,14 +141,16 @@ class ScanService : Service() {
                     Poster.post(server, body, net)
                 } catch (e: Exception) {
                     Log.w(TAG, "post failed", e)
-                    "ERR ${e.javaClass.simpleName}"
+                    Diag.postError(e.javaClass.simpleName, Diag.needsLocalNetwork(Build.VERSION.SDK_INT, checkSelfPermission(Diag.LOCAL_NETWORK) == PackageManager.PERMISSION_GRANTED))
                 }
-                store.status = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + " " + status
+                store.status = stamp() + " " + status
             }
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
         }
     }
+
+    private fun stamp() = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
 
     private fun notification(): Notification {
         val nm = getSystemService(NotificationManager::class.java)
@@ -146,5 +167,6 @@ class ScanService : Service() {
         const val ACTION_STOP = "de.aapphh.heatscan.STOP"
         private const val CHANNEL = "scan"
         private const val PERIOD_MS = 30_000L
+        @Volatile var running = false
     }
 }
