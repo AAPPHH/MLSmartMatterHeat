@@ -63,9 +63,14 @@ import kotlin.math.sin
 class MainActivity : ComponentActivity() {
     private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { ScanStarter.start(this, "permissions") }
     private var asked = false
+    private val prompt get() = intent.getBooleanExtra("prompt", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (prompt) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
         val store = Store(this)
         intent.getStringExtra("server")?.let { store.server = it }
         intent.getStringExtra("device")?.let { store.device = it }
@@ -94,18 +99,23 @@ class MainActivity : ComponentActivity() {
         var saved by remember { mutableStateOf<String?>(null) }
         LaunchedEffect(saved) {
             if (saved != null) {
-                delay(Prompt.DONE_TIMEOUT_MS)
-                saved = null
+                if (prompt) {
+                    delay(2000)
+                    finish()
+                } else {
+                    delay(Prompt.DONE_TIMEOUT_MS)
+                    saved = null
+                }
             }
         }
         Box(Modifier.fillMaxSize()) {
-            saved?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
+            (saved ?: Prompt.title(intent.getBooleanExtra("change", false)).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 key(version) {
                     if (page == 0) {
                         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
                         RoomsPage(hot, ringed) {
-                            LabelRecorder.async(this@MainActivity, it)
+                            LabelRecorder.async(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
                             saved = Prompt.done(it)
                         }
                     } else DataPage(

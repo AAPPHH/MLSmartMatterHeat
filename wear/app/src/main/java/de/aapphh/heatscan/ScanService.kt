@@ -563,6 +563,12 @@ object Prompter {
             .setSmallIcon(R.drawable.ic_launcher)
             .setTimeoutAfter(Prompt.TIMEOUT_MS)
             .setOnlyAlertOnce(!alertAgain)
+        val open = PendingIntent.getActivity(
+            c, 1, Intent(c, MainActivity::class.java).putExtra("prompt", true).putExtra("change", change).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        b.setContentIntent(open)
+        if (loud) b.setFullScreenIntent(open, true).setPriority(Notification.PRIORITY_HIGH)
         val wear = Notification.WearableExtender()
         Prompt.rooms(guess).forEach {
             val a = action(c, it, guess)
@@ -593,6 +599,8 @@ object Prompter {
             Trace.w("prompt_refresh_failed", e)
         }
     }
+
+    fun cancel(c: Context) = nm(c).cancel(ID)
 
     fun confirm(c: Context, room: String) {
         try {
