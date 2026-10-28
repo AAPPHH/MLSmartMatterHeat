@@ -176,7 +176,7 @@ adb connect <uhr-ip>:<port> && adb install -r wear/app/build/outputs/apk/release
 Die APK liegt auch im GitHub-Release. In der App erlaubst du **genauen Standort** (für WLAN-Scans) und **Geräte in der Nähe / LAN-Zugriff** (Android 17, sonst erreicht die Uhr den Minix nicht). Dann prüfst du die Server-URL (`http://192.168.178.29:8090`; auf dem Minix belegt gluetun 8080), tippst auf Start und fügst die Kachel **HeatScan** hinzu. Die Statuszeile meldet Probleme direkt, etwa „Standort aus“, „WLAN aus“ oder „LAN-Zugriff fehlt“.
 
 **Training:**
-1. In jedem Raum ein paar Mal 10–20 min verbringen und vorher auf der Uhr den Raum antippen; danach „kein Label“.
+1. Die Uhr fragt per Benachrichtigung „Wo bist du?“ (5 Raumknöpfe, Vermutung zuerst). Ein Tipp etikettiert die Scans ab der Frage und startet einen Aufenthalt: weitere Scans im selben Raum werden ohne Rückfrage etikettiert (höchstens 2 h). Wechselst du den Raum (Bewegung, danach zwei Scans mit anderem WLAN-Fingerabdruck oder abweichender Vorhersage), fragt die Uhr einmal mit Vibration „Raum gewechselt? Wo bist du jetzt?“ und etikettiert rückwirkend ab dem ersten abweichenden Scan. Vibration höchstens alle 3 min, nachts (22–7 Uhr), unterwegs und ohne Uhr am Handgelenk nur lautlos. Zusätzlich geht Antippen in App und Kachel; es entstehen keine zusätzlichen Scans.
 2. Snapshot ziehen und trainieren:
    ```bash
    curl -X POST http://localhost:8080/api/snapshot       # data/snapshot.duckdb
