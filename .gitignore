@@ -24,3 +24,5 @@ wear/keystore.properties
 *.keystore
 /firmware/br/sdkconfig.*.local
 /heatd.toml
+/chip-storage/
+/deploy/docker/.env

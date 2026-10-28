@@ -1,0 +1,34 @@
+services:
+  heatd:
+    image: heatd:local
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        NINJA_JOBS: ${NINJA_JOBS:-4}
+    network_mode: host
+    user: "${HEATD_UID:-1000}:${HEATD_GID:-1000}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HEATD_CONFIG: /etc/heatd/heatd.toml
+      HEATD_PORT: ${HEATD_PORT:-8080}
+    volumes:
+      - ../../heatd.toml:/etc/heatd/heatd.toml:ro
+      - ../../data:/data
+      - ../../models:/models
+      - ../../chip-storage:/chip-storage
+      - ../../secrets:/secrets:ro
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:$${HEATD_PORT:-8080}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
