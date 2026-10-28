@@ -370,6 +370,34 @@ class ScanService : Service() {
         }
     }
 
+    private var manualPending = false
+    private val manualTimeout = Runnable { finishManual("rejected") }
+
+    private fun finishManual(state: String) {
+        if (!manualPending) return
+        manualPending = false
+        handler.removeCallbacks(manualTimeout)
+        store.manual = state
+    }
+
+    fun manualScan() {
+        handler.post {
+            if (manualPending) return@post
+            if (!active) return@post run { store.manual = "rejected" }
+            val now = SystemClock.elapsedRealtime()
+            val ok = policy.claimManual(now) && try { wifi.startScan() } catch (e: Exception) { false }
+            Trace.i("scan_requested", "accepted" to ok, "manual" to true)
+            if (ok) {
+                lastScanRequestAt = now
+                manualPending = true
+                handler.postDelayed(manualTimeout, ScanConfig.MANUAL_WAIT_MS)
+            } else {
+                store.rejected += 1
+                store.manual = "rejected"
+            }
+        }
+    }
+
     private fun collect() {
         try {
             val results = wifi.scanResults
@@ -381,6 +409,7 @@ class ScanService : Service() {
                 return
             }
             val beat = beatPending
+            val manual = manualPending
             val newest = results.maxOf { it.timestamp }
             if (!dedup.accept(newest)) {
                 Trace.i("scan_result", "count" to results.size, "dedup" to true)
@@ -400,13 +429,13 @@ class ScanService : Service() {
             beatPending = false
             handler.removeCallbacks(beatTimeout)
             val ts = Capture.wallMs(System.currentTimeMillis(), now, newest)
-            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home) "scan" else "away")
+            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual)
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
         }
     }
 
-    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String) {
+    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false) {
         lastEnqueueAt = SystemClock.elapsedRealtime()
         val state = powerState()
         val motion = policy.mode.motion
@@ -417,11 +446,12 @@ class ScanService : Service() {
         try {
             io.execute {
                 val wall = System.currentTimeMillis()
-                val d = if (kind == "away") store.stay { it.reset() }.let { Decision() } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
+                val d = if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
                 val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId())
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
+                if (manual) handler.post { finishManual("ok") }
                 if (d.ask) Prompter.ask(this, store, away, off, d)
                 flush(kind)
             }
@@ -639,6 +669,15 @@ object LabelRecorder {
         Prompter.confirm(c, room)
         Trace.i("label", "room" to room, "from" to from, "to" to to)
         ScanService.instance?.flush("label")
+    }
+
+    fun measure(c: Context, room: String, done: () -> Unit = {}) {
+        val store = Store(c)
+        store.manual = "wait"
+        async(c, room) {
+            ScanService.instance?.manualScan() ?: run { store.manual = "rejected" }
+            done()
+        }
     }
 }
 

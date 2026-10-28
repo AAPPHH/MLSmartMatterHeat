@@ -1170,6 +1170,38 @@ class CoreTest {
     }
 
     @Test
+    fun claimManualIgnoresModeButHonoursWindowBudget() {
+        val a = ScanPolicy(true, 0)
+        repeat(ScanConfig.AWAY_AFTER_MISSES) { a.onScan(false, 1000L) }
+        assertEquals(Mode.AWAY, a.mode)
+        var t = 100_000L
+        assertTrue(a.claimManual(t))
+        assertFalse(a.claimManual(t + ScanConfig.MANUAL_GAP_MS - 1))
+        repeat(ScanConfig.SCAN_WINDOW_MAX - 1) { t += ScanConfig.MANUAL_GAP_MS; assertTrue(a.claimManual(t)) }
+        t += ScanConfig.MANUAL_GAP_MS
+        assertFalse(a.claimManual(t))
+        assertTrue(a.claimManual(100_000L + ScanConfig.SCAN_WINDOW_MS))
+    }
+
+    @Test
+    fun manualScanCarriesTappedLabelAndAdoptsFingerprint() {
+        val t = staying("kueche", roomA)
+        t.confirm("bad", t0 + 10_000)
+        val d = t.onManual(t0 + 12_000, t0 + 12_000, roomB, false, false, null)
+        assertEquals("bad", d.label)
+        assertFalse(d.ask)
+        assertEquals(Fingerprint.of(roomB), t.fp)
+        assertEquals(1, t.n)
+    }
+
+    @Test
+    fun manualMessagesFollowState() {
+        assertEquals("Messe …", Prompt.measured("bad", "wait"))
+        assertTrue(Prompt.measured("bad", "ok").endsWith("Messung ok"))
+        assertTrue(Prompt.measured("bad", "rejected").endsWith("gilt für die nächste"))
+    }
+
+    @Test
     fun promptsSkippedAwayOffBodyAndScreenOffWake() {
         assertTrue(Wake.promptAllowed(false, null, true, true))
         assertTrue(Wake.promptAllowed(false, false, false, false))

@@ -96,15 +96,17 @@ class MainActivity : ComponentActivity() {
             onDispose { store.sp.unregisterOnSharedPreferenceChangeListener(l) }
         }
         val pager = rememberPagerState { 2 }
-        var saved by remember { mutableStateOf<String?>(null) }
+        var tapped by remember { mutableStateOf<String?>(null) }
+        val saved = tapped?.let { Prompt.measured(it, version.let { _ -> store.manual }) }
+        val waiting = saved != null && store.manual == "wait"
         LaunchedEffect(saved) {
-            if (saved != null) {
+            if (saved != null && !waiting) {
                 if (prompt) {
                     delay(2000)
                     finish()
                 } else {
                     delay(Prompt.DONE_TIMEOUT_MS)
-                    saved = null
+                    tapped = null
                 }
             }
         }
@@ -115,8 +117,8 @@ class MainActivity : ComponentActivity() {
                     if (page == 0) {
                         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
                         RoomsPage(hot, ringed) {
-                            LabelRecorder.async(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
-                            saved = Prompt.done(it)
+                            LabelRecorder.measure(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
+                            tapped = it
                         }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,

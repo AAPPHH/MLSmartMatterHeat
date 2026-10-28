@@ -74,6 +74,13 @@ object Prompt {
     fun caption(room: String, guess: String?): String = (if (room == guess) "● " else "") + Rings.name(room)
 
     fun done(room: String) = "✓ Gespeichert: " + Rings.name(room)
+
+    fun measured(room: String, state: String) = when (state) {
+        "wait" -> "Messe …"
+        "ok" -> done(room) + " · Messung ok"
+        "rejected" -> done(room) + " · Messung abgelehnt, gilt für die nächste"
+        else -> done(room)
+    }
 }
 
 object Fingerprint {
@@ -233,6 +240,17 @@ class StayTracker {
             return ask(now, ts, at, cur, guess, true)
         }
         return Decision(s)
+    }
+
+    fun onManual(ts: Long, now: Long, aps: List<Ap>, moving: Boolean, motion: Boolean, guess: String?): Decision {
+        val d = onScan(ts, now, aps, moving, motion, guess)
+        val cur = Fingerprint.of(aps)
+        if (label != null && cur.isNotEmpty()) {
+            fp = cur
+            n = 1
+            diff = 0
+        }
+        return d
     }
 
     fun onGuess(scanTs: Long, room: String, p: Float?, now: Long): Decision {
@@ -858,6 +876,9 @@ class Store(private val ctx: Context) {
     var lastFreshAt: Long
         get() = sp.getLong("lastFreshAt", 0L)
         set(v) = sp.edit().putLong("lastFreshAt", v).apply()
+    var manual: String
+        get() = sp.getString("manual", "") ?: ""
+        set(v) = sp.edit().putString("manual", v).apply()
     var rejected: Int
         get() = sp.getInt("rejected", 0)
         set(v) = sp.edit().putInt("rejected", v).apply()
@@ -1003,6 +1024,8 @@ object ScanConfig {
     const val HEARTBEAT_MS = 720_000L
     const val SCAN_HOLD_MS = 30_000L
     const val MIN_GAP_MS = 20_000L
+    const val MANUAL_GAP_MS = 2_000L
+    const val MANUAL_WAIT_MS = 10_000L
     const val SCAN_WINDOW_MS = 120_000L
     const val SCAN_WINDOW_MAX = 4
     const val FLUSH_HOLD_MS = 300_000L
@@ -1093,8 +1116,10 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
 
     fun claimWake(now: Long) = mode != Mode.AWAY && claim(now)
 
-    private fun claim(now: Long): Boolean {
-        if (now - lastScanAt < ScanConfig.MIN_GAP_MS) return false
+    fun claimManual(now: Long) = claim(now, ScanConfig.MANUAL_GAP_MS)
+
+    private fun claim(now: Long, gap: Long = ScanConfig.MIN_GAP_MS): Boolean {
+        if (now - lastScanAt < gap) return false
         while (recent.isNotEmpty() && now - recent.first() >= ScanConfig.SCAN_WINDOW_MS) recent.removeFirst()
         if (recent.size >= ScanConfig.SCAN_WINDOW_MAX) return false
         recent.addLast(now)

@@ -18,7 +18,7 @@ android {
         applicationId = "de.aapphh.heatscan"
         minSdk = 30
         targetSdk = 37
-        versionCode = 12
+        versionCode = 13
         versionName = "2.3"
     }
     signingConfigs {
