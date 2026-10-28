@@ -14,6 +14,6 @@ ssh "$M" 'test -e ~/MLSmartMatterHeat/data/heatd.duckdb' || scp -q data/heatd.du
 scp -q secrets/thread_dataset.hex "$M":MLSmartMatterHeat/secrets/
 docker save heatd:local | gzip -1 | ssh "$M" 'gunzip | docker load'
 ssh "$M" "chmod 600 ~/MLSmartMatterHeat/secrets/*; cd ~/MLSmartMatterHeat/deploy/docker && docker compose up -d --no-build --force-recreate && sleep 25 && curl -fsS localhost:$PORT/health"
-code=$(ssh "$M" "curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"device":"x","from":2,"to":1,"label":"a"}' localhost:$PORT/api/label")
+code=$(ssh "$M" "curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{\"device\":\"x\",\"from\":2,\"to\":1,\"label\":\"a\"}' localhost:$PORT/api/label")
 [ "$code" = 400 ] || { echo "POST /api/label mit ungueltigem Body lieferte $code statt 400, Image ohne Label-Endpunkt?" >&2; exit 1; }
 rm -rf "$T"
