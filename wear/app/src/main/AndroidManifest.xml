@@ -56,6 +56,9 @@
             android:exported="true"
             android:permission="android.permission.DUMP" />
         <receiver
+            android:name=".LabelReceiver"
+            android:exported="false" />
+        <receiver
             android:name=".TickReceiver"
             android:exported="false" />
         <service

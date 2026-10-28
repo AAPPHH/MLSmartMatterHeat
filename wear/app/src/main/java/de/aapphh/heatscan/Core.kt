@@ -29,7 +29,40 @@ object RoomIcons {
 }
 
 object Labels {
-    fun toggle(current: String?, tapped: String): String? = if (current == tapped) null else tapped
+    const val RECENT_MS = 600_000L
+
+    fun recent(label: String?, at: Long, now: Long): String? = label?.takeIf { now - at in 0..RECENT_MS }
+}
+
+object LabelEvent {
+    const val KIND = "label"
+
+    fun window(lastTo: Long, now: Long): Pair<Long, Long> = Pair(minOf(maxOf(lastTo, now - Labels.RECENT_MS), now), now)
+
+    fun entry(device: String, from: Long, to: Long, label: String): JSONObject =
+        JSONObject().put("ts", to).put("kind", KIND).put("device", device).put("from", from).put("to", to).put("label", label)
+
+    fun isLabel(o: JSONObject) = o.optString("kind") == KIND
+
+    fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).toString()
+}
+
+object Prompt {
+    const val ALERT_GAP_MS = 600_000L
+    const val TIMEOUT_MS = 600_000L
+    const val DONE_TIMEOUT_MS = 4_000L
+    val ORDER = listOf("kueche", "wohnzimmer", "flur", "bad", "schlafzimmer")
+
+    fun quiet(hour: Int) = hour >= 22 || hour < 7
+
+    fun alert(now: Long, lastAlertAt: Long, away: Boolean, offBody: Boolean, hour: Int): Boolean =
+        !away && !offBody && !quiet(hour) && now - lastAlertAt >= ALERT_GAP_MS
+
+    fun rooms(guess: String?): List<String> = if (guess != null && guess in ORDER) listOf(guess) + ORDER.filter { it != guess } else ORDER
+
+    fun caption(room: String, guess: String?): String = (if (room == guess) "● " else "") + Rings.name(room)
+
+    fun done(room: String) = "✓ Gespeichert: " + Rings.name(room)
 }
 
 object Highlight {
@@ -441,13 +474,21 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
 
     private fun settled(c: Int) = accepted(c) || rejected(c)
 
-    fun run(queue: ScanQueue, now: Long, sendBatch: (JSONArray) -> Int, sendOne: (JSONObject) -> Int): FlushResult {
+    fun run(queue: ScanQueue, now: Long, sendBatch: (JSONArray) -> Int, sendOne: (JSONObject) -> Int, sendLabel: (JSONObject) -> Int = { 200 }): FlushResult {
         var sent = 0
         var code = 0
         try {
             while (true) {
-                val items = queue.peek(batch, now)
-                if (items.isEmpty()) break
+                val head = queue.peek(batch, now)
+                if (head.isEmpty()) break
+                if (LabelEvent.isLabel(head[0].json)) {
+                    code = sendLabel(head[0].json)
+                    if (!settled(code) && code != 404) return FlushResult(sent, code)
+                    queue.remove(head[0].seq, false)
+                    if (accepted(code)) sent++
+                    continue
+                }
+                val items = head.takeWhile { !LabelEvent.isLabel(it.json) }
                 if (!singleOnly) {
                     code = sendBatch(JSONArray().also { a -> items.forEach { a.put(it.json) } })
                     if (accepted(code)) {
@@ -520,6 +561,16 @@ class Store(private val ctx: Context) {
     var label: String?
         get() = sp.getString("label", null)?.takeIf { it in Defaults.ROOMS }
         set(v) = put("label", v)
+    var labelAt: Long
+        get() = sp.getLong("labelAt", 0L)
+        set(v) = sp.edit().putLong("labelAt", v).apply()
+    var lastLabelTo: Long
+        get() = sp.getLong("lastLabelTo", 0L)
+        set(v) = sp.edit().putLong("lastLabelTo", v).apply()
+    var lastPromptAlertAt: Long
+        get() = sp.getLong("lastPromptAlertAt", 0L)
+        set(v) = sp.edit().putLong("lastPromptAlertAt", v).apply()
+    fun recentLabel(now: Long = System.currentTimeMillis()): String? = Labels.recent(label, labelAt, now)
     var guess: String?
         get() = sp.getString("guess", null)?.takeIf { it in Defaults.ROOMS }
         set(v) = put("guess", v)
@@ -614,14 +665,12 @@ class Store(private val ctx: Context) {
         refreshTile()
     }
 
-    fun setLabelQuietly(v: String?) = sp.edit().putString("label", v).apply()
-
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
         if (key == "label" || key == "guess" || key == "status" || key == "mode" || key == "lastPost") refreshTile()
     }
 
-    private fun refreshTile() {
+    fun refreshTile() {
         try {
             TileService.getUpdater(ctx).requestUpdate(HeatTileService::class.java)
         } catch (e: Exception) {
