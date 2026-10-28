@@ -134,3 +134,29 @@ def test_cli_dispatch_and_fallback(semi, capsys):
     sup = SynthGenerator(CONFIG["synth"]).write(db.parent / "sup.duckdb", seed=1)
     clf, clusterer = fit_model({**cfg, "snapshot": sup})
     assert clusterer is None and len(clf.labels) == 4
+
+
+def make_viz_db(path, filled):
+    import duckdb
+    con = duckdb.connect(str(path))
+    con.execute("CREATE TABLE scans(scan_id BIGINT, ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, label VARCHAR, bssid VARCHAR, rssi INTEGER, freq INTEGER)")
+    con.execute("CREATE TABLE device_state(ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, motion VARCHAR, power VARCHAR, queued BOOLEAN, n_aps INTEGER, away BOOLEAN, id VARCHAR)")
+    con.execute("CREATE TABLE readings(ts TIMESTAMP, node UBIGINT, endpoint USMALLINT, attribute VARCHAR, value DOUBLE)")
+    con.execute("CREATE TABLE setpoints(ts TIMESTAMP, node UBIGINT, room VARCHAR, value DOUBLE, reason VARCHAR)")
+    if filled:
+        for i in range(12):
+            for b, base in enumerate([-40, -60, -80]):
+                con.execute("INSERT INTO scans VALUES (?, ?, now(), 'w', ?, ?, ?, ?)", [i, f"2026-10-28 07:{i:02d}:00", ["bad", "kueche", None][i % 3], f"aa:bb:cc:dd:ee:0{b}", base - 5 * (i % 3), 2412 + 1000 * b])
+        con.execute("INSERT INTO device_state VALUES ('2026-10-28 07:05:00', now(), 'w', 'still', 'doze', false, 3, false, NULL)")
+        con.execute("INSERT INTO readings VALUES ('2026-10-28 07:05:00', 5, 1, 'local_temperature', 20.0)")
+        con.execute("INSERT INTO setpoints VALUES ('2026-10-28 07:05:00', 5, 'bad', 21.0, 'schedule')")
+    con.close()
+    return path
+
+
+@pytest.mark.parametrize("filled", [True, False])
+def test_viz_builds_dashboard(tmp_path, filled):
+    from heatml.viz import VIZ, build
+    html = build(make_viz_db(tmp_path / "s.duckdb", filled), tmp_path / "d.html").read_text(encoding="utf-8")
+    assert all(t in html for t in VIZ["sections"].values())
+    assert ("Testdaten bis Commissioning" in html) == filled

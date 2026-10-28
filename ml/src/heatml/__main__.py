@@ -3,9 +3,11 @@ from collections import Counter
 from heatml.cluster import PlaceClusterer, SemiSupervisedRoom
 from heatml.data import REPO_ROOT, Snapshot
 from heatml.room import RoomClassifier
+from heatml.viz import build
 
 CONFIG = {
     "snapshot": None,
+    "viz_out": REPO_ROOT / "data" / "dashboard.html",
     "model_dir": REPO_ROOT / "models",
     "room": {
         "rssi_floor": -100.0, "rssi_span": 70.0,
@@ -58,13 +60,20 @@ def cluster(config):
     return clusterer
 
 
-COMMANDS = {"train": train, "cluster": cluster}
+def viz(config):
+    print(build(config["snapshot"], config["viz_out"]))
+
+
+COMMANDS = {"train": train, "cluster": cluster, "viz": viz}
 
 
 def main(argv):
     if len(argv) < 2 or argv[1] not in COMMANDS:
         sys.exit(f"usage: python -m heatml {{{'|'.join(COMMANDS)}}}")
-    COMMANDS[argv[1]](CONFIG)
+    config = dict(CONFIG)
+    for key, value in zip(("snapshot", "viz_out"), argv[2:]):
+        config[key] = value
+    COMMANDS[argv[1]](config)
 
 
 if __name__ == "__main__":
