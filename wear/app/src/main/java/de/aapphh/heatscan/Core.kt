@@ -516,9 +516,10 @@ class Store(private val ctx: Context) {
         get() = sp.getString("mode", "") ?: ""
         set(v) = put("mode", v)
     fun nextId(): String = synchronized(Store::class.java) {
+        val epoch = sp.getString("idEpoch", null) ?: java.lang.Long.toString(System.currentTimeMillis(), 36).also { sp.edit().putString("idEpoch", it).commit() }
         val n = sp.getLong("idSeq", 0L) + 1
         sp.edit().putLong("idSeq", n).commit()
-        EntryId.format(device, n)
+        EntryId.format("$device-$epoch", n)
     }
     var paused: Boolean
         get() = sp.getBoolean("paused", false)
