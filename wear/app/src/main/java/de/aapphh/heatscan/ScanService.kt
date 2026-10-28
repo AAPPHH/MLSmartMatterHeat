@@ -343,6 +343,7 @@ class ScanService : Service() {
                 Trace.i("scan_result", "count" to results.size, "dedup" to true)
                 return
             }
+            store.setLastAps(results.map { NamedAp(it.BSSID.lowercase(), it.SSID.orEmpty(), it.level, it.frequency) })
             val home = Home.isHome(results.map { it.SSID }, store.homeList)
             Trace.i("scan_result", "count" to results.size, "home" to home)
             if (store.atHome != home) Trace.i("home_change", "home" to home)
@@ -392,6 +393,7 @@ class ScanService : Service() {
 
     private fun send(server: String, path: String, body: String, net: Network?): Int = try {
         val reply = Poster.send(server, path, body, net)
+        if (reply.code in 200..299) store.setReply(ReplyJson.parse(reply.text))
         if (reply.code in 200..299) Poster.room(reply.text).let { if (it.isNotEmpty()) lastRoom = it; (if (it in Defaults.ROOMS) it else null).let { g -> if (store.guess != g) store.guess = g } }
         reply.code
     } catch (e: Exception) {
@@ -428,6 +430,8 @@ class ScanService : Service() {
             if (r.code != -1) store.lastError = "HTTP ${r.code}"
         }
         Trace.i("flush", "reason" to reason, "batch" to !flusher.singleOnly, "code" to r.code, "sent" to r.sent, "queueBefore" to before, "queue" to queue.size, "okTotal" to store.postsOk, "failedTotal" to store.postsFailed)
+        store.postOk = ok
+        store.postHm = Footer.hm(stamp())
         store.status = stamp() + " " + status + " q" + queue.size
         store.lastPost = store.status
     }

@@ -55,6 +55,136 @@ object Quarters {
     }
 }
 
+data class Part(val bssid: String, val share: Float)
+
+data class RoomP(val room: String, val p: Float, val parts: List<Part>)
+
+data class NamedAp(val bssid: String, val ssid: String, val rssi: Int, val freq: Int)
+
+class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>)
+
+object ReplyJson {
+    private fun <T> list(text: String?, f: (JSONObject) -> T): List<T> = try {
+        val a = JSONArray(text ?: "[]")
+        (0 until a.length()).map { f(a.getJSONObject(it)) }
+    } catch (e: Exception) { emptyList() }
+
+    private fun apOf(o: JSONObject) = Ap(o.getString("bssid").lowercase(), o.getInt("rssi"), o.getInt("freq"))
+
+    fun rooms(text: String?): List<RoomP> = list(text) { o ->
+        RoomP(o.getString("room"), o.getDouble("p").toFloat(), list(o.optJSONArray("parts")?.toString()) { Part(it.getString("bssid").lowercase(), it.getDouble("share").toFloat()) })
+    }
+
+    fun aps(text: String?): List<Ap> = list(text, ::apOf)
+
+    fun named(text: String?): List<NamedAp> = list(text) { NamedAp(it.getString("bssid").lowercase(), it.optString("ssid", ""), it.getInt("rssi"), it.getInt("freq")) }
+
+    fun roomsJson(rooms: List<RoomP>): String = JSONArray().also { a ->
+        rooms.forEach { r ->
+            a.put(JSONObject().put("room", r.room).put("p", r.p.toDouble()).put("parts", JSONArray().also { pa ->
+                r.parts.forEach { pa.put(JSONObject().put("bssid", it.bssid).put("share", it.share.toDouble())) }
+            }))
+        }
+    }.toString()
+
+    fun apsJson(aps: List<Ap>): String = JSONArray().also { a ->
+        aps.forEach { a.put(JSONObject().put("bssid", it.bssid).put("rssi", it.rssi).put("freq", it.freq)) }
+    }.toString()
+
+    fun namedJson(aps: List<NamedAp>): String = JSONArray().also { a ->
+        aps.forEach { a.put(JSONObject().put("bssid", it.bssid).put("ssid", it.ssid).put("rssi", it.rssi).put("freq", it.freq)) }
+    }.toString()
+
+    fun parse(text: String): Reply = try {
+        val o = JSONObject(text)
+        Reply(
+            if (o.isNull("probability")) null else o.optDouble("probability").toFloat().takeIf { !it.isNaN() },
+            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString())
+        )
+    } catch (e: Exception) { Reply(null, emptyList(), emptyList()) }
+}
+
+object ApNames {
+    private const val MAX = 10
+
+    private fun band(freq: Int) = when {
+        freq >= 5925 -> " 6"
+        freq >= 4900 -> " 5"
+        else -> " 2.4"
+    }
+
+    fun base(bssid: String, named: List<NamedAp>): String =
+        named.firstOrNull { it.bssid == bssid }?.ssid?.takeIf { it.isNotBlank() } ?: ("…" + bssid.takeLast(5))
+
+    fun labels(aps: List<Ap>, named: List<NamedAp>, max: Int = MAX): Map<String, String> {
+        val names = aps.associate { it.bssid to base(it.bssid, named) }
+        val dup = names.values.groupingBy { it }.eachCount().filterValues { it > 1 }.keys
+        return aps.associate { ap ->
+            val n = names.getValue(ap.bssid)
+            val suffix = if (n in dup) band(ap.freq) else ""
+            ap.bssid to n.take(max - suffix.length) + suffix
+        }
+    }
+}
+
+object Rings {
+    const val REF = 213f
+    const val STROKE = 9f / REF
+    const val GAP = 2f / REF
+    const val MARGIN = 8f / REF
+    const val START = 135f
+    const val SWEEP = 270f
+    const val TOP_COLOURS = 4
+    const val LABEL_DX = 4f / REF
+    const val LEGEND_X = -28f / REF
+    const val LEGEND_Y = 54f / REF
+    const val LEGEND_PITCH = 10f / REF
+    val PALETTE = listOf(0xFFE8710A.toInt(), 0xFF6CB4FF.toInt(), 0xFFF5C542.toInt(), 0xFFB48CFF.toInt())
+    val OTHER = 0xFF5A5A5A.toInt()
+    val REST = 0xFF3A3A3A.toInt()
+    val CAPTIONS = mapOf("wohnzimmer" to "Wo", "schlafzimmer" to "Sch", "bad" to "Bad", "kueche" to "Kü", "flur" to "Fl")
+
+    class Seg(val sweep: Float, val color: Int)
+
+    fun order(rooms: List<RoomP>): List<RoomP> =
+        if (rooms.isEmpty()) Defaults.ROOMS.map { RoomP(it, 0f, emptyList()) } else rooms.sortedByDescending { it.p }
+
+    fun radius(i: Int, d: Float): Float = d / 2f - (MARGIN + i * (STROKE + GAP)) * d
+
+    fun caption(room: String): String = CAPTIONS[room] ?: room.take(3).replaceFirstChar { it.uppercase() }
+
+    fun name(room: String): String = Defaults.CAPTIONS[room] ?: room.replaceFirstChar { it.uppercase() }
+
+    fun palette(rooms: List<RoomP>): List<String> =
+        rooms.flatMap { it.parts }.groupBy { it.bssid }.mapValues { e -> e.value.sumOf { it.share.toDouble() } }
+            .entries.sortedWith(compareByDescending<Map.Entry<String, Double>> { it.value }.thenBy { it.key }).take(TOP_COLOURS).map { it.key }
+
+    fun segments(room: RoomP, palette: List<String>): List<Seg> {
+        val fill = room.p.coerceIn(0f, 1f)
+        val out = ArrayList<Seg>()
+        var used = 0f
+        fun add(share: Float, color: Int) {
+            val s = minOf(share, fill - used)
+            if (s > 0f) {
+                out.add(Seg(s * SWEEP, color))
+                used += s
+            }
+        }
+        palette.forEachIndexed { i, b -> add(room.parts.filter { it.bssid == b }.sumOf { it.share.toDouble() }.toFloat(), PALETTE[i]) }
+        add(room.parts.filter { it.bssid !in palette }.sumOf { it.share.toDouble() }.toFloat(), OTHER)
+        add(fill - used, REST)
+        return out
+    }
+}
+
+object Footer {
+    fun line(postHm: String, ok: Boolean, queue: Int) = "${postHm.ifEmpty { "-" }} · ${if (ok) "OK" else "ERR"} · Q$queue"
+
+    fun hm(stamp: String): String = stamp.take(5)
+
+    fun topAps(named: List<NamedAp>, n: Int = 8): List<NamedAp> = named.sortedByDescending { it.rssi }.take(n)
+}
+
 object Home {
     fun parse(csv: String): List<String> = csv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
 
@@ -366,6 +496,26 @@ class Store(private val ctx: Context) {
             sp.edit().putLong("rev", System.nanoTime()).apply()
             refreshTile()
         }
+
+    var probability: Float?
+        get() = if (sp.contains("probability")) sp.getFloat("probability", 0f) else null
+        set(v) = sp.edit().also { if (v == null) it.remove("probability") else it.putFloat("probability", v) }.apply()
+    val rooms: List<RoomP> get() = ReplyJson.rooms(sp.getString("rooms", null))
+    val replyAps: List<Ap> get() = ReplyJson.aps(sp.getString("replyAps", null))
+    val lastAps: List<NamedAp> get() = ReplyJson.named(sp.getString("lastAps", null))
+    var postHm: String
+        get() = sp.getString("postHm", "") ?: ""
+        set(v) = sp.edit().putString("postHm", v).apply()
+    var postOk: Boolean
+        get() = sp.getBoolean("postOk", true)
+        set(v) = sp.edit().putBoolean("postOk", v).apply()
+
+    fun setReply(r: Reply) = sp.edit().also {
+        if (r.probability == null) it.remove("probability") else it.putFloat("probability", r.probability)
+        it.putString("rooms", ReplyJson.roomsJson(r.rooms)).putString("replyAps", ReplyJson.apsJson(r.aps))
+    }.apply()
+
+    fun setLastAps(aps: List<NamedAp>) = sp.edit().putString("lastAps", ReplyJson.namedJson(Footer.topAps(aps))).apply()
 
     fun setLabelQuietly(v: String?) = sp.edit().putString("label", v).apply()
 

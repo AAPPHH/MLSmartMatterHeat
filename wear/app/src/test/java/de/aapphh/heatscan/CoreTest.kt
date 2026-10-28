@@ -621,4 +621,116 @@ class CoreTest {
         assertEquals("bad", Quarters.room(60f, 40f, 300f))
         assertEquals(listOf(0f, 90f, 180f, 270f), Quarters.WEDGES.map { Quarters.mid(it) })
     }
+
+    private val replyText = """{"stored":4,"room":"wohnzimmer","probability":0.8,"rooms":[
+        {"room":"bad","p":0.1,"parts":[{"bssid":"AA:01","share":0.1}]},
+        {"room":"wohnzimmer","p":0.8,"parts":[{"bssid":"aa:01","share":0.4},{"bssid":"aa:02","share":0.2},{"bssid":"aa:03","share":0.1},{"bssid":"aa:04","share":0.05},{"bssid":"aa:05","share":0.02},{"bssid":"aa:06","share":0.01}]}],
+        "aps":[{"bssid":"aa:01","rssi":-45,"freq":2412}]}"""
+
+    @Test
+    fun replyParsingIsTolerant() {
+        val r = ReplyJson.parse(replyText)
+        assertEquals(0.8f, r.probability!!, 1e-6f)
+        assertEquals(2, r.rooms.size)
+        assertEquals("aa:01", r.rooms[0].parts[0].bssid)
+        assertEquals(listOf(Ap("aa:01", -45, 2412)), r.aps)
+        val old = ReplyJson.parse("""{"stored":4,"room":"wohnzimmer"}""")
+        assertEquals(null, old.probability)
+        assertTrue(old.rooms.isEmpty() && old.aps.isEmpty())
+        val nul = ReplyJson.parse("""{"probability":null,"rooms":[],"aps":[]}""")
+        assertEquals(null, nul.probability)
+        assertTrue(ReplyJson.parse("garbage").rooms.isEmpty())
+        assertTrue(ReplyJson.parse("""{"rooms":[{"room":"x"}]}""").rooms.isEmpty())
+    }
+
+    @Test
+    fun jsonRoundTrip() {
+        val r = ReplyJson.parse(replyText)
+        assertEquals(r.rooms, ReplyJson.rooms(ReplyJson.roomsJson(r.rooms)))
+        assertEquals(r.aps, ReplyJson.aps(ReplyJson.apsJson(r.aps)))
+        val named = listOf(NamedAp("aa:01", "Home", -45, 2412), NamedAp("aa:02", "", -60, 5180))
+        assertEquals(named, ReplyJson.named(ReplyJson.namedJson(named)))
+        assertTrue(ReplyJson.rooms(null).isEmpty())
+        assertTrue(ReplyJson.named("not json").isEmpty())
+    }
+
+    @Test
+    fun ringOrderAndCaptions() {
+        assertEquals(Defaults.ROOMS, Rings.order(emptyList()).map { it.room })
+        assertTrue(Rings.order(emptyList()).all { it.p == 0f })
+        assertEquals(listOf("wohnzimmer", "bad"), Rings.order(ReplyJson.parse(replyText).rooms.reversed().sortedBy { it.p }).map { it.room })
+        assertEquals(listOf("Wo", "Sch", "Bad", "Kü", "Fl"), Defaults.ROOMS.map { Rings.caption(it) })
+        assertEquals("Wohnen", Rings.name("wohnzimmer"))
+    }
+
+    @Test
+    fun segmentsAndColours() {
+        val rooms = ReplyJson.parse(replyText).rooms
+        val palette = Rings.palette(rooms)
+        assertEquals(listOf("aa:01", "aa:02", "aa:03", "aa:04"), palette)
+        val wohn = Rings.segments(rooms.first { it.room == "wohnzimmer" }, palette)
+        assertEquals(listOf(Rings.PALETTE[0], Rings.PALETTE[1], Rings.PALETTE[2], Rings.PALETTE[3], Rings.OTHER, Rings.REST), wohn.map { it.color })
+        assertEquals(0.4f * 270f, wohn[0].sweep, 1e-3f)
+        assertEquals(0.03f * 270f, wohn[4].sweep, 1e-3f)
+        assertEquals(0.02f * 270f, wohn[5].sweep, 1e-3f)
+        assertEquals(0.8f * 270f, wohn.sumOf { it.sweep.toDouble() }.toFloat(), 1e-2f)
+        val bad = Rings.segments(rooms.first { it.room == "bad" }, palette)
+        assertEquals(listOf(Rings.PALETTE[0]), bad.map { it.color })
+        assertEquals(0.1f * 270f, bad[0].sweep, 1e-3f)
+        val unexplained = Rings.segments(RoomP("flur", 0.3f, emptyList()), palette)
+        assertEquals(listOf(Rings.REST), unexplained.map { it.color })
+        assertEquals(81f, unexplained[0].sweep, 1e-3f)
+        assertTrue(Rings.segments(RoomP("flur", 0f, emptyList()), palette).isEmpty())
+        assertEquals(0.5f * 270f, Rings.segments(RoomP("flur", 0.5f, listOf(Part("aa:01", 0.9f))), listOf("aa:01")).sumOf { it.sweep.toDouble() }.toFloat(), 1e-2f)
+    }
+
+    @Test
+    fun apNames() {
+        val named = listOf(NamedAp("aa:bb:cc:dd:ee:01", "Home", -50, 2412), NamedAp("aa:bb:cc:dd:ee:02", "Home", -60, 5180), NamedAp("aa:bb:cc:dd:ee:03", "", -70, 5180))
+        assertEquals("…ee:03", ApNames.base("aa:bb:cc:dd:ee:03", named))
+        assertEquals("…ee:09", ApNames.base("aa:bb:cc:dd:ee:09", named))
+        val labels = ApNames.labels(listOf(Ap("aa:bb:cc:dd:ee:01", -50, 2412), Ap("aa:bb:cc:dd:ee:02", -60, 5180), Ap("aa:bb:cc:dd:ee:03", -70, 5180)), named)
+        assertEquals(mapOf("aa:bb:cc:dd:ee:01" to "Home 2.4", "aa:bb:cc:dd:ee:02" to "Home 5", "aa:bb:cc:dd:ee:03" to "…ee:03"), labels)
+        val long = listOf(NamedAp("a", "FRITZ!Box 1234 AB", -50, 2412), NamedAp("b", "FRITZ!Box 1234 AB", -50, 6000))
+        assertEquals(listOf("FRITZ! 2.4", "FRITZ!Bo 6"), ApNames.labels(long.map { Ap(it.bssid, it.rssi, it.freq) }, long).values.toList())
+        assertEquals("Q3", Footer.line("12:34", true, 3).takeLast(2))
+        assertEquals("12:34 · ERR · Q0", Footer.line("12:34", false, 0))
+        assertEquals(listOf(-40, -50), Footer.topAps(listOf(NamedAp("a", "", -50, 1), NamedAp("b", "", -40, 1)), 8).map { it.rssi })
+    }
+
+    @Test
+    fun legendAndLabelsClearOfRings() {
+        for (d in listOf(213f, 227f)) {
+            val half = d / 2f
+            fun ringHit(x: Float, y: Float): Boolean {
+                if (y > 0f && kotlin.math.abs(x) <= y) return false
+                val dist = kotlin.math.hypot(x, y)
+                return (0 until 5).any { kotlin.math.abs(dist - Rings.radius(it, d)) <= Rings.STROKE * d / 2f + 1f }
+            }
+            fun clear(x0: Float, x1: Float, y0: Float, y1: Float): Boolean {
+                var x = x0
+                while (x <= x1) {
+                    var y = y0
+                    while (y <= y1) {
+                        if (ringHit(x, y) || kotlin.math.hypot(x, y) > half - 2f) return false
+                        y += 0.5f
+                    }
+                    x += 0.5f
+                }
+                return true
+            }
+            for (i in 0 until 4) {
+                val y = (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
+                val x = Rings.LEGEND_X * d
+                assertTrue("legend $i at $d", clear(x - 3f, x + 6f + 16 * 4.3f, y - 4.5f, y + 4.5f))
+            }
+            for (i in 0 until 5) {
+                val a = Math.toRadians(Rings.START.toDouble())
+                val r = Rings.radius(i, d)
+                val x = r * kotlin.math.cos(a).toFloat() + Rings.LABEL_DX * d
+                val y = r * kotlin.math.sin(a).toFloat()
+                assertTrue("label $i at $d", clear(x, x + 3f * 4.3f, y - 3.5f, y + 3.5f))
+            }
+        }
+    }
 }

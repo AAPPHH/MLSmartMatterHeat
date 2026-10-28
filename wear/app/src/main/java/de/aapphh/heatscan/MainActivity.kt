@@ -1,34 +1,29 @@
 package de.aapphh.heatscan
 
 import android.content.SharedPreferences
+import android.graphics.Paint
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -37,21 +32,25 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.material.Icon
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
@@ -88,7 +87,7 @@ class MainActivity : ComponentActivity() {
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 if (page == 0) RoomsPage(version, store)
-                else SettingsPage(version, store)
+                else DataPage(version, store)
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 repeat(2) {
@@ -154,44 +153,61 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun SettingsPage(rev: Int, store: Store) {
-        val status = TileClick.statusLine(store.running, store.mode, store.status)
-        ScalingLazyColumn(Modifier.fillMaxWidth()) {
-            item { Text(status, fontSize = 11.sp) }
-            item { Text("OK ${store.postsOk} / Fehler ${store.postsFailed}", fontSize = 10.sp) }
-            item { Text(ScanStarter.extra(this@MainActivity).filter { it.first != "startError" }.joinToString(" ") { "${it.first}=${it.second}" }, fontSize = 9.sp) }
-            item {
-                Text(
-                    if (store.paused) "Fortsetzen" else "Pausieren",
-                    Modifier.border(1.dp, Color.Gray, RoundedCornerShape(8.dp)).clickable { ScanStarter.setPaused(this@MainActivity, !store.paused) }.padding(8.dp),
-                    fontSize = 12.sp
-                )
+    private fun DataPage(rev: Int, store: Store) {
+        val stored = store.rooms
+        val rooms = Rings.order(stored)
+        val palette = Rings.palette(rooms)
+        val named = store.lastAps
+        val replyAps = store.replyAps
+        val legend = palette.mapNotNull { b -> replyAps.firstOrNull { it.bssid == b } ?: named.firstOrNull { it.bssid == b }?.let { Ap(it.bssid, it.rssi, it.freq) } }
+        val names = ApNames.labels(legend, named)
+        val top = Footer.topAps(named, 4).map { Ap(it.bssid, it.rssi, it.freq) }
+        val topNames = ApNames.labels(top, named, 9)
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val dDp = minOf(maxWidth, maxHeight).value
+            Canvas(Modifier.fillMaxSize()) {
+                val d = minOf(size.width, size.height)
+                val c = Offset(size.width / 2f, size.height / 2f)
+                val stroke = Rings.STROKE * d
+                val paint = Paint().apply {
+                    isAntiAlias = true
+                    textSize = 8.sp.toPx()
+                }
+                val mid = -(paint.ascent() + paint.descent()) / 2f
+                rooms.forEachIndexed { i, room ->
+                    val r = Rings.radius(i, d)
+                    val topLeft = Offset(c.x - r, c.y - r)
+                    val box = Size(2f * r, 2f * r)
+                    drawArc(TRACK, Rings.START, Rings.SWEEP, false, topLeft, box, style = Stroke(stroke))
+                    var at = Rings.START
+                    Rings.segments(room, palette).forEach { seg ->
+                        drawArc(Color(seg.color), at, seg.sweep, false, topLeft, box, style = Stroke(stroke, cap = StrokeCap.Butt))
+                        at += seg.sweep
+                    }
+                    val a = Math.toRadians(Rings.START.toDouble())
+                    paint.color = (if (i == 0) Color.White else CAPTION).toArgb()
+                    drawIntoCanvas {
+                        it.nativeCanvas.drawText(Rings.caption(room.room), c.x + r * cos(a).toFloat() + Rings.LABEL_DX * d, c.y + r * sin(a).toFloat() + mid, paint)
+                    }
+                }
+                legend.forEachIndexed { i, ap ->
+                    val y = c.y + (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
+                    val x = c.x + Rings.LEGEND_X * d
+                    drawCircle(Color(Rings.PALETTE[i]), 2.5.dp.toPx(), Offset(x, y))
+                    paint.color = LEGEND.toArgb()
+                    drawIntoCanvas { it.nativeCanvas.drawText("${names.getValue(ap.bssid)} ${ap.rssi}", x + 6.dp.toPx(), y + mid, paint) }
+                }
             }
-            item { Field("Server", store.server) { store.server = it } }
-            item { Field("Gerät", store.device) { store.device = it } }
-            item { Field("Heim-WLANs (Komma)", store.home) { store.home = it } }
-        }
-    }
-
-    @Composable
-    private fun Field(title: String, value: String, onChange: (String) -> Unit) {
-        var text by remember(value) { mutableStateOf(value) }
-        Column {
-            Text(title, fontSize = 11.sp)
-            BasicTextField(
-                value = text,
-                onValueChange = {
-                    text = it
-                    onChange(it)
-                },
-                singleLine = true,
-                textStyle = TextStyle(color = Color.White, fontSize = 12.sp),
-                cursorBrush = SolidColor(Color.White),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, Color.Gray, RoundedCornerShape(8.dp))
-                    .padding(8.dp)
-            )
+            Column(Modifier.align(Alignment.Center).offset(y = (-4f * dDp / Rings.REF).dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                if (stored.isNotEmpty()) {
+                    Text(Rings.name(rooms[0].room), fontSize = 16.sp, fontWeight = FontWeight.Bold, color = SELECTED, maxLines = 1)
+                    Text("${((store.probability ?: rooms[0].p) * 100f).roundToInt()} %", fontSize = 10.sp, color = SELECTED, maxLines = 1)
+                } else {
+                    Text("kein Modell", fontSize = 12.sp, color = CAPTION, maxLines = 1)
+                    top.forEach { Text("${topNames.getValue(it.bssid)} ${it.rssi}", fontSize = 8.sp, color = CAPTION, maxLines = 1) }
+                }
+                Text(Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size), fontSize = 8.sp, color = CAPTION, maxLines = 1)
+            }
         }
     }
 
@@ -199,5 +215,8 @@ class MainActivity : ComponentActivity() {
         private val SELECTED = Color(0xFFE8710A)
         private val IDLE = Color(0xFF2A2A2A)
         private val INK = Color(0xFF111111)
+        private val TRACK = Color(0xFF262626)
+        private val CAPTION = Color(0xFFA8A8A8)
+        private val LEGEND = Color(0xFFC8C8C8)
     }
 }
