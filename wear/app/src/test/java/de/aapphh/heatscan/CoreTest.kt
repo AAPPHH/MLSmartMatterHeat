@@ -569,9 +569,11 @@ class CoreTest {
 
     @Test
     fun highlightPrefersLabel() {
-        assertEquals(Pair("bad", true), Highlight.of("bad", "flur"))
-        assertEquals(Pair("flur", false), Highlight.of(null, "flur"))
-        assertEquals(Pair(null, false), Highlight.of(null, null))
+        assertEquals(Pair(null, null), Highlight.of(null, null))
+        assertEquals(Pair("flur", null), Highlight.of(null, "flur"))
+        assertEquals(Pair("bad", "bad"), Highlight.of("bad", null))
+        assertEquals(Pair("bad", "bad"), Highlight.of("bad", "bad"))
+        assertEquals(Pair("flur", "bad"), Highlight.of("bad", "flur"))
     }
 
     @Test

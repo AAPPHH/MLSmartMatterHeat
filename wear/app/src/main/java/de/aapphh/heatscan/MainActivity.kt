@@ -100,10 +100,9 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun RoomsPage(rev: Int, store: Store) {
-        val (hot, confirmed) = Highlight.of(store.label, store.guess)
+        val (hot, ringed) = Highlight.of(store.label, store.guess)
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val dDp = minOf(maxWidth, maxHeight)
-            val k = dDp.value / Quarters.REF
             Canvas(
                 Modifier.fillMaxSize().pointerInput(Unit) {
                     detectTapGestures { o ->
@@ -127,7 +126,7 @@ class MainActivity : ComponentActivity() {
                         close()
                     }
                     drawPath(path, if (room == hot) SELECTED else IDLE)
-                    if (room == hot && confirmed) clipPath(path) { drawPath(path, Color.White, style = Stroke(ring)) }
+                    if (room == ringed) clipPath(path) { drawPath(path, Color.White, style = Stroke(ring)) }
                 }
                 repeat(4) {
                     val a = Math.toRadians(45.0 + it * 90.0)
@@ -136,7 +135,7 @@ class MainActivity : ComponentActivity() {
                 }
                 val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
                 drawPath(centre, if (Quarters.CENTER == hot) SELECTED else IDLE)
-                if (Quarters.CENTER == hot && confirmed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
+                if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
             }
             (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
                 val isCenter = room == Quarters.CENTER

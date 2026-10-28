@@ -29,9 +29,9 @@ class HeatTileService : TileService() {
             store.nonce = store.nonce + 1
             store.setLabelQuietly(Labels.toggle(store.label, clicked))
         }
-        val (hot, confirmed) = Highlight.of(store.label, store.guess)
+        val (hot, ring) = Highlight.of(store.label, store.guess)
         val dp = requestParams.deviceConfiguration.let { minOf(it.screenWidthDp, it.screenHeightDp).toFloat() }.takeIf { it > 0f } ?: Quarters.REF
-        val layout = layout(dp, hot, confirmed, store.nonce)
+        val layout = layout(dp, hot, ring, store.nonce)
         val tile = TileBuilders.Tile.Builder()
             .setResourcesVersion(RES_VERSION)
             .setFreshnessIntervalMillis(60_000)
@@ -54,16 +54,15 @@ class HeatTileService : TileService() {
             it.set(res.build())
         }
 
-    private fun layout(d: Float, hot: String?, confirmed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
-        val k = d / Quarters.REF
+    private fun layout(d: Float, hot: String?, ring: String?, nonce: Long): LayoutElementBuilders.LayoutElement {
         val inner = Quarters.INNER * d
         val box = LayoutElementBuilders.Box.Builder().setWidth(dp(d)).setHeight(dp(d))
-        Quarters.WEDGES.forEach { box.addContent(wedge(it, d, inner, it == hot, confirmed, nonce)) }
-        box.addContent(centre(Quarters.CENTER_R * d * 2f, Quarters.CENTER == hot, confirmed, nonce))
+        Quarters.WEDGES.forEach { box.addContent(wedge(it, d, inner, it == hot, it == ring, nonce)) }
+        box.addContent(centre(Quarters.CENTER_R * d * 2f, Quarters.CENTER == hot, Quarters.CENTER == ring, nonce))
         (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
             val a = Math.toRadians(Quarters.mid(room) - 90.0)
             val r = if (room == Quarters.CENTER) 0f else Quarters.LABEL_R * d
-            box.addContent(label(room, d, (r * cos(a)).toFloat(), (r * sin(a)).toFloat(), room == hot, k))
+            box.addContent(label(room, d, (r * cos(a)).toFloat(), (r * sin(a)).toFloat(), room == hot))
         }
         return box.build()
     }
@@ -83,6 +82,7 @@ class HeatTileService : TileService() {
                         LayoutElementBuilders.ArcLine.Builder()
                             .setLength(DimensionBuilders.degrees(length))
                             .setThickness(dp(thickness))
+                            .setStrokeCap(LayoutElementBuilders.STROKE_CAP_BUTT)
                             .setColor(ColorBuilders.argb(color))
                             .setModifiers(ModifiersBuilders.ArcModifiers.Builder().setClickable(click(room, nonce)).build())
                             .build()
@@ -91,12 +91,12 @@ class HeatTileService : TileService() {
             )
             .build()
 
-    private fun wedge(room: String, d: Float, inner: Float, selected: Boolean, confirmed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
+    private fun wedge(room: String, d: Float, inner: Float, selected: Boolean, ringed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
         val midR = (d / 2f + inner) / 2f
         val length = Quarters.SPAN - Math.toDegrees((Quarters.GAP / midR).toDouble()).toFloat()
         val fill = if (selected) SELECTED else IDLE
         val box = LayoutElementBuilders.Box.Builder().setWidth(dp(d)).setHeight(dp(d))
-        if (selected && confirmed) {
+        if (ringed) {
             val ring = 3f
             val rd = d - 2 * ring
             val ringDeg = Math.toDegrees((ring / midR).toDouble()).toFloat()
@@ -106,7 +106,7 @@ class HeatTileService : TileService() {
         return box.build()
     }
 
-    private fun centre(size: Float, selected: Boolean, confirmed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
+    private fun centre(size: Float, selected: Boolean, ringed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
         val mods = ModifiersBuilders.Modifiers.Builder()
             .setClickable(click(Quarters.CENTER, nonce))
             .setBackground(
@@ -115,11 +115,11 @@ class HeatTileService : TileService() {
                     .setCorner(ModifiersBuilders.Corner.Builder().setRadius(dp(size / 2f)).build())
                     .build()
             )
-        if (selected && confirmed) mods.setBorder(ModifiersBuilders.Border.Builder().setWidth(dp(3f)).setColor(ColorBuilders.argb(Color.WHITE)).build())
+        if (ringed) mods.setBorder(ModifiersBuilders.Border.Builder().setWidth(dp(3f)).setColor(ColorBuilders.argb(Color.WHITE)).build())
         return LayoutElementBuilders.Box.Builder().setWidth(dp(size)).setHeight(dp(size)).setModifiers(mods.build()).build()
     }
 
-    private fun label(room: String, d: Float, dx: Float, dy: Float, selected: Boolean, k: Float): LayoutElementBuilders.LayoutElement {
+    private fun label(room: String, d: Float, dx: Float, dy: Float, selected: Boolean): LayoutElementBuilders.LayoutElement {
         val centre = room == Quarters.CENTER
         val ink = if (selected) INK else Color.WHITE
         val icon = (if (centre) 28f else 24f)
@@ -140,6 +140,7 @@ class HeatTileService : TileService() {
             .setColorFilter(LayoutElementBuilders.ColorFilter.Builder().setTint(ColorBuilders.argb(ink)).build())
             .build()
         val pad = ModifiersBuilders.Padding.Builder()
+            .setRtlAware(false)
             .setStart(dp(maxOf(0f, 2 * dx))).setEnd(dp(maxOf(0f, -2 * dx)))
             .setTop(dp(maxOf(0f, 2 * dy))).setBottom(dp(maxOf(0f, -2 * dy)))
             .build()
@@ -161,7 +162,7 @@ class HeatTileService : TileService() {
     private fun dp(v: Float) = DimensionBuilders.dp(v)
 
     companion object {
-        private const val RES_VERSION = "3"
+        private const val RES_VERSION = "4"
         private const val SELECTED = 0xFFE8710A.toInt()
         private const val IDLE = 0xFF2A2A2A.toInt()
         private const val INK = 0xFF111111.toInt()

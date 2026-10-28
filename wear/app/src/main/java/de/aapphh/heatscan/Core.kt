@@ -33,7 +33,7 @@ object Labels {
 }
 
 object Highlight {
-    fun of(label: String?, guess: String?): Pair<String?, Boolean> = if (label != null) Pair(label, true) else Pair(guess, false)
+    fun of(label: String?, guess: String?): Pair<String?, String?> = Pair(guess ?: label, label)
 }
 
 object Quarters {
