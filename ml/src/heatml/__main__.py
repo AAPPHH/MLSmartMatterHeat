@@ -7,7 +7,7 @@ from heatml.viz import build
 
 CONFIG = {
     "snapshot": None,
-    "viz_out": REPO_ROOT / "data" / "dashboard.html",
+    "viz_out": REPO_ROOT / "data" / "umap3d.html",
     "model_dir": REPO_ROOT / "models",
     "room": {
         "rssi_floor": -100.0, "rssi_span": 70.0,
