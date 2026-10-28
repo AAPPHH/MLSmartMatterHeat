@@ -65,6 +65,7 @@ class ScanService : Service() {
     private var alarmSet = false
     private var active = false
     private var beatPending = false
+    private var lastEnqueueAt = 0L
     private var loggedMode: Mode? = null
     private val flusher = Flusher()
     private val flushPending = AtomicBoolean(false)
@@ -183,7 +184,8 @@ class ScanService : Service() {
             triggers = listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_MOTION_DETECT, true), sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION))
             val adaptive = step != null && (wakeStep != null || triggers.isNotEmpty()) &&
                 checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
-            policy = ScanPolicy(adaptive, SystemClock.elapsedRealtime())
+            lastEnqueueAt = SystemClock.elapsedRealtime()
+            policy = ScanPolicy(adaptive, lastEnqueueAt)
             offBodySensor = sensors.getDefaultSensor(Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT, true)
             try {
                 offBodySensor?.let { sensors.registerListener(offBodyListener, it, SensorManager.SENSOR_DELAY_NORMAL) }
@@ -247,6 +249,7 @@ class ScanService : Service() {
     private fun powerState() = PowerState.of(power.isPowerSaveMode, power.isDeviceIdleMode, offBody)
 
     private fun motion(at: Long) {
+        if (offBody == true) return
         val now = SystemClock.elapsedRealtime()
         val before = policy.mode
         val scanDue = policy.onMotion(now, at)
@@ -256,7 +259,7 @@ class ScanService : Service() {
 
     private fun tick() {
         val now = SystemClock.elapsedRealtime()
-        if (policy.onTick(now)) scan(policy.mode.sleeps)
+        if (policy.onTick(now)) scan(policy.mode.sleeps || now - lastEnqueueAt >= ScanConfig.HEARTBEAT_MS)
         schedule(now)
     }
 
@@ -358,6 +361,7 @@ class ScanService : Service() {
     }
 
     private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String) {
+        lastEnqueueAt = SystemClock.elapsedRealtime()
         val state = powerState()
         val motion = policy.mode.motion
         val label = store.label

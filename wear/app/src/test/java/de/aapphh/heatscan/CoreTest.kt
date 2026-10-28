@@ -119,6 +119,36 @@ class CoreTest {
     }
 
     @Test
+    fun motionRightAfterEnteringStillIsIgnored() {
+        val p = still()
+        assertFalse(p.onMotion(151 * s, 150 * s + 100))
+        assertEquals(Mode.STILL, p.mode)
+        assertFalse(p.onMotion(152 * s, 151 * s))
+        assertEquals(Mode.STILL, p.mode)
+        assertFalse(p.onMotion(154 * s, 154 * s))
+        assertEquals(Mode.STILL, p.mode)
+        assertEquals(ScanConfig.HEARTBEAT_MS - 4 * s, p.delay(154 * s))
+    }
+
+    @Test
+    fun motionAfterGraceWakesFromStill() {
+        val p = still()
+        assertTrue(p.onMotion(156 * s, 155 * s + ScanConfig.STILL_GRACE_MS - 5 * s + 1))
+        assertEquals(Mode.MOVING, p.mode)
+    }
+
+    @Test
+    fun graceRestartsOnEveryStillEntry() {
+        val p = still()
+        assertTrue(p.onMotion(300 * s, 300 * s))
+        p.onTick(360 * s)
+        p.onTick(430 * s)
+        assertEquals(Mode.STILL, p.mode)
+        assertFalse(p.onMotion(432 * s, 431 * s))
+        assertEquals(Mode.STILL, p.mode)
+    }
+
+    @Test
     fun staleBufferedMotionIsIgnoredInStill() {
         val p = still()
         assertFalse(p.onMotion(300 * s, 270 * s))

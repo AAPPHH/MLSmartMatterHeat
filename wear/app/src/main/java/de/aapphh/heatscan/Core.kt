@@ -399,6 +399,7 @@ object ScanConfig {
     const val QUEUED_AFTER_MS = 60_000L
     const val BATCH = 100
     const val BEAT_WAIT_MS = 8_000L
+    const val STILL_GRACE_MS = 5_000L
 }
 
 enum class Mode(val label: String, val sleeps: Boolean, val motion: String?) {
@@ -412,6 +413,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
         private set
     private var lastMotion = start
     private var nextAt = start
+    private var stillSince = Long.MIN_VALUE / 4
     private var lastScanAt = Long.MIN_VALUE / 4
     private val recent = ArrayDeque<Long>()
     private var misses = 0
@@ -419,6 +421,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
 
     fun onMotion(now: Long, at: Long): Boolean {
         if (mode == Mode.FIXED || mode == Mode.AWAY || now - at > ScanConfig.STALE_MS) return false
+        if (mode == Mode.STILL && at < stillSince + ScanConfig.STILL_GRACE_MS) return false
         lastMotion = maxOf(lastMotion, at)
         return when (mode) {
             Mode.STILL -> {
@@ -458,6 +461,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
         Mode.SETTLING -> {
             if (now - lastMotion >= ScanConfig.STILL_AFTER_MS) {
                 mode = Mode.STILL
+                stillSince = now
                 nextAt = now + ScanConfig.HEARTBEAT_MS
             }
             false
