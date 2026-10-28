@@ -1,0 +1,66 @@
+listen = "0.0.0.0:8080"
+db_path = "/data/heatd.duckdb"
+snapshot_path = "/data/snapshot.duckdb"
+dataset_path = "/secrets/thread_dataset.hex"
+model_path = "/models/room_model.onnx"
+controller = "chip-tool"
+thread_cli_prefix = "ot "
+default_setpoint = 18.0
+eco_setpoint = 16.0
+presence_boost = 1.0
+presence_timeout_minutes = 30
+still_contact_timeout_minutes = 180
+frost_setpoint = 7.0
+
+[chip_tool]
+binary = "/usr/local/bin/chip-tool"
+storage_dir = "/chip-storage"
+paa_trust_store = "/opt/paa-root-certs"
+bypass_attestation = false
+endpoint = 1
+subscribe_min_s = 5
+subscribe_max_s = 300
+timeout_s = 90
+commission_timeout_s = 180
+
+[[rooms]]
+name = "wohnzimmer"
+nodes = [5]
+
+[[rooms.schedules]]
+days = ["weekdays"]
+from = "06:00"
+to = "08:30"
+setpoint = 21.0
+
+[[rooms.schedules]]
+days = ["weekdays"]
+from = "17:00"
+to = "22:30"
+setpoint = 21.5
+
+[[rooms.schedules]]
+days = ["weekend"]
+from = "08:00"
+to = "23:00"
+setpoint = 21.5
+
+[[rooms]]
+name = "schlafzimmer"
+nodes = [6]
+
+[[rooms.schedules]]
+days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+from = "21:00"
+to = "07:00"
+setpoint = 18.5
+
+[[rooms]]
+name = "bad"
+nodes = [7]
+
+[[rooms.schedules]]
+days = ["weekdays"]
+from = "06:00"
+to = "08:00"
+setpoint = 22.0
