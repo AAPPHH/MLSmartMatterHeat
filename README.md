@@ -221,4 +221,4 @@ sh wear/build.sh
 
 `controller = "mock"` in `heatd.toml` lässt den ganzen Dienst ohne Thermostate laufen. Mit `heatml.synth` lassen sich realistische Fake-Scans erzeugen.
 
-Debug-Aktionen der Uhr (`adb shell am broadcast -n de.aapphh.heatscan/.DebugReceiver -a de.aapphh.heatscan.<AKTION>`, nur mit DUMP-Recht): `STATUS`, `START`, `CONFIG`, `PAUSE`, `FLUSH` und `DEMO`. `DEMO` schreibt Beispieldaten (Küche 82 %, fünf WLANs) in den Speicher, damit man die Datenseite ohne Modell sieht; eine echte Server-Antwort mit Räumen überschreibt sie wieder.
+Debug-Aktionen der Uhr (`adb shell am broadcast -n de.aapphh.heatscan.debug/de.aapphh.heatscan.DebugReceiver -a de.aapphh.heatscan.<AKTION>`, Debug-Build; beim Release-Build Paket `de.aapphh.heatscan`, nur mit DUMP-Recht): `STATUS`, `START`, `CONFIG`, `PAUSE`, `FLUSH` und `DEMO`. `DEMO` schreibt Beispieldaten (Küche 82 %, fünf WLANs) in den Speicher, damit man die Datenseite ohne Modell sieht; eine echte Server-Antwort mit Räumen überschreibt sie wieder.
