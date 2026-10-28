@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -89,8 +90,15 @@ class MainActivity : ComponentActivity() {
         val pager = rememberPagerState { 2 }
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
-                if (page == 0) RoomsPage(version, store)
-                else DataPage(version, store)
+                key(version) {
+                    if (page == 0) {
+                        val (hot, ringed) = Highlight.of(store.label, store.guess)
+                        RoomsPage(hot, ringed) { store.label = Labels.toggle(store.label, it) }
+                    } else DataPage(
+                        store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,
+                        Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused)
+                    )
+                }
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 repeat(2) {
@@ -99,128 +107,121 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
 
-    @Composable
-    private fun RoomsPage(rev: Int, store: Store) {
-        val (hot, ringed) = Highlight.of(store.label, store.guess)
-        BoxWithConstraints(Modifier.fillMaxSize()) {
-            val dDp = minOf(maxWidth, maxHeight)
-            Canvas(
-                Modifier.fillMaxSize().pointerInput(Unit) {
-                    detectTapGestures { o ->
-                        val d = minOf(size.width, size.height).toFloat()
-                        val room = Quarters.room(o.x - size.width / 2f, o.y - size.height / 2f, d)
-                        store.label = Labels.toggle(store.label, room)
-                    }
+@Composable
+internal fun RoomsPage(hot: String?, ringed: String?, onTap: (String) -> Unit) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val dDp = minOf(maxWidth, maxHeight)
+        Canvas(
+            Modifier.fillMaxSize().pointerInput(Unit) {
+                detectTapGestures { o ->
+                    val d = minOf(size.width, size.height).toFloat()
+                    val room = Quarters.room(o.x - size.width / 2f, o.y - size.height / 2f, d)
+                    onTap(room)
                 }
+            }
+        ) {
+            val d = minOf(size.width, size.height)
+            val c = Offset(size.width / 2f, size.height / 2f)
+            val outer = d / 2f
+            val inner = Quarters.INNER * d
+            val gap = Quarters.GAP.dp.toPx()
+            val ring = 6.dp.toPx()
+            Quarters.WEDGES.forEach { room ->
+                val start = Quarters.mid(room) - 90f - Quarters.SPAN / 2
+                val path = Path().apply {
+                    arcTo(Rect(c, outer), start, Quarters.SPAN, true)
+                    arcTo(Rect(c, inner), start + Quarters.SPAN, -Quarters.SPAN, false)
+                    close()
+                }
+                drawPath(path, if (room == hot) SELECTED else IDLE)
+                if (room == ringed) clipPath(path) { drawPath(path, Color.White, style = Stroke(ring)) }
+            }
+            repeat(4) {
+                val a = Math.toRadians(45.0 + it * 90.0)
+                val u = Offset(cos(a).toFloat(), sin(a).toFloat())
+                drawLine(Color.Black, c + u * (inner - 1f), c + u * (outer + 1f), gap)
+            }
+            val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
+            drawPath(centre, if (Quarters.CENTER == hot) SELECTED else IDLE)
+            if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
+        }
+        (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
+            val isCenter = room == Quarters.CENTER
+            val a = Math.toRadians(Quarters.mid(room) - 90.0)
+            val r = if (isCenter) 0f else Quarters.LABEL_R * dDp.value
+            val ink = if (room == hot) INK else Color.White
+            Column(
+                Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                val d = minOf(size.width, size.height)
-                val c = Offset(size.width / 2f, size.height / 2f)
-                val outer = d / 2f
-                val inner = Quarters.INNER * d
-                val gap = Quarters.GAP.dp.toPx()
-                val ring = 6.dp.toPx()
-                Quarters.WEDGES.forEach { room ->
-                    val start = Quarters.mid(room) - 90f - Quarters.SPAN / 2
-                    val path = Path().apply {
-                        arcTo(Rect(c, outer), start, Quarters.SPAN, true)
-                        arcTo(Rect(c, inner), start + Quarters.SPAN, -Quarters.SPAN, false)
-                        close()
-                    }
-                    drawPath(path, if (room == hot) SELECTED else IDLE)
-                    if (room == ringed) clipPath(path) { drawPath(path, Color.White, style = Stroke(ring)) }
-                }
-                repeat(4) {
-                    val a = Math.toRadians(45.0 + it * 90.0)
-                    val u = Offset(cos(a).toFloat(), sin(a).toFloat())
-                    drawLine(Color.Black, c + u * (inner - 1f), c + u * (outer + 1f), gap)
-                }
-                val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
-                drawPath(centre, if (Quarters.CENTER == hot) SELECTED else IDLE)
-                if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
-            }
-            (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
-                val isCenter = room == Quarters.CENTER
-                val a = Math.toRadians(Quarters.mid(room) - 90.0)
-                val r = if (isCenter) 0f else Quarters.LABEL_R * dDp.value
-                val ink = if (room == hot) INK else Color.White
-                Column(
-                    Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink)
-                    Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, maxLines = 1, color = ink)
-                }
+                Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink)
+                Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, maxLines = 1, color = ink)
             }
         }
-    }
-
-    @Composable
-    private fun DataPage(rev: Int, store: Store) {
-        val stored = store.rooms
-        val rooms = Rings.order(stored)
-        val palette = Rings.palette(rooms)
-        val colors = store.colors
-        val named = store.lastAps
-        val replyAps = store.replyAps
-        val legend = Legend.aps(palette, replyAps, named)
-        val names = ApNames.labels(legend, named)
-        BoxWithConstraints(Modifier.fillMaxSize()) {
-            val dDp = minOf(maxWidth, maxHeight).value
-            Canvas(Modifier.fillMaxSize()) {
-                val d = minOf(size.width, size.height)
-                val c = Offset(size.width / 2f, size.height / 2f)
-                val stroke = Rings.STROKE * d
-                val paint = Paint().apply {
-                    isAntiAlias = true
-                    textSize = 8.sp.toPx()
-                }
-                val mid = -(paint.ascent() + paint.descent()) / 2f
-                rooms.forEachIndexed { i, room ->
-                    val r = Rings.radius(i, d)
-                    val topLeft = Offset(c.x - r, c.y - r)
-                    val box = Size(2f * r, 2f * r)
-                    drawArc(TRACK, Rings.START, Rings.SWEEP, false, topLeft, box, style = Stroke(stroke))
-                    var at = Rings.START
-                    Rings.segments(room, colors).forEach { seg ->
-                        drawArc(Color(seg.color), at, seg.sweep, false, topLeft, box, style = Stroke(stroke, cap = StrokeCap.Butt))
-                        at += seg.sweep
-                    }
-                    val a = Math.toRadians(Rings.START.toDouble())
-                    paint.color = (if (i == 0 && stored.isNotEmpty()) Color.White else CAPTION).toArgb()
-                    drawIntoCanvas {
-                        it.nativeCanvas.drawText(Rings.caption(room.room), c.x + r * cos(a).toFloat() + Rings.LABEL_DX * d, c.y + r * sin(a).toFloat() + mid, paint)
-                    }
-                }
-            }
-            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
-                if (stored.isNotEmpty()) {
-                    val guess = store.guess ?: rooms[0].room
-                    Text(Rings.name(guess), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = SELECTED, maxLines = 1)
-                    Text("${((store.probability ?: rooms[0].p) * 100f).roundToInt()} % sicher", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.SUB_SP.sp, lineHeight = (Rings.SUB_SP * Rings.LINE_H).sp, color = SELECTED, maxLines = 1)
-                } else Text("kein Modell", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = CAPTION, maxLines = 1)
-                legend.forEach { ap ->
-                    val line = buildAnnotatedString {
-                        withStyle(SpanStyle(color = Color(colors[ap.bssid]?.color ?: ColorBook.OTHER))) { append("●") }
-                        append(" " + Legend.text(names.getValue(ap.bssid), ap.rssi))
-                    }
-                    Text(line, fontSize = Rings.LINE_SP.sp, lineHeight = (Rings.LINE_SP * Rings.LINE_H).sp, color = LEGEND, maxLines = 1)
-                }
-            }
-            Text(
-                Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused),
-                Modifier.align(Alignment.Center).offset(y = ((Footer.Y - 0.5f) * dDp).dp),
-                fontSize = Rings.LINE_SP.sp, color = CAPTION, maxLines = 1
-            )
-        }
-    }
-
-    companion object {
-        private val SELECTED = Color(0xFFE8710A)
-        private val IDLE = Color(0xFF2A2A2A)
-        private val INK = Color(0xFF111111)
-        private val TRACK = Color(0xFF262626)
-        private val CAPTION = Color(0xFFA8A8A8)
-        private val LEGEND = Color(0xFFD0D0D0)
     }
 }
+
+@Composable
+internal fun DataPage(stored: List<RoomP>, colors: Map<String, Slot>, named: List<NamedAp>, replyAps: List<Ap>, guess: String?, probability: Float?, footer: String) {
+    val rooms = Rings.order(stored)
+    val palette = Rings.palette(rooms)
+    val legend = Legend.aps(palette, replyAps, named)
+    val names = ApNames.labels(legend, named)
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val dDp = minOf(maxWidth, maxHeight).value
+        Canvas(Modifier.fillMaxSize()) {
+            val d = minOf(size.width, size.height)
+            val c = Offset(size.width / 2f, size.height / 2f)
+            val stroke = Rings.STROKE * d
+            val paint = Paint().apply {
+                isAntiAlias = true
+                textSize = 8.sp.toPx()
+            }
+            val mid = -(paint.ascent() + paint.descent()) / 2f
+            rooms.forEachIndexed { i, room ->
+                val r = Rings.radius(i, d)
+                val topLeft = Offset(c.x - r, c.y - r)
+                val box = Size(2f * r, 2f * r)
+                drawArc(TRACK, Rings.START, Rings.SWEEP, false, topLeft, box, style = Stroke(stroke))
+                var at = Rings.START
+                Rings.segments(room, colors).forEach { seg ->
+                    drawArc(Color(seg.color), at, seg.sweep, false, topLeft, box, style = Stroke(stroke, cap = StrokeCap.Butt))
+                    at += seg.sweep
+                }
+                val a = Math.toRadians(Rings.START.toDouble())
+                paint.color = (if (i == 0 && stored.isNotEmpty()) Color.White else CAPTION).toArgb()
+                drawIntoCanvas {
+                    it.nativeCanvas.drawText(Rings.caption(room.room), c.x + r * cos(a).toFloat() + Rings.LABEL_DX * d, c.y + r * sin(a).toFloat() + mid, paint)
+                }
+            }
+        }
+        Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+            if (stored.isNotEmpty()) {
+                val shown = guess ?: rooms[0].room
+                Text(Rings.name(shown), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = SELECTED, maxLines = 1)
+                Text("${((probability ?: rooms[0].p) * 100f).roundToInt()} % sicher", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.SUB_SP.sp, lineHeight = (Rings.SUB_SP * Rings.LINE_H).sp, color = SELECTED, maxLines = 1)
+            } else Text("kein Modell", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = CAPTION, maxLines = 1)
+            legend.forEach { ap ->
+                val line = buildAnnotatedString {
+                    withStyle(SpanStyle(color = Color(colors[ap.bssid]?.color ?: ColorBook.OTHER))) { append("●") }
+                    append(" " + Legend.text(names.getValue(ap.bssid), ap.rssi))
+                }
+                Text(line, fontSize = Rings.LINE_SP.sp, lineHeight = (Rings.LINE_SP * Rings.LINE_H).sp, color = LEGEND, maxLines = 1)
+            }
+        }
+        Text(
+            footer,
+            Modifier.align(Alignment.Center).offset(y = ((Footer.Y - 0.5f) * dDp).dp),
+            fontSize = Rings.LINE_SP.sp, color = CAPTION, maxLines = 1
+        )
+    }
+}
+
+private val SELECTED = Color(0xFFE8710A)
+private val IDLE = Color(0xFF2A2A2A)
+private val INK = Color(0xFF111111)
+private val TRACK = Color(0xFF262626)
+private val CAPTION = Color(0xFFA8A8A8)
+private val LEGEND = Color(0xFFD0D0D0)
