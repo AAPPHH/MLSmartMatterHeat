@@ -176,8 +176,25 @@ async fn serve(config: Config) -> Result<()> {
     rules::spawn_background(state.clone());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);
-    axum::serve(listener, http::router(state)).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
+    axum::serve(listener, http::router(state)).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn controller_command(config: Config, args: &[String]) -> Result<()> {

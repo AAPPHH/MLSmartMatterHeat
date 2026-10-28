@@ -62,6 +62,14 @@ OpenThread-Befehle brauchen in dieser Konsole das Präfix `ot`, zum Beispiel `ot
 
 `heatd`, `chip-tool` (gepinnt auf connectedhomeip `v1.5.1.0`, im Image gebaut, kein Snap) und die Produktions-PAA-Zertifikate (gleicher Tag) liegen in einem Image. Auf dem Host bleiben nur Dinge, die der Kernel oder BlueZ liefern:
 
+Port-Vorprüfung auf dem Minix vor dem ersten `up`: chip-tool braucht UDP 5550 und 5353 (Matter, mDNS), `heatd` TCP 8080; mit `network_mode: host` konkurriert das direkt mit anderen Diensten auf dem Host.
+
+```bash
+ss -lntup | grep -E ':(8080|5550|5353)\b'    # leere Ausgabe = frei; 5353 teilt sich avahi meist über SO_REUSEPORT, das ist unkritisch
+```
+
+Bei Konflikt auf 8080: `listen` in `heatd.toml` (Vorlage `deploy/docker/heatd.docker.toml`) und `HEATD_PORT` in `deploy/docker/.env` auf denselben neuen Port setzen (der Healthcheck liest `HEATD_PORT`, Standard 8080), und die Uhr/App auf den neuen Port zeigen lassen. Ist 5550 oder 5353 belegt, muss der andere Dienst weichen; chip-tool lässt sich nicht umlegen.
+
 ```bash
 sudo apt install -y bluez && sudo systemctl enable --now bluetooth
 sudo usermod -aG bluetooth $USER                                          # Pflicht: D-Bus erlaubt BlueZ-Zugriff nur dieser Gruppe (neu einloggen)
@@ -70,10 +78,24 @@ git clone https://github.com/AAPPHH/MLSmartMatterHeat.git ~/MLSmartMatterHeat &&
 cp deploy/docker/heatd.docker.toml heatd.toml                             # Räume, Node-IDs, Zeitpläne anpassen
 mkdir -p data models chip-storage secrets && scp <pc>:.../secrets/thread_dataset.hex secrets/
 scp <pc>:.../models/room_model.onnx models/                               # optional, ohne Modell liefert /api/scan keinen Raum
-cd deploy/docker
-export HEATD_UID=$(id -u) HEATD_GID=$(id -g)
-docker compose up -d --build                                              # erster Build dauert lange (chip-tool wird kompiliert)
-curl http://localhost:8080/health
+cp deploy/docker/.env.example deploy/docker/.env                          # HEATD_UID/GID (id -u, id -g), HEATD_PORT, NINJA_JOBS eintragen
+```
+
+Das Thread-Dataset entsteht auf dem PC: `heatd thread form|dataset COMx` läuft dort (serielle Verbindung zum Border Router) und schreibt `secrets/thread_dataset.hex`; die Datei wird nur ins `secrets/` des Minix kopiert (siehe `scp` oben). Auf dem Minix wird dafür keine serielle Verbindung gebraucht.
+
+Image bauen, empfohlen auf dem PC und zum Minix schicken (schneller, schont den Minix-RAM; der chip-tool-Build braucht viel RAM und Zeit):
+
+```bash
+docker build -t heatd:local -f deploy/docker/Dockerfile .                 # im Repo-Root auf dem PC, Architektur muss zum Minix passen (x86-64)
+docker save heatd:local | ssh <minix> docker load
+ssh <minix> 'cd ~/MLSmartMatterHeat/deploy/docker && docker compose up -d --no-build'
+```
+
+Alternative, Build direkt auf dem Minix: `docker compose up -d --build`. Das dauert lange und braucht mehrere GB RAM; `NINJA_JOBS` in `.env` (Standard 4, bei knappem RAM 1 oder 2) begrenzt die Parallelität von ninja (beim PC-Build: `--build-arg NINJA_JOBS=8`).
+
+```bash
+cd ~/MLSmartMatterHeat/deploy/docker
+curl http://localhost:${HEATD_PORT:-8080}/health
 ```
 
 Wichtig an der Compose-Datei (`deploy/docker/compose.yaml`):
@@ -82,13 +104,13 @@ Wichtig an der Compose-Datei (`deploy/docker/compose.yaml`):
 |---|---|
 | `network_mode: host` | Thread-Routen (IPv6, per RA vom Host gelernt), mDNS und Port 8080 für die Uhr brauchen den Netzstack des Hosts |
 | `/run/dbus/system_bus_socket` | chip-tool spricht BlueZ per D-Bus für das BLE-Commissioning; es gibt keinen rohen HCI-Zugriff |
-| `user: HEATD_UID:HEATD_GID` | D-Bus prüft die Gruppe `bluetooth` am Host-User, deshalb läuft der Container mit deiner UID statt einer festen; kein Root |
+| `user: HEATD_UID:HEATD_GID` (aus `.env`) | D-Bus prüft die Gruppe `bluetooth` am Host-User, deshalb läuft der Container mit deiner UID statt einer festen; kein Root |
 | `cap_drop: ALL` | `NET_ADMIN`/`NET_RAW` werden nicht gebraucht; BLE läuft über D-Bus, Routen setzt der Host |
 | `heatd.toml` (ro), `data/`, `models/`, `chip-storage/`, `secrets/` | Konfiguration, DuckDB + Snapshot, ONNX-Modell, Matter-Fabric (Schlüssel, sichern), Thread-Dataset |
 
-`chip-storage/` enthält die Matter-Fabric-Schlüssel; ohne dieses Verzeichnis müssen alle Thermostate neu gekoppelt werden. In `heatd.toml` stehen die Container-Pfade (`/data`, `/models`, `/chip-storage`, `/opt/paa-root-certs`); `listen` bleibt auf Port 8080, sonst passt der Healthcheck nicht. `bypass_attestation = true` ist nur der Notausgang, falls die Attestierung trotzdem scheitert.
+`chip-storage/` enthält die Matter-Fabric-Schlüssel; ohne dieses Verzeichnis müssen alle Thermostate neu gekoppelt werden. In `heatd.toml` stehen die Container-Pfade (`/data`, `/models`, `/chip-storage`, `/opt/paa-root-certs`); `listen` und `HEATD_PORT` in `.env` müssen übereinstimmen, sonst schlägt der Healthcheck fehl. `bypass_attestation = true` ist nur der Notausgang, falls die Attestierung trotzdem scheitert.
 
-Logs: `docker compose logs -f heatd`. Update: `git pull && docker compose up -d --build`. Neustart nach neuem Modell: `docker compose restart heatd`.
+`heatd` beendet sich bei `docker stop` über SIGTERM sauber. Logs: `docker compose logs -f heatd`. Update: `git pull && docker compose up -d --build`. Neustart nach neuem Modell: `docker compose restart heatd`.
 
 ### systemd (Alternative)
 
@@ -122,7 +144,7 @@ Der laufende `heatd` hält eine Sperre (`heatd.lock`) auf dem chip-tool-Speicher
 Docker:
 
 ```bash
-cd ~/MLSmartMatterHeat/deploy/docker && export HEATD_UID=$(id -u) HEATD_GID=$(id -g)
+cd ~/MLSmartMatterHeat/deploy/docker
 docker compose stop heatd                                       # Pflicht: gibt die Sperre frei, `unless-stopped` startet ihn danach nicht von selbst
 docker compose run --rm heatd commission 5 34970112332          # 11-stelliger Code oder "MT:..." vom Thermostat
 docker compose run --rm heatd read 5                            # Ist- und Solltemperatur

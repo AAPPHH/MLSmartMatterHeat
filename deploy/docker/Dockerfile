@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG MATTER_TAG=v1.5.1.0
+ARG NINJA_JOBS=4
 
 FROM rust:1.99-slim-bookworm AS heatd-build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -21,6 +22,7 @@ RUN git clone --quiet --depth 1 --branch ${MATTER_TAG} --filter=blob:none --spar
 
 FROM ubuntu:24.04 AS chip-tool-build
 ARG MATTER_TAG
+ARG NINJA_JOBS
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git ca-certificates curl unzip xz-utils gcc g++ pkg-config ninja-build python3 python3-venv python3-dev python3-pip \
@@ -31,7 +33,8 @@ RUN git clone --quiet --depth 1 --branch ${MATTER_TAG} https://github.com/projec
     && python3 scripts/checkout_submodules.py --allow-changing-global-git-config --shallow --platform linux
 SHELL ["/bin/bash", "-c"]
 RUN bash scripts/bootstrap.sh
-RUN source scripts/activate.sh && scripts/build/build_examples.py --target linux-x64-chip-tool build \
+RUN mkdir -p /shim && printf '#!/bin/sh\nexec %s -j %s "$@"\n' "$(which ninja)" "${NINJA_JOBS}" > /shim/ninja && chmod +x /shim/ninja \
+    && source scripts/activate.sh && export PATH=/shim:$PATH && scripts/build/build_examples.py --target linux-x64-chip-tool build \
     && strip -o /chip-tool out/linux-x64-chip-tool/chip-tool
 
 FROM ubuntu:24.04
