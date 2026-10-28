@@ -170,11 +170,15 @@ object Rings {
     const val SWEEP = 270f
     const val TOP_COLOURS = 6
     const val LEGEND_MAX = 4
+    const val NAME_SP = 15f
+    const val SUB_SP = 9f
+    const val LINE_SP = 8f
+    const val SUB_GAP = 3f
+    const val LEGEND_CHARS = 17
+    const val CHAR_W = 4.3f
     const val MAX_RINGS = 5
     const val LABEL_DX = 4f / REF
-    const val LEGEND_X = -26f / REF
-    const val LEGEND_Y = 57f / REF
-    const val LEGEND_PITCH = 10f / REF
+    const val LINE_H = 1.15f
     val REST = 0xFF3A3A3A.toInt()
     val CAPTIONS = mapOf("wohnzimmer" to "Wo", "schlafzimmer" to "Sch", "bad" to "Bad", "kueche" to "Kü", "flur" to "Fl")
 
@@ -213,7 +217,39 @@ object Rings {
     }
 }
 
+object Legend {
+    fun rssi(v: Int) = v.toString().replace('-', '−')
+
+    fun text(name: String, rssi: Int) = "$name ${rssi(rssi)}"
+
+    fun aps(palette: List<String>, replyAps: List<Ap>, named: List<NamedAp>): List<Ap> =
+        palette.take(Rings.LEGEND_MAX).mapNotNull { b -> replyAps.firstOrNull { it.bssid == b } ?: named.firstOrNull { it.bssid == b }?.let { Ap(it.bssid, it.rssi, it.freq) } }
+            .ifEmpty { Footer.topAps(named, Rings.LEGEND_MAX).map { Ap(it.bssid, it.rssi, it.freq) } }
+}
+
+object Demo {
+    const val GUESS = "kueche"
+    const val P = 0.82f
+    val NAMED = listOf(
+        NamedAp("02:00:00:00:00:0a", "FRITZ!Box 1234 AB", -48, 5180), NamedAp("02:00:00:00:00:0b", "FRITZ!Box 1234 AB", -55, 2412),
+        NamedAp("02:00:00:00:00:0c", "Nachbar", -71, 2437), NamedAp("02:00:00:00:00:0d", "Vodafone-A3", -79, 5200), NamedAp("02:00:00:00:00:0e", "Magenta", -82, 2462)
+    )
+    val APS = NAMED.map { Ap(it.bssid, it.rssi, it.freq) }
+
+    private fun parts(vararg v: Float) = v.mapIndexed { i, s -> Part(NAMED[i].bssid, s) }
+
+    val ROOMS = listOf(
+        RoomP("kueche", P, parts(0.40f, 0.25f, 0.10f, 0.05f)),
+        RoomP("wohnzimmer", 0.09f, listOf(Part(NAMED[1].bssid, 0.05f), Part(NAMED[4].bssid, 0.03f))),
+        RoomP("flur", 0.06f, listOf(Part(NAMED[2].bssid, 0.04f), Part(NAMED[3].bssid, 0.02f))),
+        RoomP("bad", 0.02f, listOf(Part(NAMED[4].bssid, 0.02f))),
+        RoomP("schlafzimmer", 0.01f, emptyList())
+    )
+}
+
 object Footer {
+    const val Y = 190f / Rings.REF
+
     fun line(postHm: String, ok: Boolean, queue: Int, paused: Boolean = false) =
         if (paused) "pausiert" else "${postHm.ifEmpty { "-" }} · ${if (ok) "OK" else "ERR"} · Q$queue"
 
@@ -561,7 +597,22 @@ class Store(private val ctx: Context) {
         }.apply()
     }
 
-    fun setLastAps(aps: List<NamedAp>) = sp.edit().putString("lastAps", ReplyJson.namedJson(Footer.topAps(aps))).apply()
+    fun setLastAps(aps: List<NamedAp>, now: Long = System.currentTimeMillis()) {
+        val top = Footer.topAps(aps)
+        sp.edit().also {
+            it.putString("lastAps", ReplyJson.namedJson(top))
+            if (rooms.isEmpty()) it.putString("colors", ColorBook.json(ColorBook.assign(colors, Footer.topAps(aps, Rings.LEGEND_MAX).map { a -> a.bssid }, now)))
+        }.apply()
+    }
+
+    fun setDemo(now: Long = System.currentTimeMillis()) {
+        sp.edit().also {
+            it.putFloat("probability", Demo.P).putString("guess", Demo.GUESS)
+            it.putString("rooms", ReplyJson.roomsJson(Demo.ROOMS)).putString("replyAps", ReplyJson.apsJson(Demo.APS)).putString("lastAps", ReplyJson.namedJson(Demo.NAMED))
+            it.putString("colors", ColorBook.json(ColorBook.assign(colors, Rings.palette(Rings.order(Demo.ROOMS)), now)))
+        }.apply()
+        refreshTile()
+    }
 
     fun setLabelQuietly(v: String?) = sp.edit().putString("label", v).apply()
 

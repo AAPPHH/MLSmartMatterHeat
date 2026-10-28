@@ -599,6 +599,7 @@ class DebugReceiver : BroadcastReceiver() {
             }
             ACTION_PAUSE -> ScanStarter.setPaused(c, i.getBooleanExtra("on", true))
             ACTION_FLUSH -> ScanService.instance?.flush("adb")
+            ACTION_DEMO -> store.setDemo()
         }
         val line = Summary.line(
             ScanService.running, store.paused, store.mode, store.label, store.server, store.home, store.atHome,
@@ -614,5 +615,6 @@ class DebugReceiver : BroadcastReceiver() {
         const val ACTION_CONFIG = "de.aapphh.heatscan.CONFIG"
         const val ACTION_PAUSE = "de.aapphh.heatscan.PAUSE"
         const val ACTION_FLUSH = "de.aapphh.heatscan.FLUSH"
+        const val ACTION_DEMO = "de.aapphh.heatscan.DEMO"
     }
 }

@@ -43,7 +43,10 @@ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Icon
@@ -160,10 +163,8 @@ class MainActivity : ComponentActivity() {
         val colors = store.colors
         val named = store.lastAps
         val replyAps = store.replyAps
-        val legend = palette.take(Rings.LEGEND_MAX).mapNotNull { b -> replyAps.firstOrNull { it.bssid == b } ?: named.firstOrNull { it.bssid == b }?.let { Ap(it.bssid, it.rssi, it.freq) } }
+        val legend = Legend.aps(palette, replyAps, named)
         val names = ApNames.labels(legend, named)
-        val top = Footer.topAps(named, 4).map { Ap(it.bssid, it.rssi, it.freq) }
-        val topNames = ApNames.labels(top, named, 9)
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val dDp = minOf(maxWidth, maxHeight).value
             Canvas(Modifier.fillMaxSize()) {
@@ -191,24 +192,26 @@ class MainActivity : ComponentActivity() {
                         it.nativeCanvas.drawText(Rings.caption(room.room), c.x + r * cos(a).toFloat() + Rings.LABEL_DX * d, c.y + r * sin(a).toFloat() + mid, paint)
                     }
                 }
-                legend.forEachIndexed { i, ap ->
-                    val y = c.y + (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
-                    val x = c.x + Rings.LEGEND_X * d
-                    drawCircle(Color(colors[ap.bssid]?.color ?: ColorBook.OTHER), 2.5.dp.toPx(), Offset(x, y))
-                    paint.color = LEGEND.toArgb()
-                    drawIntoCanvas { it.nativeCanvas.drawText("${names.getValue(ap.bssid)} ${ap.rssi}", x + 6.dp.toPx(), y + mid, paint) }
-                }
             }
-            Column(Modifier.align(Alignment.Center).offset(y = (-4f * dDp / Rings.REF).dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                 if (stored.isNotEmpty()) {
-                    Text(Rings.name(rooms[0].room), fontSize = 16.sp, fontWeight = FontWeight.Bold, color = SELECTED, maxLines = 1)
-                    Text("${((store.probability ?: rooms[0].p) * 100f).roundToInt()} %", fontSize = 10.sp, color = SELECTED, maxLines = 1)
-                } else {
-                    Text("kein Modell", fontSize = 12.sp, color = CAPTION, maxLines = 1)
-                    top.forEach { Text("${topNames.getValue(it.bssid)} ${it.rssi}", fontSize = 8.sp, color = CAPTION, maxLines = 1) }
+                    val guess = store.guess ?: rooms[0].room
+                    Text(Rings.name(guess), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = SELECTED, maxLines = 1)
+                    Text("${((store.probability ?: rooms[0].p) * 100f).roundToInt()} % sicher", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.SUB_SP.sp, lineHeight = (Rings.SUB_SP * Rings.LINE_H).sp, color = SELECTED, maxLines = 1)
+                } else Text("kein Modell", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = CAPTION, maxLines = 1)
+                legend.forEach { ap ->
+                    val line = buildAnnotatedString {
+                        withStyle(SpanStyle(color = Color(colors[ap.bssid]?.color ?: ColorBook.OTHER))) { append("●") }
+                        append(" " + Legend.text(names.getValue(ap.bssid), ap.rssi))
+                    }
+                    Text(line, fontSize = Rings.LINE_SP.sp, lineHeight = (Rings.LINE_SP * Rings.LINE_H).sp, color = LEGEND, maxLines = 1)
                 }
-                Text(Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused), fontSize = 8.sp, color = CAPTION, maxLines = 1)
             }
+            Text(
+                Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused),
+                Modifier.align(Alignment.Center).offset(y = ((Footer.Y - 0.5f) * dDp).dp),
+                fontSize = Rings.LINE_SP.sp, color = CAPTION, maxLines = 1
+            )
         }
     }
 
@@ -218,6 +221,6 @@ class MainActivity : ComponentActivity() {
         private val INK = Color(0xFF111111)
         private val TRACK = Color(0xFF262626)
         private val CAPTION = Color(0xFFA8A8A8)
-        private val LEGEND = Color(0xFFC8C8C8)
+        private val LEGEND = Color(0xFFD0D0D0)
     }
 }

@@ -764,25 +764,32 @@ class CoreTest {
                 }
                 return true
             }
-            for (i in 0 until Rings.LEGEND_MAX) {
-                val y = (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
-                val x = Rings.LEGEND_X * d
-                assertTrue("legend $i at $d", clear(x - 3f, x + 6f + 16 * 4.3f, y - 4.5f, y + 4.5f))
+            val h = Rings.LINE_H
+            val heights = listOf(Rings.NAME_SP * h, Rings.SUB_SP * h + Rings.SUB_GAP) + List(Rings.LEGEND_MAX) { Rings.LINE_SP * h }
+            val widths = listOf(6f * 15f * 0.6f, 12f * Rings.CHAR_W * 1.1f) + List(Rings.LEGEND_MAX) { Rings.LEGEND_CHARS * Rings.CHAR_W }
+            var y = -heights.sum() / 2f
+            val inner = Rings.radius(Rings.MAX_RINGS - 1, d) - Rings.STROKE * d / 2f
+            val blocks = heights.indices.map { i ->
+                val r = floatArrayOf(-widths[i] / 2f, y, widths[i] / 2f, y + heights[i])
+                y += heights[i]
+                r
             }
-            val legend = (0 until Rings.LEGEND_MAX).map { i ->
-                val y = (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
-                val x = Rings.LEGEND_X * d
-                floatArrayOf(x - 2.5f, y - 4.5f, x + 6f + 16 * 4.3f, y + 4.5f)
+            blocks.forEachIndexed { i, r ->
+                listOf(r[0] to r[1], r[2] to r[1], r[0] to r[3], r[2] to r[3]).forEach { (x, yy) ->
+                    assertTrue("block line $i inside innermost ring at $d", kotlin.math.hypot(x, yy) <= inner)
+                }
             }
+            val fy = (Footer.Y - 0.5f) * d
+            assertTrue("footer at $d", clear(-33f, 33f, fy - 4.5f, fy + 4.5f))
             for (i in 0 until Rings.MAX_RINGS) {
                 val a = Math.toRadians(Rings.START.toDouble())
                 val lr = Rings.radius(i, d)
                 val lx = lr * kotlin.math.cos(a).toFloat() + Rings.LABEL_DX * d
                 val ly = lr * kotlin.math.sin(a).toFloat()
                 val label = floatArrayOf(lx, ly - 3.5f, lx + 3f * 4.3f, ly + 3.5f)
-                legend.forEach { l ->
-                    val apart = l[0] - label[2] >= 2f || label[0] - l[2] >= 2f || l[1] - label[3] >= 2f || label[1] - l[3] >= 2f
-                    assertTrue("legend vs label $i at $d", apart)
+                (blocks + listOf(floatArrayOf(-33f, fy - 4.5f, 33f, fy + 4.5f))).forEach { l ->
+                    val apart = l[0] - label[2] >= 1f || label[0] - l[2] >= 1f || l[1] - label[3] >= 1f || label[1] - l[3] >= 1f
+                    assertTrue("block vs label $i at $d", apart)
                 }
             }
             for (i in 0 until 5) {
@@ -793,5 +800,23 @@ class CoreTest {
                 assertTrue("label $i at $d", clear(x, x + 3f * 4.3f, y - 3.5f, y + 3.5f))
             }
         }
+    }
+
+    @Test
+    fun legendLineAndDemoData() {
+        assertEquals("FRITZ!Box 5 −48", Legend.text("FRITZ!Box 5", -48))
+        assertEquals("X 7", Legend.text("X", 7))
+        assertEquals(190f, Footer.Y * Rings.REF, 1e-3f)
+        val sum = Demo.ROOMS.map { r -> r.parts.sumOf { it.share.toDouble() }.toFloat() to r.p }
+        sum.forEach { (parts, p) -> assertTrue(parts <= p + 1e-6f && p - parts <= 0.03f) }
+        assertEquals(0.82f, Demo.ROOMS[0].p, 0f)
+        assertEquals(listOf("kueche", "wohnzimmer", "flur", "bad", "schlafzimmer"), Rings.order(Demo.ROOMS).map { it.room })
+        val book = ColorBook.assign(emptyMap(), Rings.palette(Rings.order(Demo.ROOMS)), 1L)
+        val legend = Legend.aps(Rings.palette(Rings.order(Demo.ROOMS)), Demo.APS, Demo.NAMED)
+        assertEquals(4, legend.size)
+        assertTrue(legend.all { it.bssid in book })
+        assertEquals(listOf("FRITZ!Box 5", "FRITZ!Box 2.4"), ApNames.labels(legend, Demo.NAMED).values.take(2))
+        val none = Legend.aps(emptyList(), emptyList(), Demo.NAMED + NamedAp("02:00:00:00:00:0f", "Weit", -90, 2412))
+        assertEquals(listOf(-48, -55, -71, -79), none.map { it.rssi })
     }
 }
