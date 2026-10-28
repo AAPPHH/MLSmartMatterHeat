@@ -178,6 +178,25 @@ impl Storage {
         Ok(Ingested { stored: scan.aps.len(), duplicate: false })
     }
 
+    pub fn relabel(&self, device: &str, from_ms: i64, to_ms: i64, label: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let ids: i64 = conn.query_row(
+            "SELECT count(DISTINCT scan_id) FROM scans WHERE device = ? AND ts BETWEEN epoch_ms(?) AND epoch_ms(?)",
+            params![device, from_ms, to_ms],
+            |r| r.get(0),
+        )?;
+        conn.execute("UPDATE scans SET label = ? WHERE device = ? AND ts BETWEEN epoch_ms(?) AND epoch_ms(?)", params![label, device, from_ms, to_ms])?;
+        Ok(ids)
+    }
+
+    #[cfg(test)]
+    pub fn scan_labels(&self, device: &str) -> Result<Vec<(i64, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT epoch_ms(ts), label FROM scans WHERE device = ? ORDER BY 1")?;
+        let rows = stmt.query_map([device], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn device_statuses(&self) -> Result<Vec<DeviceStatus>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

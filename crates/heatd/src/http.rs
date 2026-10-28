@@ -22,17 +22,23 @@ pub struct AppState {
     pub commanded: Arc<Mutex<HashMap<u64, f64>>>,
 }
 
-pub struct ApiError(anyhow::Error);
+pub struct ApiError(StatusCode, anyhow::Error);
+
+impl ApiError {
+    fn bad(msg: &str) -> Self {
+        Self(StatusCode::BAD_REQUEST, anyhow::anyhow!(msg.to_string()))
+    }
+}
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self(StatusCode::INTERNAL_SERVER_ERROR, e.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": self.0.to_string()}))).into_response()
+        (self.0, Json(json!({"error": self.1.to_string()}))).into_response()
     }
 }
 
@@ -44,6 +50,16 @@ struct WindowBody {
     open: bool,
 }
 
+#[derive(Deserialize)]
+struct LabelBody {
+    device: String,
+    from: i64,
+    to: i64,
+    label: String,
+}
+
+const MAX_LABEL_SPAN_MS: i64 = 3_600_000;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
@@ -52,6 +68,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/state", get(api_state))
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
+        .route("/api/label", post(label))
         .with_state(state)
 }
 
@@ -170,6 +187,18 @@ async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> 
         windows.remove(&body.room);
     }
     Ok(Json(json!({"window_open": windows.iter().collect::<Vec<_>>()})))
+}
+
+async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> ApiResult {
+    let valid = (1..=32).contains(&body.label.len()) && body.label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    if !valid {
+        return Err(ApiError::bad("label must match ^[a-z_]{1,32}$"));
+    }
+    if body.from > body.to || body.to - body.from > MAX_LABEL_SPAN_MS {
+        return Err(ApiError::bad("range must satisfy from <= to and to - from <= 3600000"));
+    }
+    let labelled = state.storage.relabel(&body.device, body.from, body.to, &body.label)?;
+    Ok(Json(json!({"labelled": labelled})))
 }
 
 #[cfg(test)]
@@ -427,5 +456,43 @@ mod tests {
         call(&h.state, "POST", "/api/scan", Some(scan_at(after + 120_000, json!({"motion": "still"})))).await;
         let st = &h.state.storage.device_statuses().unwrap()[0];
         assert!(st.state_ts > after + 100_000);
+    }
+
+    fn label_body(device: &str, from: i64, to: i64, label: &str) -> Option<String> {
+        Some(json!({"device": device, "from": from, "to": to, "label": label}).to_string())
+    }
+
+    #[tokio::test]
+    async fn label_relabels_range_overwrites_and_is_idempotent() {
+        let h = harness(true);
+        for ts in [1_000_000, 1_500_000, 3_000_000] {
+            call(&h.state, "POST", "/api/scan", Some(scan_at(ts, json!({"label": null})))).await;
+        }
+        let mut other: Value = serde_json::from_str(&scan_at(1_200_000, json!({"label": null}))).unwrap();
+        other["device"] = json!("other-watch");
+        call(&h.state, "POST", "/api/scan", Some(other.to_string())).await;
+        let (status, body) = call(&h.state, "POST", "/api/label", label_body("pixel-watch", 1_000_000, 1_500_000, "bad")).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"labelled": 2})));
+        let again = call(&h.state, "POST", "/api/label", label_body("pixel-watch", 1_000_000, 1_500_000, "bad")).await;
+        assert_eq!(again.1, json!({"labelled": 2}));
+        let (_, body) = call(&h.state, "POST", "/api/label", label_body("pixel-watch", 1_500_000, 1_500_000, "flur")).await;
+        assert_eq!(body, json!({"labelled": 1}));
+        let labels = |device: &str| h.state.storage.scan_labels(device).unwrap();
+        assert_eq!(
+            labels("pixel-watch"),
+            vec![(1_000_000, Some("bad".to_string())), (1_500_000, Some("flur".to_string())), (3_000_000, None)]
+        );
+        assert_eq!(labels("other-watch"), vec![(1_200_000, None)]);
+    }
+
+    #[tokio::test]
+    async fn label_rejects_bad_input() {
+        let h = harness(true);
+        for bad in [label_body("pixel-watch", 0, 10, "Bad"), label_body("pixel-watch", 0, 10, ""), label_body("pixel-watch", 0, 10, &"a".repeat(33)), label_body("pixel-watch", 0, 10, "a-b"), label_body("pixel-watch", 10, 0, "bad"), label_body("pixel-watch", 0, 3_600_001, "bad")] {
+            let (status, body) = call(&h.state, "POST", "/api/label", bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body["error"].is_string());
+        }
+        assert_eq!(call(&h.state, "POST", "/api/label", label_body("pixel-watch", 0, 3_600_000, "bad")).await.0, StatusCode::OK);
     }
 }
