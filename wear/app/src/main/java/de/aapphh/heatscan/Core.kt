@@ -28,16 +28,20 @@ object RoomIcons {
     )
 }
 
-object Labels {
-    const val RECENT_MS = 600_000L
+object Span {
+    fun ms(a: Long, b: Long): Long {
+        val r = a - b
+        return if (((a xor b) and (a xor r)) < 0) (if (a < 0) Long.MIN_VALUE else Long.MAX_VALUE) else r
+    }
 
-    fun recent(label: String?, at: Long, now: Long): String? = label?.takeIf { now - at in 0..RECENT_MS }
+    fun within(now: Long, at: Long, max: Long) = ms(now, at) in 0..max
 }
 
 object LabelEvent {
     const val KIND = "label"
+    const val MAX_SPAN_MS = 3_600_000L
 
-    fun window(lastTo: Long, now: Long): Pair<Long, Long> = Pair(minOf(maxOf(lastTo, now - Labels.RECENT_MS), now), now)
+    fun window(from: Long, now: Long): Pair<Long, Long> = Pair(minOf(maxOf(from, Span.ms(now, MAX_SPAN_MS)), now), now)
 
     fun entry(device: String, from: Long, to: Long, label: String): JSONObject =
         JSONObject().put("ts", to).put("kind", KIND).put("device", device).put("from", from).put("to", to).put("label", label)
@@ -48,7 +52,7 @@ object LabelEvent {
 }
 
 object Prompt {
-    const val ALERT_GAP_MS = 600_000L
+    const val ALERT_GAP_MS = 180_000L
     const val TIMEOUT_MS = 600_000L
     const val DONE_TIMEOUT_MS = 4_000L
     val ORDER = listOf("kueche", "wohnzimmer", "flur", "bad", "schlafzimmer")
@@ -56,13 +60,211 @@ object Prompt {
     fun quiet(hour: Int) = hour >= 22 || hour < 7
 
     fun alert(now: Long, lastAlertAt: Long, away: Boolean, offBody: Boolean, hour: Int): Boolean =
-        !away && !offBody && !quiet(hour) && now - lastAlertAt >= ALERT_GAP_MS
+        !away && !offBody && !quiet(hour) && Span.ms(now, lastAlertAt) >= ALERT_GAP_MS
+
+    fun title(change: Boolean) = if (change) "Raum gewechselt? Wo bist du jetzt?" else "Wo bist du?"
 
     fun rooms(guess: String?): List<String> = if (guess != null && guess in ORDER) listOf(guess) + ORDER.filter { it != guess } else ORDER
 
     fun caption(room: String, guess: String?): String = (if (room == guess) "● " else "") + Rings.name(room)
 
     fun done(room: String) = "✓ Gespeichert: " + Rings.name(room)
+}
+
+object Fingerprint {
+    const val FLOOR = -85
+    const val MISSING = -100f
+    const val MAX_DIST_DB = 8f
+    const val MIN_OVERLAP = 0.5f
+
+    fun of(aps: List<Ap>): Map<String, Float> = aps.groupBy { it.bssid.lowercase() }.mapValues { e -> e.value.maxOf { it.rssi }.toFloat() }
+
+    private fun strong(f: Map<String, Float>) = f.filterValues { it >= FLOOR }.keys
+
+    fun distance(a: Map<String, Float>, b: Map<String, Float>): Float {
+        val keys = strong(a) + strong(b)
+        return if (keys.isEmpty()) 0f else keys.sumOf { Math.abs((a[it] ?: MISSING) - (b[it] ?: MISSING)).toDouble() }.toFloat() / keys.size
+    }
+
+    fun overlap(a: Map<String, Float>, b: Map<String, Float>): Float {
+        val u = strong(a) + strong(b)
+        return if (u.isEmpty()) 1f else strong(a).intersect(strong(b)).size.toFloat() / u.size
+    }
+
+    fun differs(a: Map<String, Float>, b: Map<String, Float>): Boolean = overlap(a, b) < MIN_OVERLAP || distance(a, b) > MAX_DIST_DB
+
+    fun blend(avg: Map<String, Float>, n: Int, cur: Map<String, Float>): Map<String, Float> =
+        (avg.keys + cur.keys).associateWith { ((avg[it] ?: MISSING) * n + (cur[it] ?: MISSING)) / (n + 1) }
+
+    fun json(f: Map<String, Float>): JSONObject = JSONObject().also { o -> f.forEach { (k, v) -> o.put(k, v.toDouble()) } }
+
+    fun parse(o: JSONObject?): Map<String, Float> = o?.keys()?.asSequence()?.associateWith { o.getDouble(it).toFloat() } ?: emptyMap()
+}
+
+class Decision(val label: String? = null, val ask: Boolean = false, val since: Long = 0L, val change: Boolean = false)
+
+class StayTracker {
+    var label: String? = null
+    var confirmedAt = 0L
+    var fp: Map<String, Float> = emptyMap()
+    var n = 0
+    var moved = false
+    var diff = 0
+    var diffAt = 0L
+    var gDiff = 0
+    var gAt = 0L
+    var gMoved = false
+    var needAsk = true
+    var lastFp: Map<String, Float> = emptyMap()
+    var lastTs = 0L
+    var askAt = 0L
+    var askSince = 0L
+    var askTs = 0L
+    var askFp: Map<String, Float> = emptyMap()
+    var askGuess: String? = null
+    var askChange = false
+    var askLoud = false
+
+    fun holding(now: Long): String? = label?.takeIf { Span.ms(now, confirmedAt) in 0 until CAP_MS }
+
+    fun pending(now: Long) = askAt != 0L && Span.within(now, askAt, Prompt.TIMEOUT_MS)
+
+    fun windowStart(now: Long): Long = if (pending(now)) askSince else maxOf(lastTs, Span.ms(now, BACK_MS))
+
+    private fun end() {
+        label = null
+        diff = 0
+        gDiff = 0
+        gMoved = false
+        moved = false
+    }
+
+    private fun ask(now: Long, ts: Long, since: Long, fp: Map<String, Float>, guess: String?, change: Boolean): Decision {
+        needAsk = false
+        askAt = now
+        askSince = since
+        askTs = ts
+        askFp = fp
+        askGuess = guess
+        askChange = change
+        return Decision(null, true, since, change)
+    }
+
+    fun reset() {
+        end()
+        needAsk = true
+    }
+
+    fun confirm(room: String, now: Long) {
+        val start = if (pending(now)) askFp else lastFp
+        end()
+        fp = start
+        n = 1
+        label = room
+        confirmedAt = now
+        needAsk = false
+        askAt = 0L
+    }
+
+    fun onScan(ts: Long, now: Long, aps: List<Ap>, moving: Boolean, motion: Boolean, guess: String?): Decision {
+        val cur = Fingerprint.of(aps)
+        if (cur.isEmpty()) return Decision(holding(now))
+        val first = lastTs == 0L
+        lastFp = cur
+        lastTs = ts
+        moved = moved || motion || moving
+        gMoved = gMoved || motion || moving
+        if (label != null && holding(now) == null) {
+            end()
+            needAsk = true
+        }
+        val s = label
+        if (s == null) {
+            if (motion || moving) needAsk = true
+            return if (needAsk && (!moving || first)) ask(now, ts, ts, cur, guess, false) else Decision(null, false, ts)
+        }
+        if (!Fingerprint.differs(fp, cur)) {
+            diff = 0
+            moved = false
+            if (n < AVG_SCANS) {
+                fp = Fingerprint.blend(fp, n, cur)
+                n++
+            }
+            return Decision(s)
+        }
+        if (diff == 0) diffAt = ts
+        diff++
+        if (moved && diff >= 2) {
+            val at = diffAt
+            end()
+            return ask(now, ts, at, cur, guess, true)
+        }
+        return Decision(s)
+    }
+
+    fun onGuess(scanTs: Long, room: String, p: Float?, now: Long): Decision {
+        val s = holding(now) ?: return Decision()
+        if (p != null && p >= GUESS_P && room != s) {
+            if (gDiff == 0) gAt = scanTs
+            gDiff++
+        } else {
+            gDiff = 0
+            gMoved = false
+        }
+        if (gDiff >= 2 && gMoved) {
+            val at = gAt
+            end()
+            return ask(now, scanTs, at, lastFp, room, true)
+        }
+        return Decision(s)
+    }
+
+    fun refresh(scanTs: Long, now: Long, guess: String?): Boolean {
+        if (!pending(now) || scanTs < askTs || guess == null || guess == askGuess) return false
+        askGuess = guess
+        return true
+    }
+
+    fun json(): String = JSONObject()
+        .put("label", label ?: JSONObject.NULL).put("confirmedAt", confirmedAt).put("fp", Fingerprint.json(fp)).put("n", n).put("moved", moved)
+        .put("diff", diff).put("diffAt", diffAt).put("gDiff", gDiff).put("gAt", gAt).put("gMoved", gMoved).put("needAsk", needAsk)
+        .put("lastFp", Fingerprint.json(lastFp)).put("lastTs", lastTs).put("askAt", askAt).put("askSince", askSince).put("askTs", askTs)
+        .put("askFp", Fingerprint.json(askFp)).put("askGuess", askGuess ?: JSONObject.NULL).put("askChange", askChange).put("askLoud", askLoud).toString()
+
+    companion object {
+        const val CAP_MS = 7_200_000L
+        const val BACK_MS = 120_000L
+        const val AVG_SCANS = 5
+        const val GUESS_P = 0.6f
+
+        fun parse(text: String?): StayTracker = StayTracker().also { t ->
+            try {
+                val o = JSONObject(text ?: return@also)
+                t.label = if (o.isNull("label")) null else o.optString("label").takeIf { it in Defaults.ROOMS }
+                t.confirmedAt = o.optLong("confirmedAt")
+                t.fp = Fingerprint.parse(o.optJSONObject("fp"))
+                t.n = o.optInt("n")
+                t.moved = o.optBoolean("moved")
+                t.diff = o.optInt("diff")
+                t.diffAt = o.optLong("diffAt")
+                t.gDiff = o.optInt("gDiff")
+                t.gAt = o.optLong("gAt")
+                t.gMoved = o.optBoolean("gMoved")
+                t.needAsk = o.optBoolean("needAsk", true)
+                t.lastFp = Fingerprint.parse(o.optJSONObject("lastFp"))
+                t.lastTs = o.optLong("lastTs")
+                t.askAt = o.optLong("askAt")
+                t.askSince = o.optLong("askSince")
+                t.askTs = o.optLong("askTs")
+                t.askFp = Fingerprint.parse(o.optJSONObject("askFp"))
+                t.askGuess = if (o.isNull("askGuess")) null else o.optString("askGuess")
+                t.askChange = o.optBoolean("askChange")
+                t.askLoud = o.optBoolean("askLoud")
+            } catch (e: Exception) {
+                Log.w(TAG, "stay parse failed", e)
+            }
+        }
+    }
 }
 
 object Highlight {
@@ -141,6 +343,11 @@ object ReplyJson {
         val last = o.optJSONArray("scans")?.let { if (it.length() > 0) it.getJSONObject(it.length() - 1) else null } ?: o
         (last.optJSONArray("aps")?.length() ?: 0) > 0
     } catch (e: Exception) { false }
+
+    fun lastTs(body: String): Long? = try {
+        val o = JSONObject(body)
+        (o.optJSONArray("scans")?.let { if (it.length() > 0) it.getJSONObject(it.length() - 1) else null } ?: o).optLong("ts").takeIf { it > 0L }
+    } catch (e: Exception) { null }
 
     fun keeps(r: Reply, postedAps: Boolean): Boolean = !r.hasRooms || postedAps
 }
@@ -378,7 +585,7 @@ object Capture {
 
 class Queued(val seq: Long, val json: JSONObject)
 
-class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE_MAX, private val maxAgeMs: Long = ScanConfig.QUEUE_AGE_MS) {
+class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE_MAX, private val maxAgeMs: Long = ScanConfig.QUEUE_AGE_MS, stripLabels: Boolean = false) {
     private class Item(val seq: Long, val ts: Long, val line: String)
 
     private val items = ArrayDeque<Item>()
@@ -389,10 +596,17 @@ class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE
         private set
 
     init {
+        var stripped = false
         try {
             file?.takeIf { it.exists() }?.useLines { lines ->
                 lines.forEach { l ->
-                    try { items.addLast(Item(nextSeq, JSONObject(l).getLong("ts"), l)); nextSeq++ } catch (e: Exception) { Log.w(TAG, "queue line dropped", e) }
+                    try {
+                        val o = JSONObject(l)
+                        val old = stripLabels && !LabelEvent.isLabel(o) && !o.isNull("label") && o.has("label")
+                        if (old) stripped = true
+                        items.addLast(Item(nextSeq, o.getLong("ts"), if (old) o.put("label", JSONObject.NULL).toString() else l))
+                        nextSeq++
+                    } catch (e: Exception) { Log.w(TAG, "queue line dropped", e) }
                 }
             }
         } catch (e: Exception) {
@@ -401,7 +615,7 @@ class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE
         val trimmed = items.size > max
         while (items.size > max) items.removeFirst()
         size = items.size
-        if (trimmed) rewrite()
+        if (trimmed || stripped) rewrite()
     }
 
     fun add(entry: JSONObject, now: Long): Int = synchronized(this) {
@@ -433,6 +647,15 @@ class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE
         if (commit) commit()
     }
 
+    fun defer(seq: Long): Long = synchronized(this) {
+        val i = items.first { it.seq == seq }
+        items.remove(i)
+        val moved = Item(nextSeq++, i.ts, i.line)
+        items.addLast(moved)
+        dirty = true
+        moved.seq
+    }
+
     fun commit() = synchronized(this) {
         if (dirty) rewrite()
     }
@@ -452,13 +675,17 @@ class ScanQueue(private val file: File?, private val max: Int = ScanConfig.QUEUE
     companion object {
         private var shared: ScanQueue? = null
 
+        private const val FORMAT = 2
+
         fun get(c: Context): ScanQueue = synchronized(this) {
-            shared ?: ScanQueue(File(c.applicationContext.filesDir, "queue.jsonl")).also { shared = it }
+            shared ?: Store(c).let { st ->
+                ScanQueue(File(c.applicationContext.filesDir, "queue.jsonl"), stripLabels = st.queueFormat < FORMAT).also { shared = it; st.queueFormat = FORMAT }
+            }
         }
     }
 }
 
-data class FlushResult(val sent: Int, val code: Int)
+data class FlushResult(val sent: Int, val code: Int, val deferred: Int = 0)
 
 class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
     private var batch = maxBatch
@@ -477,13 +704,20 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
     fun run(queue: ScanQueue, now: Long, sendBatch: (JSONArray) -> Int, sendOne: (JSONObject) -> Int, sendLabel: (JSONObject) -> Int = { 200 }): FlushResult {
         var sent = 0
         var code = 0
+        val parked = HashSet<Long>()
         try {
             while (true) {
                 val head = queue.peek(batch, now)
-                if (head.isEmpty()) break
+                if (head.isEmpty() || head[0].seq in parked) break
                 if (LabelEvent.isLabel(head[0].json)) {
-                    code = sendLabel(head[0].json)
-                    if (!settled(code) && code != 404) return FlushResult(sent, code)
+                    val c = sendLabel(head[0].json)
+                    if (c == 404) {
+                        parked.add(queue.defer(head[0].seq))
+                        if (sent == 0 && parked.size == queue.size) code = c
+                        continue
+                    }
+                    code = c
+                    if (!settled(code)) return FlushResult(sent, code, parked.size)
                     queue.remove(head[0].seq, false)
                     if (accepted(code)) sent++
                     continue
@@ -501,11 +735,11 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
                         continue
                     }
                     if (code == 404) singleOnly = true
-                    else if (!rejected(code)) return FlushResult(sent, code)
+                    else if (!rejected(code)) return FlushResult(sent, code, parked.size)
                 }
                 for (e in items) {
                     code = sendOne(e.json)
-                    if (!settled(code)) return FlushResult(sent, code)
+                    if (!settled(code)) return FlushResult(sent, code, parked.size)
                     queue.remove(e.seq, false)
                     if (accepted(code)) sent++
                 }
@@ -514,7 +748,7 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
             queue.commit()
         }
         batch = maxBatch
-        return FlushResult(sent, code)
+        return FlushResult(sent, code, parked.size)
     }
 }
 
@@ -558,19 +792,22 @@ class Store(private val ctx: Context) {
     var device: String
         get() = sp.getString("device", null) ?: ctx.getString(R.string.default_device)
         set(v) = put("device", v)
-    var label: String?
-        get() = sp.getString("label", null)?.takeIf { it in Defaults.ROOMS }
-        set(v) = put("label", v)
-    var labelAt: Long
-        get() = sp.getLong("labelAt", 0L)
-        set(v) = sp.edit().putLong("labelAt", v).apply()
-    var lastLabelTo: Long
-        get() = sp.getLong("lastLabelTo", 0L)
-        set(v) = sp.edit().putLong("lastLabelTo", v).apply()
+    fun <T> stay(f: (StayTracker) -> T): T = synchronized(Store::class.java) {
+        val t = StayTracker.parse(sp.getString("stay", null))
+        val r = f(t)
+        sp.edit().putString("stay", t.json()).apply()
+        r
+    }
+    fun stayLabel(now: Long = System.currentTimeMillis()): String? = stay { it.holding(now) }
+    var queueFormat: Int
+        get() = sp.getInt("queueFormat", 0)
+        set(v) = sp.edit().putInt("queueFormat", v).apply()
+    var labels404: Long
+        get() = sp.getLong("labels404", 0L)
+        set(v) = sp.edit().putLong("labels404", v).apply()
     var lastPromptAlertAt: Long
         get() = sp.getLong("lastPromptAlertAt", 0L)
         set(v) = sp.edit().putLong("lastPromptAlertAt", v).apply()
-    fun recentLabel(now: Long = System.currentTimeMillis()): String? = Labels.recent(label, labelAt, now)
     var guess: String?
         get() = sp.getString("guess", null)?.takeIf { it in Defaults.ROOMS }
         set(v) = put("guess", v)
@@ -667,7 +904,7 @@ class Store(private val ctx: Context) {
 
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
-        if (key == "label" || key == "guess" || key == "status" || key == "mode" || key == "lastPost") refreshTile()
+        if (key == "guess" || key == "status" || key == "mode" || key == "lastPost") refreshTile()
     }
 
     fun refreshTile() {

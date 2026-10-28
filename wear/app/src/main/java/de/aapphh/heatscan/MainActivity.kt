@@ -94,7 +94,7 @@ class MainActivity : ComponentActivity() {
         var saved by remember { mutableStateOf<String?>(null) }
         LaunchedEffect(saved) {
             if (saved != null) {
-                delay(2000)
+                delay(Prompt.DONE_TIMEOUT_MS)
                 saved = null
             }
         }
@@ -103,9 +103,9 @@ class MainActivity : ComponentActivity() {
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 key(version) {
                     if (page == 0) {
-                        val (hot, ringed) = Highlight.of(store.recentLabel(), store.guess)
+                        val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
                         RoomsPage(hot, ringed) {
-                            LabelRecorder.record(this@MainActivity, it)
+                            LabelRecorder.async(this@MainActivity, it)
                             saved = Prompt.done(it)
                         }
                     } else DataPage(

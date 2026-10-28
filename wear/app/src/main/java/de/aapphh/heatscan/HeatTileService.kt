@@ -27,9 +27,9 @@ class HeatTileService : TileService() {
         val clicked = TileClick.room(requestParams.currentState.lastClickableId, store.nonce)
         if (clicked != null) {
             store.nonce = store.nonce + 1
-            LabelRecorder.record(this, clicked, false)
+            LabelRecorder.async(this, clicked)
         }
-        val (hot, ring) = Highlight.of(store.recentLabel(), store.guess)
+        val (hot, ring) = Highlight.of(clicked ?: store.stayLabel(), store.guess)
         val dp = requestParams.deviceConfiguration.let { minOf(it.screenWidthDp, it.screenHeightDp).toFloat() }.takeIf { it > 0f } ?: Quarters.REF
         val layout = layout(dp, hot, ring, store.nonce)
         val tile = TileBuilders.Tile.Builder()

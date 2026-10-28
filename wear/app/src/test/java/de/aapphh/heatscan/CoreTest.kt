@@ -274,19 +274,23 @@ class CoreTest {
     }
 
     @Test
-    fun recentLabelExpiresAfterTenMinutes() {
-        assertEquals("bad", Labels.recent("bad", 1000, 1000 + 600_000))
-        assertEquals(null, Labels.recent("bad", 1000, 1001 + 600_000))
-        assertEquals(null, Labels.recent(null, 1000, 1000))
+    fun labelWindowStartsAtGivenTsAndStaysWithinServerCap() {
+        val now = 10_000_000_000L
+        assertEquals(Pair(now - 100, now), LabelEvent.window(now - 100, now))
+        assertEquals(Pair(now - 3_600_000, now), LabelEvent.window(0, now))
+        assertEquals(Pair(now, now), LabelEvent.window(now + 5, now))
+        assertEquals(Pair(Long.MIN_VALUE, Long.MIN_VALUE + 5), LabelEvent.window(Long.MIN_VALUE, Long.MIN_VALUE + 5))
     }
 
     @Test
-    fun labelWindowStartsAtLastLabelOrTenMinutesBack() {
-        val now = 10_000_000L
-        assertEquals(Pair(now - 600_000, now), LabelEvent.window(0, now))
-        assertEquals(Pair(now - 100, now), LabelEvent.window(now - 100, now))
-        assertEquals(Pair(now - 600_000, now), LabelEvent.window(now - 700_000, now))
-        assertEquals(Pair(now, now), LabelEvent.window(now + 5, now))
+    fun spanSaturatesInsteadOfOverflowing() {
+        assertEquals(Long.MAX_VALUE, Span.ms(Long.MAX_VALUE, -5))
+        assertEquals(Long.MIN_VALUE, Span.ms(Long.MIN_VALUE, 5))
+        assertEquals(7L, Span.ms(10, 3))
+        assertTrue(Span.within(10, 3, 7))
+        assertFalse(Span.within(10, 3, 6))
+        assertFalse(Span.within(3, 10, 100))
+        assertFalse(Span.within(Long.MAX_VALUE, Long.MIN_VALUE, 100))
     }
 
     @Test
@@ -302,6 +306,243 @@ class CoreTest {
         assertEquals(9L, b.getLong("to"))
         assertEquals("bad", b.getString("label"))
         assertTrue(Defaults.ROOMS.all { Regex("^[a-z_]{1,32}$").matches(it) })
+    }
+
+    private fun fp(vararg v: Pair<String, Int>) = v.map { Ap(it.first, it.second, 5180) }
+    private val roomA = fp("a1" to -50, "a2" to -60, "a3" to -70, "a4" to -75)
+    private val roomB = fp("b1" to -50, "b2" to -58, "b3" to -66, "a1" to -80)
+    private fun noisy(base: List<Ap>, d: Int) = base.mapIndexed { i, a -> a.copy(rssi = a.rssi + if (i % 2 == 0) d else -d) }
+    private val t0 = 1_000_000_000_000L
+
+    private fun staying(room: String = "kueche", aps: List<Ap> = roomA): StayTracker {
+        val t = StayTracker()
+        assertTrue(t.onScan(t0, t0, aps, false, false, null).ask)
+        t.confirm(room, t0 + 5_000)
+        return t
+    }
+
+    @Test
+    fun fingerprintDistanceUsesStrongUnionAndMissingFloor() {
+        val a = Fingerprint.of(roomA)
+        assertEquals(0f, Fingerprint.distance(a, a), 0f)
+        assertEquals(3f, Fingerprint.distance(a, Fingerprint.of(noisy(roomA, 3))), 0.01f)
+        assertEquals(0f, Fingerprint.distance(emptyMap(), emptyMap()), 0f)
+        assertEquals(25f, Fingerprint.distance(mapOf("x" to -75f), emptyMap()), 0.01f)
+        assertEquals(0f, Fingerprint.distance(mapOf("x" to -90f), mapOf("y" to -95f)), 0f)
+        assertFalse(Fingerprint.differs(a, Fingerprint.of(noisy(roomA, 3))))
+        assertTrue(Fingerprint.differs(a, Fingerprint.of(roomB)))
+        assertTrue(Fingerprint.differs(a, Fingerprint.of(roomA.map { it.copy(rssi = it.rssi - 12) })))
+        val sparse = Fingerprint.of(fp("a1" to -50, "a2" to -60, "n1" to -60, "n2" to -60))
+        assertTrue(Fingerprint.overlap(a, sparse) < Fingerprint.MIN_OVERLAP)
+        assertEquals(1f, Fingerprint.overlap(a, a), 0f)
+    }
+
+    @Test
+    fun sameRoomNoiseKeepsStayAndLabelsScans() {
+        val t = staying()
+        for (i in 1..20) {
+            val d = t.onScan(t0 + i * 30_000L, t0 + i * 30_000L, noisy(roomA, if (i % 2 == 0) 3 else -4), i % 3 == 0, i % 3 == 0, null)
+            assertEquals("kueche", d.label)
+            assertFalse(d.ask)
+        }
+    }
+
+    @Test
+    fun roomChangeAsksAfterTwoDifferingScansWithMovement() {
+        val t = staying()
+        val d1 = t.onScan(t0 + 60_000, t0 + 60_000, roomB, true, true, null)
+        assertEquals("kueche", d1.label)
+        assertFalse(d1.ask)
+        val d2 = t.onScan(t0 + 90_000, t0 + 90_000, noisy(roomB, 2), false, false, null)
+        assertTrue(d2.ask)
+        assertTrue(d2.change)
+        assertEquals(null, d2.label)
+        assertEquals(t0 + 60_000, d2.since)
+        assertEquals(null, t.holding(t0 + 90_000))
+        assertEquals(t0 + 60_000, t.windowStart(t0 + 100_000))
+        t.confirm("bad", t0 + 100_000)
+        assertEquals("bad", t.holding(t0 + 100_000))
+        val d3 = t.onScan(t0 + 120_000, t0 + 120_000, noisy(roomB, 1), false, false, null)
+        assertEquals("bad", d3.label)
+        assertFalse(d3.ask)
+    }
+
+    @Test
+    fun noChangeWithoutMovementAndSingleDifferingScanIsIgnored() {
+        val t = staying()
+        for (i in 1..5) assertFalse(t.onScan(t0 + i * 30_000L, t0 + i * 30_000L, roomB, false, false, null).ask)
+        assertEquals("kueche", t.holding(t0 + 200_000))
+        val u = staying()
+        assertFalse(u.onScan(t0 + 60_000, t0 + 60_000, roomB, true, true, null).ask)
+        assertFalse(u.onScan(t0 + 90_000, t0 + 90_000, roomA, false, false, null).ask)
+        assertFalse(u.onScan(t0 + 120_000, t0 + 120_000, roomB, false, false, null).ask)
+        assertEquals("kueche", u.holding(t0 + 130_000))
+    }
+
+    @Test
+    fun stayExpiresAfterTwoHoursAndAsksOnce() {
+        val t = staying()
+        val late = t0 + 5_000 + StayTracker.CAP_MS
+        assertEquals("kueche", t.holding(late - 1))
+        val d = t.onScan(late, late, roomA, false, false, null)
+        assertTrue(d.ask)
+        assertFalse(d.change)
+        assertEquals(null, d.label)
+        assertFalse(t.onScan(late + 720_000, late + 720_000, roomA, false, false, null).ask)
+    }
+
+    @Test
+    fun confidentGuessDifferingTwiceCountsAsChangeWhenMoved() {
+        val t = staying()
+        t.onScan(t0 + 30_000, t0 + 30_000, roomA, true, true, null)
+        assertFalse(t.onGuess(t0 + 30_000, "bad", 0.9f, t0 + 31_000).ask)
+        val d = t.onGuess(t0 + 60_000, "bad", 0.7f, t0 + 61_000)
+        assertTrue(d.ask)
+        assertTrue(d.change)
+        assertEquals(t0 + 30_000, d.since)
+        assertEquals("bad", t.askGuess)
+    }
+
+    @Test
+    fun weakInterruptedOrUnmovedGuessesDoNotChange() {
+        val t = staying()
+        t.onScan(t0 + 30_000, t0 + 30_000, roomA, true, true, null)
+        assertFalse(t.onGuess(t0 + 30_000, "bad", 0.5f, t0 + 31_000).ask)
+        assertFalse(t.onGuess(t0 + 60_000, "bad", 0.9f, t0 + 61_000).ask)
+        assertFalse(t.onGuess(t0 + 90_000, "kueche", 0.9f, t0 + 91_000).ask)
+        assertFalse(t.onGuess(t0 + 120_000, "bad", 0.9f, t0 + 121_000).ask)
+        val u = staying()
+        assertFalse(u.onGuess(t0 + 30_000, "bad", 0.9f, t0 + 31_000).ask)
+        assertFalse(u.onGuess(t0 + 60_000, "bad", 0.9f, t0 + 61_000).ask)
+    }
+
+    @Test
+    fun withoutStayAsksOnFirstScanAndAfterSettlingButNotWhileMoving() {
+        val t = StayTracker()
+        assertTrue(t.onScan(t0, t0, roomA, true, true, null).ask)
+        assertFalse(t.onScan(t0 + 30_000, t0 + 30_000, roomB, true, true, null).ask)
+        assertFalse(t.onScan(t0 + 60_000, t0 + 60_000, roomB, true, true, null).ask)
+        assertTrue(t.onScan(t0 + 90_000, t0 + 90_000, roomB, false, false, null).ask)
+        assertFalse(t.onScan(t0 + 810_000, t0 + 810_000, roomB, false, false, null).ask)
+    }
+
+    @Test
+    fun stillHeartbeatPromptsWhenSettleScanDidNotCarryAps() {
+        val t = StayTracker()
+        t.onScan(t0, t0, roomA, false, false, null)
+        t.onScan(t0 + 30_000, t0 + 30_000, roomA, true, true, null)
+        assertFalse(t.onScan(t0 + 60_000, t0 + 60_000, emptyList(), false, false, null).ask)
+        assertTrue(t.onScan(t0 + 720_000, t0 + 720_000, roomA, false, false, null).ask)
+    }
+
+    @Test
+    fun awayResetEndsStayAndAsksOnReturn() {
+        val t = staying()
+        t.reset()
+        assertEquals(null, t.holding(t0 + 10_000))
+        assertTrue(t.onScan(t0 + 20_000, t0 + 20_000, roomA, false, false, null).ask)
+    }
+
+    @Test
+    fun confirmUsesPromptFingerprintAndAveragesFirstScans() {
+        val t = StayTracker()
+        t.onScan(t0, t0, roomA, false, false, null)
+        t.onScan(t0 + 30_000, t0 + 30_000, roomB, true, true, null)
+        t.confirm("kueche", t0 + 40_000)
+        assertEquals(Fingerprint.of(roomA), t.fp)
+        t.onScan(t0 + 60_000, t0 + 60_000, noisy(roomA, 4), false, false, null)
+        assertEquals(-48f, t.fp.getValue("a1"), 0.01f)
+        assertEquals(2, t.n)
+        repeat(10) { t.onScan(t0 + 90_000L + it * 1000, t0 + 90_000L + it * 1000, roomA, false, false, null) }
+        assertEquals(StayTracker.AVG_SCANS, t.n)
+    }
+
+    @Test
+    fun windowStartIsPromptScanOrLastScanAtMostTwoMinutesBack() {
+        val now = t0 + 1_000_000
+        val t = StayTracker()
+        assertEquals(now - StayTracker.BACK_MS, t.windowStart(now))
+        t.onScan(now - 400_000, now - 400_000, roomA, false, false, null)
+        assertEquals(now - 400_000, t.windowStart(now - 390_000))
+        assertEquals(now + 300_000 - StayTracker.BACK_MS, t.windowStart(now + 300_000))
+        t.confirm("kueche", now - 380_000)
+        t.onScan(now - 30_000, now - 30_000, roomA, false, false, null)
+        assertEquals(now - 30_000, t.windowStart(now))
+    }
+
+    @Test
+    fun promptRefreshesOnceWhenReplyGuessDiffers() {
+        val t = StayTracker()
+        t.onScan(t0, t0, roomA, false, false, "flur")
+        assertFalse(t.refresh(t0, t0 + 1000, "flur"))
+        assertFalse(t.refresh(t0 - 1, t0 + 1000, "bad"))
+        assertTrue(t.refresh(t0, t0 + 1000, "bad"))
+        assertFalse(t.refresh(t0, t0 + 2000, "bad"))
+        assertFalse(t.refresh(t0, t0 + Prompt.TIMEOUT_MS + 1, "kueche"))
+    }
+
+    @Test
+    fun stayStateSurvivesJsonRoundTrip() {
+        val t = staying("bad")
+        t.onScan(t0 + 60_000, t0 + 60_000, roomB, true, true, "flur")
+        val r = StayTracker.parse(t.json())
+        assertEquals(t.json(), r.json())
+        assertEquals("bad", r.holding(t0 + 70_000))
+        assertEquals(null, StayTracker.parse("kaputt").label)
+        assertEquals(null, StayTracker.parse(null).label)
+    }
+
+    @Test
+    fun replyTimestampComesFromLastScanOfBatch() {
+        assertEquals(7L, ReplyJson.lastTs("{\"scans\":[{\"ts\":5},{\"ts\":7}]}"))
+        assertEquals(9L, ReplyJson.lastTs("{\"ts\":9,\"aps\":[]}"))
+        assertEquals(null, ReplyJson.lastTs("x"))
+    }
+
+    @Test
+    fun promptTitleAndRateLimit() {
+        assertEquals("Raum gewechselt? Wo bist du jetzt?", Prompt.title(true))
+        assertEquals("Wo bist du?", Prompt.title(false))
+        assertEquals(180_000L, Prompt.ALERT_GAP_MS)
+        assertFalse(Prompt.alert(t0 + 179_999, t0, false, false, 12))
+        assertTrue(Prompt.alert(t0 + 180_000, t0, false, false, 12))
+        assertFalse(Prompt.alert(t0 + 999_999_999, t0, false, false, 22))
+        assertTrue(Prompt.alert(Long.MAX_VALUE, Long.MIN_VALUE, false, false, 12))
+    }
+
+    @Test
+    fun deferredLabelStaysQueuedWhileScansFlow() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        q.add(LabelEvent.entry("d", 0, 1, "bad"), 1)
+        q.add(entry(2), 2)
+        q.add(entry(3), 3)
+        val sent = mutableListOf<Long>()
+        val r = Flusher(10).run(q, 5, { a -> (0 until a.length()).forEach { sent.add(a.getJSONObject(it).getLong("ts")) }; 200 }, { 200 }, { 404 })
+        assertEquals(listOf(2L, 3L), sent)
+        assertEquals(2, r.sent)
+        assertEquals(1, r.deferred)
+        assertEquals(200, r.code)
+        assertEquals(1, q.size)
+        assertTrue(LabelEvent.isLabel(q.peek(1, 5)[0].json))
+        val r2 = Flusher(10).run(q, 5, { 200 }, { 200 }, { 404 })
+        assertEquals(404, r2.code)
+        assertEquals(1, r2.deferred)
+        assertEquals(1, q.size)
+        assertEquals(1, Flusher(10).run(q, 5, { 200 }, { 200 }, { 200 }).sent)
+        assertEquals(0, q.size)
+    }
+
+    @Test
+    fun oldStickyLabelsAreStrippedOnLoadButLabelEventsStay() {
+        val f = File.createTempFile("queue", ".jsonl")
+        f.writeText(entry(1, "bad").toString() + "\n" + LabelEvent.entry("d", 0, 2, "flur").toString() + "\n" + entry(3).toString() + "\n")
+        val q = ScanQueue(f, 100, Long.MAX_VALUE, true)
+        val items = q.peek(10, 5)
+        assertTrue(items[0].json.isNull("label"))
+        assertEquals("flur", items[1].json.getString("label"))
+        assertFalse(f.readText().contains("\"bad\""))
+        assertEquals(3, ScanQueue(f, 100, Long.MAX_VALUE, false).size)
+        f.delete()
     }
 
     @Test
