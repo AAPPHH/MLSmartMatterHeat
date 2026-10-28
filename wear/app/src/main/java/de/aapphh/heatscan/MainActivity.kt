@@ -22,6 +22,9 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -88,12 +91,23 @@ class MainActivity : ComponentActivity() {
             onDispose { store.sp.unregisterOnSharedPreferenceChangeListener(l) }
         }
         val pager = rememberPagerState { 2 }
+        var saved by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(saved) {
+            if (saved != null) {
+                delay(2000)
+                saved = null
+            }
+        }
         Box(Modifier.fillMaxSize()) {
+            saved?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 key(version) {
                     if (page == 0) {
-                        val (hot, ringed) = Highlight.of(store.label, store.guess)
-                        RoomsPage(hot, ringed) { store.label = Labels.toggle(store.label, it) }
+                        val (hot, ringed) = Highlight.of(store.recentLabel(), store.guess)
+                        RoomsPage(hot, ringed) {
+                            LabelRecorder.record(this@MainActivity, it)
+                            saved = Prompt.done(it)
+                        }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,
                         Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused)

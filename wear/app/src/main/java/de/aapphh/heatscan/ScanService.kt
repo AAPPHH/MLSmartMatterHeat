@@ -338,6 +338,7 @@ class ScanService : Service() {
                 store.status = stamp() + " " + cause
                 return
             }
+            val beat = beatPending
             val newest = results.maxOf { it.timestamp }
             if (!dedup.accept(newest)) {
                 Trace.i("scan_result", "count" to results.size, "dedup" to true)
@@ -355,23 +356,25 @@ class ScanService : Service() {
             beatPending = false
             handler.removeCallbacks(beatTimeout)
             val ts = Capture.wallMs(System.currentTimeMillis(), now, newest)
-            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home) "scan" else "away")
+            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home) "scan" else "away", home && !beat)
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
         }
     }
 
-    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String) {
+    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, prompt: Boolean = false) {
         lastEnqueueAt = SystemClock.elapsedRealtime()
         val state = powerState()
         val motion = policy.mode.motion
-        val label = store.label
+        val label: String? = null
+        val off = offBody == true
         try {
             io.execute {
                 val body = Payload.build(ts, store.device, label, aps, motion, state, away, store.nextId())
                 val dropped = queue.add(body, System.currentTimeMillis())
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (label ?: "-"))
                 store.status = stamp() + " " + kind + " q" + queue.size
+                if (prompt) Prompter.ask(this, store, away, off)
                 flush(kind)
             }
         } catch (e: RejectedExecutionException) {
@@ -403,6 +406,15 @@ class ScanService : Service() {
         -1
     }
 
+    private fun sendLabel(server: String, e: JSONObject, net: Network?): Int = try {
+        Poster.send(server, "/api/label", LabelEvent.body(e), net).code
+    } catch (ex: Exception) {
+        lastException = ex.javaClass.simpleName
+        store.lastError = ex.toString()
+        Trace.w("post", ex, "path" to "/api/label")
+        -1
+    }
+
     private fun runFlush(reason: String) {
         val server = store.server
         val net = network
@@ -413,7 +425,8 @@ class ScanService : Service() {
             flusher.run(
                 queue, System.currentTimeMillis(),
                 { a -> send(server, "/api/scans", JSONObject().put("scans", a).toString(), net) },
-                { e -> send(server, "/api/scan", e.toString(), net) }
+                { e -> send(server, "/api/scan", e.toString(), net) },
+                { e -> sendLabel(server, e, net) }
             )
         } finally {
             lock?.let { if (it.isHeld) it.release() }
@@ -459,6 +472,83 @@ class ScanService : Service() {
             c, 0, Intent(c, TickReceiver::class.java).setAction(ACTION_TICK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+    }
+}
+
+object Prompter {
+    private const val CHANNEL = "room"
+    private const val QUIET = "room_quiet"
+    private const val ID = 3
+    const val ACTION = "de.aapphh.heatscan.LABEL"
+
+    private fun nm(c: Context): NotificationManager = c.getSystemService(NotificationManager::class.java).also {
+        it.createNotificationChannel(NotificationChannel(CHANNEL, "Raum", NotificationManager.IMPORTANCE_DEFAULT).apply { enableVibration(true) })
+        it.createNotificationChannel(NotificationChannel(QUIET, "Raum leise", NotificationManager.IMPORTANCE_LOW).apply { enableVibration(false) })
+    }
+
+    private fun action(c: Context, room: String, guess: String?): Notification.Action {
+        val pi = PendingIntent.getBroadcast(
+            c, Defaults.ROOMS.indexOf(room) + 10, Intent(c, LabelReceiver::class.java).setAction(ACTION).setData(android.net.Uri.parse("room:$room")).putExtra("room", room),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(c, RoomIcons.RES.getValue(room)), Prompt.caption(room, guess), pi).build()
+    }
+
+    fun ask(c: Context, store: Store, away: Boolean, offBody: Boolean) {
+        try {
+            val now = System.currentTimeMillis()
+            val alert = Prompt.alert(now, store.lastPromptAlertAt, away, offBody, java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY))
+            if (alert) store.lastPromptAlertAt = now
+            val guess = store.guess
+            val b = Notification.Builder(c, if (alert) CHANNEL else QUIET)
+                .setContentTitle("Wo bist du?")
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setTimeoutAfter(Prompt.TIMEOUT_MS)
+                .setOnlyAlertOnce(!alert)
+            Prompt.rooms(guess).forEach { b.addAction(action(c, it, guess)) }
+            nm(c).notify(ID, b.build())
+        } catch (e: Exception) {
+            Trace.w("prompt_failed", e)
+        }
+    }
+
+    fun confirm(c: Context, room: String) {
+        try {
+            nm(c).notify(ID, Notification.Builder(c, QUIET)
+                .setContentTitle(Prompt.done(room))
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setTimeoutAfter(Prompt.DONE_TIMEOUT_MS)
+                .setOnlyAlertOnce(true)
+                .build())
+        } catch (e: Exception) {
+            Trace.w("confirm_failed", e)
+        }
+    }
+}
+
+object LabelRecorder {
+    fun record(c: Context, room: String, refreshTile: Boolean = true) {
+        if (room !in Defaults.ROOMS) return
+        val store = Store(c)
+        val now = System.currentTimeMillis()
+        val (from, to) = LabelEvent.window(store.lastLabelTo, now)
+        ScanQueue.get(c).add(LabelEvent.entry(store.device, from, to, room), now)
+        store.lastLabelTo = to
+        store.labelAt = now
+        store.label = room
+        if (refreshTile) store.refreshTile()
+        Prompter.confirm(c, room)
+        Trace.i("label", "room" to room, "from" to from, "to" to to)
+        ScanService.instance?.flush("label")
+    }
+}
+
+class LabelReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        if (i.action != Prompter.ACTION) return
+        val room = i.getStringExtra("room") ?: return
+        val pending = goAsync()
+        Thread { try { LabelRecorder.record(c, room) } finally { pending.finish() } }.start()
     }
 }
 

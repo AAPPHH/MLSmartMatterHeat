@@ -274,10 +274,93 @@ class CoreTest {
     }
 
     @Test
-    fun labelToggle() {
-        assertEquals("bad", Labels.toggle(null, "bad"))
-        assertEquals("bad", Labels.toggle("flur", "bad"))
-        assertEquals(null, Labels.toggle("bad", "bad"))
+    fun recentLabelExpiresAfterTenMinutes() {
+        assertEquals("bad", Labels.recent("bad", 1000, 1000 + 600_000))
+        assertEquals(null, Labels.recent("bad", 1000, 1001 + 600_000))
+        assertEquals(null, Labels.recent(null, 1000, 1000))
+    }
+
+    @Test
+    fun labelWindowStartsAtLastLabelOrTenMinutesBack() {
+        val now = 10_000_000L
+        assertEquals(Pair(now - 600_000, now), LabelEvent.window(0, now))
+        assertEquals(Pair(now - 100, now), LabelEvent.window(now - 100, now))
+        assertEquals(Pair(now - 600_000, now), LabelEvent.window(now - 700_000, now))
+        assertEquals(Pair(now, now), LabelEvent.window(now + 5, now))
+    }
+
+    @Test
+    fun labelEventJson() {
+        val e = LabelEvent.entry("w", 5, 9, "bad")
+        assertTrue(LabelEvent.isLabel(e))
+        assertFalse(LabelEvent.isLabel(Payload.build(1, "w", null, emptyList())))
+        assertEquals(9L, e.getLong("ts"))
+        val b = JSONObject(LabelEvent.body(e))
+        assertEquals(setOf("device", "from", "to", "label"), b.keys().asSequence().toSet())
+        assertEquals("w", b.getString("device"))
+        assertEquals(5L, b.getLong("from"))
+        assertEquals(9L, b.getLong("to"))
+        assertEquals("bad", b.getString("label"))
+        assertTrue(Defaults.ROOMS.all { Regex("^[a-z_]{1,32}$").matches(it) })
+    }
+
+    @Test
+    fun promptAlertThrottleAndQuietRules() {
+        val gap = Prompt.ALERT_GAP_MS
+        assertTrue(Prompt.alert(gap, 0, false, false, 12))
+        assertFalse(Prompt.alert(gap - 1, 0, false, false, 12))
+        assertTrue(Prompt.alert(2 * gap, gap, false, false, 12))
+        assertFalse(Prompt.alert(gap, 0, true, false, 12))
+        assertFalse(Prompt.alert(gap, 0, false, true, 12))
+        assertFalse(Prompt.alert(gap, 0, false, false, 22))
+        assertFalse(Prompt.alert(gap, 0, false, false, 3))
+        assertFalse(Prompt.alert(gap, 0, false, false, 6))
+        assertTrue(Prompt.alert(gap, 0, false, false, 7))
+        assertTrue(Prompt.alert(gap, 0, false, false, 21))
+    }
+
+    @Test
+    fun promptListsGuessFirstAndMarked() {
+        assertEquals(listOf("kueche", "wohnzimmer", "flur", "bad", "schlafzimmer"), Prompt.rooms(null))
+        assertEquals(listOf("bad", "kueche", "wohnzimmer", "flur", "schlafzimmer"), Prompt.rooms("bad"))
+        assertEquals(Prompt.ORDER, Prompt.rooms("unbekannt"))
+        assertEquals("● Bad", Prompt.caption("bad", "bad"))
+        assertEquals("Küche", Prompt.caption("kueche", "bad"))
+        assertEquals("✓ Gespeichert: Wohnen", Prompt.done("wohnzimmer"))
+        assertEquals(Defaults.ROOMS.toSet(), Prompt.ORDER.toSet())
+    }
+
+    @Test
+    fun labelsFlushAfterQueuedScansInOrder() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        q.add(entry(1), 1)
+        q.add(entry(2), 2)
+        q.add(LabelEvent.entry("d", 0, 3, "bad"), 3)
+        q.add(entry(4), 4)
+        val sent = mutableListOf<String>()
+        val r = Flusher(10).run(q, 5,
+            { a -> sent.add("batch" + (0 until a.length()).map { a.getJSONObject(it).getLong("ts") }); 200 },
+            { sent.add("one"); 200 },
+            { sent.add("label" + it.getLong("ts")); 200 })
+        assertEquals(listOf("batch[1, 2]", "label3", "batch[4]"), sent)
+        assertEquals(4, r.sent)
+        assertEquals(0, q.size)
+    }
+
+    @Test
+    fun failedLabelKeepsItAndLaterScans() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        q.add(LabelEvent.entry("d", 0, 1, "bad"), 1)
+        q.add(entry(2), 2)
+        assertEquals(503, Flusher(10).run(q, 5, { 200 }, { 200 }, { 503 }).code)
+        assertEquals(2, q.size)
+        Flusher(10).run(q, 5, { 200 }, { 200 }, { 400 })
+        assertEquals(0, q.size)
+    }
+
+    @Test
+    fun scansCarryNoStickyLabel() {
+        assertTrue(Payload.build(1, "d", null, emptyList()).isNull("label"))
     }
 
     @Test
