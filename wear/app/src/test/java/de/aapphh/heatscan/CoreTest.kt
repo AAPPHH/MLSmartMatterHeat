@@ -596,4 +596,29 @@ class CoreTest {
         assertEquals(8, r.sent)
         assertEquals(0, q.size)
     }
+
+    @Test
+    fun highlightPrefersLabel() {
+        assertEquals(Pair(null, null), Highlight.of(null, null))
+        assertEquals(Pair("flur", null), Highlight.of(null, "flur"))
+        assertEquals(Pair("bad", "bad"), Highlight.of("bad", null))
+        assertEquals(Pair("bad", "bad"), Highlight.of("bad", "bad"))
+        assertEquals(Pair("flur", "bad"), Highlight.of("bad", "flur"))
+    }
+
+    @Test
+    fun quartersHitTest() {
+        val d = 213f
+        assertEquals("wohnzimmer", Quarters.room(0f, 0f, d))
+        assertEquals("wohnzimmer", Quarters.room(0f, -41f, d))
+        assertEquals("schlafzimmer", Quarters.room(0f, -77f, d))
+        assertEquals("bad", Quarters.room(77f, 0f, d))
+        assertEquals("kueche", Quarters.room(0f, 77f, d))
+        assertEquals("flur", Quarters.room(-77f, 0f, d))
+        assertEquals("schlafzimmer", Quarters.room(50f, -51f, d))
+        assertEquals("bad", Quarters.room(51f, -50f, d))
+        assertEquals("flur", Quarters.room(-60f, -59f, d))
+        assertEquals("bad", Quarters.room(60f, 40f, 300f))
+        assertEquals(listOf(0f, 90f, 180f, 270f), Quarters.WEDGES.map { Quarters.mid(it) })
+    }
 }

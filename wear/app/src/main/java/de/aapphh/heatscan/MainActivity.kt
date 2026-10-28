@@ -5,6 +5,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -18,7 +19,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
@@ -33,13 +33,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
@@ -82,7 +87,7 @@ class MainActivity : ComponentActivity() {
         val pager = rememberPagerState { 2 }
         Box(Modifier.fillMaxSize()) {
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
-                if (page == 0) RoomsPage(version, store, store.label, TileClick.statusLine(store.running, store.mode, store.status))
+                if (page == 0) RoomsPage(version, store)
                 else SettingsPage(version, store)
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -94,33 +99,57 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun RoomsPage(rev: Int, store: Store, label: String?, center: String) {
+    private fun RoomsPage(rev: Int, store: Store) {
+        val (hot, ringed) = Highlight.of(store.label, store.guess)
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val size = 46.dp
-            val radius = minOf(maxWidth, maxHeight) / 2 - size / 2 - 3.dp
-            Defaults.ROOMS.forEachIndexed { i, room ->
-                val a = Math.toRadians(-90.0 + i * 72.0)
-                RoomButton(
-                    room, room == label, size,
-                    Modifier.align(Alignment.Center).offset((radius.value * cos(a)).dp, (radius.value * sin(a)).dp)
-                ) { store.label = Labels.toggle(store.label, room) }
+            val dDp = minOf(maxWidth, maxHeight)
+            Canvas(
+                Modifier.fillMaxSize().pointerInput(Unit) {
+                    detectTapGestures { o ->
+                        val d = minOf(size.width, size.height).toFloat()
+                        val room = Quarters.room(o.x - size.width / 2f, o.y - size.height / 2f, d)
+                        store.label = Labels.toggle(store.label, room)
+                    }
+                }
+            ) {
+                val d = minOf(size.width, size.height)
+                val c = Offset(size.width / 2f, size.height / 2f)
+                val outer = d / 2f
+                val inner = Quarters.INNER * d
+                val gap = Quarters.GAP.dp.toPx()
+                val ring = 6.dp.toPx()
+                Quarters.WEDGES.forEach { room ->
+                    val start = Quarters.mid(room) - 90f - Quarters.SPAN / 2
+                    val path = Path().apply {
+                        arcTo(Rect(c, outer), start, Quarters.SPAN, true)
+                        arcTo(Rect(c, inner), start + Quarters.SPAN, -Quarters.SPAN, false)
+                        close()
+                    }
+                    drawPath(path, if (room == hot) SELECTED else IDLE)
+                    if (room == ringed) clipPath(path) { drawPath(path, Color.White, style = Stroke(ring)) }
+                }
+                repeat(4) {
+                    val a = Math.toRadians(45.0 + it * 90.0)
+                    val u = Offset(cos(a).toFloat(), sin(a).toFloat())
+                    drawLine(Color.Black, c + u * (inner - 1f), c + u * (outer + 1f), gap)
+                }
+                val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
+                drawPath(centre, if (Quarters.CENTER == hot) SELECTED else IDLE)
+                if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
             }
-            Text(
-                center, Modifier.align(Alignment.Center).width(radius), fontSize = 9.sp, textAlign = TextAlign.Center,
-                maxLines = 4, overflow = TextOverflow.Ellipsis
-            )
-        }
-    }
-
-    @Composable
-    private fun RoomButton(room: String, selected: Boolean, size: androidx.compose.ui.unit.Dp, modifier: Modifier, onClick: () -> Unit) {
-        Column(
-            modifier.size(size).clip(CircleShape).background(if (selected) SELECTED else IDLE).clickable(onClick = onClick),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size(22.dp), tint = Color.White)
-            Text(Defaults.CAPTIONS.getValue(room), fontSize = 8.sp, maxLines = 1, color = Color.White)
+            (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
+                val isCenter = room == Quarters.CENTER
+                val a = Math.toRadians(Quarters.mid(room) - 90.0)
+                val r = if (isCenter) 0f else Quarters.LABEL_R * dDp.value
+                val ink = if (room == hot) INK else Color.White
+                Column(
+                    Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink)
+                    Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, maxLines = 1, color = ink)
+                }
+            }
         }
     }
 
@@ -169,5 +198,6 @@ class MainActivity : ComponentActivity() {
     companion object {
         private val SELECTED = Color(0xFFE8710A)
         private val IDLE = Color(0xFF2A2A2A)
+        private val INK = Color(0xFF111111)
     }
 }
