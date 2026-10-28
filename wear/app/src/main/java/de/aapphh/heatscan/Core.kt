@@ -180,7 +180,11 @@ class StayTracker {
     }
 
     fun confirm(room: String, now: Long) {
-        val start = if (pending(now)) askFp else lastFp
+        val start = when {
+            pending(now) && askWake -> if (fresh(now)) lastFp else emptyMap()
+            pending(now) -> askFp
+            else -> lastFp
+        }
         end()
         fp = start
         n = 1
@@ -301,7 +305,11 @@ class StayTracker {
 object Wake {
     const val GAP_MS = 20_000L
 
+    const val FRESH_MS = 120_000L
+
     fun scanDue(now: Long, lastRequestAt: Long, idle: Boolean) = !idle && now - lastRequestAt >= GAP_MS
+
+    fun promptAllowed(away: Boolean, offBody: Boolean?, wake: Boolean, interactive: Boolean) = !away && offBody != true && (!wake || interactive)
 
     fun settled(before: Mode, after: Mode) = before == Mode.MOVING && (after == Mode.SETTLING || after == Mode.STILL)
 }
@@ -1082,6 +1090,8 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
         Mode.MOVING -> minOf(nextAt, lastMotion + ScanConfig.MOVE_WINDOW_MS)
         Mode.SETTLING -> lastMotion + ScanConfig.STILL_AFTER_MS
     } - now)
+
+    fun claimWake(now: Long) = mode != Mode.AWAY && claim(now)
 
     private fun claim(now: Long): Boolean {
         if (now - lastScanAt < ScanConfig.MIN_GAP_MS) return false

@@ -121,7 +121,7 @@ class ScanService : Service() {
                 Intent.ACTION_SCREEN_ON -> {
                     Trace.i("screen_on", "queue" to queue.size)
                     flush("screen_on")
-                    onWake("screen_on", false)
+                    onWake("screen_on", power.isDeviceIdleMode)
                 }
                 Intent.ACTION_POWER_CONNECTED -> {
                     Trace.i("charger", "queue" to queue.size)
@@ -131,7 +131,7 @@ class ScanService : Service() {
                     Trace.i("power_change", "action" to i.action, "doze" to power.isDeviceIdleMode, "saver" to power.isPowerSaveMode, "power" to powerState(), "queue" to queue.size)
                     if (!power.isDeviceIdleMode) {
                         flush("idle_exit")
-                        if (i.action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) onWake("idle_exit", power.isDeviceIdleMode)
+                        if (i.action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) onWake("idle_exit", false)
                     }
                 }
             }
@@ -275,7 +275,8 @@ class ScanService : Service() {
     private fun onWake(reason: String, idle: Boolean) {
         if (!active) return
         val now = SystemClock.elapsedRealtime()
-        if (Wake.scanDue(now, lastScanRequestAt, idle)) {
+        val freshAge = System.currentTimeMillis() - store.lastFreshAt
+        if (Wake.scanDue(now, lastScanRequestAt, idle) && freshAge !in 0 until Wake.FRESH_MS && policy.claimWake(now)) {
             Trace.i("wake_scan", "reason" to reason)
             scan()
         }
@@ -285,6 +286,7 @@ class ScanService : Service() {
     private fun promptNoScan(reason: String, wake: Boolean) {
         val away = policy.away
         val off = offBody == true
+        if (!Wake.promptAllowed(away, offBody, wake, power.isInteractive)) return
         try {
             io.execute {
                 val d = store.stay { it.promptWithoutScan(System.currentTimeMillis(), store.guess, wake) }
@@ -353,9 +355,9 @@ class ScanService : Service() {
             handler.removeCallbacks(beatTimeout)
             handler.postDelayed(beatTimeout, ScanConfig.BEAT_WAIT_MS)
         }
-        lastScanRequestAt = SystemClock.elapsedRealtime()
         try {
             val ok = wifi.startScan()
+            if (ok) lastScanRequestAt = SystemClock.elapsedRealtime()
             Trace.i("scan_requested", "accepted" to ok, "beat" to beat)
             if (!ok) {
                 store.rejected += 1
@@ -363,6 +365,7 @@ class ScanService : Service() {
             }
         } catch (e: Exception) {
             Trace.w("scan_requested", e, "accepted" to false, "beat" to beat)
+            store.rejected += 1
             collect()
         }
     }

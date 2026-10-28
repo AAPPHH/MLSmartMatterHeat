@@ -1156,6 +1156,29 @@ class CoreTest {
     }
 
     @Test
+    fun claimWakeHonoursBudgetAndAway() {
+        val p = ScanPolicy(true, 0)
+        assertTrue(p.claimWake(100_000))
+        assertFalse(p.claimWake(100_000 + ScanConfig.MIN_GAP_MS - 1))
+        var t = 100_000L
+        repeat(ScanConfig.SCAN_WINDOW_MAX - 1) { t += ScanConfig.MIN_GAP_MS; assertTrue(p.claimWake(t)) }
+        assertFalse(p.claimWake(t + ScanConfig.MIN_GAP_MS))
+        val a = ScanPolicy(true, 0)
+        repeat(ScanConfig.AWAY_AFTER_MISSES) { a.onScan(false, 1000L) }
+        assertEquals(Mode.AWAY, a.mode)
+        assertFalse(a.claimWake(10_000_000))
+    }
+
+    @Test
+    fun promptsSkippedAwayOffBodyAndScreenOffWake() {
+        assertTrue(Wake.promptAllowed(false, null, true, true))
+        assertTrue(Wake.promptAllowed(false, false, false, false))
+        assertFalse(Wake.promptAllowed(true, null, false, true))
+        assertFalse(Wake.promptAllowed(false, true, false, true))
+        assertFalse(Wake.promptAllowed(false, null, true, false))
+    }
+
+    @Test
     fun settleAndWakePromptWithoutFreshScan() {
         val t = StayTracker()
         val d = t.promptWithoutScan(t0, "bad", false)
@@ -1189,6 +1212,13 @@ class CoreTest {
         u.promptWithoutScan(t0, null, true)
         assertEquals(t0 - 40_000, u.windowStart(t0 + 30_000))
         assertEquals(t0 + 200_000, u.windowStart(t0 + 200_000))
+        u.confirm("bad", t0 + 200_000)
+        assertTrue(u.fp.isEmpty())
+        val w = StayTracker()
+        w.onScan(t0 - 40_000, t0 - 40_000, roomA, false, false, null)
+        w.promptWithoutScan(t0, null, true)
+        w.confirm("bad", t0 + 30_000)
+        assertFalse(w.fp.isEmpty())
     }
 
     @Test
