@@ -66,6 +66,7 @@ class ScanService : Service() {
     private var active = false
     private var beatPending = false
     private var lastEnqueueAt = 0L
+    private var lastScanRequestAt = Long.MIN_VALUE / 4
     private var loggedMode: Mode? = null
     private val flusher = Flusher()
     private val flushPending = AtomicBoolean(false)
@@ -120,6 +121,7 @@ class ScanService : Service() {
                 Intent.ACTION_SCREEN_ON -> {
                     Trace.i("screen_on", "queue" to queue.size)
                     flush("screen_on")
+                    onWake("screen_on", false)
                 }
                 Intent.ACTION_POWER_CONNECTED -> {
                     Trace.i("charger", "queue" to queue.size)
@@ -127,7 +129,10 @@ class ScanService : Service() {
                 }
                 PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED, PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
                     Trace.i("power_change", "action" to i.action, "doze" to power.isDeviceIdleMode, "saver" to power.isPowerSaveMode, "power" to powerState(), "queue" to queue.size)
-                    if (!power.isDeviceIdleMode) flush("idle_exit")
+                    if (!power.isDeviceIdleMode) {
+                        flush("idle_exit")
+                        if (i.action == PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) onWake("idle_exit", power.isDeviceIdleMode)
+                    }
                 }
             }
         }
@@ -261,8 +266,36 @@ class ScanService : Service() {
 
     private fun tick() {
         val now = SystemClock.elapsedRealtime()
+        val before = policy.mode
         if (policy.onTick(now)) scan(policy.mode.sleeps || now - lastEnqueueAt >= ScanConfig.HEARTBEAT_MS)
+        if (Wake.settled(before, policy.mode)) promptNoScan("settled", false)
         schedule(now)
+    }
+
+    private fun onWake(reason: String, idle: Boolean) {
+        if (!active) return
+        val now = SystemClock.elapsedRealtime()
+        if (Wake.scanDue(now, lastScanRequestAt, idle)) {
+            Trace.i("wake_scan", "reason" to reason)
+            scan()
+        }
+        promptNoScan(reason, true)
+    }
+
+    private fun promptNoScan(reason: String, wake: Boolean) {
+        val away = policy.away
+        val off = offBody == true
+        try {
+            io.execute {
+                val d = store.stay { it.promptWithoutScan(System.currentTimeMillis(), store.guess, wake) }
+                if (d.ask) {
+                    Trace.i("prompt_no_scan", "reason" to reason, "since" to d.since)
+                    Prompter.ask(this, store, away, off, d)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "prompt rejected", e)
+        }
     }
 
     private fun schedule(now: Long) {
@@ -320,10 +353,14 @@ class ScanService : Service() {
             handler.removeCallbacks(beatTimeout)
             handler.postDelayed(beatTimeout, ScanConfig.BEAT_WAIT_MS)
         }
+        lastScanRequestAt = SystemClock.elapsedRealtime()
         try {
             val ok = wifi.startScan()
             Trace.i("scan_requested", "accepted" to ok, "beat" to beat)
-            if (!ok) collect()
+            if (!ok) {
+                store.rejected += 1
+                collect()
+            }
         } catch (e: Exception) {
             Trace.w("scan_requested", e, "accepted" to false, "beat" to beat)
             collect()
@@ -346,6 +383,8 @@ class ScanService : Service() {
                 Trace.i("scan_result", "count" to results.size, "dedup" to true)
                 return
             }
+            store.lastFreshAt = System.currentTimeMillis()
+            store.rejected = 0
             store.setLastAps(results.map { NamedAp(it.BSSID.lowercase(), it.SSID.orEmpty(), it.level, it.frequency) })
             val home = Home.isHome(results.map { it.SSID }, store.homeList)
             Trace.i("scan_result", "count" to results.size, "home" to home)
@@ -629,6 +668,8 @@ object ScanStarter {
 
     fun extra(c: Context): List<Pair<String, Any?>> = listOf(
         "startError" to Store(c).startError,
+        "lastFreshScan" to Footer.fresh(Store(c).lastFreshAt),
+        "rejected" to Store(c).rejected,
         "queue" to ScanQueue.get(c).size,
         "bgLoc" to bgLocation(c),
         "idleWhitelist" to c.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(c.packageName),

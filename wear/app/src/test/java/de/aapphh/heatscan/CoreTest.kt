@@ -1143,4 +1143,66 @@ class CoreTest {
         val none = Legend.aps(emptyList(), emptyList(), Demo.NAMED + NamedAp("02:00:00:00:00:0f", "Weit", -90, 2412))
         assertEquals(listOf(-48, -55, -71, -79), none.map { it.rssi })
     }
+
+    @Test
+    fun wakeScanIsDebouncedAndSkippedInDoze() {
+        assertTrue(Wake.scanDue(100_000, 100_000 - Wake.GAP_MS, false))
+        assertFalse(Wake.scanDue(100_000, 100_000 - Wake.GAP_MS + 1, false))
+        assertFalse(Wake.scanDue(100_000, 0, true))
+        assertTrue(Wake.settled(Mode.MOVING, Mode.SETTLING))
+        assertTrue(Wake.settled(Mode.MOVING, Mode.STILL))
+        assertFalse(Wake.settled(Mode.SETTLING, Mode.STILL))
+        assertFalse(Wake.settled(Mode.MOVING, Mode.MOVING))
+    }
+
+    @Test
+    fun settleAndWakePromptWithoutFreshScan() {
+        val t = StayTracker()
+        val d = t.promptWithoutScan(t0, "bad", false)
+        assertTrue(d.ask)
+        assertFalse(d.change)
+        assertEquals(t0, d.since)
+        assertTrue(t.pending(t0 + 1000))
+        assertFalse(t.promptWithoutScan(t0 + 1000, null, false).ask)
+        t.askAt = 0L
+        assertFalse(t.promptWithoutScan(t0 + 300_000, null, true).ask)
+        assertTrue(t.promptWithoutScan(t0 + Prompt.WAKE_GAP_MS + 1, null, true).ask)
+        val held = staying()
+        assertFalse(held.promptWithoutScan(t0 + 10_000, null, true).ask)
+        assertFalse(held.promptWithoutScan(t0 + 10_000, null, false).ask)
+    }
+
+    @Test
+    fun windowStartsAtAnswerTimeWithoutRecentFreshScan() {
+        val t = StayTracker()
+        t.promptWithoutScan(t0, null, true)
+        val now = t0 + 90_000
+        assertEquals(Pair(now, now), LabelEvent.window(t.windowStart(now), now))
+        t.confirm("bad", now)
+        val d = t.onScan(now + 30_000, now + 30_000, roomB, false, false, null)
+        assertEquals("bad", d.label)
+        assertFalse(d.ask)
+        val u = StayTracker()
+        u.onScan(t0 - 40_000, t0 - 40_000, roomA, false, false, null)
+        u.askAt = 0L
+        u.lastAskAt = 0L
+        u.promptWithoutScan(t0, null, true)
+        assertEquals(t0 - 40_000, u.windowStart(t0 + 30_000))
+        assertEquals(t0 + 200_000, u.windowStart(t0 + 200_000))
+    }
+
+    @Test
+    fun cachedScanResultsDoNotCountAsFreshScans() {
+        val d = Dedup()
+        val t = StayTracker()
+        var asks = 0
+        for (newest in listOf(100L, 100L, 100L, 50L)) if (d.accept(newest)) {
+            if (t.onScan(newest, newest, roomA, false, false, null).ask) asks++
+        }
+        assertEquals(1, asks)
+        assertEquals(100L, t.lastTs)
+        assertEquals("-", Footer.fresh(0))
+        assertEquals("pausiert", Footer.line("1", true, 0, true, "12:00", 2))
+        assertEquals("12:34 · OK · Q3 · S12:30 · R2", Footer.line("12:34", true, 3, false, "12:30", 2))
+    }
 }

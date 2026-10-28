@@ -11,6 +11,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 data class Ap(val bssid: String, val rssi: Int, val freq: Int)
 
@@ -61,6 +64,8 @@ object Prompt {
 
     fun alert(now: Long, lastAlertAt: Long, away: Boolean, offBody: Boolean, hour: Int): Boolean =
         !away && !offBody && !quiet(hour) && Span.ms(now, lastAlertAt) >= ALERT_GAP_MS
+
+    const val WAKE_GAP_MS = 600_000L
 
     fun title(change: Boolean) = if (change) "Raum gewechselt? Wo bist du jetzt?" else "Wo bist du?"
 
@@ -124,12 +129,20 @@ class StayTracker {
     var askGuess: String? = null
     var askChange = false
     var askLoud = false
+    var askWake = false
+    var lastAskAt = 0L
 
     fun holding(now: Long): String? = label?.takeIf { Span.ms(now, confirmedAt) in 0 until CAP_MS }
 
     fun pending(now: Long) = askAt != 0L && Span.within(now, askAt, Prompt.TIMEOUT_MS)
 
-    fun windowStart(now: Long): Long = if (pending(now)) askSince else maxOf(lastTs, Span.ms(now, BACK_MS))
+    fun fresh(now: Long) = lastTs != 0L && Span.within(now, lastTs, BACK_MS)
+
+    fun windowStart(now: Long): Long = when {
+        pending(now) && askWake -> if (fresh(now)) lastTs else now
+        pending(now) -> askSince
+        else -> maxOf(lastTs, Span.ms(now, BACK_MS))
+    }
 
     private fun end() {
         label = null
@@ -147,7 +160,18 @@ class StayTracker {
         askFp = fp
         askGuess = guess
         askChange = change
+        askWake = false
+        lastAskAt = now
         return Decision(null, true, since, change)
+    }
+
+    fun promptWithoutScan(now: Long, guess: String?, wake: Boolean): Decision {
+        if (holding(now) != null || pending(now)) return Decision(holding(now))
+        if (wake && Span.within(now, lastAskAt, Prompt.WAKE_GAP_MS)) return Decision()
+        val since = if (fresh(now)) lastTs else now
+        val d = ask(now, since, since, lastFp, guess, false)
+        askWake = true
+        return d
     }
 
     fun reset() {
@@ -179,6 +203,11 @@ class StayTracker {
             needAsk = true
         }
         val s = label
+        if (s != null && fp.isEmpty()) {
+            fp = cur
+            n = 1
+            return Decision(s)
+        }
         if (s == null) {
             if (motion || moving) needAsk = true
             return if (needAsk && (!moving || first)) ask(now, ts, ts, cur, guess, false) else Decision(null, false, ts)
@@ -229,7 +258,7 @@ class StayTracker {
         .put("label", label ?: JSONObject.NULL).put("confirmedAt", confirmedAt).put("fp", Fingerprint.json(fp)).put("n", n).put("moved", moved)
         .put("diff", diff).put("diffAt", diffAt).put("gDiff", gDiff).put("gAt", gAt).put("gMoved", gMoved).put("needAsk", needAsk)
         .put("lastFp", Fingerprint.json(lastFp)).put("lastTs", lastTs).put("askAt", askAt).put("askSince", askSince).put("askTs", askTs)
-        .put("askFp", Fingerprint.json(askFp)).put("askGuess", askGuess ?: JSONObject.NULL).put("askChange", askChange).put("askLoud", askLoud).toString()
+        .put("askFp", Fingerprint.json(askFp)).put("askGuess", askGuess ?: JSONObject.NULL).put("askChange", askChange).put("askLoud", askLoud).put("askWake", askWake).put("lastAskAt", lastAskAt).toString()
 
     companion object {
         const val CAP_MS = 7_200_000L
@@ -260,11 +289,21 @@ class StayTracker {
                 t.askGuess = if (o.isNull("askGuess")) null else o.optString("askGuess")
                 t.askChange = o.optBoolean("askChange")
                 t.askLoud = o.optBoolean("askLoud")
+                t.askWake = o.optBoolean("askWake")
+                t.lastAskAt = o.optLong("lastAskAt")
             } catch (e: Exception) {
                 Log.w(TAG, "stay parse failed", e)
             }
         }
     }
+}
+
+object Wake {
+    const val GAP_MS = 20_000L
+
+    fun scanDue(now: Long, lastRequestAt: Long, idle: Boolean) = !idle && now - lastRequestAt >= GAP_MS
+
+    fun settled(before: Mode, after: Mode) = before == Mode.MOVING && (after == Mode.SETTLING || after == Mode.STILL)
 }
 
 object Highlight {
@@ -490,8 +529,11 @@ object Demo {
 object Footer {
     const val Y = 190f / Rings.REF
 
-    fun line(postHm: String, ok: Boolean, queue: Int, paused: Boolean = false) =
-        if (paused) "pausiert" else "${postHm.ifEmpty { "-" }} · ${if (ok) "OK" else "ERR"} · Q$queue"
+    fun line(postHm: String, ok: Boolean, queue: Int, paused: Boolean = false, fresh: String = "", rejected: Int = 0) =
+        if (paused) "pausiert" else "${postHm.ifEmpty { "-" }} · ${if (ok) "OK" else "ERR"} · Q$queue" +
+            (if (fresh.isNotEmpty() && fresh != "-") " · S$fresh" else "") + (if (rejected > 0) " · R$rejected" else "")
+
+    fun fresh(ts: Long): String = if (ts <= 0L) "-" else SimpleDateFormat("HH:mm", Locale.US).format(Date(ts))
 
     fun hm(stamp: String): String = stamp.take(5)
 
@@ -805,6 +847,12 @@ class Store(private val ctx: Context) {
     var labels404: Long
         get() = sp.getLong("labels404", 0L)
         set(v) = sp.edit().putLong("labels404", v).apply()
+    var lastFreshAt: Long
+        get() = sp.getLong("lastFreshAt", 0L)
+        set(v) = sp.edit().putLong("lastFreshAt", v).apply()
+    var rejected: Int
+        get() = sp.getInt("rejected", 0)
+        set(v) = sp.edit().putInt("rejected", v).apply()
     var lastPromptAlertAt: Long
         get() = sp.getLong("lastPromptAlertAt", 0L)
         set(v) = sp.edit().putLong("lastPromptAlertAt", v).apply()

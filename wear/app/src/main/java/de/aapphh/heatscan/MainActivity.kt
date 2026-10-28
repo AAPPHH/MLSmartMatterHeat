@@ -110,7 +110,7 @@ class MainActivity : ComponentActivity() {
                         }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,
-                        Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused)
+                        Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected)
                     )
                 }
             }
