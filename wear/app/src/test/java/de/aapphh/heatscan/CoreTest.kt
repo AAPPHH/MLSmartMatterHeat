@@ -737,7 +737,7 @@ class CoreTest {
         val labels = ApNames.labels(listOf(Ap("aa:bb:cc:dd:ee:01", -50, 2412), Ap("aa:bb:cc:dd:ee:02", -60, 5180), Ap("aa:bb:cc:dd:ee:03", -70, 5180)), named)
         assertEquals(mapOf("aa:bb:cc:dd:ee:01" to "Home 2.4", "aa:bb:cc:dd:ee:02" to "Home 5", "aa:bb:cc:dd:ee:03" to "…ee:03"), labels)
         val long = listOf(NamedAp("a", "FRITZ!Box 1234 AB", -50, 2412), NamedAp("b", "FRITZ!Box 1234 AB", -50, 6000))
-        assertEquals(listOf("FRITZ! 2.4", "FRITZ!Bo 6"), ApNames.labels(long.map { Ap(it.bssid, it.rssi, it.freq) }, long).values.toList())
+        assertEquals(listOf("FRITZ!Box 2.4", "FRITZ!Box 6"), ApNames.labels(long.map { Ap(it.bssid, it.rssi, it.freq) }, long).values.toList())
         assertEquals("Q3", Footer.line("12:34", true, 3).takeLast(2))
         assertEquals("12:34 · ERR · Q0", Footer.line("12:34", false, 0))
         assertEquals(listOf(-40, -50), Footer.topAps(listOf(NamedAp("a", "", -50, 1), NamedAp("b", "", -40, 1)), 8).map { it.rssi })

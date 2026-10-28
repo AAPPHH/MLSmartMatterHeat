@@ -139,7 +139,7 @@ object ColorBook {
 }
 
 object ApNames {
-    private const val MAX = 10
+    private const val MAX = 13
 
     private fun band(freq: Int) = when {
         freq >= 5925 -> " 6"
@@ -156,7 +156,7 @@ object ApNames {
         return aps.associate { ap ->
             val n = names.getValue(ap.bssid)
             val suffix = if (n in dup) band(ap.freq) else ""
-            ap.bssid to n.take(max - suffix.length) + suffix
+            ap.bssid to n.substringBefore(' ').ifEmpty { n }.take(max - 4) + suffix
         }
     }
 }
