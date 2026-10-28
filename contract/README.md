@@ -24,6 +24,10 @@ Berechnung per Okklusion, modellunabhängig: pro BSSID des Scans aus dem Vokabul
 
 Batch für gepufferte Scans: `{"scans": [...]}`, Elemente wie bei `/api/scan` (`batch_example.json`). Antwort `200` mit `{"stored": <aps gesamt>, "accepted": <anzahl scans>, "duplicates": <anzahl wiederholter ids>, "room": <raum der Vorhersage mit dem größten ts im Batch oder null>}`. Die Reihenfolge der Elemente ist beliebig.
 
+## `POST /api/label`
+
+Nachträgliches Etikettieren (`label_example.json`): `{"device": <string>, "from": <epoch ms>, "to": <epoch ms>, "label": <string>}`. `label` muss `^[a-z_]{1,32}$` entsprechen, `from <= to` und `to - from <= 3600000`, sonst `400` mit `{"error": ...}`. heatd setzt `scans.label = label` für alle Zeilen des Geräts mit `ts` in `[from, to]` (beide Grenzen inklusive, `ts` wie bei `/api/scan` als Millisekunden nach TIMESTAMP gewandelt). Überschreiben ist gewollt: die letzte Korrektur gewinnt. Antwort `200` mit `{"labelled": <anzahl verschiedener scan_id>}`; idempotent. Raum-IDs der Uhr bleiben `kueche`, `wohnzimmer`, `flur`, `bad`, `schlafzimmer`.
+
 ## Präsenz
 
 Jeder Scan und Heartbeat schreibt eine Zeile in `device_state`. Vorhersagen tragen den Scan-`ts` (nicht die Eingangszeit), spät hochgeladene Scans werden also nie "frisch". Der belegte Raum ist die Vorhersage mit dem größten `ts` des Geräts und gilt, solange (i) der jüngste `device_state` (größter `ts`) `motion = still` meldet und der letzte Kontakt (`received_at`) jünger als `still_contact_timeout_minutes` (180) ist oder (ii) die Vorhersage jünger als `presence_timeout_minutes` (30) ist. Ist `power` `saver`/`offbody` oder der Kontakt älter als `still_contact_timeout_minutes`, ist die Präsenz unbekannt: Zeitplan ohne Boost, kein Eco. Eco gilt nur, wenn der jüngste Zustand `away = true` meldet.
