@@ -388,7 +388,7 @@ class ScanService : Service() {
 
     private fun send(server: String, path: String, body: String, net: Network?): Int = try {
         val reply = Poster.send(server, path, body, net)
-        if (reply.code in 200..299) Poster.room(reply.text).let { if (it.isNotEmpty()) lastRoom = it }
+        if (reply.code in 200..299) Poster.room(reply.text).let { if (it.isNotEmpty()) lastRoom = it; if (it in Defaults.ROOMS && store.guess != it) store.guess = it }
         reply.code
     } catch (e: Exception) {
         lastException = e.javaClass.simpleName

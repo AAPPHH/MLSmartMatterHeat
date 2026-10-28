@@ -13,6 +13,9 @@ import androidx.wear.tiles.RequestBuilders
 import androidx.wear.tiles.TileBuilders
 import androidx.wear.tiles.TileService
 import com.google.common.util.concurrent.ListenableFuture
+import android.graphics.Color
+import kotlin.math.cos
+import kotlin.math.sin
 
 class HeatTileService : TileService() {
     override fun onTileEnterEvent(requestParams: EventBuilders.TileEnterEvent) {
@@ -26,23 +29,9 @@ class HeatTileService : TileService() {
             store.nonce = store.nonce + 1
             store.setLabelQuietly(Labels.toggle(store.label, clicked))
         }
-        val label = store.label
-        val nonce = store.nonce
-        val layout = LayoutElementBuilders.Column.Builder()
-            .setHorizontalAlignment(LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER)
-            .addContent(row(Defaults.ROOMS.take(2), label, nonce))
-            .addContent(spacer(6f))
-            .addContent(row(Defaults.ROOMS.drop(2), label, nonce))
-            .addContent(spacer(6f))
-            .addContent(
-                LayoutElementBuilders.Text.Builder()
-                    .setText(TileClick.statusLine(store.running, store.mode, store.status))
-                    .setMaxLines(2)
-                    .setModifiers(ModifiersBuilders.Modifiers.Builder().setClickable(startClick()).build())
-                    .setFontStyle(LayoutElementBuilders.FontStyle.Builder().setSize(DimensionBuilders.sp(10f)).build())
-                    .build()
-            )
-            .build()
+        val (hot, confirmed) = Highlight.of(store.label, store.guess)
+        val dp = requestParams.deviceConfiguration.let { minOf(it.screenWidthDp, it.screenHeightDp).toFloat() }.takeIf { it > 0f } ?: Quarters.REF
+        val layout = layout(dp, hot, confirmed, store.nonce)
         val tile = TileBuilders.Tile.Builder()
             .setResourcesVersion(RES_VERSION)
             .setFreshnessIntervalMillis(60_000)
@@ -65,62 +54,116 @@ class HeatTileService : TileService() {
             it.set(res.build())
         }
 
-    private fun startClick() = ModifiersBuilders.Clickable.Builder()
-        .setId("start")
-        .setOnClick(
-            ActionBuilders.LaunchAction.Builder()
-                .setAndroidActivity(ActionBuilders.AndroidActivity.Builder().setPackageName(packageName).setClassName(StartActivity::class.java.name).build())
-                .build()
-        )
-        .build()
-
-    private fun row(rooms: List<String>, label: String?, nonce: Long): LayoutElementBuilders.Row {
-        val row = LayoutElementBuilders.Row.Builder().setVerticalAlignment(LayoutElementBuilders.VERTICAL_ALIGN_CENTER)
-        rooms.forEachIndexed { i, room ->
-            if (i > 0) row.addContent(spacer(6f, true))
-            row.addContent(button(room, room == label, nonce))
+    private fun layout(d: Float, hot: String?, confirmed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
+        val k = d / Quarters.REF
+        val inner = Quarters.INNER * d
+        val box = LayoutElementBuilders.Box.Builder().setWidth(dp(d)).setHeight(dp(d))
+        Quarters.WEDGES.forEach { box.addContent(wedge(it, d, inner, it == hot, confirmed, nonce)) }
+        box.addContent(centre(Quarters.CENTER_R * d * 2f, Quarters.CENTER == hot, confirmed, nonce))
+        (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
+            val a = Math.toRadians(Quarters.mid(room) - 90.0)
+            val r = if (room == Quarters.CENTER) 0f else Quarters.LABEL_R * d
+            box.addContent(label(room, d, (r * cos(a)).toFloat(), (r * sin(a)).toFloat(), room == hot, k))
         }
-        return row.build()
+        return box.build()
     }
 
-    private fun button(room: String, selected: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
-        val click = ModifiersBuilders.Clickable.Builder()
-            .setId(TileClick.id(room, nonce))
-            .setOnClick(ActionBuilders.LoadAction.Builder().build())
+    private fun click(room: String, nonce: Long) = ModifiersBuilders.Clickable.Builder()
+        .setId(TileClick.id(room, nonce))
+        .setOnClick(ActionBuilders.LoadAction.Builder().build())
+        .build()
+
+    private fun arc(room: String, size: Float, thickness: Float, length: Float, color: Int, nonce: Long): LayoutElementBuilders.LayoutElement =
+        LayoutElementBuilders.Box.Builder().setWidth(dp(size)).setHeight(dp(size))
+            .addContent(
+                LayoutElementBuilders.Arc.Builder()
+                    .setAnchorAngle(DimensionBuilders.degrees(Quarters.mid(room)))
+                    .setAnchorType(LayoutElementBuilders.ARC_ANCHOR_CENTER)
+                    .addContent(
+                        LayoutElementBuilders.ArcLine.Builder()
+                            .setLength(DimensionBuilders.degrees(length))
+                            .setThickness(dp(thickness))
+                            .setColor(ColorBuilders.argb(color))
+                            .setModifiers(ModifiersBuilders.ArcModifiers.Builder().setClickable(click(room, nonce)).build())
+                            .build()
+                    )
+                    .build()
+            )
             .build()
+
+    private fun wedge(room: String, d: Float, inner: Float, selected: Boolean, confirmed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
+        val midR = (d / 2f + inner) / 2f
+        val length = Quarters.SPAN - Math.toDegrees((Quarters.GAP / midR).toDouble()).toFloat()
+        val fill = if (selected) SELECTED else IDLE
+        val box = LayoutElementBuilders.Box.Builder().setWidth(dp(d)).setHeight(dp(d))
+        if (selected && confirmed) {
+            val ring = 3f
+            val rd = d - 2 * ring
+            val ringDeg = Math.toDegrees((ring / midR).toDouble()).toFloat()
+            box.addContent(arc(room, d, d / 2f - inner, length, Color.WHITE, nonce))
+            box.addContent(arc(room, rd, rd / 2f - inner - ring, length - 2 * ringDeg, fill, nonce))
+        } else box.addContent(arc(room, d, d / 2f - inner, length, fill, nonce))
+        return box.build()
+    }
+
+    private fun centre(size: Float, selected: Boolean, confirmed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
         val mods = ModifiersBuilders.Modifiers.Builder()
-            .setClickable(click)
+            .setClickable(click(Quarters.CENTER, nonce))
             .setBackground(
                 ModifiersBuilders.Background.Builder()
                     .setColor(ColorBuilders.argb(if (selected) SELECTED else IDLE))
-                    .setCorner(ModifiersBuilders.Corner.Builder().setRadius(DimensionBuilders.dp(BUTTON / 2)).build())
+                    .setCorner(ModifiersBuilders.Corner.Builder().setRadius(dp(size / 2f)).build())
+                    .build()
+            )
+        if (selected && confirmed) mods.setBorder(ModifiersBuilders.Border.Builder().setWidth(dp(3f)).setColor(ColorBuilders.argb(Color.WHITE)).build())
+        return LayoutElementBuilders.Box.Builder().setWidth(dp(size)).setHeight(dp(size)).setModifiers(mods.build()).build()
+    }
+
+    private fun label(room: String, d: Float, dx: Float, dy: Float, selected: Boolean, k: Float): LayoutElementBuilders.LayoutElement {
+        val centre = room == Quarters.CENTER
+        val ink = if (selected) INK else Color.WHITE
+        val icon = (if (centre) 28f else 24f)
+        val text = LayoutElementBuilders.Text.Builder()
+            .setText(Defaults.CAPTIONS.getValue(room))
+            .setMaxLines(1)
+            .setFontStyle(
+                LayoutElementBuilders.FontStyle.Builder()
+                    .setSize(DimensionBuilders.sp(if (centre) 11f else 10f))
+                    .setColor(ColorBuilders.argb(ink))
                     .build()
             )
             .build()
+        val image = LayoutElementBuilders.Image.Builder()
+            .setResourceId(room)
+            .setWidth(dp(icon))
+            .setHeight(dp(icon))
+            .setColorFilter(LayoutElementBuilders.ColorFilter.Builder().setTint(ColorBuilders.argb(ink)).build())
+            .build()
+        val pad = ModifiersBuilders.Padding.Builder()
+            .setStart(dp(maxOf(0f, 2 * dx))).setEnd(dp(maxOf(0f, -2 * dx)))
+            .setTop(dp(maxOf(0f, 2 * dy))).setBottom(dp(maxOf(0f, -2 * dy)))
+            .build()
         return LayoutElementBuilders.Box.Builder()
-            .setWidth(DimensionBuilders.dp(BUTTON))
-            .setHeight(DimensionBuilders.dp(BUTTON))
+            .setWidth(dp(d)).setHeight(dp(d))
             .setHorizontalAlignment(LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER)
             .setVerticalAlignment(LayoutElementBuilders.VERTICAL_ALIGN_CENTER)
-            .setModifiers(mods)
+            .setModifiers(ModifiersBuilders.Modifiers.Builder().setPadding(pad).build())
             .addContent(
-                LayoutElementBuilders.Image.Builder()
-                    .setResourceId(room)
-                    .setWidth(DimensionBuilders.dp(24f))
-                    .setHeight(DimensionBuilders.dp(24f))
+                LayoutElementBuilders.Column.Builder()
+                    .setHorizontalAlignment(LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER)
+                    .addContent(image)
+                    .addContent(text)
                     .build()
             )
             .build()
     }
 
-    private fun spacer(size: Float, horizontal: Boolean = false) = LayoutElementBuilders.Spacer.Builder()
-        .also { if (horizontal) it.setWidth(DimensionBuilders.dp(size)) else it.setHeight(DimensionBuilders.dp(size)) }
-        .build()
+    private fun dp(v: Float) = DimensionBuilders.dp(v)
 
     companion object {
-        private const val RES_VERSION = "2"
-        private const val BUTTON = 44f
+        private const val RES_VERSION = "3"
         private const val SELECTED = 0xFFE8710A.toInt()
         private const val IDLE = 0xFF2A2A2A.toInt()
+        private const val INK = 0xFF111111.toInt()
     }
 }

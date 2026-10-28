@@ -32,6 +32,29 @@ object Labels {
     fun toggle(current: String?, tapped: String): String? = if (current == tapped) null else tapped
 }
 
+object Highlight {
+    fun of(label: String?, guess: String?): Pair<String?, Boolean> = if (label != null) Pair(label, true) else Pair(guess, false)
+}
+
+object Quarters {
+    val WEDGES = listOf("schlafzimmer", "bad", "kueche", "flur")
+    const val CENTER = "wohnzimmer"
+    const val REF = 213f
+    const val INNER = 46f / REF
+    const val CENTER_R = 42f / REF
+    const val LABEL_R = 77f / REF
+    const val GAP = 3f
+    const val SPAN = 90f
+
+    fun mid(room: String): Float = WEDGES.indexOf(room) * SPAN
+
+    fun room(dx: Float, dy: Float, d: Float): String {
+        if (kotlin.math.hypot(dx, dy) < CENTER_R * d) return CENTER
+        val deg = Math.toDegrees(kotlin.math.atan2(dx.toDouble(), -dy.toDouble())).toFloat()
+        return WEDGES[(((deg + SPAN / 2 + 360f) % 360f) / SPAN).toInt() % WEDGES.size]
+    }
+}
+
 object Home {
     fun parse(csv: String): List<String> = csv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
 
@@ -294,6 +317,9 @@ class Store(private val ctx: Context) {
     var label: String?
         get() = sp.getString("label", null)?.takeIf { it in Defaults.ROOMS }
         set(v) = put("label", v)
+    var guess: String?
+        get() = sp.getString("guess", null)?.takeIf { it in Defaults.ROOMS }
+        set(v) = put("guess", v)
     var status: String
         get() = sp.getString("status", "-") ?: "-"
         set(v) = put("status", v)
@@ -345,7 +371,7 @@ class Store(private val ctx: Context) {
 
     private fun put(key: String, v: String?) {
         sp.edit().putString(key, v).apply()
-        if (key == "label" || key == "status" || key == "mode" || key == "lastPost") refreshTile()
+        if (key == "label" || key == "guess" || key == "status" || key == "mode" || key == "lastPost") refreshTile()
     }
 
     private fun refreshTile() {
