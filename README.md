@@ -83,7 +83,7 @@ cp deploy/docker/.env.example deploy/docker/.env                          # HEAT
 
 Das Thread-Dataset entsteht auf dem PC: `heatd thread form|dataset COMx` läuft dort (serielle Verbindung zum Border Router) und schreibt `secrets/thread_dataset.hex`; die Datei wird nur ins `secrets/` des Minix kopiert (siehe `scp` oben). Auf dem Minix wird dafür keine serielle Verbindung gebraucht.
 
-Image bauen, empfohlen auf dem PC und zum Minix schicken (schneller, schont den Minix-RAM; der chip-tool-Build braucht viel RAM und Zeit):
+Kurzweg: `bash deploy/docker/minix-up.sh` (Port 8090, Mock-Controller bis zum Commissioning) kopiert Konfiguration, Daten und Dataset und startet den Container. Sonst manuell: Image bauen, empfohlen auf dem PC und zum Minix schicken (schneller, schont den Minix-RAM; der chip-tool-Build braucht viel RAM und Zeit):
 
 ```bash
 docker build -t heatd:local -f deploy/docker/Dockerfile .                 # im Repo-Root auf dem PC, Architektur muss zum Minix passen (x86-64)
@@ -173,7 +173,7 @@ sh wear/build.sh                                         # Tests + signierte Rel
 adb connect <uhr-ip>:<port> && adb install -r wear/app/build/outputs/apk/release/app-release.apk
 ```
 
-Die APK liegt auch im GitHub-Release. In der App erlaubst du **genauen Standort** (für WLAN-Scans) und **Geräte in der Nähe / LAN-Zugriff** (Android 17, sonst erreicht die Uhr den Minix nicht). Dann prüfst du die Server-URL (`http://192.168.178.29:8080`), tippst auf Start und fügst die Kachel **HeatScan** hinzu. Die Statuszeile meldet Probleme direkt, etwa „Standort aus“, „WLAN aus“ oder „LAN-Zugriff fehlt“.
+Die APK liegt auch im GitHub-Release. In der App erlaubst du **genauen Standort** (für WLAN-Scans) und **Geräte in der Nähe / LAN-Zugriff** (Android 17, sonst erreicht die Uhr den Minix nicht). Dann prüfst du die Server-URL (`http://192.168.178.29:8090`; auf dem Minix belegt gluetun 8080), tippst auf Start und fügst die Kachel **HeatScan** hinzu. Die Statuszeile meldet Probleme direkt, etwa „Standort aus“, „WLAN aus“ oder „LAN-Zugriff fehlt“.
 
 **Training:**
 1. In jedem Raum ein paar Mal 10–20 min verbringen und vorher auf der Uhr den Raum antippen; danach „kein Label“.
