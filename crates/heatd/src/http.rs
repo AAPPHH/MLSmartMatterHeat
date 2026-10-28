@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::infer::RoomModel;
+use crate::infer::{Explanation, RoomModel};
 use crate::storage::{now_ms, BatchBody, ScanBody, Storage};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -61,6 +61,20 @@ struct Outcome {
     stored: usize,
     duplicate: bool,
     room: Option<(String, i64)>,
+    explanation: Explanation,
+}
+
+fn attribution(out: Option<&Outcome>) -> Value {
+    match out.and_then(|o| o.room.as_ref().map(|r| (o, &r.0))) {
+        Some((o, label)) => json!({"probability": o.explanation.probability(label), "rooms": o.explanation.rooms, "aps": o.explanation.aps}),
+        None => json!({"probability": null, "rooms": [], "aps": []}),
+    }
+}
+
+fn merge(response: &mut Value, extra: Value) {
+    for (k, v) in extra.as_object().unwrap() {
+        response[k] = v.clone();
+    }
 }
 
 fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, ApiError> {
@@ -70,17 +84,20 @@ fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, A
         body.ts = received;
     }
     let mut room = None;
+    let mut explanation = Explanation::default();
     if let Some(model) = state.model.as_ref().filter(|_| !body.aps.is_empty()) {
         room = Some(model.predict(&body.aps)?);
+        explanation = model.explain(&body.aps)?;
     }
     let prediction = room.as_ref().map(|(label, probability)| (label.as_str(), *probability));
     let done = state.storage.ingest(&body, received, prediction)?;
-    Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)) })
+    Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)), explanation })
 }
 
 async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiResult {
     let out = ingest(&state, &body, now_ms())?;
-    let mut response = json!({"stored": out.stored, "room": out.room.map(|r| r.0)});
+    let mut response = json!({"stored": out.stored, "room": out.room.as_ref().map(|r| r.0.clone())});
+    merge(&mut response, attribution(Some(&out)));
     if out.duplicate {
         response["duplicate"] = json!(true);
     }
@@ -90,16 +107,18 @@ async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiR
 async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> ApiResult {
     let received = now_ms();
     let (mut stored, mut duplicates) = (0, 0);
-    let mut latest: Option<(String, i64)> = None;
+    let mut latest: Option<Outcome> = None;
     for scan in &body.scans {
         let out = ingest(&state, scan, received)?;
         stored += out.stored;
         duplicates += usize::from(out.duplicate);
-        if let Some(room) = out.room.filter(|r| latest.as_ref().is_none_or(|l| r.1 >= l.1)) {
-            latest = Some(room);
+        if out.room.as_ref().is_some_and(|r| latest.as_ref().and_then(|l| l.room.as_ref()).is_none_or(|l| r.1 >= l.1)) {
+            latest = Some(out);
         }
     }
-    Ok(Json(json!({"stored": stored, "accepted": body.scans.len(), "duplicates": duplicates, "room": latest.map(|r| r.0)})))
+    let mut response = json!({"stored": stored, "accepted": body.scans.len(), "duplicates": duplicates, "room": latest.as_ref().and_then(|o| o.room.as_ref().map(|r| r.0.clone()))});
+    merge(&mut response, attribution(latest.as_ref()));
+    Ok(Json(response))
 }
 
 async fn api_state(State(state): State<AppState>) -> ApiResult {
@@ -193,6 +212,16 @@ mod tests {
     }
 
     async fn call(state: &AppState, method: &str, uri: &str, body: Option<String>) -> (StatusCode, Value) {
+        let (status, mut value) = call_raw(state, method, uri, body).await;
+        if let Some(map) = value.as_object_mut() {
+            for key in ["probability", "rooms", "aps"].into_iter().filter(|_| uri.starts_with("/api/scan")) {
+                map.remove(key);
+            }
+        }
+        (status, value)
+    }
+
+    async fn call_raw(state: &AppState, method: &str, uri: &str, body: Option<String>) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(method)
             .uri(uri)
@@ -294,6 +323,29 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(Path::new(snap["path"].as_str().unwrap()).exists());
         assert_eq!(call(&h.state, "GET", "/health", None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn scan_reply_carries_attribution() {
+        let h = harness(true);
+        let (_, body) = call_raw(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        assert!(body["probability"].as_f64().unwrap() > 0.9);
+        let rooms = body["rooms"].as_array().unwrap();
+        assert_eq!(rooms.len(), 3);
+        assert_eq!(rooms[0]["room"], "wohnzimmer");
+        let sum: f64 = rooms[0]["parts"].as_array().unwrap().iter().map(|p| p["share"].as_f64().unwrap()).sum();
+        assert!((sum - rooms[0]["p"].as_f64().unwrap()).abs() < 1e-6);
+        let aps: Vec<&str> = body["aps"].as_array().unwrap().iter().map(|a| a["bssid"].as_str().unwrap()).collect();
+        assert_eq!(aps[0], "aa:bb:cc:00:00:01");
+        assert!(!aps.contains(&"aa:bb:cc:00:00:99"));
+        let (_, batch) = call_raw(&h.state, "POST", "/api/scans", Some(fixture("batch_example.json"))).await;
+        assert_eq!(batch["rooms"].as_array().unwrap().len(), 3);
+        assert!(!batch["aps"].as_array().unwrap().is_empty());
+        let (_, heartbeat) = call_raw(&h.state, "POST", "/api/scan", Some(fixture("heartbeat_example.json"))).await;
+        assert_eq!((heartbeat["probability"].clone(), heartbeat["rooms"].clone(), heartbeat["aps"].clone()), (Value::Null, json!([]), json!([])));
+        let bare = harness(false);
+        let (_, none) = call_raw(&bare.state, "POST", "/api/scan", Some(scan_body())).await;
+        assert_eq!((none["probability"].clone(), none["rooms"].clone(), none["aps"].clone()), (Value::Null, json!([]), json!([])));
     }
 
     #[tokio::test]

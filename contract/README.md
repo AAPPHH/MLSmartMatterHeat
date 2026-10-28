@@ -14,6 +14,12 @@ Optionales Feld `id` (String) bei Scans und Heartbeats, einzeln und im Batch: ei
 
 Liegt `ts` mehr als 5 Minuten nach der Eingangszeit (Uhrenabweichung), setzt heatd `ts` auf `received_at` und protokolliert es.
 
+### Zuordnung der Schätzung (Attribution)
+
+Antworten von `/api/scan` und `/api/scans` tragen zusätzlich (für den Scan, der den gemeldeten `room` lieferte; alte Felder unverändert): `probability` (Wahrscheinlichkeit des gemeldeten Raums oder `null`), `rooms` (alle Labels, nach `p` absteigend: `{"room", "p", "parts": [{"bssid", "share"}]}`) und `aps` (`{"bssid", "rssi", "freq"}` für jede in `parts` genannte BSSID, nach Gesamtanteil über alle Räume absteigend). Ohne Modell, bei leerem Scan oder Heartbeat: `null`, `[]`, `[]`.
+
+Berechnung per Okklusion, modellunabhängig: pro BSSID des Scans aus dem Vokabular wird das Modell ohne diese BSSID erneut ausgeführt (ein gebündelter ONNX-Lauf); `drop_c = max(0, full_c - without_c)`. Pro Raum `c` sind `parts` die BSSIDs mit `drop_c > 0`, `share = full_c * drop_c / sum(drop_c)`, die Anteile summieren sich also zu `p`. Ist die Summe 0, ist `parts` leer (die ganze Wahrscheinlichkeit ist unerklärt).
+
 ## `POST /api/scans`
 
 Batch für gepufferte Scans: `{"scans": [...]}`, Elemente wie bei `/api/scan` (`batch_example.json`). Antwort `200` mit `{"stored": <aps gesamt>, "accepted": <anzahl scans>, "duplicates": <anzahl wiederholter ids>, "room": <raum der Vorhersage mit dem größten ts im Batch oder null>}`. Die Reihenfolge der Elemente ist beliebig.

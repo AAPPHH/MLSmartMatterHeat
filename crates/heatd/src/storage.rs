@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS ingest_ids (device VARCHAR, id VARCHAR, PRIMARY KEY (
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS id VARCHAR;
 ";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AccessPoint {
     pub bssid: String,
     pub rssi: i32,
