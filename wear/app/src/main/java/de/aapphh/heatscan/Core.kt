@@ -61,7 +61,7 @@ data class RoomP(val room: String, val p: Float, val parts: List<Part>)
 
 data class NamedAp(val bssid: String, val ssid: String, val rssi: Int, val freq: Int)
 
-class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>)
+class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true)
 
 object ReplyJson {
     private fun <T> list(text: String?, f: (JSONObject) -> T): List<T> = try {
@@ -99,9 +99,43 @@ object ReplyJson {
         val o = JSONObject(text)
         Reply(
             if (o.isNull("probability")) null else o.optDouble("probability").toFloat().takeIf { !it.isNaN() },
-            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString())
+            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms")
         )
-    } catch (e: Exception) { Reply(null, emptyList(), emptyList()) }
+    } catch (e: Exception) { Reply(null, emptyList(), emptyList(), false) }
+
+    fun postedAps(body: String): Boolean = try {
+        val o = JSONObject(body)
+        val last = o.optJSONArray("scans")?.let { if (it.length() > 0) it.getJSONObject(it.length() - 1) else null } ?: o
+        (last.optJSONArray("aps")?.length() ?: 0) > 0
+    } catch (e: Exception) { false }
+
+    fun keeps(r: Reply, postedAps: Boolean): Boolean = !r.hasRooms || postedAps
+}
+
+data class Slot(val color: Int, val used: Long)
+
+object ColorBook {
+    val PALETTE = listOf(0xFFE8710A.toInt(), 0xFF6CB4FF.toInt(), 0xFFF5C542.toInt(), 0xFFB48CFF.toInt(), 0xFF4DD0B5.toInt(), 0xFFF28BB4.toInt())
+    val OTHER = 0xFF5A5A5A.toInt()
+
+    fun assign(current: Map<String, Slot>, used: List<String>, now: Long): Map<String, Slot> {
+        val book = LinkedHashMap(current.filterValues { it.color in PALETTE })
+        used.filter { it in book }.forEach { book[it] = book.getValue(it).copy(used = now) }
+        used.filter { it !in book }.forEach { b ->
+            val taken = book.values.map { it.color }.toSet()
+            val color = PALETTE.firstOrNull { it !in taken } ?: book.entries.filter { it.key !in used }
+                .minWith(compareBy<Map.Entry<String, Slot>> { it.value.used }.thenBy { it.key }).also { book.remove(it.key) }.value.color
+            book[b] = Slot(color, now)
+        }
+        return book
+    }
+
+    fun json(book: Map<String, Slot>): String = JSONObject().also { o -> book.forEach { (b, s) -> o.put(b, JSONArray().put(s.color).put(s.used)) } }.toString()
+
+    fun parse(text: String?): Map<String, Slot> = try {
+        val o = JSONObject(text ?: "{}")
+        o.keys().asSequence().associateWith { o.getJSONArray(it).let { a -> Slot(a.getInt(0), a.getLong(1)) } }.filterValues { it.color in PALETTE }
+    } catch (e: Exception) { emptyMap() }
 }
 
 object ApNames {
@@ -134,20 +168,20 @@ object Rings {
     const val MARGIN = 8f / REF
     const val START = 135f
     const val SWEEP = 270f
-    const val TOP_COLOURS = 4
+    const val TOP_COLOURS = 6
+    const val LEGEND_MAX = 4
+    const val MAX_RINGS = 5
     const val LABEL_DX = 4f / REF
-    const val LEGEND_X = -28f / REF
-    const val LEGEND_Y = 54f / REF
+    const val LEGEND_X = -26f / REF
+    const val LEGEND_Y = 57f / REF
     const val LEGEND_PITCH = 10f / REF
-    val PALETTE = listOf(0xFFE8710A.toInt(), 0xFF6CB4FF.toInt(), 0xFFF5C542.toInt(), 0xFFB48CFF.toInt())
-    val OTHER = 0xFF5A5A5A.toInt()
     val REST = 0xFF3A3A3A.toInt()
     val CAPTIONS = mapOf("wohnzimmer" to "Wo", "schlafzimmer" to "Sch", "bad" to "Bad", "kueche" to "Kü", "flur" to "Fl")
 
     class Seg(val sweep: Float, val color: Int)
 
     fun order(rooms: List<RoomP>): List<RoomP> =
-        if (rooms.isEmpty()) Defaults.ROOMS.map { RoomP(it, 0f, emptyList()) } else rooms.sortedByDescending { it.p }
+        if (rooms.isEmpty()) Defaults.ROOMS.map { RoomP(it, 0f, emptyList()) } else rooms.sortedByDescending { it.p }.take(MAX_RINGS)
 
     fun radius(i: Int, d: Float): Float = d / 2f - (MARGIN + i * (STROKE + GAP)) * d
 
@@ -159,7 +193,7 @@ object Rings {
         rooms.flatMap { it.parts }.groupBy { it.bssid }.mapValues { e -> e.value.sumOf { it.share.toDouble() } }
             .entries.sortedWith(compareByDescending<Map.Entry<String, Double>> { it.value }.thenBy { it.key }).take(TOP_COLOURS).map { it.key }
 
-    fun segments(room: RoomP, palette: List<String>): List<Seg> {
+    fun segments(room: RoomP, colors: Map<String, Slot>): List<Seg> {
         val fill = room.p.coerceIn(0f, 1f)
         val out = ArrayList<Seg>()
         var used = 0f
@@ -170,15 +204,18 @@ object Rings {
                 used += s
             }
         }
-        palette.forEachIndexed { i, b -> add(room.parts.filter { it.bssid == b }.sumOf { it.share.toDouble() }.toFloat(), PALETTE[i]) }
-        add(room.parts.filter { it.bssid !in palette }.sumOf { it.share.toDouble() }.toFloat(), OTHER)
+        ColorBook.PALETTE.forEach { c ->
+            colors.filterValues { it.color == c }.keys.firstOrNull()?.let { b -> add(room.parts.filter { it.bssid == b }.sumOf { it.share.toDouble() }.toFloat(), c) }
+        }
+        add(room.parts.filter { it.bssid !in colors }.sumOf { it.share.toDouble() }.toFloat(), ColorBook.OTHER)
         add(fill - used, REST)
         return out
     }
 }
 
 object Footer {
-    fun line(postHm: String, ok: Boolean, queue: Int) = "${postHm.ifEmpty { "-" }} · ${if (ok) "OK" else "ERR"} · Q$queue"
+    fun line(postHm: String, ok: Boolean, queue: Int, paused: Boolean = false) =
+        if (paused) "pausiert" else "${postHm.ifEmpty { "-" }} · ${if (ok) "OK" else "ERR"} · Q$queue"
 
     fun hm(stamp: String): String = stamp.take(5)
 
@@ -510,10 +547,18 @@ class Store(private val ctx: Context) {
         get() = sp.getBoolean("postOk", true)
         set(v) = sp.edit().putBoolean("postOk", v).apply()
 
-    fun setReply(r: Reply) = sp.edit().also {
-        if (r.probability == null) it.remove("probability") else it.putFloat("probability", r.probability)
-        it.putString("rooms", ReplyJson.roomsJson(r.rooms)).putString("replyAps", ReplyJson.apsJson(r.aps))
-    }.apply()
+    var colors: Map<String, Slot>
+        get() = ColorBook.parse(sp.getString("colors", null))
+        set(v) = sp.edit().putString("colors", ColorBook.json(v)).apply()
+
+    fun setReply(r: Reply, postedAps: Boolean = true, now: Long = System.currentTimeMillis()) {
+        if (!ReplyJson.keeps(r, postedAps)) return
+        sp.edit().also {
+            if (r.probability == null) it.remove("probability") else it.putFloat("probability", r.probability)
+            it.putString("rooms", ReplyJson.roomsJson(r.rooms)).putString("replyAps", ReplyJson.apsJson(r.aps))
+            it.putString("colors", ColorBook.json(ColorBook.assign(colors, Rings.palette(Rings.order(r.rooms)), now)))
+        }.apply()
+    }
 
     fun setLastAps(aps: List<NamedAp>) = sp.edit().putString("lastAps", ReplyJson.namedJson(Footer.topAps(aps))).apply()
 

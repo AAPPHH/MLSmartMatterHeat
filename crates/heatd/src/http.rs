@@ -87,7 +87,10 @@ fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, A
     let mut explanation = Explanation::default();
     if let Some(model) = state.model.as_ref().filter(|_| !body.aps.is_empty()) {
         room = Some(model.predict(&body.aps)?);
-        explanation = model.explain(&body.aps)?;
+        explanation = model.explain(&body.aps).unwrap_or_else(|e| {
+            eprintln!("explain failed for {}: {e}", body.device);
+            Explanation::default()
+        });
     }
     let prediction = room.as_ref().map(|(label, probability)| (label.as_str(), *probability));
     let done = state.storage.ingest(&body, received, prediction)?;

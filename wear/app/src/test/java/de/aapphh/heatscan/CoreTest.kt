@@ -667,21 +667,66 @@ class CoreTest {
     fun segmentsAndColours() {
         val rooms = ReplyJson.parse(replyText).rooms
         val palette = Rings.palette(rooms)
-        assertEquals(listOf("aa:01", "aa:02", "aa:03", "aa:04"), palette)
-        val wohn = Rings.segments(rooms.first { it.room == "wohnzimmer" }, palette)
-        assertEquals(listOf(Rings.PALETTE[0], Rings.PALETTE[1], Rings.PALETTE[2], Rings.PALETTE[3], Rings.OTHER, Rings.REST), wohn.map { it.color })
+        assertEquals(listOf("aa:01", "aa:02", "aa:03", "aa:04", "aa:05", "aa:06"), palette)
+        val colors = ColorBook.assign(emptyMap(), palette, 1L)
+        val pal = ColorBook.PALETTE
+        val wohn = Rings.segments(rooms.first { it.room == "wohnzimmer" }, colors)
+        assertEquals(pal + Rings.REST, wohn.map { it.color })
         assertEquals(0.4f * 270f, wohn[0].sweep, 1e-3f)
-        assertEquals(0.03f * 270f, wohn[4].sweep, 1e-3f)
-        assertEquals(0.02f * 270f, wohn[5].sweep, 1e-3f)
         assertEquals(0.8f * 270f, wohn.sumOf { it.sweep.toDouble() }.toFloat(), 1e-2f)
-        val bad = Rings.segments(rooms.first { it.room == "bad" }, palette)
-        assertEquals(listOf(Rings.PALETTE[0]), bad.map { it.color })
+        val bad = Rings.segments(rooms.first { it.room == "bad" }, colors)
+        assertEquals(listOf(pal[0]), bad.map { it.color })
         assertEquals(0.1f * 270f, bad[0].sweep, 1e-3f)
-        val unexplained = Rings.segments(RoomP("flur", 0.3f, emptyList()), palette)
+        val few = ColorBook.assign(emptyMap(), listOf("aa:01"), 1L)
+        val other = Rings.segments(rooms.first { it.room == "wohnzimmer" }, few)
+        assertEquals(listOf(pal[0], ColorBook.OTHER, Rings.REST), other.map { it.color })
+        val unexplained = Rings.segments(RoomP("flur", 0.3f, emptyList()), colors)
         assertEquals(listOf(Rings.REST), unexplained.map { it.color })
         assertEquals(81f, unexplained[0].sweep, 1e-3f)
-        assertTrue(Rings.segments(RoomP("flur", 0f, emptyList()), palette).isEmpty())
-        assertEquals(0.5f * 270f, Rings.segments(RoomP("flur", 0.5f, listOf(Part("aa:01", 0.9f))), listOf("aa:01")).sumOf { it.sweep.toDouble() }.toFloat(), 1e-2f)
+        assertTrue(Rings.segments(RoomP("flur", 0f, emptyList()), colors).isEmpty())
+        assertEquals(0.5f * 270f, Rings.segments(RoomP("flur", 0.5f, listOf(Part("aa:01", 0.9f))), few).sumOf { it.sweep.toDouble() }.toFloat(), 1e-2f)
+    }
+
+    @Test
+    fun colorBookIsStableAndEvictsLeastRecentlyUsed() {
+        val first = ColorBook.assign(emptyMap(), listOf("a", "b", "c"), 10L)
+        assertEquals(3, first.values.map { it.color }.toSet().size)
+        val reordered = ColorBook.assign(first, listOf("c", "a", "b", "d"), 20L)
+        listOf("a", "b", "c").forEach { assertEquals(first.getValue(it).color, reordered.getValue(it).color) }
+        assertEquals(20L, reordered.getValue("a").used)
+        val full = ColorBook.assign(reordered, listOf("e", "f"), 30L)
+        assertEquals(6, full.size)
+        val touched = ColorBook.assign(full, listOf("a", "d", "e", "f", "b", "g"), 40L)
+        assertTrue("c" !in touched)
+        assertEquals(full.getValue("c").color, touched.getValue("g").color)
+        assertEquals(6, touched.values.map { it.color }.toSet().size)
+        assertEquals(touched, ColorBook.parse(ColorBook.json(touched)))
+        assertTrue(ColorBook.parse("junk").isEmpty())
+        val churn = (1..40).fold(emptyMap<String, Slot>()) { b, i -> ColorBook.assign(b, listOf("x$i", "x${i + 1}", "x${i + 2}", "x${i % 7}", "x${i % 5}", "x${i % 3}").distinct(), i.toLong()) }
+        assertTrue(churn.size <= 6 && churn.values.map { it.color }.toSet().size == churn.size)
+    }
+
+    @Test
+    fun heartbeatKeepsDataSheet() {
+        val data = ReplyJson.parse(replyText)
+        val beat = ReplyJson.parse("""{"stored":1,"room":null,"probability":null,"rooms":[],"aps":[]}""")
+        val old = ReplyJson.parse("""{"stored":4,"room":"wohnzimmer"}""")
+        assertTrue(ReplyJson.keeps(data, true))
+        assertTrue(!ReplyJson.keeps(beat, false))
+        assertTrue(ReplyJson.keeps(beat, true))
+        assertTrue(ReplyJson.keeps(old, false))
+        assertTrue(ReplyJson.postedAps("""{"ts":1,"aps":[{"bssid":"a","rssi":-1,"freq":1}]}"""))
+        assertTrue(!ReplyJson.postedAps("""{"ts":1,"aps":[]}"""))
+        assertTrue(!ReplyJson.postedAps("""{"scans":[{"aps":[{"bssid":"a"}]},{"aps":[]}]}"""))
+        assertTrue(ReplyJson.postedAps("""{"scans":[{"aps":[]},{"aps":[{"bssid":"a"}]}]}"""))
+        assertEquals("pausiert", Footer.line("12:34", true, 3, true))
+    }
+
+    @Test
+    fun ringsAreCappedAtFive() {
+        val many = (1..8).map { RoomP("r$it", it / 10f, emptyList()) }
+        assertEquals(5, Rings.order(many).size)
+        assertEquals("r8", Rings.order(many)[0].room)
     }
 
     @Test
@@ -719,10 +764,26 @@ class CoreTest {
                 }
                 return true
             }
-            for (i in 0 until 4) {
+            for (i in 0 until Rings.LEGEND_MAX) {
                 val y = (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
                 val x = Rings.LEGEND_X * d
                 assertTrue("legend $i at $d", clear(x - 3f, x + 6f + 16 * 4.3f, y - 4.5f, y + 4.5f))
+            }
+            val legend = (0 until Rings.LEGEND_MAX).map { i ->
+                val y = (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
+                val x = Rings.LEGEND_X * d
+                floatArrayOf(x - 2.5f, y - 4.5f, x + 6f + 16 * 4.3f, y + 4.5f)
+            }
+            for (i in 0 until Rings.MAX_RINGS) {
+                val a = Math.toRadians(Rings.START.toDouble())
+                val lr = Rings.radius(i, d)
+                val lx = lr * kotlin.math.cos(a).toFloat() + Rings.LABEL_DX * d
+                val ly = lr * kotlin.math.sin(a).toFloat()
+                val label = floatArrayOf(lx, ly - 3.5f, lx + 3f * 4.3f, ly + 3.5f)
+                legend.forEach { l ->
+                    val apart = l[0] - label[2] >= 2f || label[0] - l[2] >= 2f || l[1] - label[3] >= 2f || label[1] - l[3] >= 2f
+                    assertTrue("legend vs label $i at $d", apart)
+                }
             }
             for (i in 0 until 5) {
                 val a = Math.toRadians(Rings.START.toDouble())

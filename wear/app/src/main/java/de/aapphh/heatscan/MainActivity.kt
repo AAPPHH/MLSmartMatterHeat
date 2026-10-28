@@ -157,9 +157,10 @@ class MainActivity : ComponentActivity() {
         val stored = store.rooms
         val rooms = Rings.order(stored)
         val palette = Rings.palette(rooms)
+        val colors = store.colors
         val named = store.lastAps
         val replyAps = store.replyAps
-        val legend = palette.mapNotNull { b -> replyAps.firstOrNull { it.bssid == b } ?: named.firstOrNull { it.bssid == b }?.let { Ap(it.bssid, it.rssi, it.freq) } }
+        val legend = palette.take(Rings.LEGEND_MAX).mapNotNull { b -> replyAps.firstOrNull { it.bssid == b } ?: named.firstOrNull { it.bssid == b }?.let { Ap(it.bssid, it.rssi, it.freq) } }
         val names = ApNames.labels(legend, named)
         val top = Footer.topAps(named, 4).map { Ap(it.bssid, it.rssi, it.freq) }
         val topNames = ApNames.labels(top, named, 9)
@@ -180,12 +181,12 @@ class MainActivity : ComponentActivity() {
                     val box = Size(2f * r, 2f * r)
                     drawArc(TRACK, Rings.START, Rings.SWEEP, false, topLeft, box, style = Stroke(stroke))
                     var at = Rings.START
-                    Rings.segments(room, palette).forEach { seg ->
+                    Rings.segments(room, colors).forEach { seg ->
                         drawArc(Color(seg.color), at, seg.sweep, false, topLeft, box, style = Stroke(stroke, cap = StrokeCap.Butt))
                         at += seg.sweep
                     }
                     val a = Math.toRadians(Rings.START.toDouble())
-                    paint.color = (if (i == 0) Color.White else CAPTION).toArgb()
+                    paint.color = (if (i == 0 && stored.isNotEmpty()) Color.White else CAPTION).toArgb()
                     drawIntoCanvas {
                         it.nativeCanvas.drawText(Rings.caption(room.room), c.x + r * cos(a).toFloat() + Rings.LABEL_DX * d, c.y + r * sin(a).toFloat() + mid, paint)
                     }
@@ -193,7 +194,7 @@ class MainActivity : ComponentActivity() {
                 legend.forEachIndexed { i, ap ->
                     val y = c.y + (Rings.LEGEND_Y + i * Rings.LEGEND_PITCH) * d
                     val x = c.x + Rings.LEGEND_X * d
-                    drawCircle(Color(Rings.PALETTE[i]), 2.5.dp.toPx(), Offset(x, y))
+                    drawCircle(Color(colors[ap.bssid]?.color ?: ColorBook.OTHER), 2.5.dp.toPx(), Offset(x, y))
                     paint.color = LEGEND.toArgb()
                     drawIntoCanvas { it.nativeCanvas.drawText("${names.getValue(ap.bssid)} ${ap.rssi}", x + 6.dp.toPx(), y + mid, paint) }
                 }
@@ -206,7 +207,7 @@ class MainActivity : ComponentActivity() {
                     Text("kein Modell", fontSize = 12.sp, color = CAPTION, maxLines = 1)
                     top.forEach { Text("${topNames.getValue(it.bssid)} ${it.rssi}", fontSize = 8.sp, color = CAPTION, maxLines = 1) }
                 }
-                Text(Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size), fontSize = 8.sp, color = CAPTION, maxLines = 1)
+                Text(Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused), fontSize = 8.sp, color = CAPTION, maxLines = 1)
             }
         }
     }

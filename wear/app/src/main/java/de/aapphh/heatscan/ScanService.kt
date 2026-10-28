@@ -393,7 +393,7 @@ class ScanService : Service() {
 
     private fun send(server: String, path: String, body: String, net: Network?): Int = try {
         val reply = Poster.send(server, path, body, net)
-        if (reply.code in 200..299) store.setReply(ReplyJson.parse(reply.text))
+        if (reply.code in 200..299) store.setReply(ReplyJson.parse(reply.text), ReplyJson.postedAps(body))
         if (reply.code in 200..299) Poster.room(reply.text).let { if (it.isNotEmpty()) lastRoom = it; (if (it in Defaults.ROOMS) it else null).let { g -> if (store.guess != g) store.guess = g } }
         reply.code
     } catch (e: Exception) {
