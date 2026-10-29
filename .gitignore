@@ -29,3 +29,4 @@ wear/keystore.properties
 /heatd.toml
 /chip-storage/
 /deploy/docker/.env
+/paa/
