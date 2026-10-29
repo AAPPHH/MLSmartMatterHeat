@@ -8,6 +8,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -82,6 +84,7 @@ class MainActivity : ComponentActivity() {
         ScanStarter.start(this, "permissions")
     }
     private val prompt get() = intent.getBooleanExtra("prompt", false)
+    private val learnPrompt get() = prompt && intent.getBooleanExtra("learn", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -125,6 +128,12 @@ class MainActivity : ComponentActivity() {
         val view = tapped?.let { Tap.view(state, it, until, now) }
         val kind = view?.kind
         val haptic = LocalHapticFeedback.current
+        val learning = version.let { store.learnAt != 0L }
+        val progress = version.let { store.progress }
+        val learnView = Learn.view(learning, progress)
+        LaunchedEffect(version, tapped) {
+            if (learnPrompt && tapped == null && store.learnPromptAt == 0L) finish()
+        }
         LaunchedEffect(locked, tapped) {
             while (locked || tapped != null) {
                 now = System.currentTimeMillis()
@@ -149,12 +158,12 @@ class MainActivity : ComponentActivity() {
         }
         Box(Modifier.fillMaxSize()) {
             val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
-            (hint ?: Prompt.title(intent.getBooleanExtra("change", false)).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
+            (hint ?: Prompt.title(intent.getBooleanExtra("change", false), learnPrompt).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 key(version) {
                     if (page == 0) {
                         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
-                        RoomsPage(hot, ringed, locked) {
+                        RoomsPage(hot, ringed, locked, learnView) {
                             if (!Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
                                 LabelRecorder.measure(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
                                 tapped = it
@@ -165,6 +174,14 @@ class MainActivity : ComponentActivity() {
                         Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected), store.match
                     )
                 }
+            }
+            if (!prompt && view == null && pager.currentPage == 0) {
+                Text(
+                    Learn.chip(learning, progress),
+                    Modifier.align(Alignment.TopCenter).padding(top = 2.dp).clip(RoundedCornerShape(50)).background(if (learning) SELECTED else IDLE)
+                        .clickable { ScanService.instance?.setLearning(!learning) }.padding(horizontal = 10.dp, vertical = 2.dp),
+                    fontSize = 9.sp, maxLines = 1, color = if (learning) INK else Color.White
+                )
             }
             view?.let {
                 Column(Modifier.fillMaxSize().background(TapColors.of(it.kind)).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
@@ -182,7 +199,8 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, onTap: (String) -> Unit) {
+    val fill = { room: String -> if (room == hot) SELECTED else when (learn?.tones?.get(room)) { RoomTone.LOW -> LOW; RoomTone.DONE -> DONE; else -> IDLE } }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val dDp = minOf(maxWidth, maxHeight)
         Canvas(
@@ -207,7 +225,7 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, o
                     arcTo(Rect(c, inner), start + Quarters.SPAN, -Quarters.SPAN, false)
                     close()
                 }
-                drawPath(path, if (room == hot) SELECTED else IDLE)
+                drawPath(path, fill(room))
                 if (room == ringed) clipPath(path) { drawPath(path, Color.White, style = Stroke(ring)) }
             }
             repeat(4) {
@@ -216,7 +234,7 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, o
                 drawLine(Color.Black, c + u * (inner - 1f), c + u * (outer + 1f), gap)
             }
             val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
-            drawPath(centre, if (Quarters.CENTER == hot) SELECTED else IDLE)
+            drawPath(centre, fill(Quarters.CENTER))
             if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
             val pillTopLeft = Offset(c.x - Quarters.NONE_HALF_W * d, c.y + Quarters.NONE_TOP * d)
             val pillSize = Size(2f * Quarters.NONE_HALF_W * d, Quarters.NONE_H * d)
@@ -234,13 +252,15 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, o
             val isCenter = room == Quarters.CENTER
             val a = Math.toRadians(Quarters.mid(room) - 90.0)
             val r = if (isCenter) 0f else Quarters.labelR(room) * dDp.value
-            val ink = if (room == hot) INK else if (locked) CAPTION else Color.White
+            val dim = locked || learn?.tones?.get(room) == RoomTone.DONE
+            val ink = if (room == hot) INK else if (dim) CAPTION else Color.White
             Column(
                 Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink)
                 Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, maxLines = 1, color = ink)
+                learn?.badges?.get(room)?.let { Text(it, fontSize = 9.sp, lineHeight = 9.sp, maxLines = 1, color = ink) }
             }
         }
     }
@@ -309,6 +329,8 @@ internal fun DataPage(stored: List<RoomP>, colors: Map<String, Slot>, named: Lis
 
 private val SELECTED = Color(0xFFE8710A)
 private val IDLE = Color(0xFF2A2A2A)
+private val LOW = Color(0xFF5A3A12)
+private val DONE = Color(0xFF181818)
 private val INK = Color(0xFF111111)
 private val TRACK = Color(0xFF262626)
 private val CAPTION = Color(0xFFA8A8A8)
