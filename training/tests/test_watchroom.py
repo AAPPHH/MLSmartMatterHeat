@@ -227,3 +227,54 @@ def test_xgb_trains_on_single_day(config, tmp_path):
     bundle = Trainer(cfg).fit(scans, [])
     assert bundle["kind"] == "xgb" and bundle["metrics"]["cv_macro_f1"]["xgb"] > 0
     export(bundle, cfg, tmp_path, "s1", {})
+
+
+def room_scans(rooms, n=30):
+    from heattrain.watchroom import Scan
+    rng = np.random.default_rng(2)
+    return [Scan(1e9 + i * 60 + j * 5000, "d", {"aa": b + rng.normal(0, 2), "bb": -60.0 + rng.normal(0, 2)}, r, "rest")
+            for j, (r, b) in enumerate(zip(rooms, (-40.0, -80.0, -65.0))) for i in range(n)]
+
+
+def small_cfg(config):
+    return {**config, "min_sender_scans": 1, "min_sender_days": 1, "min_room_scans": 5, "min_state_scans": 10 ** 6}
+
+
+@pytest.mark.parametrize("rooms", [["a", "b"], ["a", "b", "c"]])
+def test_xgb_onnx_parity_for_room_counts(config, tmp_path, rooms):
+    from heattrain.watchroom import Trainer, export, full_proba
+    cfg = small_cfg(config)
+    bundle = Trainer(cfg).fit(room_scans(rooms), [])
+    out = export(bundle, cfg, tmp_path, "p", {})
+    meta = json.loads((out / "model.json").read_text())
+    assert meta["classifier"] == "xgb" and meta["rooms"] == rooms
+    got = ort.InferenceSession(str(out / meta["states"]["all"])).run(None, {"x": bundle["X"]})[0]
+    assert np.abs(got - full_proba(bundle["models"]["all"], bundle["X"], len(rooms))).max() < 1e-5
+
+
+def test_room_without_rows_after_filtering_is_dropped(config, tmp_path):
+    from heattrain.watchroom import Trainer, export
+    scans = room_scans(["a", "b", "c"])
+    for s in scans:
+        if s.room == "c":
+            s.state = "offbody"
+    cfg = small_cfg(config)
+    bundle = Trainer(cfg).fit(scans, [])
+    assert bundle["rooms"] == ["a", "b"]
+    export(bundle, cfg, tmp_path, "d", {})
+
+
+def test_single_room_raises_value_error(config):
+    from heattrain.watchroom import Trainer
+    with pytest.raises(ValueError, match="at least 2 rooms"):
+        Trainer(small_cfg(config)).fit(room_scans(["a"]), [])
+
+
+@pytest.mark.parametrize("rooms", [["a", "b"], ["a", "b", "c"]])
+def test_train_produces_model_dir(config, tmp_path, monkeypatch, rooms):
+    scans = room_scans(rooms)
+    for i, s in enumerate(scans):
+        s.ts += (i % 3) * 86400
+    monkeypatch.setattr("heattrain.watchroom.load_scans", lambda *a: (scans, []))
+    meta = json.loads((train(small_cfg(config), tmp_path, tmp_path / "m", version="t") / "model.json").read_text())
+    assert meta["classifier"] == "xgb" and meta["feature_version"] == 2 and meta["rooms"] == rooms

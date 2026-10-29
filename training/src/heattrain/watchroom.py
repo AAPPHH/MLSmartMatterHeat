@@ -236,7 +236,7 @@ class Trainer:
     def make(self, kind, y):
         c = self.cfg
         if kind == "xgb":
-            return XGBClassifier(objective="multi:softprob", n_estimators=c["xgb_trees"], max_depth=c["xgb_depth"], learning_rate=c["xgb_lr"], min_child_weight=1,
+            return XGBClassifier(objective="binary:logistic" if len(np.unique(y)) == 2 else "multi:softprob", n_estimators=c["xgb_trees"], max_depth=c["xgb_depth"], learning_rate=c["xgb_lr"], min_child_weight=1,
                                  subsample=0.8, colsample_bytree=0.8, random_state=c["seed"], n_jobs=1)
         base = {"knn": lambda: KNeighborsClassifier(c["knn_k"]), "svm": lambda: SVC(C=c["svm_c"], gamma=c["svm_gamma"], class_weight="balanced"),
                 "gb": lambda: GradientBoostingClassifier(n_estimators=c["gb_trees"], max_depth=c["gb_depth"], random_state=c["seed"])}[kind]()
@@ -248,7 +248,8 @@ class Trainer:
         if kind != "xgb":
             return model.fit(X, y)
         classes = np.unique(y)
-        model.set_params(num_class=len(classes))
+        if len(classes) > 2:
+            model.set_params(num_class=len(classes))
         model.fit(X, np.searchsorted(classes, y), sample_weight=compute_sample_weight("balanced", y))
         return model if len(classes) == k else Dense(model, classes)
 
@@ -283,17 +284,23 @@ class Trainer:
                     best = (key, float(round(tau, 2)), float(round(delta, 2)), m)
         return best[1], best[2], best[3]
 
+    def kept_rooms(self, scans):
+        counts = Counter(s.room for s in scans)
+        rooms = sorted(r for r, n in counts.items() if n >= self.cfg["min_room_scans"])
+        if len(rooms) < 2:
+            raise ValueError(f"need at least 2 rooms with {self.cfg['min_room_scans']} labelled scans, got {dict(counts)}")
+        return rooms
+
     def fit(self, scans, links):
         c = self.cfg
-        labelled = [s for s in scans if s.room]
-        counts = Counter(s.room for s in labelled)
-        rooms = sorted(r for r, n in counts.items() if n >= c["min_room_scans"])
-        if len(rooms) < 2:
-            raise ValueError(f"need at least 2 rooms with {c['min_room_scans']} labelled scans, got {dict(counts)}")
-        labelled = [s for s in labelled if s.room in rooms and s.state not in NO_TEMPLATE]
+        labelled = [s for s in scans if s.room and s.state not in NO_TEMPLATE]
+        rooms = self.kept_rooms(labelled)
+        labelled = [s for s in labelled if s.room in rooms]
         senders = vocabulary(labelled, c)
         spec = feature_spec(c, senders, labelled)
         keep = [s for s in labelled if any(b in s.aps for b in senders)]
+        rooms = self.kept_rooms(keep)
+        keep = [s for s in keep if s.room in rooms]
         X = np.stack([features(spec, s.hist or [s.aps]) for s in keep])
         y = np.array([rooms.index(s.room) for s in keep])
         days = np.array([day_of(s) for s in keep])
@@ -376,10 +383,13 @@ def train(cfg, data_root, models_dir, version=None):
     metrics = {}
     tr, ho = split_days(scans, cfg["holdout_frac"])
     if any(s.room for s in tr) and any(s.room for s in ho):
-        metrics["holdout"] = holdout(cfg, tr, ho, links)
-        metrics["holdout"]["days"] = sorted({datetime.fromtimestamp(s.ts, timezone.utc).date().isoformat() for s in ho})
-        if cfg.get("feature_version", 2) > 1:
-            metrics["holdout"]["v1"] = holdout({**cfg, "feature_version": 1}, tr, ho, links)
+        try:
+            metrics["holdout"] = holdout(cfg, tr, ho, links)
+            metrics["holdout"]["days"] = sorted({datetime.fromtimestamp(s.ts, timezone.utc).date().isoformat() for s in ho})
+            if cfg.get("feature_version", 2) > 1:
+                metrics["holdout"]["v1"] = holdout({**cfg, "feature_version": 1}, tr, ho, links)
+        except ValueError:
+            metrics.pop("holdout", None)
     bundle = trainer.fit(scans, links)
     metrics.update(bundle["metrics"])
     out = export(bundle, cfg, models_dir, version, metrics)
