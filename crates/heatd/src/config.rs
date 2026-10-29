@@ -101,11 +101,66 @@ impl Blackout {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Room {
     pub name: String,
+    #[serde(default)]
     pub nodes: Vec<u64>,
     #[serde(default)]
     pub schedules: Vec<Schedule>,
     #[serde(default)]
     pub exploration: Exploration,
+    #[serde(default)]
+    pub exterior: Vec<String>,
+}
+
+pub const NEIGHBOUR_KINDS: [&str; 4] = ["unknown", "wall", "ceiling", "open"];
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawNeighbour {
+    Pair([String; 2]),
+    Link {
+        a: String,
+        b: String,
+        #[serde(default = "unknown_kind")]
+        kind: String,
+        #[serde(default)]
+        partial: bool,
+    },
+}
+
+fn unknown_kind() -> String {
+    "unknown".into()
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(from = "RawNeighbour")]
+pub struct Neighbour {
+    pub a: String,
+    pub b: String,
+    pub kind: String,
+    pub partial: bool,
+}
+
+impl From<RawNeighbour> for Neighbour {
+    fn from(raw: RawNeighbour) -> Self {
+        match raw {
+            RawNeighbour::Pair([a, b]) => Self { a, b, kind: unknown_kind(), partial: false },
+            RawNeighbour::Link { a, b, kind, partial } => Self { a, b, kind, partial },
+        }
+    }
+}
+
+impl Neighbour {
+    #[cfg(test)]
+    pub fn pair(a: &str, b: &str) -> Self {
+        Self { a: a.into(), b: b.into(), kind: unknown_kind(), partial: false }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Building {
+    pub floor: Option<i32>,
+    pub roof_rooms: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,11 +169,15 @@ pub struct HeatSource {
     pub kind: String,
     pub operating_hours: Option<String>,
     pub night_shutdown: Option<String>,
+    pub scope: Option<String>,
+    pub efficiency_class: Option<String>,
+    pub flow_temp_controllable: Option<bool>,
+    pub night_setback_controllable: Option<bool>,
 }
 
 impl Default for HeatSource {
     fn default() -> Self {
-        Self { kind: "unknown".into(), operating_hours: None, night_shutdown: None }
+        Self { kind: "unknown".into(), operating_hours: None, night_shutdown: None, scope: None, efficiency_class: None, flow_temp_controllable: None, night_setback_controllable: None }
     }
 }
 
@@ -148,8 +207,11 @@ pub struct Config {
     pub longitude: Option<f64>,
     pub weather_url: String,
     pub ntp_server: String,
-    pub neighbours: Vec<[String; 2]>,
+    pub neighbours: Vec<Neighbour>,
     pub heat_source: HeatSource,
+    pub building: Building,
+    pub manual_hold_minutes: f64,
+    pub poll_silence_s: u64,
 }
 
 impl Default for Config {
@@ -180,6 +242,9 @@ impl Default for Config {
             ntp_server: "pool.ntp.org".into(),
             neighbours: Vec::new(),
             heat_source: HeatSource::default(),
+            building: Building::default(),
+            manual_hold_minutes: 120.0,
+            poll_silence_s: 300,
         }
     }
 }
@@ -204,10 +269,17 @@ impl Config {
                 blackout.minutes()?;
             }
         }
-        for pair in &config.neighbours {
-            if let Some(unknown) = pair.iter().find(|r| !config.rooms.iter().any(|room| &room.name == *r)) {
+        let known = |name: &String| config.rooms.iter().any(|room| &room.name == name);
+        for link in &config.neighbours {
+            if let Some(unknown) = [&link.a, &link.b].into_iter().find(|r| !known(r)) {
                 return Err(anyhow!("neighbours: unknown room {unknown}"));
             }
+            if !NEIGHBOUR_KINDS.contains(&link.kind.as_str()) {
+                return Err(anyhow!("neighbours: unknown kind {} (expected {})", link.kind, NEIGHBOUR_KINDS.join(", ")));
+            }
+        }
+        if let Some(unknown) = config.building.roof_rooms.iter().find(|r| !known(r)) {
+            return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
         Ok(config)
     }

@@ -1085,6 +1085,17 @@ mod tests {
         assert!(err.contains("boom") && err.contains("exited with") && !err.contains('\x1b'), "{err}");
     }
 
+    #[tokio::test]
+    async fn inventory_keeps_raw_output_when_chip_tool_exits_non_zero() {
+        let binary = if cfg!(windows) { "cmd" } else { "sh" };
+        let script = if cfg!(windows) { "echo [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0001 DataVersion: 1 & echo [TOO]   VendorName: \"X\" & exit 3" } else { "printf '[TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0001 DataVersion: 1\n[TOO]   VendorName: \"X\"\n'; exit 3" };
+        let flag = if cfg!(windows) { "/C" } else { "-c" };
+        let out = run_lenient(binary, &[flag.to_string(), script.to_string()], 10).await.unwrap();
+        assert!(out.failure().unwrap().contains("exited with") && out.combined().contains("VendorName"), "{out:?}");
+        let inventory = Inventory::from_raw(5, out.combined(), String::new());
+        assert_eq!(inventory.attributes.len(), 1);
+    }
+
     #[test]
     fn storage_lock_is_exclusive() {
         let dir = std::env::temp_dir().join(format!("heatd-lock-test-{}", std::process::id()));

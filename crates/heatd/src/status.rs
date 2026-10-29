@@ -93,6 +93,10 @@ impl Status {
         self.0.lock().unwrap().last_roll = Some((ts_us, ok));
     }
 
+    pub fn last_report_us(&self, node: u64) -> Option<i64> {
+        self.0.lock().unwrap().nodes.get(&node).and_then(|n| n.last_report_us)
+    }
+
     #[cfg(test)]
     pub fn node(&self, node: u64) -> Option<NodeStatus> {
         self.0.lock().unwrap().nodes.get(&node).cloned()

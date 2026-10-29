@@ -244,6 +244,9 @@ async fn controller_command(config: Config, args: &[String]) -> Result<()> {
             println!("{state:#?}");
         }
         [cmd, node] if cmd == "inventory" => {
+            if config.controller == ControllerKind::Mock {
+                bail!("inventory needs controller = \"chip-tool\", the config says mock");
+            }
             let (path, inventory) = inventory::capture(controller.as_ref(), Path::new(&config.inventory_dir), node.parse()?).await?;
             println!("{} attributes, {} events, {} warnings", inventory.attributes.len(), inventory.events.len(), inventory.errors.len());
             println!("{}", path.display());

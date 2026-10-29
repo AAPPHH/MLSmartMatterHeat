@@ -3,7 +3,7 @@ use crate::inventory;
 use crate::lake::{self, kind, AttributeReport, Event};
 use crate::status::SubState;
 use crate::storage::Reading;
-use matter_controller::{CaptureItem, RawAttribute, RawEvent};
+use matter_controller::{CaptureItem, RawAttribute, RawEvent, SOURCE_POLL, SOURCE_SUBSCRIPTION};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -72,7 +72,7 @@ pub enum Out {
     Attribute(AttributeReport),
     Event(Event),
     Firmware { label: String, complete: bool, changed: bool },
-    Core { endpoint: u16, name: &'static str, value: f64 },
+    Core { endpoint: u16, name: &'static str, value: f64, poll: bool },
 }
 
 pub struct NodeCapture {
@@ -102,12 +102,16 @@ impl NodeCapture {
         let mut out = Vec::new();
         match item {
             CaptureItem::Attribute(a) => {
-                self.up(&mut out, now, "report");
+                if a.source == SOURCE_SUBSCRIPTION {
+                    self.up(&mut out, now, "report");
+                }
                 self.attribute(a, now, &mut out);
                 self.last_us = now;
             }
             CaptureItem::Event(e) => {
-                self.up(&mut out, now, "report");
+                if e.source == SOURCE_SUBSCRIPTION {
+                    self.up(&mut out, now, "report");
+                }
                 self.event(e, now, &mut out);
                 self.last_us = now;
             }
@@ -162,7 +166,7 @@ impl NodeCapture {
         }
         if let Some((name, value)) = a.core() {
             self.latest.update(self.node, name, value, now / 1000);
-            out.push(Out::Core { endpoint: a.endpoint, name, value });
+            out.push(Out::Core { endpoint: a.endpoint, name, value, poll: a.source == SOURCE_POLL });
         }
         out.push(Out::Attribute(AttributeReport {
             ts: now,
@@ -254,7 +258,9 @@ fn apply(state: &AppState, node: u64, busy: &Arc<AtomicBool>, timing: Timing, ou
     match out {
         Out::Attribute(row) => {
             state.status.node_report(node, row.ts);
-            state.status.subscription(node, SubState::Subscribed, row.ts);
+            if row.source == SOURCE_SUBSCRIPTION {
+                state.status.subscription(node, SubState::Subscribed, row.ts);
+            }
             log_error(state.sink.append(row));
         }
         Out::Event(row) => {
@@ -265,7 +271,7 @@ fn apply(state: &AppState, node: u64, busy: &Arc<AtomicBool>, timing: Timing, ou
             }
             log_error(state.sink.append(row));
         }
-        Out::Core { endpoint, name, value } => crate::rules::on_report(state, &matter_controller::AttributeReport { node, endpoint, attribute: name.into(), value }, crate::storage::now_ms()),
+        Out::Core { endpoint, name, value, poll } => crate::rules::on_report(state, &matter_controller::AttributeReport { node, endpoint, attribute: name.into(), value }, poll, crate::storage::now_ms()),
         Out::Firmware { label, complete, changed } => {
             if changed || (complete && !inventory::exists(&PathBuf::from(&state.config.inventory_dir), node, &label)) {
                 start_inventory(state, node, busy, timing);
@@ -295,9 +301,11 @@ async fn capture_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing:
 
 async fn poll_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing: Timing) {
     let mut failures = 0u32;
+    let silence_us = state.config.poll_silence_s as i64 * 1_000_000;
     loop {
         sleep(poll_delay(timing.poll, failures)).await;
-        if busy.load(Ordering::SeqCst) {
+        let silent = state.status.last_report_us(node).is_none_or(|t| lake::now_us() - t >= silence_us);
+        if busy.load(Ordering::SeqCst) || !silent {
             continue;
         }
         match state.controller.poll(node).await {
@@ -426,7 +434,8 @@ mod tests {
     }
 
     fn state(dir: &std::path::Path, mock: Arc<MockController>) -> AppState {
-        let toml = format!("inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_str().unwrap().replace('\\', "/"));
+        let toml = format!("poll_silence_s = 0
+inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_str().unwrap().replace('\\', "/"));
         let config = Config::parse(&toml).unwrap();
         AppState {
             storage: Arc::new(Storage::open(dir.join("state.duckdb").to_str().unwrap()).unwrap()),

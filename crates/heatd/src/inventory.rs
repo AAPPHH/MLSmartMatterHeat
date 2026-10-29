@@ -51,13 +51,18 @@ pub fn latest_firmware(dir: &Path, node: u64) -> Option<String> {
     newest.max().map(|(_, fw)| fw)
 }
 
-pub fn write_report(dir: &Path, inventory: &Inventory, generated: &str) -> Result<PathBuf> {
-    let fw = firmware(inventory);
-    let stem = stem(inventory.node, &fw);
+fn write_raw(dir: &Path, stem: &str, inventory: &Inventory) -> Result<()> {
     let raw = dir.join("raw");
     std::fs::create_dir_all(&raw).with_context(|| format!("create {}", raw.display()))?;
     std::fs::write(raw.join(format!("{stem}.attributes.log")), &inventory.raw_attributes)?;
     std::fs::write(raw.join(format!("{stem}.events.log")), &inventory.raw_events)?;
+    Ok(())
+}
+
+pub fn write_report(dir: &Path, inventory: &Inventory, generated: &str) -> Result<PathBuf> {
+    let fw = firmware(inventory);
+    let stem = stem(inventory.node, &fw);
+    write_raw(dir, &stem, inventory)?;
     let mut json = serde_json::to_value(inventory)?;
     json["fw"] = Value::String(fw);
     json["generated"] = Value::String(generated.to_string());
@@ -69,6 +74,12 @@ pub fn write_report(dir: &Path, inventory: &Inventory, generated: &str) -> Resul
 
 pub async fn capture(controller: &dyn MatterController, dir: &Path, node: u64) -> Result<(PathBuf, Inventory)> {
     let inventory = controller.inventory(node).await?;
+    if inventory.attributes.is_empty() {
+        let stem = format!("{}_failed_{}", inventory.node, chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+        write_raw(dir, &stem, &inventory)?;
+        let reason = inventory.errors.first().map_or("no error line", String::as_str);
+        anyhow::bail!("no attributes parsed from chip-tool output (raw logs saved as raw/{stem}.*): {reason}");
+    }
     let path = write_report(dir, &inventory, &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))?;
     Ok((path, inventory))
 }

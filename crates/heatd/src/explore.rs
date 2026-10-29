@@ -194,7 +194,7 @@ impl Explorer {
                 setpoint,
                 base,
                 start: now,
-                end: now + Duration::minutes(i64::from(plan.minutes)),
+                end: (plan.start + Duration::minutes(i64::from(plan.minutes))).max(now),
             };
             self.active.insert(room.name.clone(), experiment.clone());
             out.push(Lifecycle::Started(experiment));

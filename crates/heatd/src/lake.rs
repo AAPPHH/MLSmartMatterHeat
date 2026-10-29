@@ -771,6 +771,15 @@ impl Sink {
         self.flush_where(|_| true)
     }
 
+    pub fn flush_table(&self, table: Table) -> Result<usize> {
+        let mut st = self.state.lock().unwrap();
+        let keys: Vec<_> = st.buffers.keys().filter(|k| k.0 == table).copied().collect();
+        for key in &keys {
+            self.flush_key(&mut st, *key)?;
+        }
+        Ok(keys.len())
+    }
+
     pub fn close(&self) -> Result<()> {
         self.flush()?;
         let mut st = self.state.lock().unwrap();

@@ -12,6 +12,57 @@ use std::time::Duration;
 
 pub const MIN_CHANGE_C: f64 = 0.5;
 pub const MANUAL_TOLERANCE_C: f64 = 0.05;
+const DESIRED_EPS_C: f64 = 0.01;
+const GRACE_FACTOR: i64 = 2;
+
+#[derive(Debug, Clone)]
+pub struct Sent {
+    pub target: f64,
+    pub previous: Option<f64>,
+    pub written_ms: i64,
+    pub acked: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Hold {
+    pub value: f64,
+    pub since_ms: i64,
+    pub desired: f64,
+}
+
+#[derive(Debug, Default)]
+pub struct Commands {
+    sent: HashMap<u64, Sent>,
+    device: HashMap<u64, f64>,
+    desired: HashMap<u64, f64>,
+    holds: HashMap<u64, Hold>,
+}
+
+impl Commands {
+    pub fn target(&self, node: u64) -> Option<f64> {
+        self.sent.get(&node).map(|s| s.target)
+    }
+
+    pub fn holding(&self, nodes: &[u64]) -> bool {
+        nodes.iter().any(|n| self.holds.contains_key(n))
+    }
+
+    pub fn hold(&self, node: u64) -> Option<&Hold> {
+        self.holds.get(&node)
+    }
+
+    fn release_due(&mut self, want: &Desired, now_ms: i64, hold_ms: i64) -> bool {
+        self.desired.insert(want.node, want.setpoint);
+        let Some(hold) = self.holds.get(&want.node) else { return true };
+        if now_ms - hold.since_ms < hold_ms && (want.setpoint - hold.desired).abs() < DESIRED_EPS_C {
+            return false;
+        }
+        if let Some(hold) = self.holds.remove(&want.node) {
+            self.sent.insert(want.node, Sent { target: hold.value, previous: None, written_ms: 0, acked: None });
+        }
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Presence {
@@ -291,7 +342,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let windows = state.windows.lock().unwrap().clone();
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
     let exploring = {
-        let blocked = |room: &str| if windows.contains(room) { Some("window_open") } else if away { Some("away") } else { None };
+        let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
+        let blocked = |room: &str| if windows.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
         let base = |room: &Room| base_setpoint(room, &state.config, now);
         let mut explorer = state.explorer.lock().unwrap();
         let lifecycle = explorer.tick(now, &Inputs { config: &state.config, blocked: &blocked, base: &base });
@@ -302,15 +354,26 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     };
     let readings = state.latest.all();
     let mut written = Vec::new();
+    let hold_ms = (state.config.manual_hold_minutes * 60_000.0) as i64;
     for want in desired(now, &state.config, presence.as_ref(), &windows, &exploring) {
-        let last = state.commanded.lock().unwrap().get(&want.node).copied();
-        if last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C) {
-            continue;
-        }
-        let old = last.or_else(|| readings.iter().find(|r| r.node == want.node && r.attribute == "occupied_heating_setpoint").map(|r| r.value));
+        let (old, prior) = {
+            let mut commands = state.commanded.lock().unwrap();
+            if !commands.release_due(&want, now_ms, hold_ms) {
+                continue;
+            }
+            let last = commands.target(want.node);
+            if last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C) {
+                continue;
+            }
+            let device = commands.device.get(&want.node).copied();
+            let old = device.or(last).or_else(|| readings.iter().find(|r| r.node == want.node && r.attribute == "occupied_heating_setpoint").map(|r| r.value));
+            (old, commands.sent.get(&want.node).cloned())
+        };
         let decision = proposal(state, &want, now_ms, old, &readings, presence.as_ref());
         log("decision", state.sink.append(decision.clone()));
-        state.commanded.lock().unwrap().insert(want.node, want.setpoint);
+        let sink = state.sink.clone();
+        log("decision flush", tokio::task::spawn_blocking(move || sink.flush()).await.map_err(anyhow::Error::from).and_then(|r| r.map(|_| ())));
+        state.commanded.lock().unwrap().sent.insert(want.node, Sent { target: want.setpoint, previous: old, written_ms: now_ms, acked: None });
         let outcome = state.controller.write_heating_setpoint(want.node, want.setpoint).await;
         let error = outcome.as_ref().err().map(|e| e.to_string());
         log("decision result", state.sink.append(result_row(&decision, want.reason, error)));
@@ -321,10 +384,10 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
             }
             Err(e) => {
                 eprintln!("setpoint node {}: {e}", want.node);
-                let mut commanded = state.commanded.lock().unwrap();
-                match last {
-                    Some(l) => commanded.insert(want.node, l),
-                    None => commanded.remove(&want.node),
+                let mut commands = state.commanded.lock().unwrap();
+                match prior {
+                    Some(p) => commands.sent.insert(want.node, p),
+                    None => commands.sent.remove(&want.node),
                 };
             }
         }
@@ -332,12 +395,39 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     Ok(written)
 }
 
-pub fn on_report(state: &AppState, report: &AttributeReport, now_ms: i64) {
+fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) -> Option<f64> {
+    let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
+    let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
+    let mut commands = state.commanded.lock().unwrap();
+    commands.device.insert(report.node, report.value);
+    let Some(sent) = commands.sent.get_mut(&report.node) else {
+        commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None });
+        return None;
+    };
+    if near(report.value, sent.target) || sent.acked.is_some_and(|a| near(a, report.value)) {
+        return None;
+    }
+    if now_ms - sent.written_ms < grace_ms {
+        if !sent.previous.is_some_and(|p| near(p, report.value)) {
+            sent.acked = Some(report.value);
+        }
+        return None;
+    }
+    if poll {
+        return None;
+    }
+    let previous = sent.acked.unwrap_or(sent.target);
+    let desired = commands.desired.get(&report.node).copied().unwrap_or(previous);
+    commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None });
+    commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, desired });
+    Some(previous)
+}
+
+pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
     if report.attribute != OCCUPIED_HEATING_SETPOINT.snake {
         return;
     }
-    let previous = state.commanded.lock().unwrap().insert(report.node, report.value);
-    let Some(previous) = previous.filter(|p| (p - report.value).abs() >= MANUAL_TOLERANCE_C) else { return };
+    let Some(previous) = manual_change(state, report, poll, now_ms) else { return };
     let Some(room) = state.config.rooms.iter().find(|r| r.nodes.contains(&report.node)) else { return };
     let (aborted, running) = {
         let mut explorer = state.explorer.lock().unwrap();

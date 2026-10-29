@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::infer::{Explanation, RoomModel};
 use crate::explore::Explorer;
-use crate::lake::{self, Label, WatchRaw};
+use crate::lake::{self, kind, Event, Label, Table, WatchRaw};
 use crate::rules::{presence_event, Tracker};
 use crate::storage::{now_ms, BatchBody, ScanBody, Storage};
 use axum::extract::State;
@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use matter_controller::MatterController;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +26,7 @@ pub struct AppState {
     pub model: Option<Arc<RoomModel>>,
     pub controller: Arc<dyn MatterController>,
     pub windows: Arc<Mutex<HashSet<String>>>,
-    pub commanded: Arc<Mutex<HashMap<u64, f64>>>,
+    pub commanded: Arc<Mutex<crate::rules::Commands>>,
     pub explorer: Arc<Mutex<Explorer>>,
     pub tracker: Arc<Mutex<Tracker>>,
     pub batch_seq: Arc<AtomicU64>,
@@ -180,7 +180,7 @@ fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, A
     Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)), explanation })
 }
 
-fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, received_ms: i64, batch_id: u64, aps: impl Iterator<Item = (String, i32, Option<u8>, Option<u16>)>) -> usize {
+fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, received_ms: i64, batch_id: u64, aps: impl Iterator<Item = (String, i32, Option<u8>, Option<u16>)>) -> anyhow::Result<usize> {
     let rows: Vec<WatchRaw> = aps
         .map(|(sender, rssi, channel, freq)| WatchRaw {
             ts: ts_ms * 1000,
@@ -195,15 +195,27 @@ fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, 
         })
         .collect();
     let n = rows.len();
-    if let Err(e) = state.sink.append_many(rows) {
-        eprintln!("watch_raw: {e}");
-    }
-    n
+    state.sink.append_many(rows)?;
+    Ok(n)
 }
 
 fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(String, f64)>, explanation: &Explanation) {
     let batch = state.next_batch();
-    raw_rows(state, &body.device, body.ts, None, received, batch, body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok())));
+    if let Err(e) = raw_rows(state, &body.device, body.ts, None, received, batch, body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok()))) {
+        eprintln!("watch_raw: {e}");
+    }
+    if let Some(label) = body.label.as_deref().filter(|l| !l.is_empty()) {
+        let row = Label { ts: body.ts * 1000, room: label.into(), source: "watch".into(), device: Some(body.device.clone()), ..Default::default() };
+        if let Err(e) = state.sink.append(row) {
+            eprintln!("labels: {e}");
+        }
+    }
+    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "away": body.away, "id": body.id});
+    let mut state_event = Event::now(kind::WATCH_STATE, "watch").with_detail(detail);
+    state_event.ts = body.ts * 1000;
+    if let Err(e) = state.sink.append(state_event) {
+        eprintln!("watch_state: {e}");
+    }
     if let Some((label, probability)) = room {
         let probs: serde_json::Map<String, Value> = explanation.rooms.iter().map(|r| (r.room.clone(), json!(r.p))).collect();
         let model_id = std::path::Path::new(&state.config.model_path).file_name().map(|f| f.to_string_lossy().into_owned());
@@ -232,15 +244,19 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
 async fn watch_measurement(State(state): State<AppState>, Json(body): Json<MeasurementBody>) -> ApiResult {
     let received = now_ms();
     if let Some(id) = &body.id {
-        if !state.storage.claim_id(&body.device, id)? {
+        if state.storage.seen_id(&body.device, id)? {
             return Ok(Json(json!({"stored": 0, "duplicate": true})));
         }
     }
     let batch = body.batch_id.unwrap_or_else(|| state.next_batch());
     let ts = body.ts.min(received + MAX_FUTURE_MS);
     let aps = body.measurements.into_iter().map(|m| (m.sender, m.rssi, m.channel, m.freq));
-    let stored = raw_rows(&state, &body.device, ts, body.device_ts, received, batch, aps);
-    state.sink.flush().ok();
+    let stored = raw_rows(&state, &body.device, ts, body.device_ts, received, batch, aps)?;
+    let sink = state.sink.clone();
+    tokio::task::spawn_blocking(move || sink.flush_table(Table::WatchRaw)).await.map_err(anyhow::Error::from)??;
+    if let Some(id) = &body.id {
+        state.storage.claim_id(&body.device, id)?;
+    }
     Ok(Json(json!({"stored": stored, "batch_id": batch})))
 }
 
@@ -275,7 +291,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
     let readings = state.latest.all();
     let setpoints = state.storage.last_setpoints()?;
     let windows = state.windows.lock().unwrap().clone();
-    let commanded = state.commanded.lock().unwrap().clone();
+    let commands = state.commanded.lock().unwrap();
     let rooms: Vec<Value> = state
         .config
         .rooms
@@ -292,7 +308,8 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                         "local_temperature": reading("local_temperature"),
                         "occupied_heating_setpoint": reading("occupied_heating_setpoint"),
                         "system_mode": reading("system_mode"),
-                        "commanded_setpoint": commanded.get(&node),
+                        "commanded_setpoint": commands.target(node),
+                        "manual_hold": commands.hold(node).map(|h| json!({"value": h.value, "since_ts": h.since_ms})),
                         "reason": setpoint.map(|s| s.reason.clone()),
                         "setpoint_ts": setpoint.map(|s| s.ts),
                     })
@@ -717,7 +734,7 @@ mod tests {
         let by_node: Vec<(String, String)> = some(&column(&d, "node")).into_iter().zip(some(&column(&d, "applied"))).collect();
         assert_eq!(by_node, vec![("5".into(), "false".into()), ("5".into(), "true".into()), ("6".into(), "false".into()), ("6".into(), "false".into())]);
         assert!(column(&d, "inputs.extra")[3].as_ref().unwrap().contains("error"));
-        assert!(h.state.commanded.lock().unwrap().get(&6).is_none());
+        assert!(h.state.commanded.lock().unwrap().target(6).is_none());
         let retried = control_step(&h.state, noon, 2_000).await.unwrap();
         assert!(retried.is_empty());
     }
@@ -810,7 +827,7 @@ nodes = [7]
             assert!(m < 4000);
         }
         let report = matter_controller::AttributeReport { node: 5, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value: 23.5 };
-        crate::rules::on_report(&h.state, &report, 1_700_000_000_000 + m * 60_000);
+        crate::rules::on_report(&h.state, &report, false, 1_700_000_000_000 + m * 60_000);
         assert!(h.state.explorer.lock().unwrap().active_in("a").is_none());
         let e = lake_rows(&h, "events");
         let kinds = some(&column(&e, "kind"));
@@ -829,12 +846,98 @@ nodes = [7]
         let h = harness(false);
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         let report = |value| matter_controller::AttributeReport { node: 5, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value };
-        crate::rules::on_report(&h.state, &report(19.0), 1_000);
+        crate::rules::on_report(&h.state, &report(19.0), false, 1_000);
         control_step(&h.state, noon, 2_000).await.unwrap();
-        crate::rules::on_report(&h.state, &report(18.0), 2_001);
+        crate::rules::on_report(&h.state, &report(18.0), false, 2_001);
         assert!(!some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
-        crate::rules::on_report(&h.state, &report(20.0), 3_000);
+        crate::rules::on_report(&h.state, &report(20.0), false, 300_000);
         assert!(some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
+    }
+
+    fn setpoint_report(value: f64) -> matter_controller::AttributeReport {
+        matter_controller::AttributeReport { node: 5, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value }
+    }
+
+    async fn device_setpoint(h: &Harness) -> f64 {
+        h.mock.read_thermostat(5).await.unwrap().occupied_heating_setpoint_c.unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_change_is_held_until_the_desired_setpoint_changes_or_the_hold_expires() {
+        let schedule = "[[rooms.schedules]]
+days = ['weekdays']
+from = '13:00'
+to = '14:00'
+setpoint = 21.0
+";
+        let h = harness_with(false, "away_guard_minutes = 0
+manual_hold_minutes = 120
+", &format!("[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+{schedule}"));
+        let monday = |h, m| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(h, m, 0).unwrap();
+        let t0 = 1_700_000_000_000;
+        let min = 60_000;
+        crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - min);
+        control_step(&h.state, monday(12, 0), t0).await.unwrap();
+        assert_eq!(device_setpoint(&h).await, 18.0);
+        h.mock.write_heating_setpoint(5, 22.0).await.unwrap();
+        crate::rules::on_report(&h.state, &setpoint_report(22.0), false, t0 + 5 * min);
+        assert!(h.state.commanded.lock().unwrap().holding(&[5]));
+        for m in 6..30 {
+            control_step(&h.state, monday(12, m as u32), t0 + m * min).await.unwrap();
+        }
+        assert_eq!(device_setpoint(&h).await, 22.0);
+        let rules = some(&column(&lake_rows(&h, "decisions"), "rule"));
+        assert_eq!(rules.iter().filter(|r| *r == "manual").count(), 1);
+        control_step(&h.state, monday(13, 0), t0 + 60 * min).await.unwrap();
+        assert_eq!(device_setpoint(&h).await, 21.0);
+        assert!(!h.state.commanded.lock().unwrap().holding(&[5]));
+    }
+
+    #[tokio::test]
+    async fn manual_hold_expires_after_the_configured_time() {
+        let h = harness_with(false, "manual_hold_minutes = 120
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let (t0, min) = (1_700_000_000_000, 60_000);
+        crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - min);
+        control_step(&h.state, noon, t0).await.unwrap();
+        h.mock.write_heating_setpoint(5, 22.0).await.unwrap();
+        crate::rules::on_report(&h.state, &setpoint_report(22.0), false, t0 + 5 * min);
+        control_step(&h.state, noon, t0 + 100 * min).await.unwrap();
+        assert_eq!(device_setpoint(&h).await, 22.0);
+        control_step(&h.state, noon, t0 + 126 * min).await.unwrap();
+        assert_eq!(device_setpoint(&h).await, 18.0);
+    }
+
+    #[tokio::test]
+    async fn stale_reports_and_clamped_values_right_after_a_write_are_not_manual() {
+        let h = harness(false);
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let t0 = 1_700_000_000_000;
+        crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - 1_000);
+        control_step(&h.state, noon, t0).await.unwrap();
+        crate::rules::on_report(&h.state, &setpoint_report(19.0), true, t0 + 1_000);
+        crate::rules::on_report(&h.state, &setpoint_report(18.5), false, t0 + 2_000);
+        control_step(&h.state, noon, t0 + 60_000).await.unwrap();
+        crate::rules::on_report(&h.state, &setpoint_report(21.0), true, t0 + 600_000);
+        assert!(!h.state.commanded.lock().unwrap().holding(&[5]));
+        assert!(!some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
+    }
+
+    #[tokio::test]
+    async fn watch_labels_and_state_in_scans_reach_the_lake() {
+        let h = harness(false);
+        let body = json!({"ts": now_ms(), "device": "pixel-watch", "label": "kueche", "motion": "still", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]}).to_string();
+        call(&h.state, "POST", "/api/scan", Some(body)).await;
+        let labels = lake_rows(&h, "labels");
+        assert_eq!(some(&column(&labels, "room")), vec!["kueche".to_string()]);
+        assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "watch_state"));
     }
 
     #[tokio::test]
@@ -862,7 +965,7 @@ nodes = [6]
         assert!(early.iter().all(|w| (w.setpoint, w.reason) == (21.0, "schedule")));
         let away = control_step(&h.state, monday_7, now).await.unwrap();
         assert_eq!(away.iter().map(|w| (w.setpoint, w.reason, w.rule)).collect::<Vec<_>>(), vec![(18.0, "away", "presence"); 2]);
-        assert!(h.state.commanded.lock().unwrap().values().all(|v| *v == 18.0));
+        assert!([5, 6].iter().all(|n| h.state.commanded.lock().unwrap().target(*n) == Some(18.0)));
         let events = lake_rows(&h, "events");
         let kinds = some(&column(&events, "kind"));
         assert_eq!(kinds.iter().filter(|k| *k == "presence_leave").count(), 1);
@@ -913,10 +1016,10 @@ nodes = [6]
         assert_eq!(column(&raw, "sender").len(), 4);
         assert!(column(&raw, "channel").iter().all(|c| c.is_some()));
         let model = lake_rows(&h, "labels");
-        assert_eq!((some(&column(&model, "source")), some(&column(&model, "room"))), (vec!["model".to_string()], vec!["wohnzimmer".to_string()]));
-        assert!(column(&model, "confidence")[0].as_ref().unwrap().parse::<f64>().unwrap() > 0.9);
-        assert_eq!(column(&model, "model_id")[0].as_deref(), Some("room_model.onnx"));
-        assert!(column(&model, "probs")[0].as_ref().unwrap().contains("wohnzimmer"));
+        assert_eq!((some(&column(&model, "source")), some(&column(&model, "room"))), (vec!["watch".to_string(), "model".to_string()], vec!["wohnzimmer".to_string(); 2]));
+        assert!(column(&model, "confidence")[1].as_ref().unwrap().parse::<f64>().unwrap() > 0.9);
+        assert_eq!(column(&model, "model_id")[1].as_deref(), Some("room_model.onnx"));
+        assert!(column(&model, "probs")[1].as_ref().unwrap().contains("wohnzimmer"));
         let (_, batch) = call(&h.state, "POST", "/api/scans", Some(fixture("batch_example.json"))).await;
         assert_eq!(batch["stored"], 4);
         assert_eq!(column(&lake_rows(&h, "watch_raw"), "sender").len(), 8);
@@ -926,8 +1029,8 @@ nodes = [6]
         assert_eq!((status, labelled), (StatusCode::OK, json!({"labelled": 0})));
         let l = lake_rows(&h, "labels");
         let watch: Vec<usize> = (0..column(&l, "source").len()).filter(|&i| column(&l, "source")[i].as_deref() == Some("watch")).collect();
-        assert_eq!(watch.len(), 2);
-        assert_eq!((column(&l, "room")[watch[1]].as_deref(), column(&l, "from_ts")[watch[1]].as_deref(), column(&l, "to_ts")[watch[1]].as_deref()), (Some("flur"), Some("3000000"), Some("4000000")));
+        assert_eq!(watch.len(), 3);
+        assert_eq!((column(&l, "room")[watch[2]].as_deref(), column(&l, "from_ts")[watch[2]].as_deref(), column(&l, "to_ts")[watch[2]].as_deref()), (Some("flur"), Some("3000000"), Some("4000000")));
         assert_eq!(call(&h.state, "POST", "/watch/label", label_body("pixel-watch", 0, 10, "Bad")).await.0, StatusCode::BAD_REQUEST);
     }
 }

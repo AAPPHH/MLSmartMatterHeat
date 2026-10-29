@@ -147,7 +147,7 @@ fn meta_is_versioned_and_written_only_on_change() {
     let heat: Value = serde_json::from_str(&known["heat_source"]).unwrap();
     assert_eq!((heat["type"].as_str(), heat["night_shutdown"].as_str(), heat["operating_hours"].is_null()), (Some("gas"), Some("22:00-05:00"), true));
     cfg.heat_source.night_shutdown = Some("23:00-05:00".into());
-    cfg.neighbours.push(["a".into(), "b".into()]);
+    cfg.neighbours.push(crate::config::Neighbour::pair("a", "b"));
     assert_eq!(write_meta(&sink, &cfg, T0 + 2).unwrap(), 1);
     sink.close().unwrap();
     assert!(meta_in_lake(dir.path()).unwrap()["heat_source"].contains("23:00-05:00"));

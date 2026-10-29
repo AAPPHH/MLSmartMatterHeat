@@ -178,6 +178,11 @@ impl Storage {
         Ok(Ingested { stored: scan.aps.len(), duplicate: false })
     }
 
+    pub fn seen_id(&self, device: &str, id: &str) -> Result<bool> {
+        let count: i64 = self.conn.lock().unwrap().query_row("SELECT count(*) FROM ingest_ids WHERE device = ? AND id = ?", params![device, id], |r| r.get(0))?;
+        Ok(count > 0)
+    }
+
     pub fn claim_id(&self, device: &str, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute("INSERT INTO ingest_ids VALUES (?, ?) ON CONFLICT DO NOTHING", params![device, id])? > 0)
     }

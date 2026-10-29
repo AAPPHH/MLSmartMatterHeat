@@ -177,15 +177,36 @@ impl WeatherJob {
 
 pub fn meta_values(config: &Config) -> Vec<(&'static str, String)> {
     let rooms: Vec<Value> = config.rooms.iter().map(|r| json!({"name": r.name, "nodes": r.nodes})).collect();
-    let mut pairs: Vec<[&str; 2]> = config.neighbours.iter().map(|[a, b]| if a <= b { [a.as_str(), b.as_str()] } else { [b.as_str(), a.as_str()] }).collect();
+    let mut pairs: Vec<[&str; 2]> = config.neighbours.iter().map(|n| if n.a <= n.b { [n.a.as_str(), n.b.as_str()] } else { [n.b.as_str(), n.a.as_str()] }).collect();
     pairs.sort();
     pairs.dedup();
     let heat = &config.heat_source;
     let mut out = vec![
         ("rooms", Value::Array(rooms)),
         ("adjacency", json!(pairs)),
-        ("heat_source", json!({"type": heat.kind, "operating_hours": heat.operating_hours, "night_shutdown": heat.night_shutdown})),
+        (
+            "heat_source",
+            json!({
+                "type": heat.kind,
+                "operating_hours": heat.operating_hours,
+                "night_shutdown": heat.night_shutdown,
+                "scope": heat.scope,
+                "efficiency_class": heat.efficiency_class,
+                "flow_temp_controllable": heat.flow_temp_controllable,
+                "night_setback_controllable": heat.night_setback_controllable,
+            }),
+        ),
     ];
+    let mut links: Vec<Value> = config.neighbours.iter().filter(|n| n.kind != "unknown").map(|n| json!({"a": n.a, "b": n.b, "kind": n.kind, "partial": n.partial})).collect();
+    links.sort_by_key(|l| l.to_string());
+    links.dedup();
+    if !links.is_empty() {
+        out.push(("links", Value::Array(links)));
+    }
+    let exterior: serde_json::Map<String, Value> = config.rooms.iter().filter(|r| !r.exterior.is_empty()).map(|r| (r.name.clone(), json!(r.exterior))).collect();
+    if config.building.floor.is_some() || !config.building.roof_rooms.is_empty() || !exterior.is_empty() {
+        out.push(("building", json!({"floor": config.building.floor, "roof_rooms": config.building.roof_rooms, "exterior": exterior})));
+    }
     if let Some((lat, lon)) = config.coordinates() {
         out.push(("coordinates", json!({"lat": lat, "lon": lon})));
     }
