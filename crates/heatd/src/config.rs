@@ -339,6 +339,36 @@ mod tests {
     }
 
     #[test]
+    fn docker_config_describes_the_home() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/docker/heatd.docker.toml")).unwrap();
+        for config in [Config::parse(&text).unwrap(), Config::parse(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../heatd.example.toml")).unwrap()).unwrap()] {
+            let nodes: Vec<(&str, Vec<u64>)> = config.rooms.iter().map(|r| (r.name.as_str(), r.nodes.clone())).collect();
+            assert_eq!(nodes, vec![("wohnzimmer", vec![5]), ("schlafzimmer", vec![6]), ("bad", vec![7]), ("kueche", vec![8]), ("flur", vec![])]);
+            assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
+            assert_eq!((config.latitude, config.longitude, config.away_setpoint), (Some(52.52), Some(13.40), 18.0));
+            assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 300, 120.0));
+            assert_eq!(config.neighbours.iter().filter(|n| n.kind == "wall").count(), 5);
+            assert_eq!(config.neighbours.iter().filter(|n| n.kind == "ceiling").count(), 4);
+            assert!(config.neighbours.iter().any(|n| n.kind == "ceiling" && n.partial) && config.neighbours.iter().any(|n| n.kind == "open"));
+            assert_eq!((config.heat_source.kind.as_str(), config.heat_source.efficiency_class.as_deref(), config.heat_source.flow_temp_controllable), ("oil", Some("E"), Some(false)));
+            assert!(config.rooms.iter().all(|r| !r.exploration.enabled));
+            let kitchen = config.rooms.iter().find(|r| r.name == "kueche").unwrap();
+            assert_eq!(kitchen.schedules.len(), 2);
+            assert!(kitchen.schedules.iter().all(|s| s.setpoint == 21.0));
+        }
+    }
+
+    #[test]
+    fn rooms_without_nodes_and_bad_kinds() {
+        let config = Config::parse("[[rooms]]
+name = 'flur'").unwrap();
+        assert!(config.rooms[0].nodes.is_empty() && config.all_nodes().is_empty());
+        assert!(Config::parse("neighbours = [{ a = 'a', b = 'a', kind = 'door' }]
+[[rooms]]
+name = 'a'").is_err());
+    }
+
+    #[test]
     fn defaults_and_validation() {
         let config = Config::parse("").unwrap();
         assert_eq!(config.db_path, "data/heatd.duckdb");

@@ -273,3 +273,17 @@ fn status_feeds_health_and_metrics() {
     }
     assert!(!metrics.contains("heatd_node_last_report_age_seconds{node=\"6\"}"));
 }
+
+#[test]
+fn meta_carries_links_building_and_heat_details_for_the_home() {
+    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/docker/heatd.docker.toml")).unwrap();
+    let values: std::collections::HashMap<_, _> = meta_values(&crate::config::Config::parse(&text).unwrap()).into_iter().collect();
+    let links: Value = serde_json::from_str(&values["links"]).unwrap();
+    assert_eq!(links.as_array().unwrap().len(), 10);
+    let building: Value = serde_json::from_str(&values["building"]).unwrap();
+    assert_eq!((building["floor"].clone(), building["roof_rooms"][0].clone(), building["exterior"]["flur"][0].clone()), (3.into(), "schlafzimmer".into(), "front_door".into()));
+    let heat: Value = serde_json::from_str(&values["heat_source"]).unwrap();
+    assert_eq!((heat["type"].as_str(), heat["scope"].as_str(), heat["efficiency_class"].as_str(), heat["night_setback_controllable"].as_bool()), (Some("oil"), Some("central"), Some("E"), Some(false)));
+    let rooms: Value = serde_json::from_str(&values["rooms"]).unwrap();
+    assert_eq!(rooms[4], serde_json::json!({"name": "flur", "nodes": []}));
+}

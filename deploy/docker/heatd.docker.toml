@@ -10,21 +10,40 @@ thread_cli_prefix = "ot "
 default_setpoint = 18.0
 away_setpoint = 18.0
 away_guard_minutes = 20
+manual_hold_minutes = 120
+poll_silence_s = 300
 # exploration_seed = 1
-# latitude = 52.52
-# longitude = 13.41
+latitude = 52.52
+longitude = 13.40
 # weather_url = "https://api.open-meteo.com/v1/forecast"
 # ntp_server = "pool.ntp.org"
-# neighbours = [["wohnzimmer", "schlafzimmer"], ["wohnzimmer", "bad"]]
 presence_boost = 1.0
 presence_timeout_minutes = 30
 still_contact_timeout_minutes = 180
 frost_setpoint = 7.0
+neighbours = [
+    { a = "wohnzimmer", b = "flur", kind = "wall" },
+    { a = "wohnzimmer", b = "bad", kind = "wall" },
+    { a = "kueche", b = "flur", kind = "wall" },
+    { a = "kueche", b = "bad", kind = "wall" },
+    { a = "bad", b = "flur", kind = "wall" },
+    { a = "schlafzimmer", b = "wohnzimmer", kind = "ceiling" },
+    { a = "schlafzimmer", b = "kueche", kind = "ceiling" },
+    { a = "schlafzimmer", b = "bad", kind = "ceiling" },
+    { a = "schlafzimmer", b = "flur", kind = "ceiling", partial = true },
+    { a = "flur", b = "schlafzimmer", kind = "open" },
+]
 
-# [heat_source]
-# kind = "unknown"
-# operating_hours = "05:00-22:00"
-# night_shutdown = "22:00-05:00"
+[heat_source]
+kind = "oil"
+scope = "central"
+efficiency_class = "E"
+flow_temp_controllable = false
+night_setback_controllable = false
+
+[building]
+floor = 3
+roof_rooms = ["schlafzimmer"]
 
 [chip_tool]
 binary = "/usr/local/bin/chip-tool"
@@ -32,7 +51,7 @@ storage_dir = "/chip-storage"
 paa_trust_store = "/opt/paa-root-certs"
 bypass_attestation = false
 endpoint = 1
-subscribe_min_s = 1
+subscribe_min_s = 30
 subscribe_max_s = 300
 timeout_s = 90
 commission_timeout_s = 180
@@ -85,3 +104,23 @@ days = ["weekdays"]
 from = "06:00"
 to = "08:00"
 setpoint = 22.0
+
+[[rooms]]
+name = "kueche"
+nodes = [8]
+
+[[rooms.schedules]]
+days = ["weekdays"]
+from = "06:30"
+to = "08:00"
+setpoint = 21.0
+
+[[rooms.schedules]]
+days = ["weekdays"]
+from = "17:30"
+to = "20:00"
+setpoint = 21.0
+
+[[rooms]]
+name = "flur"
+exterior = ["front_door"]

@@ -162,7 +162,7 @@ sudo systemctl stop heatd                                # Pflicht: sonst "stop 
 sudo systemctl start heatd
 ```
 
-**Inventar:** Direkt nach dem Commissioning liest `inventory` alle Attribute und Ereignisse eines Thermostats (chip-tool Wildcard-Reads) und legt sie in `inventory_dir` (Standard `inventory/`, Docker `/data/inventory`) ab: `<node>_<firmware>.json`, `<node>_<firmware>.md` (je Endpoint und Cluster eine Tabelle mit Wert und Schreibbarkeit, dazu Features, Befehle, Batterie, Thread-Nachbarn mit RSSI/LQI, Zähler und Ereignisse) sowie die Rohlogs unter `inventory/raw/`. `<firmware>` ist die SoftwareVersionString des Geräts. Herstellerspezifische Cluster (ab 0xFC00 oder mit Vendor-Präfix) bleiben erhalten und sind mit "vendor" markiert. Der Befehl braucht die Sperre, also `heatd` vorher stoppen:
+**Inventar:** Direkt nach dem Commissioning liest `inventory` alle Attribute und Ereignisse eines Thermostats (chip-tool Wildcard-Reads) und legt sie in `inventory_dir` (Standard `inventory/`, Docker `/data/inventory`) ab: `<node>_<firmware>.json`, `<node>_<firmware>.md` (je Endpoint und Cluster eine Tabelle mit Wert und Schreibbarkeit, dazu Features, Befehle, Batterie, Thread-Nachbarn mit RSSI/LQI, Zähler und Ereignisse) sowie die Rohlogs unter `inventory/raw/`. `<firmware>` ist die SoftwareVersionString des Geräts. Herstellerspezifische Cluster (ab 0xFC00 oder mit Vendor-Präfix) bleiben als Einträge erhalten und sind mit "vendor" markiert; chip-tool kennt ihre Werte aber nicht ("Don't know how to log"), deshalb steht dort `<not decoded by chip-tool, see raw log>`, den Rohwert findest du nur im Rohlog. Der Befehl braucht die Sperre, also `heatd` vorher stoppen und `controller = "chip-tool"` (mit `controller = "mock"` bricht er ab):
 
 ```bash
 cd ~/MLSmartMatterHeat/deploy/docker
@@ -171,11 +171,11 @@ docker compose run --rm heatd inventory 5                       # schreibt /data
 docker compose up -d heatd
 ```
 
-systemd: `./target/release/heatd inventory 5`. Ein Lauf dauert bis zu `3 × timeout_s`; ein schlafendes Thermostat braucht eventuell einen zweiten Versuch. Im laufenden `heatd` wird das Inventar nach einem Firmware-Wechsel (BasicInformation SoftwareVersion oder SoftwareVersionString) automatisch neu erzeugt, ohne `heatd` zu stoppen.
+systemd: `./target/release/heatd inventory 5`. Jeder der beiden chip-tool-Aufrufe (Attribute, Events) darf bis zu `3 × timeout_s` dauern (`--timeout` wird entsprechend gesetzt). Endet chip-tool mit Fehler oder läuft in den Timeout, werden trotzdem die Rohlogs unter `inventory/raw/` geschrieben (bei null geparsten Attributen als `<node>_failed_<zeit>.*`) und die Fehler stehen im Inventar; ein schlafendes Thermostat braucht eventuell einen zweiten Versuch. Im laufenden `heatd` wird das Inventar nach einem Firmware-Wechsel (BasicInformation SoftwareVersion oder SoftwareVersionString) automatisch neu erzeugt. Damit nie zwei chip-tool-Prozesse auf demselben Storage laufen, hält `heatd` dafür die interaktive Sitzung kurz an und startet sie danach neu (Subscriptions bauen sich neu auf, einige Minuten ohne Reports sind möglich). Sichere `/chip-storage` vor dem ersten Deploy (`cp -a chip-storage chip-storage.bak`), die Fabric-Schlüssel liegen dort.
 
-**Matter-Erfassung:** Pro Node abonniert `heatd` per chip-tool alle Attribute und Events (`any subscribe-by-id` / `any subscribe-event-by-id`, 1 bis 300 s) und schreibt jeden Report unverändert in die Lake-Tabellen `attribute_reports` und `events` (siehe `docs/data-foundation.md`, Abschnitt "Abweichungen": Rohwert ist der von chip-tool gedruckte Text, nicht TLV). Zusätzlich fragt ein 60-s-Poll LocalTemperature, OccupiedHeatingSetpoint, PIHeatingDemand, SystemMode und BatPercentRemaining ab (`source=poll`); bei Fehlschlägen wird die Pause bis auf 16 Minuten verdoppelt und ein `poll_failed`-Event geschrieben. Abriss und Wiederaufbau der Subscription, StartUp/ShutDown und Firmware-Wechsel landen als Zeilen in `events`.
+**Matter-Erfassung:** Pro Node abonniert `heatd` per chip-tool alle Attribute und Events (`any subscribe-by-id` / `any subscribe-event-by-id`, `subscribe_min_s` = 30 bis `subscribe_max_s` = 300 s; das schont die Batterie des schlafenden Thermostats; ein manueller Eingriff am Gerät fällt daher bis zu 30 s später auf) und schreibt jeden Report unverändert in die Lake-Tabellen `attribute_reports` und `events` (siehe `docs/data-foundation.md`, Abschnitt "Abweichungen": Rohwert ist der von chip-tool gedruckte Text, nicht TLV). Zusätzlich fragt ein Heartbeat-Poll LocalTemperature, OccupiedHeatingSetpoint, PIHeatingDemand, SystemMode und BatPercentRemaining ab (`source=poll`), aber nur für einen Node, von dem in den letzten `poll_silence_s` = 300 s kein Report kam; bei Fehlschlägen wird die Pause bis auf 16 Minuten verdoppelt und ein `poll_failed`-Event geschrieben. Abriss und Wiederaufbau der Subscription, StartUp/ShutDown und Firmware-Wechsel landen als Zeilen in `events`.
 
-Im Betrieb liegen zusätzlich folgende Werte im Speicher (`/api/state`) und in `attribute_reports`: `pi_heating_demand`, `thermostat_running_state`, `local_temperature_calibration`, Batterie (`bat_voltage` in mV, `bat_percent_remaining` in %, `bat_charge_level`), `routing_role` und RSSI/LQI des Thread-Parents (`thread_parent_rssi`, `thread_parent_last_rssi`, `thread_parent_lqi`). Nicht unterstützte Attribute werden einmal im Log gemeldet und übersprungen.
+Im Betrieb liegen zusätzlich folgende Werte im Speicher (`/api/state`) und in `attribute_reports`: `pi_heating_demand`, `thermostat_running_state`, `local_temperature_calibration`, Batterie (`bat_voltage` in mV, `bat_percent_remaining` in %, `bat_charge_level`), `routing_role` und RSSI/LQI des Thread-Parents (`thread_parent_rssi`, `thread_parent_last_rssi`, `thread_parent_lqi`). Die Subscriptions sind volle Wildcards (höchstens zwei pro Node: Attribute und Events), fehlende optionale Cluster stören sie nicht; Fehlerzeilen von chip-tool werden einmal im Log gemeldet.
 
 Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen. Das Commissioning darf bis zu 180 s dauern (`commission_timeout_s`).
 
@@ -207,11 +207,13 @@ Feature-Auswahl: Nur stabile BSSIDs kommen ins Modell, also solche, die in genü
 `heatd` schreibt alle Rohdaten als Arrow-Streams nach `<data_dir>/raw/` und rollt sie täglich um 03:00 in Parquet (`<data_dir>/parquet/`, Marker `.rolled`). Schema: `docs/data-foundation.md`.
 
 ```bash
-heatd migrate                                                   # einmalig: alte DuckDB-Daten (scans, readings, setpoints) in die Lake übernehmen
+heatd migrate                                                   # einmalig, VOR dem ersten Start dieses Builds: alte DuckDB-Daten in die Lake übernehmen
 heatd inventory 5                                               # Geräteinventar (siehe oben), heatd vorher stoppen
 heatd export --room wohnzimmer --from 2026-10-01 --to 2026-10-20   # 1-min-Raster (analysis/views/room_minute.sql) als Parquet, --to inklusive
 heatd report [2026-10-20]                                       # Tagesreport nach <data_dir>/reports/<datum>.md (läuft automatisch um 03:10)
 ```
+
+`migrate` übernimmt nur Zeilen vor dem ersten `startup`-Event von `heatd` in `raw/events` (ohne dieses Event vor dem ältesten `watch_raw`-Zeitstempel), liest vorher alle Tabellen vollständig ein und schreibt danach; so entstehen keine Doppelzeilen, weil der laufende Build DuckDB und Lake parallel beschreibt.
 
 Docker: `docker compose run --rm heatd export --room wohnzimmer --from ... --to ...` schreibt nach `/data/exports/`.
 
@@ -221,10 +223,13 @@ Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `depl
 |---|---|
 | `latitude`, `longitude` | schaltet den stündlichen Open-Meteo-Abruf (Wetter, `weather_url` überschreibt den Endpunkt) und `coordinates` in `meta` ein; ohne beide aus |
 | `away_setpoint`, `away_guard_minutes` | Sollwert bei Abwesenheit (18 °C) und Zeit, die die getragene Uhr das WLAN fehlen muss (20 min) |
+| `manual_hold_minutes` | ändert jemand den Sollwert am Thermostat, hält `heatd` diesen Wert bis sich der gewünschte Sollwert (Zeitplan, Anwesenheit, Abwesenheit) ändert, höchstens so lange (120), und läuft dann weiter; Entscheidung `rule=manual` und Label `override` einmal, ein laufendes Experiment bricht ab |
+| `poll_silence_s` | Heartbeat-Poll pro Node nur, wenn so lange (300 s) kein Report kam |
 | `exploration_seed` | Seed für die zufälligen Startzeiten der Experimente |
 | `[rooms.exploration]` | je Raum `enabled` (Standard `false`), `p_per_day`, `comfort_min`, `comfort_max`, `blackout = [{from, to}]` |
-| `neighbours` | Raumpaare `[["a","b"], ...]` für die Nachbartemperaturen im Raster |
-| `[heat_source]` | `kind`, `operating_hours`, `night_shutdown` als `meta` |
+| `neighbours` | Nachbarräume: `{ a, b, kind = "wall" oder "ceiling" oder "open", partial }` (bei `ceiling` liegt `a` über `b`), alte Paare `["a","b"]` gelten weiter (Art unbekannt); die Paare liefern die Nachbartemperaturen im Raster, die Arten stehen als `links` in `meta` |
+| `[heat_source]` | `kind`, `scope`, `efficiency_class`, `flow_temp_controllable`, `night_setback_controllable`, `operating_hours`, `night_shutdown` als `meta` |
+| `[building]`, `rooms.exterior` | `floor`, `roof_rooms`; Außentüren je Raum (`exterior = ["front_door"]`) als `meta` `building`. Räume ohne Thermostat (`nodes` weglassen, z. B. der Flur) sind erlaubt |
 | `ntp_server` | SNTP-Drift-Check (Event ab 1 s), leer schaltet ihn aus |
 | `inventory_dir` | Ablage der Inventardateien |
 
@@ -241,7 +246,7 @@ Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `depl
 | – | sonst | `default_setpoint` |
 | + | Uhr im Raum, jünger als `presence_timeout_minutes` | `+ presence_boost` |
 
-Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °C vom zuletzt gesetzten abweicht.
+Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °C vom zuletzt gesetzten abweicht. Die Entscheidung wird vor dem Geräte-Schreiben auf Platte geschrieben (fsync). Berichte, die kurz nach einem eigenen Schreiben noch den alten oder einen vom Gerät gerundeten Wert zeigen (2 × `timeout_s`), und Poll-Antworten gelten nie als manueller Eingriff. Ein echter manueller Eingriff am Thermostat wird bis zur nächsten Änderung des gewünschten Sollwerts gehalten, höchstens `manual_hold_minutes`.
 
 ## API
 
