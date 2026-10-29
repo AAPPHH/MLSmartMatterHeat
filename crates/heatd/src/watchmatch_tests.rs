@@ -336,3 +336,50 @@ fn drift_alarm_needs_a_rise_of_half_and_enough_rows() {
     assert_eq!(drift_alarm(&sink).unwrap(), 1);
     sink.flush().unwrap();
 }
+
+const PIPELINE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/watchroom_trained");
+
+fn pipeline_env() -> Env {
+    let env = Env::new();
+    let target = env.models().join("py1");
+    std::fs::create_dir_all(&target).unwrap();
+    for entry in std::fs::read_dir(Path::new(PIPELINE).join("py1")).unwrap().flatten() {
+        std::fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+    }
+    env
+}
+
+fn lake_inference_rows(env: &Env) -> usize {
+    let dir = env.dir.path().join("lake/raw/watch_inference");
+    std::fs::read_dir(dir).unwrap().flatten().map(|e| lake::load_stream(&e.path()).unwrap().batches.iter().map(|b| b.num_rows()).sum::<usize>()).sum()
+}
+
+#[test]
+fn python_trained_model_classifies_and_survives_model_removal() {
+    let env = pipeline_env();
+    let wm = env.matcher("latest");
+    assert!(wm.active() && wm.model_version().as_deref() == Some("py1"));
+    let samples: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(Path::new(PIPELINE).join("samples.json")).unwrap()).unwrap();
+    let (mut right, mut sure) = (0, 0);
+    for (i, s) in samples.iter().enumerate() {
+        let list: Vec<(String, i32)> = s["aps"].as_array().unwrap().iter().map(|a| (a[0].as_str().unwrap().to_uppercase(), a[1].as_i64().unwrap() as i32)).collect();
+        let row = wm.scan_at(&format!("dev{i}"), T, T, NOON, &list).expect("scan was processed");
+        assert_eq!((row.matcher.as_str(), row.model_version.as_str(), row.state.as_str()), ("room", "py1", "rest"));
+        if !row.abstained {
+            sure += 1;
+            right += (row.result_room.as_deref() == s["room"].as_str()) as usize;
+        }
+    }
+    assert!(sure * 10 >= samples.len() * 8, "coverage {sure}/{}", samples.len());
+    assert_eq!(right, sure);
+    wm.sink().flush().unwrap();
+    assert_eq!(lake_inference_rows(&env), samples.len());
+    std::fs::remove_dir_all(env.models()).unwrap();
+    let after = env.matcher("latest");
+    assert!(!after.active());
+    let row = after.scan_at("dev0", T, T, NOON, &[("AA:BB:CC:00:00:01".into(), -50)]).unwrap();
+    assert_eq!((row.abstained, row.reason.as_deref(), row.model_version.as_str(), row.result_room.clone()), (true, Some("no_model"), "none", None));
+    assert_eq!(after.effective(T), None);
+    after.sink().flush().unwrap();
+    assert!(lake_reasons(&env).contains(&Some("no_model".to_string())));
+}

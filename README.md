@@ -190,6 +190,8 @@ adb connect <uhr-ip>:<port> && adb install -r wear/app/build/outputs/apk/release
 
 Die APK liegt auch im GitHub-Release. In der App erlaubst du **genauen Standort** (für WLAN-Scans) und **Geräte in der Nähe / LAN-Zugriff** (Android 17, sonst erreicht die Uhr den Minix nicht). Dann prüfst du die Server-URL (`http://192.168.178.29:8090`; auf dem Minix belegt gluetun 8080), tippst auf Start und fügst die Kachel **HeatScan** hinzu. Die Statuszeile meldet Probleme direkt, etwa „Standort aus“, „WLAN aus“ oder „LAN-Zugriff fehlt“.
 
+Ab Version 2.4 misst die Uhr zusätzlich Hauttemperatur, Puls, Bewegung (Varianz), Trageerkennung und Akku und schickt sie gebündelt (alle 5 min oder 50 Samples) an `POST /watch/measurement`. Dafür auf der Uhr unter Einstellungen > Apps > HeatScan > Berechtigungen **Körpersensoren** (Puls, `READ_HEART_RATE`) und **Hauttemperatur** (`READ_SKIN_TEMPERATURE`) erlauben (Wear OS 6, SDK 36 und höher; die App fragt beim Start). Fehlt eine Berechtigung oder der Sensor, wird nur dieser Kanal übersprungen; die Statuszeile zeigt es unter `sensors=` (z. B. `hr=ok,skin=Recht verweigert`). Ein älteres heatd antwortet 422, dann fällt die Uhr eine Stunde auf `/api/scan` zurück.
+
 **Training:**
 1. Die Uhr fragt per Benachrichtigung „Wo bist du?“ (5 Raumknöpfe, Vermutung zuerst). Ein Tipp etikettiert die Scans ab der Frage und startet einen Aufenthalt: weitere Scans im selben Raum werden ohne Rückfrage etikettiert (höchstens 2 h). Wechselst du den Raum (Bewegung, danach zwei Scans mit anderem WLAN-Fingerabdruck oder abweichender Vorhersage), fragt die Uhr einmal mit Vibration „Raum gewechselt? Wo bist du jetzt?“ und etikettiert rückwirkend ab dem ersten abweichenden Scan. Vibration höchstens alle 3 min, nachts (22–7 Uhr), unterwegs und ohne Uhr am Handgelenk nur lautlos. Zusätzlich geht Antippen in App und Kachel; es entstehen keine zusätzlichen Scans.
 2. Snapshot ziehen und trainieren:
@@ -274,6 +276,26 @@ uv run pytest
 ```
 
 Ablauf: gelabelte WLAN-Scans (Fenster-Labels mit `from_ts`/`to_ts` und Punkt-Labels) werden je Scan gruppiert, per Regel einem Zustand zugeordnet (rest, sleep, active, offbody, charging; ohne Puls und Bewegung `all`), kNN gegen Gradient Boosting per Tages-Block-CV gewählt und kalibriert. τ und δ maximieren Macro-F1 bei Coverage ≥ 0,8; die HMM-Übergänge kommen aus den `links` in `meta` (Wand/offen bevorzugt, ohne Meta gleichverteilt). Beim Export wird ONNX gegen sklearn geprüft (≤ 1e-5). Abweichung: HistGradientBoosting lässt sich mit skl2onnx 1.20 und onnx 1.23 nicht konvertieren, daher klassisches GradientBoosting.
+
+Auf der heatd-Seite aktivierst du den Abgleich in `heatd.toml` (Docker: `deploy/docker/heatd.docker.toml`, `/models` ist ein Volume):
+
+```toml
+[watchmatch]
+enabled = true
+model_dir = "/models/watchroom"   # darin <version>/model.json + ONNX
+model_version = "latest"          # oder fester Versionsname; "latest" prüft stündlich auf ein neueres Modell
+scan_fresh_s = 180
+
+[watchmatch.state]                # Zustandsregeln, gleiche Werte wie im Training (CONFIG in training/src/heattrain/__main__.py)
+hr_rest_max = 75
+hr_active_min = 100
+motion_active_min = 0.5
+sleep_hours = "23-7"
+```
+
+Ohne Modell schreibt heatd `no_model`-Zeilen in `watch_inference` und heizt wie vorher (kein Absturz). Beobachten: `/health` (Block `watch`), `/metrics` (`heatd_watch_*`) und der Tagesbericht (Abschnitt Watch, Event `matcher_drift`). Ablauf: Uhr sammelt Etiketten und WLAN, `heattrain watchroom` trainiert, Modellordner nach `/models/watchroom/<version>` legen, heatd lädt ohne Neustart.
+
+Ende-zu-Ende-Fixture ohne Hardware: `cd training && PYTHONPATH=tests uv run python tests/make_heatd_fixture.py` erzeugt synthetische Daten, trainiert mit der echten Pipeline und schreibt das Modell nach `crates/heatd/tests/fixtures/watchroom_trained/`; der heatd-Test lädt es, prüft `watch_inference`-Zeilen und den `no_model`-Pfad nach Entfernen des Modellordners.
 
 Wöchentliches Neutraining extern, z. B. systemd-Timer auf dem Minix (nicht deployt):
 

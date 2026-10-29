@@ -1190,6 +1190,25 @@ nodes = [6]
     }
 
     #[tokio::test]
+    async fn watch_app_example_payload_is_accepted_verbatim() {
+        let h = harness(false);
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../contract/measurement_example.json")).unwrap();
+        let kotlin = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../wear/app/src/test/resources/measurement_example.json")).unwrap();
+        assert_eq!(text, kotlin);
+        let (status, resp) = call(&h.state, "POST", "/watch/measurement", Some(text.clone())).await;
+        assert_eq!((status, resp["stored"].clone(), resp["batch_id"].clone()), (StatusCode::OK, json!(7), json!(1761580800500123i64)));
+        let (_, again) = call(&h.state, "POST", "/watch/measurement", Some(text)).await;
+        assert_eq!(again["stored"], json!(0));
+        assert_eq!(again["duplicate"], json!(true));
+        let r = lake_rows(&h, "watch_raw");
+        let mut kinds = some(&column(&r, "sensor_type"));
+        kinds.sort();
+        assert_eq!(kinds, ["battery", "charging", "hr", "motion", "offbody", "rssi", "temp"].map(String::from).to_vec());
+        assert_eq!(some(&column(&r, "device")), vec!["pixel-watch".to_string(); 7]);
+        assert!(some(&column(&r, "sender")).contains(&"aa:bb:cc:00:00:01".to_string()));
+    }
+
+    #[tokio::test]
     async fn legacy_endpoints_write_new_tables_and_keep_contract() {
         let h = harness(true);
         let (status, body) = call(&h.state, "POST", "/api/scan", Some(scan_body())).await;

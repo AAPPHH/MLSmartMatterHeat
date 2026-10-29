@@ -3,7 +3,7 @@
 *.duckdb
 *.duckdb.wal
 *.onnx
-!/crates/heatd/tests/fixtures/*.onnx
+!/crates/heatd/tests/fixtures/**/*.onnx
 /wear/.gradle/
 /wear/build/
 /wear/app/build/
