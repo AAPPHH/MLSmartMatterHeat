@@ -1,5 +1,8 @@
 use crate::config::Config;
 use crate::infer::{Explanation, RoomModel};
+use crate::explore::Explorer;
+use crate::lake::{self, Label, WatchRaw};
+use crate::rules::{presence_event, Tracker};
 use crate::storage::{now_ms, BatchBody, ScanBody, Storage};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -10,6 +13,7 @@ use matter_controller::MatterController;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -21,6 +25,15 @@ pub struct AppState {
     pub controller: Arc<dyn MatterController>,
     pub windows: Arc<Mutex<HashSet<String>>>,
     pub commanded: Arc<Mutex<HashMap<u64, f64>>>,
+    pub explorer: Arc<Mutex<Explorer>>,
+    pub tracker: Arc<Mutex<Tracker>>,
+    pub batch_seq: Arc<AtomicU64>,
+}
+
+impl AppState {
+    pub fn next_batch(&self) -> u64 {
+        self.batch_seq.fetch_add(1, Ordering::SeqCst)
+    }
 }
 
 pub struct ApiError(StatusCode, anyhow::Error);
@@ -56,10 +69,46 @@ struct LabelBody {
     device: String,
     from: i64,
     to: i64,
+    #[serde(alias = "room")]
     label: String,
 }
 
+#[derive(Deserialize)]
+struct MeasurementBody {
+    device: String,
+    ts: i64,
+    #[serde(default)]
+    device_ts: Option<i64>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    batch_id: Option<u64>,
+    #[serde(alias = "aps")]
+    measurements: Vec<Measurement>,
+}
+
+#[derive(Deserialize)]
+struct Measurement {
+    #[serde(alias = "bssid")]
+    sender: String,
+    rssi: i32,
+    #[serde(default)]
+    channel: Option<u8>,
+    #[serde(default)]
+    freq: Option<u16>,
+}
+
 const MAX_LABEL_SPAN_MS: i64 = 3_600_000;
+
+pub fn channel_of(freq: u16) -> Option<u8> {
+    match freq {
+        2484 => Some(14),
+        2412..=2472 => Some(((freq - 2407) / 5) as u8),
+        5160..=5885 => Some(((freq - 5000) / 5) as u8),
+        5955..=7115 => Some(((freq - 5950) / 5) as u8),
+        _ => None,
+    }
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -70,6 +119,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
         .route("/api/label", post(label))
+        .route("/watch/measurement", post(watch_measurement))
+        .route("/watch/label", post(label))
         .with_state(state)
 }
 
@@ -112,7 +163,74 @@ fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, A
     }
     let prediction = room.as_ref().map(|(label, probability)| (label.as_str(), *probability));
     let done = state.storage.ingest(&body, received, prediction)?;
+    if !done.duplicate {
+        record_scan(state, &body, received, room.as_ref(), &explanation);
+    }
     Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)), explanation })
+}
+
+fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, received_ms: i64, batch_id: u64, aps: impl Iterator<Item = (String, i32, Option<u8>, Option<u16>)>) -> usize {
+    let rows: Vec<WatchRaw> = aps
+        .map(|(sender, rssi, channel, freq)| WatchRaw {
+            ts: ts_ms * 1000,
+            device_ts: device_ts.map(|t| t * 1000),
+            sender: sender.to_lowercase(),
+            rssi: rssi.clamp(i8::MIN as i32, i8::MAX as i32) as i8,
+            channel: channel.or_else(|| freq.and_then(channel_of)),
+            batch_id,
+            device: device.into(),
+            freq,
+            received_ts: Some(received_ms * 1000),
+        })
+        .collect();
+    let n = rows.len();
+    if let Err(e) = state.sink.append_many(rows) {
+        eprintln!("watch_raw: {e}");
+    }
+    n
+}
+
+fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(String, f64)>, explanation: &Explanation) {
+    let batch = state.next_batch();
+    raw_rows(state, &body.device, body.ts, None, received, batch, body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok())));
+    if let Some((label, probability)) = room {
+        let probs: serde_json::Map<String, Value> = explanation.rooms.iter().map(|r| (r.room.clone(), json!(r.p))).collect();
+        let model_id = std::path::Path::new(&state.config.model_path).file_name().map(|f| f.to_string_lossy().into_owned());
+        let row = Label {
+            ts: body.ts * 1000,
+            room: label.clone(),
+            source: "model".into(),
+            device: Some(body.device.clone()),
+            confidence: Some(*probability as f32),
+            model_id,
+            probs: (!probs.is_empty()).then(|| Value::Object(probs).to_string()),
+            ..Default::default()
+        };
+        if let Err(e) = state.sink.append(row) {
+            eprintln!("labels: {e}");
+        }
+    }
+    let transition = state.tracker.lock().unwrap().observe(&body.device, body.ts, body.away, body.motion, body.power);
+    if let Some(t) = transition {
+        if let Err(e) = state.sink.append(presence_event(&body.device, t)) {
+            eprintln!("presence event: {e}");
+        }
+    }
+}
+
+async fn watch_measurement(State(state): State<AppState>, Json(body): Json<MeasurementBody>) -> ApiResult {
+    let received = now_ms();
+    if let Some(id) = &body.id {
+        if !state.storage.claim_id(&body.device, id)? {
+            return Ok(Json(json!({"stored": 0, "duplicate": true})));
+        }
+    }
+    let batch = body.batch_id.unwrap_or_else(|| state.next_batch());
+    let ts = body.ts.min(received + MAX_FUTURE_MS);
+    let aps = body.measurements.into_iter().map(|m| (m.sender, m.rssi, m.channel, m.freq));
+    let stored = raw_rows(&state, &body.device, ts, body.device_ts, received, batch, aps);
+    state.sink.flush().ok();
+    Ok(Json(json!({"stored": stored, "batch_id": batch})))
 }
 
 async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiResult {
@@ -199,6 +317,10 @@ async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> Ap
         return Err(ApiError::bad("range must satisfy from <= to and to - from <= 3600000"));
     }
     let labelled = state.storage.relabel(&body.device, body.from, body.to, &body.label)?;
+    let row = Label { ts: lake::now_us(), from_ts: Some(body.from * 1000), to_ts: Some(body.to * 1000), room: body.label.clone(), source: "watch".into(), device: Some(body.device.clone()), ..Default::default() };
+    if let Err(e) = state.sink.append(row) {
+        eprintln!("labels: {e}");
+    }
     Ok(Json(json!({"labelled": labelled})))
 }
 
@@ -224,9 +346,13 @@ mod tests {
     }
 
     fn harness(with_model: bool) -> Harness {
+        harness_with(with_model, "away_guard_minutes = 0\n", "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n")
+    }
+
+    fn harness_with(with_model: bool, head: &str, rooms: &str) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let toml = format!(
-            "db_path = '{0}/live.duckdb'\nsnapshot_path = '{0}/out/snapshot.duckdb'\ndefault_setpoint = 18.0\n[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n",
+            "db_path = '{0}/live.duckdb'\nsnapshot_path = '{0}/out/snapshot.duckdb'\ndefault_setpoint = 18.0\n{head}{rooms}",
             dir.path().to_str().unwrap().replace('\\', "/")
         );
         let config = Config::parse(&toml).unwrap();
@@ -241,6 +367,9 @@ mod tests {
             controller: mock.clone(),
             windows: Default::default(),
             commanded: Default::default(),
+            explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
+            tracker: Default::default(),
+            batch_seq: Arc::new(AtomicU64::new(1)),
         };
         Harness { state, mock, _dir: dir }
     }
@@ -339,7 +468,7 @@ mod tests {
         assert_eq!((boosted[0].setpoint, boosted[0].reason), (19.0, "presence_boost"));
         call(&h.state, "POST", "/api/scan", Some(json!({"ts": now + 1, "device": "pixel-watch", "motion": "moving", "away": true}).to_string())).await;
         let eco = control_step(&h.state, noon, now + 1).await.unwrap();
-        assert_eq!((eco[0].setpoint, eco[0].reason), (16.0, "away_eco"));
+        assert_eq!((eco[0].setpoint, eco[0].reason), (18.0, "away"));
     }
 
     #[tokio::test]
@@ -497,4 +626,280 @@ mod tests {
         }
         assert_eq!(call(&h.state, "POST", "/api/label", label_body("pixel-watch", 0, 3_600_000, "bad")).await.0, StatusCode::OK);
     }
+
+    fn lake_rows(h: &Harness, table: &str) -> Vec<arrow::record_batch::RecordBatch> {
+        h.state.sink.flush().unwrap();
+        let dir = h._dir.path().join("lake/raw").join(table);
+        let mut files: Vec<_> = std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        files.sort();
+        files.iter().flat_map(|f| lake::load_stream(f).unwrap().batches).collect()
+    }
+
+    fn column(batches: &[arrow::record_batch::RecordBatch], name: &str) -> Vec<Option<String>> {
+        use arrow::array::{Array, StringArray};
+        batches
+            .iter()
+            .flat_map(|b| {
+                let (parent, field) = name.split_once('.').unwrap_or(("", name));
+                let col = if parent.is_empty() { b.column_by_name(field).unwrap().clone() } else { b.column_by_name(parent).unwrap().as_any().downcast_ref::<arrow::array::StructArray>().unwrap().column_by_name(field).unwrap().clone() };
+                let col = if matches!(col.data_type(), arrow::datatypes::DataType::Timestamp(..)) { arrow::compute::cast(&col, &arrow::datatypes::DataType::Int64).unwrap() } else { col };
+                let text = arrow::compute::cast(&col, &arrow::datatypes::DataType::Utf8).unwrap();
+                let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..text.len()).map(|i| (!text.is_null(i)).then(|| text.value(i).to_string())).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn some(v: &[Option<String>]) -> Vec<String> {
+        v.iter().map(|s| s.clone().unwrap_or_else(|| "-".into())).collect()
+    }
+
+    fn rooms_config(extra_room: &str) -> Harness {
+        harness_with(false, "", &format!("[[rooms]]\nname = 'a'\nnodes = [5]\n[[rooms]]\nname = 'b'\nnodes = [6]\n{extra_room}"))
+    }
+
+    #[tokio::test]
+    async fn decision_is_persisted_before_write_and_followed_by_result_row() {
+        let h = harness(false);
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        control_step(&h.state, noon, 1_700_000_000_000).await.unwrap();
+        let d = lake_rows(&h, "decisions");
+        assert_eq!((some(&column(&d, "rule")), some(&column(&d, "applied")), some(&column(&d, "proposed"))), (vec!["schedule".to_string(); 2], vec!["false".to_string(), "true".into()], vec!["true".to_string(); 2]));
+        assert_eq!(some(&column(&d, "setpoint_new")), vec!["18.0".to_string(); 2]);
+        assert_eq!(some(&column(&d, "room")), vec!["wohnzimmer".to_string(); 2]);
+        assert_eq!(some(&column(&d, "exploration")), vec!["false".to_string(); 2]);
+        assert_eq!(some(&column(&d, "inputs.occupancy")), vec!["unknown".to_string(); 2]);
+        assert_eq!(some(&column(&d, "inputs.schedule_setpoint")), vec!["18.0".to_string(); 2]);
+        assert_eq!(some(&column(&d, "inputs.frost_setpoint")), vec!["7.0".to_string(); 2]);
+        assert_eq!(some(&column(&d, "commit")), vec![lake::COMMIT.to_string(); 2]);
+        let extra = column(&d, "inputs.extra");
+        assert!(extra[0].as_ref().unwrap().contains("\"proposal\"") && extra[1].as_ref().unwrap().contains("\"result\""));
+        control_step(&h.state, noon, 1_700_000_060_000).await.unwrap();
+        assert_eq!(column(&lake_rows(&h, "decisions"), "rule").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_write_is_logged_and_does_not_abort_other_rooms() {
+        let h = rooms_config("");
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let written = control_step(&h.state, noon, 1_000).await.unwrap();
+        assert_eq!(written.iter().map(|w| w.node).collect::<Vec<_>>(), vec![5]);
+        let d = lake_rows(&h, "decisions");
+        let by_node: Vec<(String, String)> = some(&column(&d, "node")).into_iter().zip(some(&column(&d, "applied"))).collect();
+        assert_eq!(by_node, vec![("5".into(), "false".into()), ("5".into(), "true".into()), ("6".into(), "false".into()), ("6".into(), "false".into())]);
+        assert!(column(&d, "inputs.extra")[3].as_ref().unwrap().contains("error"));
+        assert!(h.state.commanded.lock().unwrap().get(&6).is_none());
+        let retried = control_step(&h.state, noon, 2_000).await.unwrap();
+        assert!(retried.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sink_failure_does_not_abort_tick() {
+        let mut h = rooms_config("");
+        h.mock.add_node(6, 19.0, 19.0);
+        h.state.sink = lake::Sink::open(lake::LakeConfig { flush_rows: 1, ..lake::LakeConfig::new(h._dir.path().join("broken")) }).unwrap();
+        std::fs::remove_dir_all(h._dir.path().join("broken/raw/decisions")).unwrap();
+        std::fs::write(h._dir.path().join("broken/raw/decisions"), b"not a dir").unwrap();
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let written = control_step(&h.state, noon, 1_000).await.unwrap();
+        assert_eq!(written.len(), 2);
+    }
+
+    fn explore_room() -> &'static str {
+        "[rooms.exploration]\nenabled = true\np_per_day = 1.0\ncomfort_min = 16.0\ncomfort_max = 22.0\n"
+    }
+
+    fn three_rooms() -> Harness {
+        let rooms = format!("[[rooms]]
+name = 'a'
+nodes = [5]
+{0}[[rooms]]
+name = 'b'
+nodes = [6]
+{0}blackout = [{{ from = '22:00', to = '07:00' }}]
+[[rooms]]
+name = 'c'
+nodes = [7]
+", explore_room());
+        let h = harness_with(false, "exploration_seed = 11
+", &rooms);
+        h.mock.add_node(6, 19.0, 19.0);
+        h.mock.add_node(7, 19.0, 19.0);
+        h
+    }
+
+    #[tokio::test]
+    async fn simulated_day_runs_marked_experiments_for_every_enabled_room() {
+        let h = three_rooms();
+        let start = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        for m in (0..1440 + 240).step_by(10) {
+            control_step(&h.state, start + chrono::Duration::minutes(m), 1_700_000_000_000 + m * 60_000).await.unwrap();
+        }
+        let e = lake_rows(&h, "events");
+        let kinds = some(&column(&e, "kind"));
+        let node = some(&column(&e, "node"));
+        for n in ["5", "6"] {
+            assert!(kinds.iter().zip(&node).any(|(k, x)| k == "experiment_start" && x == n), "node {n}");
+        }
+        assert!(!kinds.iter().zip(&node).any(|(k, x)| k.starts_with("experiment") && x == "7"));
+        let ids = column(&e, "experiment_id");
+        let first_day = |k: &str, i: &Option<String>| k == "experiment_start" && i.as_ref().is_some_and(|i| i.starts_with("exp-20251027"));
+        let started: Vec<&String> = kinds.iter().zip(&ids).filter(|(k, i)| first_day(k, i)).filter_map(|(_, i)| i.as_ref()).collect();
+        assert!(started.len() >= 2);
+        for id in started {
+            let closed = kinds.iter().zip(&ids).filter(|(k, i)| (*k == "experiment_end" || *k == "experiment_abort") && i.as_ref() == Some(id)).count();
+            assert_eq!(closed, 1, "{id}");
+        }
+        assert!(kinds.iter().zip(&ids).all(|(k, i)| !k.starts_with("experiment") || i.is_some()));
+        let d = lake_rows(&h, "decisions");
+        let (explo, id, rule, new) = (column(&d, "exploration"), column(&d, "experiment_id"), column(&d, "rule"), column(&d, "setpoint_new"));
+        let marked = (0..explo.len()).filter(|&i| explo[i].as_deref() == Some("true")).count();
+        assert!(marked >= 4);
+        for i in 0..explo.len() {
+            assert_eq!(explo[i].as_deref() == Some("true"), id[i].is_some());
+            assert_eq!(rule[i].as_deref() == Some("exploration"), id[i].is_some());
+            assert!(new[i].as_ref().unwrap().parse::<f64>().unwrap() >= 7.0);
+        }
+        let room = column(&d, "room");
+        assert!((0..explo.len()).all(|i| room[i].as_deref() != Some("c") || explo[i].as_deref() == Some("false")));
+    }
+
+    #[tokio::test]
+    async fn window_open_prevents_experiments_and_manual_change_aborts_running() {
+        let h = harness_with(false, "exploration_seed = 3\n", &format!("[[rooms]]\nname = 'a'\nnodes = [5]\n{}", explore_room()));
+        let start = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        call(&h.state, "POST", "/api/window", Some("{\"room\":\"a\",\"open\":true}".into())).await;
+        for m in (0..1440).step_by(30) {
+            control_step(&h.state, start + chrono::Duration::minutes(m), 1_700_000_000_000 + m * 60_000).await.unwrap();
+        }
+        assert!(!some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "experiment_start"));
+        call(&h.state, "POST", "/api/window", Some("{\"room\":\"a\",\"open\":false}".into())).await;
+        let mut m = 1440;
+        while h.state.explorer.lock().unwrap().active_in("a").is_none() {
+            control_step(&h.state, start + chrono::Duration::minutes(m), 1_700_000_000_000 + m * 60_000).await.unwrap();
+            m += 10;
+            assert!(m < 4000);
+        }
+        let report = matter_controller::AttributeReport { node: 5, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value: 23.5 };
+        crate::rules::on_report(&h.state, &report, 1_700_000_000_000 + m * 60_000);
+        assert!(h.state.explorer.lock().unwrap().active_in("a").is_none());
+        let e = lake_rows(&h, "events");
+        let kinds = some(&column(&e, "kind"));
+        assert_eq!(kinds.iter().filter(|k| *k == "experiment_abort").count(), 1);
+        assert!(column(&e, "detail").iter().flatten().any(|d| d.contains("manual_override")));
+        let d = lake_rows(&h, "decisions");
+        let i = some(&column(&d, "rule")).iter().position(|r| r == "manual").unwrap();
+        assert_eq!((column(&d, "setpoint_new")[i].clone(), column(&d, "applied")[i].clone(), column(&d, "proposed")[i].clone()), (Some("23.5".into()), Some("true".into()), Some("false".into())));
+        assert!(column(&d, "experiment_id")[i].is_some());
+        let l = lake_rows(&h, "labels");
+        assert_eq!((some(&column(&l, "source")), some(&column(&l, "room"))), (vec!["override".to_string()], vec!["a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn echo_of_own_write_and_first_report_are_not_manual() {
+        let h = harness(false);
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let report = |value| matter_controller::AttributeReport { node: 5, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value };
+        crate::rules::on_report(&h.state, &report(19.0), 1_000);
+        control_step(&h.state, noon, 2_000).await.unwrap();
+        crate::rules::on_report(&h.state, &report(18.0), 2_001);
+        assert!(!some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
+        crate::rules::on_report(&h.state, &report(20.0), 3_000);
+        assert!(some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
+    }
+
+    #[tokio::test]
+    async fn away_needs_guard_then_sets_all_rooms_and_logs_presence_events() {
+        let schedule = "[[rooms.schedules]]
+days = ['weekdays']
+from = '06:00'
+to = '08:30'
+setpoint = 21.0
+";
+        let h = harness_with(false, "", &format!("[[rooms]]
+name = 'a'
+nodes = [5]
+{schedule}[[rooms]]
+name = 'b'
+nodes = [6]
+{schedule}"));
+        h.mock.add_node(6, 19.0, 19.0);
+        let monday_7 = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(7, 0, 0).unwrap();
+        let now = now_ms();
+        let body = |ts: i64, away: bool, motion: &str| json!({"ts": ts, "device": "pixel-watch", "motion": motion, "away": away}).to_string();
+        call(&h.state, "POST", "/api/scan", Some(body(now - 40 * 60_000, true, "moving"))).await;
+        call(&h.state, "POST", "/api/scan", Some(body(now - 5 * 60_000, true, "still"))).await;
+        let early = control_step(&h.state, monday_7, now - 30 * 60_000).await.unwrap();
+        assert!(early.iter().all(|w| (w.setpoint, w.reason) == (21.0, "schedule")));
+        let away = control_step(&h.state, monday_7, now).await.unwrap();
+        assert_eq!(away.iter().map(|w| (w.setpoint, w.reason, w.rule)).collect::<Vec<_>>(), vec![(18.0, "away", "presence"); 2]);
+        assert!(h.state.commanded.lock().unwrap().values().all(|v| *v == 18.0));
+        let events = lake_rows(&h, "events");
+        let kinds = some(&column(&events, "kind"));
+        assert_eq!(kinds.iter().filter(|k| *k == "presence_leave").count(), 1);
+        assert!(column(&events, "detail").iter().flatten().any(|d| d.contains("watch_wifi")));
+        call(&h.state, "POST", "/api/scan", Some(body(now + 1, false, "moving"))).await;
+        assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "presence_arrive"));
+    }
+
+    #[tokio::test]
+    async fn watch_still_at_home_is_never_away() {
+        let h = harness(false);
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let now = now_ms();
+        for k in 0..6 {
+            let body = json!({"ts": now - (6 - k) * 600_000, "device": "pixel-watch", "motion": "still", "away": true, "power": "doze"}).to_string();
+            call(&h.state, "POST", "/api/scan", Some(body)).await;
+        }
+        let out = control_step(&h.state, noon, now).await.unwrap();
+        assert!(out.iter().all(|w| w.reason != "away"));
+        assert!(!some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "presence_leave"));
+    }
+
+    #[tokio::test]
+    async fn watch_measurement_writes_watch_raw_with_derived_channel() {
+        let h = harness(false);
+        let body = json!({"device": "w", "ts": 1_761_580_800_000i64, "device_ts": 5, "id": "m-1", "batch_id": 77, "measurements": [
+            {"sender": "AA:BB:CC:00:00:01", "rssi": -61, "freq": 2437}, {"sender": "aa:bb:cc:00:00:02", "rssi": -70, "freq": 5180}, {"sender": "aa:bb:cc:00:00:03", "rssi": -80, "channel": 9}]});
+        let (status, resp) = call(&h.state, "POST", "/watch/measurement", Some(body.to_string())).await;
+        assert_eq!((status, resp["stored"].clone(), resp["batch_id"].clone()), (StatusCode::OK, json!(3), json!(77)));
+        let (_, again) = call(&h.state, "POST", "/watch/measurement", Some(body.to_string())).await;
+        assert_eq!(again, json!({"stored": 0, "duplicate": true}));
+        let r = lake_rows(&h, "watch_raw");
+        assert_eq!(some(&column(&r, "sender")), ["aa:bb:cc:00:00:01", "aa:bb:cc:00:00:02", "aa:bb:cc:00:00:03"].map(String::from).to_vec());
+        assert_eq!(some(&column(&r, "channel")), ["6", "36", "9"].map(String::from).to_vec());
+        assert_eq!((some(&column(&r, "rssi")), some(&column(&r, "batch_id")), some(&column(&r, "device"))), (vec!["-61".to_string(), "-70".into(), "-80".into()], vec!["77".to_string(); 3], vec!["w".to_string(); 3]));
+        assert_eq!(column(&r, "ts")[0].as_deref(), Some("1761580800000000"));
+        assert_eq!(column(&r, "device_ts")[0].as_deref(), Some("5000"));
+        assert_eq!([2412u16, 2472, 2484, 5180, 5955, 1000].map(channel_of), [Some(1), Some(13), Some(14), Some(36), Some(1), None]);
+    }
+
+    #[tokio::test]
+    async fn legacy_endpoints_write_new_tables_and_keep_contract() {
+        let h = harness(true);
+        let (status, body) = call(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        assert_eq!((status, body), (StatusCode::OK, json!({"stored": 4, "room": "wohnzimmer"})));
+        call(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        let raw = lake_rows(&h, "watch_raw");
+        assert_eq!(column(&raw, "sender").len(), 4);
+        assert!(column(&raw, "channel").iter().all(|c| c.is_some()));
+        let model = lake_rows(&h, "labels");
+        assert_eq!((some(&column(&model, "source")), some(&column(&model, "room"))), (vec!["model".to_string()], vec!["wohnzimmer".to_string()]));
+        assert!(column(&model, "confidence")[0].as_ref().unwrap().parse::<f64>().unwrap() > 0.9);
+        assert_eq!(column(&model, "model_id")[0].as_deref(), Some("room_model.onnx"));
+        assert!(column(&model, "probs")[0].as_ref().unwrap().contains("wohnzimmer"));
+        let (_, batch) = call(&h.state, "POST", "/api/scans", Some(fixture("batch_example.json"))).await;
+        assert_eq!(batch["stored"], 4);
+        assert_eq!(column(&lake_rows(&h, "watch_raw"), "sender").len(), 8);
+        let (status, labelled) = call(&h.state, "POST", "/api/label", label_body("pixel-watch", 1_000, 2_000, "bad")).await;
+        assert_eq!((status, labelled), (StatusCode::OK, json!({"labelled": 0})));
+        let (status, labelled) = call(&h.state, "POST", "/watch/label", Some(json!({"device": "pixel-watch", "from": 3_000, "to": 4_000, "room": "flur"}).to_string())).await;
+        assert_eq!((status, labelled), (StatusCode::OK, json!({"labelled": 0})));
+        let l = lake_rows(&h, "labels");
+        let watch: Vec<usize> = (0..column(&l, "source").len()).filter(|&i| column(&l, "source")[i].as_deref() == Some("watch")).collect();
+        assert_eq!(watch.len(), 2);
+        assert_eq!((column(&l, "room")[watch[1]].as_deref(), column(&l, "from_ts")[watch[1]].as_deref(), column(&l, "to_ts")[watch[1]].as_deref()), (Some("flur"), Some("3000000"), Some("4000000")));
+        assert_eq!(call(&h.state, "POST", "/watch/label", label_body("pixel-watch", 0, 10, "Bad")).await.0, StatusCode::BAD_REQUEST);
+    }
 }
+
