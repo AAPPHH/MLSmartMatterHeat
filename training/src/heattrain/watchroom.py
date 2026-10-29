@@ -14,6 +14,7 @@ from skl2onnx.common.data_types import FloatTensorType
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
 from heattrain.eval import NO_TEMPLATE, Matcher, band_of, evaluate, features, forward, report_md, score
 
 
@@ -215,7 +216,8 @@ class Trainer:
 
     def make(self, kind, y):
         c = self.cfg
-        base = KNeighborsClassifier(c["knn_k"]) if kind == "knn" else GradientBoostingClassifier(n_estimators=c["gb_trees"], max_depth=c["gb_depth"], random_state=c["seed"])
+        base = {"knn": lambda: KNeighborsClassifier(c["knn_k"]), "svm": lambda: SVC(C=c["svm_c"], gamma=c["svm_gamma"], class_weight="balanced"),
+                "gb": lambda: GradientBoostingClassifier(n_estimators=c["gb_trees"], max_depth=c["gb_depth"], random_state=c["seed"])}[kind]()
         folds = min(3, int(np.bincount(y)[np.bincount(y) > 0].min()))
         return CalibratedClassifierCV(base, method="sigmoid", cv=folds) if folds >= 2 else base
 

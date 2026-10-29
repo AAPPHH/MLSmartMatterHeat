@@ -13,7 +13,7 @@ CONFIG = {
     "t_hold_min": 30,
     "min_sender_scans": 10, "min_sender_days": 2, "max_senders": 64,
     "min_room_scans": 20, "min_state_scans": 60, "min_state_room_scans": 10,
-    "candidates": ["knn", "gb"], "knn_k": 7, "gb_trees": 60, "gb_depth": 3, "seed": 0,
+    "candidates": ["svm", "knn", "gb"], "svm_c": 10.0, "svm_gamma": "scale", "knn_k": 7, "gb_trees": 60, "gb_depth": 3, "seed": 0,
     "cv_folds": 4, "min_coverage": 0.8, "holdout_frac": 0.3,
     "hmm": {"stay_prob": 0.95, "weight_link": {"wall": 6.0, "open": 8.0, "ceiling": 3.0}, "weight_other": 1.0,
             "default_links": [["keiner", "flur", "open"], ["keiner", "wohnzimmer", "open"]]},
