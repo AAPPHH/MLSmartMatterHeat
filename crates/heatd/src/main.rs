@@ -1,6 +1,7 @@
 mod config;
 mod http;
 mod infer;
+mod inventory;
 mod rules;
 mod storage;
 
@@ -12,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | thread form <serial-port> | thread dataset <serial-port>";
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | thread form <serial-port> | thread dataset <serial-port>";
 const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -210,6 +211,15 @@ async fn controller_command(config: Config, args: &[String]) -> Result<()> {
             let state = controller.read_thermostat(node.parse()?).await?;
             println!("{state:#?}");
         }
+        [cmd, node] if cmd == "inventory" => {
+            let node: u64 = node.parse()?;
+            let inventory = controller.inventory(node).await?;
+            let now = chrono::Utc::now();
+            let dir = inventory::report_dir(&config.db_path, node, &now.format("%Y%m%d-%H%M%S").to_string());
+            inventory::write_report(&dir, &inventory, &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))?;
+            println!("{} attributes, {} events, {} warnings", inventory.attributes.len(), inventory.events.len(), inventory.errors.len());
+            println!("{}", dir.display());
+        }
         [cmd, node, celsius] if cmd == "set" => {
             controller.write_heating_setpoint(node.parse()?, celsius.parse()?).await?;
             println!("setpoint {celsius} written to node {node}");
@@ -232,7 +242,7 @@ fn run(args: Vec<String>) -> Result<()> {
             let dataset = open_cli(port, &config)?.active_dataset()?;
             save_dataset(&config, &dataset)
         }
-        ["commission" | "read" | "set", ..] => runtime()?.block_on(controller_command(config, &args)),
+        ["commission" | "read" | "set" | "inventory", ..] => runtime()?.block_on(controller_command(config, &args)),
         _ => bail!(USAGE),
     }
 }
