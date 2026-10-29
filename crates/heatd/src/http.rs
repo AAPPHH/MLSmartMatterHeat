@@ -621,7 +621,7 @@ fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<Strin
     let max_span_us = 2 * state.config.watchmatch.label_tolerance_s * 1_000_000;
     let mut rows: Vec<(i64, String)> = Vec::new();
     for batch in crate::context::read_raw(state.sink.root(), Table::Labels, None)? {
-        let (ts, from, to) = (crate::context::ts_column(&batch, "ts")?, crate::context::ts_column(&batch, "from_ts")?, crate::context::ts_column(&batch, "to_ts")?);
+        let (from, to) = (crate::context::ts_column(&batch, "from_ts")?, crate::context::ts_column(&batch, "to_ts")?);
         let (room, source) = (crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
         let retroactive = |i: usize| !from.is_null(i) && !to.is_null(i) && to.value(i) - from.value(i) > max_span_us;
         rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && !to.is_null(i) && to.value(i) >= since_us && !retroactive(i)).map(|i| (to.value(i), room.value(i).to_string())));
