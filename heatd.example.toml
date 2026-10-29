@@ -12,6 +12,16 @@ presence_boost = 1.0
 presence_timeout_minutes = 30
 still_contact_timeout_minutes = 180
 frost_setpoint = 7.0
+# weather and coordinates meta stay disabled until both are set (placeholders: Berlin)
+# latitude = 52.52
+# longitude = 13.41
+ntp_server = "pool.ntp.org"
+neighbours = [["wohnzimmer", "schlafzimmer"], ["wohnzimmer", "bad"]]
+
+[heat_source]
+kind = "unknown"
+# operating_hours = "05:00-22:00"
+# night_shutdown = "22:00-05:00"
 
 [chip_tool]
 binary = "chip-tool"

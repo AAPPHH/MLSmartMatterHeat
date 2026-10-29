@@ -464,11 +464,11 @@ impl LakeConfig {
     }
 }
 
-fn raw_dir(root: &Path, table: Table) -> PathBuf {
+pub fn raw_dir(root: &Path, table: Table) -> PathBuf {
     root.join("raw").join(table.name())
 }
 
-fn parquet_dir(root: &Path, table: Table, date: NaiveDate) -> PathBuf {
+pub fn parquet_dir(root: &Path, table: Table, date: NaiveDate) -> PathBuf {
     root.join("parquet").join(table.name()).join(format!("date={date}"))
 }
 
@@ -590,7 +590,7 @@ fn parse_raw_name(name: &str) -> Option<(NaiveDate, u32)> {
     Some((NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?, n?))
 }
 
-fn raw_files(root: &Path, table: Table, date: Option<NaiveDate>) -> Result<Vec<(PathBuf, u64)>> {
+pub fn raw_files(root: &Path, table: Table, date: Option<NaiveDate>) -> Result<Vec<(PathBuf, u64)>> {
     let dir = raw_dir(root, table);
     let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(Vec::new()) };
     let mut files: Vec<(NaiveDate, u32, PathBuf, u64)> = Vec::new();
@@ -860,7 +860,7 @@ fn string_columns(fields: &Fields, prefix: &[String], out: &mut Vec<Vec<String>>
     }
 }
 
-fn write_parquet(path: &Path, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
+pub fn write_parquet(path: &Path, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<u64> {
     let mut paths = Vec::new();
     string_columns(schema.fields(), &[], &mut paths);
     let mut props = WriterProperties::builder()

@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ pkg-config 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+COPY analysis analysis
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/root/.cache/ort.pyke.io \
     --mount=type=cache,target=/src/target \

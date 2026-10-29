@@ -17,6 +17,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub storage: Arc<Storage>,
     pub sink: crate::lake::Sink,
+    pub status: crate::status::Status,
     pub model: Option<Arc<RoomModel>>,
     pub controller: Arc<dyn MatterController>,
     pub windows: Arc<Mutex<HashSet<String>>>,
@@ -63,7 +64,8 @@ const MAX_LABEL_SPAN_MS: i64 = 3_600_000;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/api/scan", post(scan))
         .route("/api/scans", post(scans))
         .route("/api/state", get(api_state))
@@ -71,6 +73,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/window", post(window))
         .route("/api/label", post(label))
         .with_state(state)
+}
+
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(state.status.health(crate::lake::now_us()))
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], state.status.metrics(crate::lake::now_us()))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -236,6 +246,7 @@ mod tests {
         let state = AppState {
             storage: Arc::new(Storage::open(&config.db_path).unwrap()),
             sink: crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap(),
+            status: crate::status::Status::new(crate::lake::now_us()),
             config: Arc::new(config),
             model,
             controller: mock.clone(),
@@ -357,6 +368,22 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(Path::new(snap["path"].as_str().unwrap()).exists());
         assert_eq!(call(&h.state, "GET", "/health", None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_and_metrics_expose_node_status() {
+        let h = harness(false);
+        h.state.status.register_nodes([5]);
+        h.state.status.subscription(5, crate::status::SubState::Subscribed, crate::lake::now_us());
+        h.state.status.node_report(5, crate::lake::now_us());
+        let (code, health) = call(&h.state, "GET", "/health", None).await;
+        assert_eq!((code, health["status"].as_str(), health["nodes"][0]["node"].as_u64(), health["nodes"][0]["subscription"].as_str()), (StatusCode::OK, Some("ok"), Some(5), Some("subscribed")));
+        assert!(health["nodes"][0]["last_report_age_s"].as_f64().unwrap() < 5.0);
+        let response = router(h.state.clone()).oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
+        let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(text.contains("heatd_node_subscription{node=\"5\",state=\"subscribed\"} 1") && text.contains("heatd_node_reports_total{node=\"5\"} 1"), "{text}");
     }
 
     #[tokio::test]

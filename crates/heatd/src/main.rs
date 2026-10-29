@@ -1,4 +1,7 @@
 mod config;
+mod context;
+#[cfg(test)]
+mod context_tests;
 mod http;
 mod infer;
 mod inventory;
@@ -6,7 +9,11 @@ mod lake;
 #[cfg(test)]
 mod lake_tests;
 mod migrate;
+mod report;
+#[cfg(test)]
+mod report_tests;
 mod rules;
+mod status;
 mod storage;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | thread form <serial-port> | thread dataset <serial-port>";
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | report [date] | thread form <serial-port> | thread dataset <serial-port>";
 const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -173,14 +180,19 @@ async fn serve(config: Config) -> Result<()> {
     let sink = lake::Sink::open(lake::LakeConfig::new(&config.data_dir))?;
     sink.append(lake::Event::now(lake::kind::STARTUP, "heatd").with_detail(serde_json::json!({"commit": lake::COMMIT, "schema_version": lake::SCHEMA_VERSION})))?;
     lake::spawn_background(sink.clone());
+    let status = status::Status::new(lake::now_us());
+    status.register_nodes(config.all_nodes());
+    let config = Arc::new(config);
+    context::spawn_background(sink.clone(), status.clone(), config.clone(), context::Io::live(&config));
     let state = http::AppState {
         sink: sink.clone(),
+        status,
         storage: Arc::new(storage::Storage::open(&config.db_path)?),
         model,
         controller,
         windows: Default::default(),
         commanded: Default::default(),
-        config: Arc::new(config),
+        config,
     };
     rules::spawn_background(state.clone());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
@@ -239,6 +251,21 @@ async fn controller_command(config: Config, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn flag<'a>(args: &[&'a str], name: &str) -> Option<&'a str> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1])
+}
+
+fn export_command(config: &Config, args: &[&str]) -> Result<()> {
+    let date = |name: &str| -> Result<chrono::NaiveDate> {
+        let text = flag(args, name).ok_or_else(|| anyhow!(USAGE))?;
+        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| anyhow!("bad {name} {text}, expected YYYY-MM-DD"))
+    };
+    let room = flag(args, "--room").ok_or_else(|| anyhow!(USAGE))?;
+    let (path, rows) = report::export(Path::new(&config.data_dir), room, date("--from")?, date("--to")?, flag(args, "--out").map(Into::into))?;
+    println!("{rows} rows written to {}", path.display());
+    Ok(())
+}
+
 fn run(args: Vec<String>) -> Result<()> {
     let config = Config::load(Path::new(&std::env::var("HEATD_CONFIG").unwrap_or_else(|_| "heatd.toml".into())))?;
     let runtime = || tokio::runtime::Builder::new_multi_thread().enable_all().build();
@@ -253,6 +280,9 @@ fn run(args: Vec<String>) -> Result<()> {
             save_dataset(&config, &dataset)
         }
         ["migrate"] => migrate::run(&config),
+        ["export", rest @ ..] => export_command(&config, rest),
+        ["report"] => report::report_command(Path::new(&config.data_dir), None).map(|p| println!("{}", p.display())),
+        ["report", date] => report::report_command(Path::new(&config.data_dir), Some(date)).map(|p| println!("{}", p.display())),
         ["commission" | "read" | "set" | "inventory", ..] => runtime()?.block_on(controller_command(config, &args)),
         _ => bail!(USAGE),
     }

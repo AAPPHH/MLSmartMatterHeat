@@ -76,6 +76,20 @@ pub struct Room {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct HeatSource {
+    pub kind: String,
+    pub operating_hours: Option<String>,
+    pub night_shutdown: Option<String>,
+}
+
+impl Default for HeatSource {
+    fn default() -> Self {
+        Self { kind: "unknown".into(), operating_hours: None, night_shutdown: None }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -93,6 +107,12 @@ pub struct Config {
     pub still_contact_timeout_minutes: f64,
     pub frost_setpoint: f64,
     pub rooms: Vec<Room>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub weather_url: String,
+    pub ntp_server: String,
+    pub neighbours: Vec<[String; 2]>,
+    pub heat_source: HeatSource,
 }
 
 impl Default for Config {
@@ -114,6 +134,12 @@ impl Default for Config {
             still_contact_timeout_minutes: 180.0,
             frost_setpoint: 7.0,
             rooms: Vec::new(),
+            latitude: None,
+            longitude: None,
+            weather_url: "https://api.open-meteo.com/v1/forecast".into(),
+            ntp_server: "pool.ntp.org".into(),
+            neighbours: Vec::new(),
+            heat_source: HeatSource::default(),
         }
     }
 }
@@ -135,7 +161,16 @@ impl Config {
                 schedule.weekdays()?;
             }
         }
+        for pair in &config.neighbours {
+            if let Some(unknown) = pair.iter().find(|r| !config.rooms.iter().any(|room| &room.name == *r)) {
+                return Err(anyhow!("neighbours: unknown room {unknown}"));
+            }
+        }
         Ok(config)
+    }
+
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        self.latitude.zip(self.longitude).filter(|(la, lo)| la.abs() <= 90.0 && lo.abs() <= 180.0)
     }
 
     #[cfg(test)]
