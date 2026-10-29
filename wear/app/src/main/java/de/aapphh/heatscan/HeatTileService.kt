@@ -61,10 +61,47 @@ class HeatTileService : TileService() {
         box.addContent(centre(Quarters.CENTER_R * d * 2f, Quarters.CENTER == hot, Quarters.CENTER == ring, nonce))
         (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
             val a = Math.toRadians(Quarters.mid(room) - 90.0)
-            val r = if (room == Quarters.CENTER) 0f else Quarters.LABEL_R * d
+            val r = if (room == Quarters.CENTER) 0f else Quarters.labelR(room) * d
             box.addContent(label(room, d, (r * cos(a)).toFloat(), (r * sin(a)).toFloat(), room == hot))
         }
+        box.addContent(none(d, Defaults.NONE == hot, Defaults.NONE == ring, nonce))
         return box.build()
+    }
+
+    private fun none(d: Float, selected: Boolean, ringed: Boolean, nonce: Long): LayoutElementBuilders.LayoutElement {
+        val w = Quarters.NONE_HALF_W * d * 2f
+        val h = Quarters.NONE_H * d
+        val mods = ModifiersBuilders.Modifiers.Builder()
+            .setClickable(click(Defaults.NONE, nonce))
+            .setBackground(
+                ModifiersBuilders.Background.Builder()
+                    .setColor(ColorBuilders.argb(if (selected) SELECTED else IDLE))
+                    .setCorner(ModifiersBuilders.Corner.Builder().setRadius(dp(h / 2f)).build())
+                    .build()
+            )
+        if (ringed) mods.setBorder(ModifiersBuilders.Border.Builder().setWidth(dp(2f)).setColor(ColorBuilders.argb(Color.WHITE)).build())
+        val text = LayoutElementBuilders.Text.Builder()
+            .setText(Prompt.caption(Defaults.NONE, null))
+            .setMaxLines(1)
+            .setFontStyle(
+                LayoutElementBuilders.FontStyle.Builder()
+                    .setSize(DimensionBuilders.sp(10f))
+                    .setColor(ColorBuilders.argb(if (selected) INK else Color.WHITE))
+                    .build()
+            )
+            .build()
+        val pill = LayoutElementBuilders.Box.Builder().setWidth(dp(w)).setHeight(dp(h))
+            .setHorizontalAlignment(LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER)
+            .setVerticalAlignment(LayoutElementBuilders.VERTICAL_ALIGN_CENTER)
+            .setModifiers(mods.build())
+            .addContent(text)
+            .build()
+        return LayoutElementBuilders.Box.Builder().setWidth(dp(d)).setHeight(dp(d))
+            .setHorizontalAlignment(LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER)
+            .setVerticalAlignment(LayoutElementBuilders.VERTICAL_ALIGN_TOP)
+            .setModifiers(ModifiersBuilders.Modifiers.Builder().setPadding(ModifiersBuilders.Padding.Builder().setTop(dp(d / 2f + Quarters.NONE_TOP * d)).build()).build())
+            .addContent(pill)
+            .build()
     }
 
     private fun click(room: String, nonce: Long) = ModifiersBuilders.Clickable.Builder()
@@ -162,7 +199,7 @@ class HeatTileService : TileService() {
     private fun dp(v: Float) = DimensionBuilders.dp(v)
 
     companion object {
-        private const val RES_VERSION = "4"
+        private const val RES_VERSION = "5"
         private const val SELECTED = 0xFFE8710A.toInt()
         private const val IDLE = 0xFF2A2A2A.toInt()
         private const val INK = 0xFF111111.toInt()

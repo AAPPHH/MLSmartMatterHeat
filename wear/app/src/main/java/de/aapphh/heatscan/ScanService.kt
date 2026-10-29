@@ -643,7 +643,7 @@ object Prompter {
 
     private fun action(c: Context, room: String, guess: String?): Notification.Action {
         val pi = PendingIntent.getBroadcast(
-            c, Defaults.ROOMS.indexOf(room) + 10, Intent(c, LabelReceiver::class.java).setAction(ACTION).setData(android.net.Uri.parse("room:$room")).putExtra("room", room),
+            c, Defaults.LABELS.indexOf(room) + 10, Intent(c, LabelReceiver::class.java).setAction(ACTION).setData(android.net.Uri.parse("room:$room")).putExtra("room", room),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(c, RoomIcons.RES.getValue(room)), Prompt.caption(room, guess), pi).build()
@@ -721,7 +721,7 @@ object LabelRecorder {
     }
 
     private fun record(c: Context, room: String) {
-        if (room !in Defaults.ROOMS) return
+        if (room !in Defaults.LABELS) return
         val store = Store(c)
         val now = System.currentTimeMillis()
         val (from, to) = LabelEvent.window(store.stay { it.windowStart(now) }, now)

@@ -38,6 +38,10 @@ class ScreenshotTest {
 
     @Test fun rooms_label_bad_guess_kueche() = shot("rooms_label_bad_guess_kueche") { RoomsPage("kueche", "bad") {} }
 
+    @Test fun rooms_label_keiner() = shot("rooms_label_keiner") { RoomsPage("keiner", null) {} }
+
+    @Test fun rooms_label_keiner_guess_flur() = shot("rooms_label_keiner_guess_flur") { RoomsPage("flur", "keiner") {} }
+
     @Test fun data_demo() = shot("data_demo") { demo() }
 
     @Test fun data_no_model() = shot("data_no_model") {

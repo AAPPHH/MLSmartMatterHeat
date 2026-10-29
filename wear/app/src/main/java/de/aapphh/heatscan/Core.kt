@@ -21,13 +21,15 @@ object Defaults {
     const val SERVER = "http://192.168.178.29:8080"
     const val HOME = "FRITZ!Box 1234 AB"
     val ROOMS = listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur")
-    val CAPTIONS = mapOf("wohnzimmer" to "Wohnen", "schlafzimmer" to "Schlafen", "bad" to "Bad", "kueche" to "Küche", "flur" to "Flur")
+    const val NONE = "keiner"
+    val LABELS = ROOMS + NONE
+    val CAPTIONS = mapOf("wohnzimmer" to "Wohnen", "schlafzimmer" to "Schlafen", "bad" to "Bad", "kueche" to "Küche", "flur" to "Flur", NONE to "Kein Raum")
 }
 
 object RoomIcons {
     val RES = mapOf(
         "wohnzimmer" to R.drawable.ic_wohnzimmer, "schlafzimmer" to R.drawable.ic_schlafzimmer, "bad" to R.drawable.ic_bad,
-        "kueche" to R.drawable.ic_kueche, "flur" to R.drawable.ic_flur
+        "kueche" to R.drawable.ic_kueche, "flur" to R.drawable.ic_flur, Defaults.NONE to R.drawable.ic_keiner
     )
 }
 
@@ -71,9 +73,9 @@ object Prompt {
 
     fun title(change: Boolean) = if (change) "Raum gewechselt? Wo bist du jetzt?" else "Wo bist du?"
 
-    fun rooms(guess: String?): List<String> = if (guess != null && guess in ORDER) listOf(guess) + ORDER.filter { it != guess } else ORDER
+    fun rooms(guess: String?): List<String> = (if (guess != null && guess in ORDER) listOf(guess) + ORDER.filter { it != guess } else ORDER) + Defaults.NONE
 
-    fun caption(room: String, guess: String?): String = (if (room == guess) "● " else "") + Rings.name(room)
+    fun caption(room: String, guess: String?): String = if (room == Defaults.NONE) "Keiner" else (if (room == guess) "● " else "") + Rings.name(room)
 
     fun done(room: String) = "✓ Gespeichert: " + Rings.name(room)
 
@@ -293,7 +295,7 @@ class StayTracker {
         fun parse(text: String?): StayTracker = StayTracker().also { t ->
             try {
                 val o = JSONObject(text ?: return@also)
-                t.label = if (o.isNull("label")) null else o.optString("label").takeIf { it in Defaults.ROOMS }
+                t.label = if (o.isNull("label")) null else o.optString("label").takeIf { it in Defaults.LABELS }
                 t.confirmedAt = o.optLong("confirmedAt")
                 t.fp = Fingerprint.parse(o.optJSONObject("fp"))
                 t.n = o.optInt("n")
@@ -347,10 +349,18 @@ object Quarters {
     const val LABEL_R = 77f / REF
     const val GAP = 3f
     const val SPAN = 90f
+    const val NONE_TOP = 84f / REF
+    const val NONE_H = 15f / REF
+    const val NONE_HALF_W = 31f / REF
+    const val NONE_HIT_TOP = 80f / REF
+    val LABEL_SHIFT = mapOf("kueche" to -11f / REF)
+
+    fun labelR(room: String): Float = LABEL_R + (LABEL_SHIFT[room] ?: 0f)
 
     fun mid(room: String): Float = WEDGES.indexOf(room) * SPAN
 
     fun room(dx: Float, dy: Float, d: Float): String {
+        if (dy >= NONE_HIT_TOP * d && kotlin.math.abs(dx) <= (NONE_HALF_W + 0.02f) * d && kotlin.math.hypot(dx, dy) <= 0.5f * d) return Defaults.NONE
         if (kotlin.math.hypot(dx, dy) < CENTER_R * d) return CENTER
         val deg = Math.toDegrees(kotlin.math.atan2(dx.toDouble(), -dy.toDouble())).toFloat()
         return WEDGES[(((deg + SPAN / 2 + 360f) % 360f) / SPAN).toInt() % WEDGES.size]
@@ -592,7 +602,7 @@ object TileClick {
         if (!id.startsWith(PREFIX)) return null
         val parts = id.removePrefix(PREFIX).split(':')
         if (parts.size != 2 || parts[1] != nonce.toString()) return null
-        return parts[0].takeIf { it in Defaults.ROOMS }
+        return parts[0].takeIf { it in Defaults.LABELS }
     }
 
     fun statusLine(running: Boolean, mode: String, status: String): String =
