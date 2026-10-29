@@ -246,6 +246,9 @@ pub struct WindowSection {
     pub probe_min: f64,
     pub probe_drop_k: f64,
     pub max_events_per_hour: usize,
+    pub valve_low_pct: f64,
+    pub radiator_cold_min: f64,
+    pub manual_max_min: f64,
 }
 
 impl Default for WindowSection {
@@ -260,8 +263,8 @@ impl Default for WindowSection {
             setpoint_guard_min: 20.0,
             min_outdoor_delta_k: 5.0,
             cooldown_grace_min: 30.0,
-            expected_cooldown_factor: 2.0,
-            fallback_cooldown_k_per_h: 1.5,
+            expected_cooldown_factor: 1.5,
+            fallback_cooldown_k_per_h: 20.0,
             cooldown_sample_min: 15.0,
             cooldown_days: 14.0,
             wind_ms: 6.0,
@@ -274,6 +277,9 @@ impl Default for WindowSection {
             probe_min: 10.0,
             probe_drop_k: 0.5,
             max_events_per_hour: 4,
+            valve_low_pct: 10.0,
+            radiator_cold_min: 45.0,
+            manual_max_min: 720.0,
         }
     }
 }

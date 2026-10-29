@@ -443,11 +443,14 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let outdoor = state.status.outdoor(lake::now_us());
     let found = state.windows.lock().unwrap().step(&state.config, now_ms, outdoor);
     found.into_iter().for_each(|e| window_event(state, e));
-    let windows = state.windows.lock().unwrap().open_rooms();
+    let (windows, window_busy) = {
+        let w = state.windows.lock().unwrap();
+        (w.open_rooms(), w.active_rooms())
+    };
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
-        let blocked = |room: &str| if windows.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
+        let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
         let base = |room: &Room| base_setpoint(room, &state.config, now);
         let mut explorer = state.explorer.lock().unwrap();
         let lifecycle = explorer.tick(now, &Inputs { config: &state.config, blocked: &blocked, base: &base });

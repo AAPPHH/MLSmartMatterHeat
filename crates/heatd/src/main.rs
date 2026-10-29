@@ -193,6 +193,9 @@ async fn serve(config: Config) -> Result<()> {
     };
     let sink = lake::Sink::open(lake::LakeConfig::new(&config.data_dir))?;
     sink.append(lake::Event::now(lake::kind::STARTUP, "heatd").with_detail(serde_json::json!({"commit": lake::COMMIT, "schema_version": lake::SCHEMA_VERSION})))?;
+    let mut windows = window::Windows::default();
+    let replayed = windows.rebuild(&config, Path::new(&config.data_dir), lake::now_us() / 1000);
+    println!("window history: {replayed} readings");
     lake::spawn_background(sink.clone());
     let status = status::Status::new(lake::now_us());
     status.register_nodes(config.all_nodes());
@@ -208,7 +211,7 @@ async fn serve(config: Config) -> Result<()> {
         storage: Arc::new(storage::Storage::open(&config.db_path)?),
         model,
         controller,
-        windows: Default::default(),
+        windows: Arc::new(std::sync::Mutex::new(windows)),
         commanded: Default::default(),
         explorer: Arc::new(std::sync::Mutex::new(explore::Explorer::new(config.exploration_seed.unwrap_or_else(|| lake::now_us() as u64)))),
         tracker: Default::default(),
