@@ -166,6 +166,11 @@ commit: dict<utf8>
 - `setpoint_old` / `setpoint_new` in C, `mode` = target SystemMode text, `proposed` = a rule/policy suggested it, `applied` = it was written to the device, `commit` = heatd commit (`lake::COMMIT`).
 - Manual interventions (setpoint changed at the device, detected as a report without own decision) are `rule=manual` here and additionally a `labels` row with `source=override`.
 
+- Append-only write protocol: each setpoint write produces two rows with the same `ts`, `room`, `node`, `rule`, `inputs` and `experiment_id`. The proposal row (`proposed=true, applied=false`) is persisted before the device write; after the attempt a result row follows (`applied=true` on success, `applied=false` on failure). `inputs.extra` is a JSON object: `phase` = `proposal` | `result` | `observed` (manual), `reason` = rule detail (`schedule`, `default`, `presence_boost`, `away`, `window_open`, `exploration`), result rows add `ref_ts` (ts of the proposal) and `error` on failure. Consumers take the latest row per (`ts`, `node`). Unchanged setpoints (hysteresis, < 0.5 C) write no row. A sink error is logged and never aborts the tick or the other rooms; the device write still happens.
+- `rule=manual` rows: `proposed=false, applied=true`, `setpoint_old` = last commanded value, `setpoint_new` = value reported by the device, `experiment_id` = the experiment it aborted (if any).
+- `rule=exploration`: `exploration=true` and `experiment_id` set on all decisions of a running experiment; `rule=window` uses the frost setpoint.
+- Away: the watch must report away continuously for `away_guard_minutes` (default 20) and must have been carried (a `moving` report since away began), so a watch lying at home or charging never triggers it. Contact and power checks (`still_contact_timeout_minutes`, saver/offbody) still apply. Confirmed leave is logged as `presence_leave` (ts = start of the absence), return as `presence_arrive`, detail `{source: watch_wifi, device}`. Away target is `away_setpoint` (default 18.0) for all rooms, except window-open (frost).
+
 ### labels
 
 Producers: /watch/label and alias /api/label (source `watch`), manual entry (`manual`), rule core for overrides (`override`), room model (`model`). Partitioned by date.
