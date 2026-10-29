@@ -61,7 +61,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
-    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { ScanStarter.start(this, "permissions") }
+    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { ScanService.instance?.refreshSensors(); ScanStarter.start(this, "permissions") }
     private var asked = false
     private val prompt get() = intent.getBooleanExtra("prompt", false)
 
