@@ -59,7 +59,7 @@ object LabelEvent {
 
     fun watchBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("to")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("room", o.getString("label")).put("source", "watch").put("heat", o.optBoolean("heat", true)).toString()
 
-    fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).toString()
+    fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).put("heat", o.optBoolean("heat", true)).toString()
 }
 
 object Heat {
@@ -785,7 +785,7 @@ object Summary {
 object Payload {
     fun build(
         ts: Long, device: String, label: String?, aps: List<Ap>,
-        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null
+        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null, heat: Boolean? = null
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
@@ -796,6 +796,7 @@ object Payload {
         .put("power", power ?: JSONObject.NULL)
         .put("away", away)
         .also { if (bedtime != null) it.put("bedtime", bedtime) }
+        .also { if (heat != null) it.put("heat", heat) }
         .put("aps", JSONArray().also { arr ->
             aps.forEach { arr.put(JSONObject().put("bssid", it.bssid.lowercase()).put("rssi", it.rssi).put("freq", it.freq)) }
         })

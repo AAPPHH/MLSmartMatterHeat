@@ -109,6 +109,7 @@ object MeasureBatch {
             listOf("motion", "power", "label").forEach { k -> if (!e.isNull(k) && e.has(k)) o.put(k, e.getString(k)) }
             if (e.has("away")) o.put("away", e.getBoolean("away"))
             if (e.has("bedtime") && !e.isNull("bedtime")) o.put("bedtime", e.getBoolean("bedtime"))
+            if (e.has("heat") && !e.isNull("heat")) o.put("heat", e.getBoolean("heat"))
             if (e.optBoolean("queued")) o.put("queued", true)
         }
     }

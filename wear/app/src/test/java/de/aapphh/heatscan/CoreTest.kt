@@ -303,11 +303,13 @@ class CoreTest {
         assertFalse(LabelEvent.isLabel(Payload.build(1, "w", null, emptyList())))
         assertEquals(9L, e.getLong("ts"))
         val b = JSONObject(LabelEvent.body(e))
-        assertEquals(setOf("device", "from", "to", "label"), b.keys().asSequence().toSet())
+        assertEquals(setOf("device", "from", "to", "label", "heat"), b.keys().asSequence().toSet())
         assertEquals("w", b.getString("device"))
         assertEquals(5L, b.getLong("from"))
         assertEquals(9L, b.getLong("to"))
         assertEquals("bad", b.getString("label"))
+        assertTrue(b.getBoolean("heat"))
+        assertFalse(JSONObject(LabelEvent.body(LabelEvent.entry("w", 5, 9, "bad", false))).getBoolean("heat"))
         assertTrue(Defaults.ROOMS.all { Regex("^[a-z_]{1,32}$").matches(it) })
     }
 

@@ -431,7 +431,7 @@ class ScanService : Service() {
                 Trace.i("learn_pending_timeout")
                 learnPending = false
             }
-            val step = if (!learnReady) LearnStep.WAIT else Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt)
+            val step = Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt).let { if (!learnReady && it != LearnStep.STOP) LearnStep.WAIT else it }
             when (step) {
                 LearnStep.STOP -> stopLearn("auto")
                 LearnStep.DISCARD -> {
@@ -667,7 +667,7 @@ class ScanService : Service() {
                 val wall = System.currentTimeMillis()
                 if (manual) LabelRecorder.point(applicationContext, manualRoom, ts, manualHeat, false)
                 val d = if (learn || (manual && !manualHeat)) Decision() else if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
-                val body = Payload.build(ts, store.device, if (manual) null else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime())
+                val body = Payload.build(ts, store.device, if (manual) (if (manualHeat) manualRoom else null) else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime(), if (manual && !manualHeat || learn) false else null)
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
