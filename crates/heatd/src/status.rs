@@ -36,6 +36,7 @@ pub struct NodeStatus {
     pub reports: u64,
 }
 
+const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
 const BATTERY_KEEP_US: i64 = 86_400_000_000;
 const BATTERY_MAX_STEP_US: i64 = 1_800_000_000;
 const BATTERY_MIN_HOURS: f64 = 0.5;
@@ -71,6 +72,7 @@ struct Inner {
     ntp_offset_s: Option<f64>,
     weather_ok_us: Option<i64>,
     weather_rows: u64,
+    outdoor: Option<(i64, f64, Option<f64>)>,
     last_roll: Option<(i64, bool)>,
 }
 
@@ -116,6 +118,14 @@ impl Status {
         let mut inner = self.0.lock().unwrap();
         inner.weather_ok_us = Some(ts_us);
         inner.weather_rows += rows as u64;
+    }
+
+    pub fn outdoor_obs(&self, ts_us: i64, temp_c: f64, wind_ms: Option<f64>) {
+        self.0.lock().unwrap().outdoor = Some((ts_us, temp_c, wind_ms));
+    }
+
+    pub fn outdoor(&self, now_us: i64) -> Option<(f64, Option<f64>)> {
+        self.0.lock().unwrap().outdoor.filter(|o| now_us - o.0 <= OUTDOOR_MAX_AGE_US).map(|o| (o.1, o.2))
     }
 
     pub fn watch_inference(&self, matcher: &str, state: &str, abstained: bool) {

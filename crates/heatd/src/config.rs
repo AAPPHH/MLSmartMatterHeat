@@ -222,6 +222,64 @@ impl Default for WatchMatchSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct WindowSection {
+    pub enabled: bool,
+    pub window_slope_min: f64,
+    pub open_drop_k: f64,
+    pub open_window_min: f64,
+    pub open_slope_k_per_h: f64,
+    pub open_sustain_min: f64,
+    pub setpoint_guard_min: f64,
+    pub min_outdoor_delta_k: f64,
+    pub cooldown_grace_min: f64,
+    pub expected_cooldown_factor: f64,
+    pub fallback_cooldown_k_per_h: f64,
+    pub cooldown_sample_min: f64,
+    pub cooldown_days: f64,
+    pub wind_ms: f64,
+    pub wind_relax: f64,
+    pub min_open_min: f64,
+    pub close_rise_k: f64,
+    pub close_window_min: f64,
+    pub max_open_min: f64,
+    pub max_timeout_min: f64,
+    pub probe_min: f64,
+    pub probe_drop_k: f64,
+    pub max_events_per_hour: usize,
+}
+
+impl Default for WindowSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_slope_min: 6.0,
+            open_drop_k: 1.0,
+            open_window_min: 10.0,
+            open_slope_k_per_h: -4.0,
+            open_sustain_min: 4.0,
+            setpoint_guard_min: 20.0,
+            min_outdoor_delta_k: 5.0,
+            cooldown_grace_min: 30.0,
+            expected_cooldown_factor: 2.0,
+            fallback_cooldown_k_per_h: 1.5,
+            cooldown_sample_min: 15.0,
+            cooldown_days: 14.0,
+            wind_ms: 6.0,
+            wind_relax: 0.2,
+            min_open_min: 5.0,
+            close_rise_k: 0.3,
+            close_window_min: 10.0,
+            max_open_min: 20.0,
+            max_timeout_min: 60.0,
+            probe_min: 10.0,
+            probe_drop_k: 0.5,
+            max_events_per_hour: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -257,6 +315,7 @@ pub struct Config {
     pub manual_hold_minutes: f64,
     pub poll_silence_s: u64,
     pub watchmatch: WatchMatchSection,
+    pub window: WindowSection,
 }
 
 impl Default for Config {
@@ -293,9 +352,10 @@ impl Default for Config {
             neighbours: Vec::new(),
             heat_source: HeatSource::default(),
             building: Building::default(),
-            manual_hold_minutes: 120.0,
+            manual_hold_minutes: 60.0,
             poll_silence_s: 300,
             watchmatch: WatchMatchSection::default(),
+            window: WindowSection::default(),
         }
     }
 }
@@ -402,7 +462,7 @@ mod tests {
             assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
             assert_eq!((config.latitude, config.longitude, config.away_setpoint), (Some(52.52), Some(13.40), 18.0));
             assert_eq!((config.occupied_setpoint, config.sleep_room.as_deref()), (21.0, Some("schlafzimmer")));
-            assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 300, 120.0));
+            assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 300, 60.0));
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "wall").count(), 5);
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "ceiling").count(), 4);
             assert!(config.neighbours.iter().any(|n| n.kind == "ceiling" && n.partial) && config.neighbours.iter().any(|n| n.kind == "open"));

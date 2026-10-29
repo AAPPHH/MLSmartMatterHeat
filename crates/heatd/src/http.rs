@@ -1107,7 +1107,7 @@ nodes = [7]
     }
 
     #[tokio::test]
-    async fn manual_change_is_held_until_the_desired_setpoint_changes_or_the_hold_expires() {
+    async fn manual_change_is_held_for_exactly_the_hold_time_even_when_the_schedule_changes() {
         let schedule = "[[rooms.schedules]]
 days = ['weekdays']
 from = '13:00'
@@ -1115,7 +1115,7 @@ to = '14:00'
 setpoint = 21.0
 ";
         let h = harness_with(false, "away_guard_minutes = 0
-manual_hold_minutes = 120
+manual_hold_minutes = 60
 ", &format!("[[rooms]]
 name = 'wohnzimmer'
 nodes = [5]
@@ -1135,14 +1135,17 @@ nodes = [5]
         assert_eq!(device_setpoint(&h).await, 22.0);
         let rules = some(&column(&lake_rows(&h, "decisions"), "rule"));
         assert_eq!(rules.iter().filter(|r| *r == "manual").count(), 1);
-        control_step(&h.state, monday(13, 0), t0 + 60 * min).await.unwrap();
+        control_step(&h.state, monday(13, 0), t0 + 64 * min).await.unwrap();
+        assert_eq!(device_setpoint(&h).await, 22.0);
+        assert!(h.state.commanded.lock().unwrap().holding(&[5]));
+        control_step(&h.state, monday(13, 1), t0 + 65 * min).await.unwrap();
         assert_eq!(device_setpoint(&h).await, 21.0);
         assert!(!h.state.commanded.lock().unwrap().holding(&[5]));
     }
 
     #[tokio::test]
     async fn manual_hold_expires_after_the_configured_time() {
-        let h = harness_with(false, "manual_hold_minutes = 120
+        let h = harness_with(false, "manual_hold_minutes = 60
 ", "[[rooms]]
 name = 'wohnzimmer'
 nodes = [5]
@@ -1153,9 +1156,9 @@ nodes = [5]
         control_step(&h.state, noon, t0).await.unwrap();
         h.mock.write_heating_setpoint(5, 22.0).await.unwrap();
         crate::rules::on_report(&h.state, &setpoint_report(22.0), false, t0 + 5 * min);
-        control_step(&h.state, noon, t0 + 100 * min).await.unwrap();
+        control_step(&h.state, noon, t0 + 64 * min).await.unwrap();
         assert_eq!(device_setpoint(&h).await, 22.0);
-        control_step(&h.state, noon, t0 + 126 * min).await.unwrap();
+        control_step(&h.state, noon, t0 + 65 * min).await.unwrap();
         assert_eq!(device_setpoint(&h).await, 18.0);
     }
 

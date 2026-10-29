@@ -48,9 +48,14 @@ pub mod kind {
     pub const POLL_FAILED: &str = "poll_failed";
     pub const MATCHER_DRIFT: &str = "matcher_drift";
     pub const OCCUPANCY_END: &str = "occupancy_end";
-    pub const ALL: [&str; 18] = [
+    pub const WINDOW_OPEN: &str = "window_open";
+    pub const WINDOW_CLOSE: &str = "window_close";
+    pub const WINDOW_REOPEN: &str = "window_reopen";
+    pub const WINDOW_SUPPRESSED: &str = "window_suppressed";
+    pub const ALL: [&str; 22] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
         ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
+        WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED,
     ];
 }
 

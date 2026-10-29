@@ -27,7 +27,6 @@ pub struct Sent {
 pub struct Hold {
     pub value: f64,
     pub since_ms: i64,
-    pub desired: f64,
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +90,6 @@ impl Occ {
 pub struct Commands {
     sent: HashMap<u64, Sent>,
     device: HashMap<u64, f64>,
-    desired: HashMap<u64, f64>,
     holds: HashMap<u64, Hold>,
     last_write: HashMap<u64, (i64, &'static str)>,
     deferred: HashMap<u64, f64>,
@@ -112,9 +110,8 @@ impl Commands {
     }
 
     fn release_due(&mut self, want: &Desired, now_ms: i64, hold_ms: i64) -> Option<bool> {
-        self.desired.insert(want.node, want.setpoint);
         let Some(hold) = self.holds.get(&want.node) else { return Some(false) };
-        if now_ms - hold.since_ms < hold_ms && (want.setpoint - hold.desired).abs() < DESIRED_EPS_C {
+        if now_ms - hold.since_ms < hold_ms && !matches!(want.reason, "window_open" | "away") {
             return None;
         }
         if let Some(hold) = self.holds.remove(&want.node) {
@@ -554,9 +551,8 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
         return None;
     }
     let previous = sent.acked.unwrap_or(sent.target);
-    let desired = commands.desired.get(&report.node).copied().unwrap_or(previous);
     commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None });
-    commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, desired });
+    commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms });
     Some(previous)
 }
 

@@ -167,6 +167,9 @@ impl WeatherJob {
         let hours = parse_hourly(&(self.fetch)(&self.url)?)?;
         let rows = weather_rows(&hours, now_us, self.last_obs);
         let newest_obs = rows.iter().filter(|r| r.kind == "obs").map(|r| r.ts).max();
+        if let Some(o) = rows.iter().filter(|r| r.kind == "obs" && r.temp_c.is_some()).max_by_key(|r| r.ts) {
+            status.outdoor_obs(now_us, o.temp_c.unwrap_or_default() as f64, o.wind_ms.map(f64::from));
+        }
         let count = rows.len();
         sink.append_many(rows)?;
         self.last_obs = self.last_obs.max(newest_obs);
