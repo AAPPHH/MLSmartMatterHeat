@@ -222,6 +222,7 @@ impl Storage {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    #[cfg(test)]
     pub fn insert_reading(&self, ts_ms: i64, node: u64, endpoint: u16, attribute: &str, value: f64) -> Result<()> {
         self.conn.lock().unwrap().execute("INSERT INTO readings VALUES (epoch_ms(?), ?, ?, ?, ?)", params![ts_ms, node, endpoint, attribute, value])?;
         Ok(())
@@ -238,6 +239,7 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn last_readings(&self) -> Result<Vec<Reading>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

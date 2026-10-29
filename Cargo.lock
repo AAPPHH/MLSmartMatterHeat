@@ -743,6 +743,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "ureq",
 ]
 
 [[package]]
@@ -1919,6 +1920,7 @@ checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64",
  "der",
+ "flate2",
  "log",
  "native-tls",
  "percent-encoding",

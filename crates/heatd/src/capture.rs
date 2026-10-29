@@ -1,6 +1,7 @@
 use crate::http::AppState;
 use crate::inventory;
 use crate::lake::{self, kind, AttributeReport, Event};
+use crate::status::SubState;
 use crate::storage::Reading;
 use matter_controller::{CaptureItem, RawAttribute, RawEvent};
 use serde_json::json;
@@ -71,6 +72,7 @@ pub enum Out {
     Attribute(AttributeReport),
     Event(Event),
     Firmware { label: String, complete: bool, changed: bool },
+    Core { endpoint: u16, name: &'static str, value: f64 },
 }
 
 pub struct NodeCapture {
@@ -160,6 +162,7 @@ impl NodeCapture {
         }
         if let Some((name, value)) = a.core() {
             self.latest.update(self.node, name, value, now / 1000);
+            out.push(Out::Core { endpoint: a.endpoint, name, value });
         }
         out.push(Out::Attribute(AttributeReport {
             ts: now,
@@ -249,8 +252,20 @@ fn start_inventory(state: &AppState, node: u64, busy: &Arc<AtomicBool>, timing: 
 
 fn apply(state: &AppState, node: u64, busy: &Arc<AtomicBool>, timing: Timing, out: Out) {
     match out {
-        Out::Attribute(row) => log_error(state.sink.append(row)),
-        Out::Event(row) => log_error(state.sink.append(row)),
+        Out::Attribute(row) => {
+            state.status.node_report(node, row.ts);
+            state.status.subscription(node, SubState::Subscribed, row.ts);
+            log_error(state.sink.append(row));
+        }
+        Out::Event(row) => {
+            match row.kind.as_str() {
+                kind::SUBSCRIPTION_LOST => state.status.subscription(node, SubState::Lost, row.ts),
+                kind::RESUBSCRIBED => state.status.subscription(node, SubState::Subscribed, row.ts),
+                _ => {}
+            }
+            log_error(state.sink.append(row));
+        }
+        Out::Core { endpoint, name, value } => crate::rules::on_report(state, &matter_controller::AttributeReport { node, endpoint, attribute: name.into(), value }, crate::storage::now_ms()),
         Out::Firmware { label, complete, changed } => {
             if changed || (complete && !inventory::exists(&PathBuf::from(&state.config.inventory_dir), node, &label)) {
                 start_inventory(state, node, busy, timing);
@@ -422,6 +437,10 @@ mod tests {
             controller: mock,
             windows: Default::default(),
             commanded: Default::default(),
+            status: crate::status::Status::new(lake::now_us()),
+            explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
+            tracker: Default::default(),
+            batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 

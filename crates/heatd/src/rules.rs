@@ -299,10 +299,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         lifecycle.into_iter().for_each(|life| lifecycle_event(state, life));
         active
     };
-    let readings = state.storage.last_readings().unwrap_or_else(|e| {
-        eprintln!("readings: {e}");
-        Vec::new()
-    });
+    let readings = state.latest.all();
     let mut written = Vec::new();
     for want in desired(now, &state.config, presence.as_ref(), &windows, &exploring) {
         let last = state.commanded.lock().unwrap().get(&want.node).copied();
@@ -335,7 +332,6 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
 }
 
 pub fn on_report(state: &AppState, report: &AttributeReport, now_ms: i64) {
-    log("store reading", state.storage.insert_reading(now_ms, report.node, report.endpoint, &report.attribute, report.value));
     if report.attribute != OCCUPIED_HEATING_SETPOINT.snake {
         return;
     }
