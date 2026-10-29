@@ -1,0 +1,144 @@
+[0;32m[1761580800.001] [4821:4825] [CTL] Resolving _matter._tcp node 0x0000000000000005[0m
+[0;32m[1761580800.002] [4821:4825] [TOO] Sending command to node 0x5[0m
+[0;32m[1761580800.003] [4821:4825] [EM] >>> [E:51234r S:3411 M:187654321 (Ack:12345)] (S) Msg RX from 1:0000000000000005 [B2C3] --- Type 0001:05 (IM:ReportData) (B:1180)[0m
+[0;34m[1761580800.004] [4821:4825] [DMG] ReportDataMessage =[0m
+[0;34m[1761580800.005] [4821:4825] [DMG] {[0m
+[0;32m[1761580800.006] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_001D Attribute 0x0000_0000 DataVersion: 11[0m
+[0;32m[1761580800.007] [4821:4825] [TOO]   DeviceTypeList: 1 entries[0m
+[0;32m[1761580800.008] [4821:4825] [TOO]     [1]: {[0m
+[0;32m[1761580800.009] [4821:4825] [TOO]       DeviceType: 22[0m
+[0;32m[1761580800.010] [4821:4825] [TOO]       Revision: 1[0m
+[0;32m[1761580800.011] [4821:4825] [TOO]      }[0m
+[0;32m[1761580800.012] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_001D Attribute 0x0000_0001 DataVersion: 11[0m
+[0;32m[1761580800.013] [4821:4825] [TOO]   ServerList: 3 entries[0m
+[0;32m[1761580800.014] [4821:4825] [TOO]     [1]: 29[0m
+[0;32m[1761580800.015] [4821:4825] [TOO]     [2]: 40[0m
+[0;32m[1761580800.016] [4821:4825] [TOO]     [3]: 53[0m
+[0;32m[1761580800.017] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0001 DataVersion: 12[0m
+[0;32m[1761580800.018] [4821:4825] [TOO]   VendorName: "Eurotronic"[0m
+[0;32m[1761580800.019] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0002 DataVersion: 12[0m
+[0;32m[1761580800.020] [4821:4825] [TOO]   VendorID: 4151[0m
+[0;32m[1761580800.021] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0003 DataVersion: 12[0m
+[0;32m[1761580800.022] [4821:4825] [TOO]   ProductName: "Comet Zero"[0m
+[0;32m[1761580800.023] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0005 DataVersion: 12[0m
+[0;32m[1761580800.024] [4821:4825] [TOO]   NodeLabel: [0m
+[0;32m[1761580800.025] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0009 DataVersion: 12[0m
+[0;32m[1761580800.026] [4821:4825] [TOO]   SoftwareVersion: 66[0m
+[0;32m[1761580800.027] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_000A DataVersion: 12[0m
+[0;32m[1761580800.028] [4821:4825] [TOO]   SoftwareVersionString: "1.2.2"[0m
+[0;32m[1761580800.029] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_000F DataVersion: 12[0m
+[0;32m[1761580800.030] [4821:4825] [TOO]   SerialNumber: "EU0042"[0m
+[0;32m[1761580800.031] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0013 DataVersion: 12[0m
+[0;32m[1761580800.032] [4821:4825] [TOO]   CapabilityMinima: {[0m
+[0;32m[1761580800.033] [4821:4825] [TOO]     CaseSessionsPerFabric: 3[0m
+[0;32m[1761580800.034] [4821:4825] [TOO]     SubscriptionsPerFabric: 3[0m
+[0;32m[1761580800.035] [4821:4825] [TOO]    }[0m
+[0;32m[1761580800.036] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000B DataVersion: 21[0m
+[0;32m[1761580800.037] [4821:4825] [TOO]   BatVoltage: 2950[0m
+[0;32m[1761580800.038] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000C DataVersion: 21[0m
+[0;32m[1761580800.039] [4821:4825] [TOO]   BatPercentRemaining: 190[0m
+[0;32m[1761580800.040] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000E DataVersion: 21[0m
+[0;32m[1761580800.041] [4821:4825] [TOO]   BatChargeLevel: 0[0m
+[0;32m[1761580800.042] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_0011 DataVersion: 21[0m
+[0;32m[1761580800.043] [4821:4825] [TOO]   BatPresent: true[0m
+[0;32m[1761580800.044] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_0013 DataVersion: 21[0m
+[0;32m[1761580800.045] [4821:4825] [TOO]   BatReplacementDescription: "2x AA"[0m
+[0;32m[1761580800.046] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0000 DataVersion: 5[0m
+[0;32m[1761580800.047] [4821:4825] [TOO]   Channel: 26[0m
+[0;32m[1761580800.048] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0001 DataVersion: 5[0m
+[0;32m[1761580800.049] [4821:4825] [TOO]   RoutingRole: 2[0m
+[0;32m[1761580800.050] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0002 DataVersion: 5[0m
+[0;32m[1761580800.051] [4821:4825] [TOO]   NetworkName: "thread-net-1"[0m
+[0;32m[1761580800.052] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0003 DataVersion: 5[0m
+[0;32m[1761580800.053] [4821:4825] [TOO]   PanId: 12345[0m
+[0;32m[1761580800.054] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0007 DataVersion: 5[0m
+[0;32m[1761580800.055] [4821:4825] [TOO]   NeighborTable: 2 entries[0m
+[0;32m[1761580800.056] [4821:4825] [TOO]     [1]: {[0m
+[0;32m[1761580800.057] [4821:4825] [TOO]       ExtAddress: 1311768467294899695[0m
+[0;32m[1761580800.058] [4821:4825] [TOO]       Age: 12[0m
+[0;32m[1761580800.059] [4821:4825] [TOO]       Rloc16: 20480[0m
+[0;32m[1761580800.060] [4821:4825] [TOO]       LinkFrameCounter: 4521[0m
+[0;32m[1761580800.061] [4821:4825] [TOO]       MleFrameCounter: 880[0m
+[0;32m[1761580800.062] [4821:4825] [TOO]       Lqi: 3[0m
+[0;32m[1761580800.063] [4821:4825] [TOO]       AverageRssi: -61[0m
+[0;32m[1761580800.064] [4821:4825] [TOO]       LastRssi: -63[0m
+[0;32m[1761580800.065] [4821:4825] [TOO]       FrameErrorRate: 0[0m
+[0;32m[1761580800.066] [4821:4825] [TOO]       MessageErrorRate: 0[0m
+[0;32m[1761580800.067] [4821:4825] [TOO]       RxOnWhenIdle: true[0m
+[0;32m[1761580800.068] [4821:4825] [TOO]       FullThreadDevice: true[0m
+[0;32m[1761580800.069] [4821:4825] [TOO]       FullNetworkData: true[0m
+[0;32m[1761580800.070] [4821:4825] [TOO]       IsChild: false[0m
+[0;32m[1761580800.071] [4821:4825] [TOO]      }[0m
+[0;32m[1761580800.072] [4821:4825] [TOO]     [2]: {[0m
+[0;32m[1761580800.073] [4821:4825] [TOO]       ExtAddress: 1311768467294899696[0m
+[0;32m[1761580800.074] [4821:4825] [TOO]       Age: 40[0m
+[0;32m[1761580800.075] [4821:4825] [TOO]       Rloc16: 20481[0m
+[0;32m[1761580800.076] [4821:4825] [TOO]       LinkFrameCounter: 9[0m
+[0;32m[1761580800.077] [4821:4825] [TOO]       MleFrameCounter: 8[0m
+[0;32m[1761580800.078] [4821:4825] [TOO]       Lqi: 2[0m
+[0;32m[1761580800.079] [4821:4825] [TOO]       AverageRssi: null[0m
+[0;32m[1761580800.080] [4821:4825] [TOO]       LastRssi: -80[0m
+[0;32m[1761580800.081] [4821:4825] [TOO]       FrameErrorRate: 3[0m
+[0;32m[1761580800.082] [4821:4825] [TOO]       MessageErrorRate: 1[0m
+[0;32m[1761580800.083] [4821:4825] [TOO]       RxOnWhenIdle: false[0m
+[0;32m[1761580800.084] [4821:4825] [TOO]       FullThreadDevice: false[0m
+[0;32m[1761580800.085] [4821:4825] [TOO]       FullNetworkData: false[0m
+[0;32m[1761580800.086] [4821:4825] [TOO]       IsChild: true[0m
+[0;32m[1761580800.087] [4821:4825] [TOO]      }[0m
+[0;32m[1761580800.088] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0008 DataVersion: 5[0m
+[0;32m[1761580800.089] [4821:4825] [TOO]   RouteTable: 0 entries[0m
+[0;32m[1761580800.090] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0016 DataVersion: 5[0m
+[0;32m[1761580800.091] [4821:4825] [TOO]   TxTotalCount: 1234[0m
+[0;32m[1761580800.092] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0027 DataVersion: 5[0m
+[0;32m[1761580800.093] [4821:4825] [TOO]   RxTotalCount: 987[0m
+[0;32m[1761580800.094] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0015 DataVersion: 5[0m
+[0;32m[1761580800.095] [4821:4825] [TOO]   ParentChangeCount: 1[0m
+[0;32m[1761580800.096] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_FFFC DataVersion: 5[0m
+[0;32m[1761580800.097] [4821:4825] [TOO]   FeatureMap: 15[0m
+[0;32m[1761580800.098] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0000 DataVersion: 3037862385[0m
+[0;32m[1761580800.099] [4821:4825] [TOO]   LocalTemperature: 2150[0m
+[0;32m[1761580800.100] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0001 DataVersion: 3037862385[0m
+[0;32m[1761580800.101] [4821:4825] [TOO]   OutdoorTemperature: null[0m
+[0;32m[1761580800.102] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0003 DataVersion: 3037862385[0m
+[0;32m[1761580800.103] [4821:4825] [TOO]   AbsMinHeatSetpointLimit: 500[0m
+[0;32m[1761580800.104] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0004 DataVersion: 3037862385[0m
+[0;32m[1761580800.105] [4821:4825] [TOO]   AbsMaxHeatSetpointLimit: 3000[0m
+[0;32m[1761580800.106] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0008 DataVersion: 3037862385[0m
+[0;32m[1761580800.107] [4821:4825] [TOO]   PIHeatingDemand: 35[0m
+[0;32m[1761580800.108] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0010 DataVersion: 3037862385[0m
+[0;32m[1761580800.109] [4821:4825] [TOO]   LocalTemperatureCalibration: -5[0m
+[0;32m[1761580800.110] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0012 DataVersion: 3037862385[0m
+[0;32m[1761580800.111] [4821:4825] [TOO]   OccupiedHeatingSetpoint: 2100[0m
+[0;32m[1761580800.112] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_001B DataVersion: 3037862385[0m
+[0;32m[1761580800.113] [4821:4825] [TOO]   ControlSequenceOfOperation: 2[0m
+[0;32m[1761580800.114] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_001C DataVersion: 3037862385[0m
+[0;32m[1761580800.115] [4821:4825] [TOO]   SystemMode: 4[0m
+[0;32m[1761580800.116] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0029 DataVersion: 3037862385[0m
+[0;32m[1761580800.117] [4821:4825] [TOO]   ThermostatRunningState: 1[0m
+[0;32m[1761580800.118] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0050 DataVersion: 3037862385[0m
+[0;32m[1761580800.119] [4821:4825] [TOO]   Presets: 0 entries[0m
+[0;32m[1761580800.120] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFF8 DataVersion: 3037862385[0m
+[0;32m[1761580800.121] [4821:4825] [TOO]   GeneratedCommandList: 0 entries[0m
+[0;32m[1761580800.122] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFF9 DataVersion: 3037862385[0m
+[0;32m[1761580800.123] [4821:4825] [TOO]   AcceptedCommandList: 3 entries[0m
+[0;32m[1761580800.124] [4821:4825] [TOO]     [1]: 0[0m
+[0;32m[1761580800.125] [4821:4825] [TOO]     [2]: 1[0m
+[0;32m[1761580800.126] [4821:4825] [TOO]     [3]: 2[0m
+[0;32m[1761580800.127] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFFA DataVersion: 3037862385[0m
+[0;32m[1761580800.128] [4821:4825] [TOO]   EventList: 0 entries[0m
+[0;32m[1761580800.129] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFFB DataVersion: 3037862385[0m
+[0;32m[1761580800.130] [4821:4825] [TOO]   AttributeList: 4 entries[0m
+[0;32m[1761580800.131] [4821:4825] [TOO]     [1]: 0[0m
+[0;32m[1761580800.132] [4821:4825] [TOO]     [2]: 18[0m
+[0;32m[1761580800.133] [4821:4825] [TOO]     [3]: 28[0m
+[0;32m[1761580800.134] [4821:4825] [TOO]     [4]: 65528[0m
+[0;32m[1761580800.135] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFFC DataVersion: 3037862385[0m
+[0;32m[1761580800.136] [4821:4825] [TOO]   FeatureMap: 35[0m
+[0;32m[1761580800.137] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFFD DataVersion: 3037862385[0m
+[0;32m[1761580800.138] [4821:4825] [TOO]   ClusterRevision: 6[0m
+[0;32m[1761580800.139] [4821:4825] [TOO] Endpoint: 1 Cluster: 0xFFF1_FC01 Attribute 0xFFF1_0001 DataVersion: 7[0m
+[0;32m[1761580800.140] [4821:4825] [TOO]   Unknown: 77[0m
+[0;32m[1761580800.141] [4821:4825] [TOO] Endpoint: 1 Cluster: 0xFFF1_FC01 Attribute 0xFFF1_0002 DataVersion: 7[0m
+[0;32m[1761580800.142] [4821:4825] [TOO]   VendorTrvMode: "auto"[0m
+[0;32m[1761580800.143] [4821:4825] [TOO] Response Failure: IM Error 0x00000581: General error: 0x81 (UNSUPPORTED_CLUSTER)[0m
+[0;34m[1761580800.144] [4821:4825] [DMG] }[0m

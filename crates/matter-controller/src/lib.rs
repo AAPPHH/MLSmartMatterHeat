@@ -1,4 +1,5 @@
 mod chip_tool;
+mod inventory;
 mod mock;
 
 use async_trait::async_trait;
@@ -6,6 +7,11 @@ use std::collections::BTreeMap;
 use tokio::sync::mpsc::Receiver;
 
 pub use chip_tool::{strip_ansi, ChipToolConfig, ChipToolController, ReportParser, StorageLock};
+pub use inventory::{
+    attribute_name, attribute_writable, cluster_name, command_name, event_name, hex_id, is_vendor_id, parse_attributes, parse_events, parse_number, parse_scalar,
+    thermostat_features, AttributeRecord, EventRecord, Inventory, ACCEPTED_COMMAND_LIST, ATTRIBUTE_LIST, CLUSTER_REVISION, EVENT_LIST, FEATURE_MAP,
+    GENERATED_COMMAND_LIST, NEIGHBOR_TABLE, POWER_SOURCE_CLUSTER, ROUTE_TABLE, THREAD_DIAGNOSTICS_CLUSTER,
+};
 pub use mock::MockController;
 
 pub type NodeId = u64;
@@ -24,6 +30,30 @@ pub const LOCAL_TEMPERATURE: AttributeSpec = AttributeSpec { id: 0x0000, pascal:
 pub const OCCUPIED_HEATING_SETPOINT: AttributeSpec = AttributeSpec { id: 0x0012, pascal: "OccupiedHeatingSetpoint", snake: "occupied_heating_setpoint", kebab: "occupied-heating-setpoint", scale: 100.0 };
 pub const SYSTEM_MODE: AttributeSpec = AttributeSpec { id: 0x001C, pascal: "SystemMode", snake: "system_mode", kebab: "system-mode", scale: 1.0 };
 pub const WATCHED: [&AttributeSpec; 3] = [&LOCAL_TEMPERATURE, &OCCUPIED_HEATING_SETPOINT, &SYSTEM_MODE];
+pub const PI_HEATING_DEMAND: AttributeSpec = AttributeSpec { id: 0x0008, pascal: "PIHeatingDemand", snake: "pi_heating_demand", kebab: "pi-heating-demand", scale: 1.0 };
+pub const LOCAL_TEMPERATURE_CALIBRATION: AttributeSpec = AttributeSpec { id: 0x0010, pascal: "LocalTemperatureCalibration", snake: "local_temperature_calibration", kebab: "local-temperature-calibration", scale: 10.0 };
+pub const THERMOSTAT_RUNNING_STATE: AttributeSpec = AttributeSpec { id: 0x0029, pascal: "ThermostatRunningState", snake: "thermostat_running_state", kebab: "thermostat-running-state", scale: 1.0 };
+pub const BAT_VOLTAGE: AttributeSpec = AttributeSpec { id: 0x000B, pascal: "BatVoltage", snake: "bat_voltage", kebab: "bat-voltage", scale: 1.0 };
+pub const BAT_PERCENT_REMAINING: AttributeSpec = AttributeSpec { id: 0x000C, pascal: "BatPercentRemaining", snake: "bat_percent_remaining", kebab: "bat-percent-remaining", scale: 2.0 };
+pub const BAT_CHARGE_LEVEL: AttributeSpec = AttributeSpec { id: 0x000E, pascal: "BatChargeLevel", snake: "bat_charge_level", kebab: "bat-charge-level", scale: 1.0 };
+pub const ROUTING_ROLE: AttributeSpec = AttributeSpec { id: 0x0001, pascal: "RoutingRole", snake: "routing_role", kebab: "routing-role", scale: 1.0 };
+pub const NEIGHBOR_TABLE_SPEC: AttributeSpec = AttributeSpec { id: 0x0007, pascal: "NeighborTable", snake: "neighbor_table", kebab: "neighbor-table", scale: 1.0 };
+
+pub struct SubscriptionGroup {
+    pub cluster: &'static str,
+    pub cluster_id: u32,
+    pub attributes: &'static [&'static AttributeSpec],
+}
+
+pub const EXTRA_SUBSCRIPTIONS: [SubscriptionGroup; 3] = [
+    SubscriptionGroup { cluster: "thermostat", cluster_id: THERMOSTAT_CLUSTER, attributes: &[&PI_HEATING_DEMAND, &LOCAL_TEMPERATURE_CALIBRATION, &THERMOSTAT_RUNNING_STATE] },
+    SubscriptionGroup { cluster: "powersource", cluster_id: 0x002F, attributes: &[&BAT_VOLTAGE, &BAT_PERCENT_REMAINING, &BAT_CHARGE_LEVEL] },
+    SubscriptionGroup { cluster: "threadnetworkdiagnostics", cluster_id: 0x0035, attributes: &[&ROUTING_ROLE, &NEIGHBOR_TABLE_SPEC] },
+];
+
+pub const THREAD_PARENT_RSSI: &str = "thread_parent_rssi";
+pub const THREAD_PARENT_LAST_RSSI: &str = "thread_parent_last_rssi";
+pub const THREAD_PARENT_LQI: &str = "thread_parent_lqi";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -76,4 +106,5 @@ pub trait MatterController: Send + Sync {
     async fn read_thermostat(&self, node: NodeId) -> Result<ThermostatState>;
     async fn write_heating_setpoint(&self, node: NodeId, celsius: f64) -> Result<()>;
     async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>>;
+    async fn inventory(&self, node: NodeId) -> Result<Inventory>;
 }

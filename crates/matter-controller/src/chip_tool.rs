@@ -1,7 +1,9 @@
 use crate::{
-    centi_degrees, AttributeReport, AttributeSpec, Error, MatterController, NodeId, Result, ThermostatState, OCCUPIED_HEATING_SETPOINT, WATCHED,
+    centi_degrees, parse_number, AttributeReport, AttributeSpec, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
+    NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -18,6 +20,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 const COMMISSION_MARGIN_S: u64 = 15;
 const LOCK_FILE: &str = "heatd.lock";
+const INVENTORY_TIMEOUT_FACTOR: u64 = 3;
+const WILDCARD: &str = "0xFFFFFFFF";
+const WILDCARD_ENDPOINT: &str = "0xFFFF";
 
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
@@ -36,7 +41,7 @@ pub fn strip_ansi(text: &str) -> String {
     out
 }
 
-fn clean(line: &str) -> String {
+pub(crate) fn clean(line: &str) -> String {
     strip_ansi(line).trim_end().to_string()
 }
 
@@ -132,6 +137,35 @@ impl ChipToolConfig {
         )
     }
 
+    pub fn extra_subscribe_lines(&self, node: NodeId) -> Vec<String> {
+        EXTRA_SUBSCRIPTIONS
+            .iter()
+            .map(|group| {
+                let ids: Vec<String> = group.attributes.iter().map(|s| format!("0x{:04X}", s.id)).collect();
+                format!(
+                    "{} subscribe-by-id {} {} {} {} {WILDCARD_ENDPOINT} --keepSubscriptions 1 --auto-resubscribe 1",
+                    group.cluster,
+                    ids.join(","),
+                    self.subscribe_min_s,
+                    self.subscribe_max_s,
+                    node
+                )
+            })
+            .collect()
+    }
+
+    pub fn subscribe_lines(&self, node: NodeId) -> Vec<String> {
+        std::iter::once(self.subscribe_line(node)).chain(self.extra_subscribe_lines(node)).collect()
+    }
+
+    pub fn inventory_attribute_args(&self, node: NodeId) -> Vec<String> {
+        self.args(&strings(&["any", "read-by-id", WILDCARD, WILDCARD, &node.to_string(), WILDCARD_ENDPOINT]))
+    }
+
+    pub fn inventory_event_args(&self, node: NodeId) -> Vec<String> {
+        self.args(&strings(&["any", "read-event-by-id", WILDCARD, WILDCARD, &node.to_string(), WILDCARD_ENDPOINT]))
+    }
+
     pub fn lock_path(&self) -> PathBuf {
         let dir = self.storage_dir.as_ref().map(PathBuf::from).unwrap_or_else(|| {
             std::env::var_os("SNAP_USER_COMMON")
@@ -160,7 +194,7 @@ fn strings(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
-fn payload(line: &str) -> Option<&str> {
+pub(crate) fn payload(line: &str) -> Option<&str> {
     ["[TOO]", "CHIP:TOO:"].iter().find_map(|marker| line.find(marker).map(|i| &line[i + marker.len()..]))
 }
 
@@ -193,7 +227,7 @@ fn status_code(line: &str, marker: &str) -> Option<u32> {
     u32::from_str_radix(&hex, 16).ok()
 }
 
-fn is_failure(line: &str) -> bool {
+pub(crate) fn is_failure(line: &str) -> bool {
     let body = payload(line).unwrap_or(line).trim();
     body.starts_with("Run command failure")
         || body.starts_with("Response Failure")
@@ -209,25 +243,63 @@ fn rx_peer(line: &str) -> Option<NodeId> {
     NodeId::from_str_radix(token.split_once(':')?.1, 16).ok()
 }
 
+fn spec_for(name: &str) -> Option<&'static AttributeSpec> {
+    WATCHED.iter().copied().chain(EXTRA_SUBSCRIPTIONS.iter().flat_map(|g| g.attributes.iter().copied())).find(|s| s.pascal == name)
+}
+
+#[derive(Default)]
+struct Neighbor {
+    lqi: Option<f64>,
+    average_rssi: Option<f64>,
+    last_rssi: Option<f64>,
+    is_child: Option<bool>,
+}
+
 pub struct ReportParser {
     node: NodeId,
     endpoint: u16,
+    cluster: u32,
+    attribute: u32,
+    neighbor: Option<Neighbor>,
 }
 
 impl ReportParser {
     pub fn new(node: NodeId, default_endpoint: u16) -> Self {
-        Self { node, endpoint: default_endpoint }
+        Self { node, endpoint: default_endpoint, cluster: 0, attribute: u32::MAX, neighbor: None }
     }
 
     pub fn feed(&mut self, raw: &str) -> Option<AttributeReport> {
+        self.feed_all(raw).into_iter().next()
+    }
+
+    pub fn feed_all(&mut self, raw: &str) -> Vec<AttributeReport> {
         let line = clean(raw);
-        let body = payload(&line)?;
+        let Some(body) = payload(&line) else { return Vec::new() };
         if let Some(rest) = body.trim_start().strip_prefix("Endpoint:") {
-            if let Some(ep) = rest.split_whitespace().next().and_then(|t| t.parse().ok()) {
-                self.endpoint = ep;
-            }
-            return None;
+            self.header(rest);
+            return Vec::new();
         }
+        if self.cluster == THREAD_DIAGNOSTICS_CLUSTER && self.attribute == NEIGHBOR_TABLE {
+            return self.neighbor_line(body.trim());
+        }
+        self.attribute_line(body).into_iter().collect()
+    }
+
+    fn header(&mut self, rest: &str) {
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        if let Some(ep) = tokens.first().and_then(|t| t.parse().ok()) {
+            self.endpoint = ep;
+        }
+        let id_after = |key: &str| {
+            let at = tokens.iter().position(|t| *t == key)?;
+            u32::try_from(parse_number(tokens.get(at + 1)?)?).ok()
+        };
+        self.cluster = id_after("Cluster:").unwrap_or(0);
+        self.attribute = id_after("Attribute").unwrap_or(u32::MAX);
+        self.neighbor = None;
+    }
+
+    fn attribute_line(&self, body: &str) -> Option<AttributeReport> {
         if !body.starts_with("  ") {
             return None;
         }
@@ -236,7 +308,7 @@ impl ReportParser {
             return None;
         }
         let raw = parse_value(value)?;
-        let known = WATCHED.iter().find(|s| s.pascal == name);
+        let known = spec_for(name);
         Some(AttributeReport {
             node: self.node,
             endpoint: self.endpoint,
@@ -244,11 +316,33 @@ impl ReportParser {
             value: raw / known.map_or(1.0, |s| s.scale),
         })
     }
+
+    fn neighbor_line(&mut self, text: &str) -> Vec<AttributeReport> {
+        if text.starts_with('[') && text.ends_with('{') {
+            self.neighbor = Some(Neighbor::default());
+            return Vec::new();
+        }
+        if text == "}" {
+            let Some(n) = self.neighbor.take().filter(|n| n.is_child != Some(true)) else { return Vec::new() };
+            let report = |attribute: &str, value: Option<f64>| value.map(|value| AttributeReport { node: self.node, endpoint: self.endpoint, attribute: attribute.to_string(), value });
+            return [report(THREAD_PARENT_RSSI, n.average_rssi), report(THREAD_PARENT_LAST_RSSI, n.last_rssi), report(THREAD_PARENT_LQI, n.lqi)].into_iter().flatten().collect();
+        }
+        if let (Some(n), Some((key, value))) = (self.neighbor.as_mut(), text.split_once(": ")) {
+            match key {
+                "Lqi" => n.lqi = parse_value(value),
+                "AverageRssi" => n.average_rssi = parse_value(value),
+                "LastRssi" => n.last_rssi = parse_value(value),
+                "IsChild" => n.is_child = parse_value(value).map(|v| v != 0.0),
+                _ => {}
+            }
+        }
+        Vec::new()
+    }
 }
 
 pub fn parse_reports(output: &str, node: NodeId, default_endpoint: u16) -> Vec<AttributeReport> {
     let mut parser = ReportParser::new(node, default_endpoint);
-    output.lines().filter_map(|l| parser.feed(l)).collect()
+    output.lines().flat_map(|l| parser.feed_all(l)).collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -268,28 +362,33 @@ impl StreamParser {
         Self { reports: ReportParser::new(0, default_endpoint), peer: None, in_write: false }
     }
 
-    pub fn feed(&mut self, raw: &str, sole_node: Option<NodeId>) -> Option<StreamEvent> {
+    pub fn feed(&mut self, raw: &str, sole_node: Option<NodeId>) -> Vec<StreamEvent> {
         let line = clean(raw);
         if let Some(peer) = rx_peer(&line) {
             self.peer = Some(peer);
-            return None;
+            return Vec::new();
         }
         if line.contains("WriteResponseMessage") {
             self.in_write = true;
-            return None;
+            return Vec::new();
         }
         if self.in_write {
             if let Some(code) = status_code(&line, "status = 0x") {
                 self.in_write = false;
-                return Some(StreamEvent::Write(if code == 0 { Ok(()) } else { Err(line.trim().to_string()) }));
+                return vec![StreamEvent::Write(if code == 0 { Ok(()) } else { Err(line.trim().to_string()) })];
             }
         }
         if is_failure(&line) {
-            return Some(StreamEvent::Write(Err(line.trim().to_string())));
+            return vec![StreamEvent::Write(Err(line.trim().to_string()))];
         }
         let node = self.peer.or(sole_node);
         self.reports.node = node.unwrap_or(0);
-        self.reports.feed(&line).filter(|_| node.is_some()).map(StreamEvent::Report)
+        let reports = self.reports.feed_all(&line);
+        if node.is_some() {
+            reports.into_iter().map(StreamEvent::Report).collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -318,6 +417,7 @@ fn output_tail(output: &str, lines: usize) -> String {
 struct Hub {
     subs: Mutex<Vec<(NodeId, Sender<AttributeReport>)>>,
     pending: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
+    logged: Mutex<HashSet<String>>,
 }
 
 impl Hub {
@@ -332,9 +432,19 @@ impl Hub {
         self.subs.lock().unwrap().iter().map(|(n, _)| *n).collect()
     }
 
-    fn finish_write(&self, result: std::result::Result<(), String>) {
-        if let Some(tx) = self.pending.lock().unwrap().take() {
-            let _ = tx.send(result);
+    fn finish_write(&self, result: std::result::Result<(), String>) -> Option<String> {
+        match self.pending.lock().unwrap().take() {
+            Some(tx) => {
+                let _ = tx.send(result);
+                None
+            }
+            None => result.err(),
+        }
+    }
+
+    fn log_once(&self, message: &str) {
+        if self.logged.lock().unwrap().insert(message.to_string()) {
+            eprintln!("chip-tool: {message}");
         }
     }
 
@@ -378,7 +488,9 @@ impl Session {
             let mut guard = self.stdin.lock().await;
             let stdin = guard.insert(stdin);
             for node in self.hub.nodes() {
-                Self::send(stdin, &self.config.subscribe_line(node)).await?;
+                for line in self.config.subscribe_lines(node) {
+                    Self::send(stdin, &line).await?;
+                }
             }
         }
         self.ready.send_replace(true);
@@ -390,11 +502,18 @@ impl Session {
             match reader.read_until(b'\n', &mut buf).await {
                 Ok(0) => break Ok(()),
                 Err(e) => break Err(Error::from(e)),
-                Ok(_) => match parser.feed(&String::from_utf8_lossy(&buf), self.hub.sole_node()) {
-                    Some(StreamEvent::Report(report)) => self.hub.dispatch(report).await,
-                    Some(StreamEvent::Write(result)) => self.hub.finish_write(result),
-                    None => {}
-                },
+                Ok(_) => {
+                    for event in parser.feed(&String::from_utf8_lossy(&buf), self.hub.sole_node()) {
+                        match event {
+                            StreamEvent::Report(report) => self.hub.dispatch(report).await,
+                            StreamEvent::Write(result) => {
+                                if let Some(message) = self.hub.finish_write(result) {
+                                    self.hub.log_once(&message);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         };
         self.ready.send_replace(false);
@@ -430,7 +549,9 @@ impl Session {
             known
         };
         if let (Some(stdin), false) = (guard.as_mut(), known) {
-            Self::send(stdin, &self.config.subscribe_line(node)).await?;
+            for line in self.config.subscribe_lines(node) {
+                Self::send(stdin, &line).await?;
+            }
         }
         Ok(rx)
     }
@@ -485,16 +606,21 @@ impl ChipToolController {
         Self { config, session: Some(session) }
     }
 
-    async fn run(&self, args: Vec<String>, limit_s: u64) -> Result<String> {
+    async fn output(&self, args: Vec<String>, limit_s: u64) -> Result<(String, String)> {
         let child = Command::new(&self.config.binary).args(&args).stdin(Stdio::null()).kill_on_drop(true).output();
         let output = timeout(Duration::from_secs(limit_s), child)
             .await
             .map_err(|_| Error::Command(format!("timeout after {limit_s}s: {}", args.join(" "))))??;
-        let text = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
         if !output.status.success() {
-            return Err(Error::Command(format!("chip-tool exited with {}: {}", output.status, output_tail(&text, 10))));
+            return Err(Error::Command(format!("chip-tool exited with {}: {}", output.status, output_tail(&format!("{stdout}\n{stderr}"), 10))));
         }
-        Ok(text)
+        Ok((stdout, stderr))
+    }
+
+    async fn run(&self, args: Vec<String>, limit_s: u64) -> Result<String> {
+        let (stdout, stderr) = self.output(args, limit_s).await?;
+        Ok(format!("{stdout}\n{stderr}"))
     }
 }
 
@@ -528,6 +654,22 @@ impl MatterController for ChipToolController {
             None => Err(Error::Command("subscribe needs a serving controller".into())),
         }
     }
+
+    async fn inventory(&self, node: NodeId) -> Result<Inventory> {
+        let limit = self.config.timeout_s * INVENTORY_TIMEOUT_FACTOR;
+        let (attributes, _) = self.output(self.config.inventory_attribute_args(node), limit).await?;
+        let (raw_events, failure) = match self.output(self.config.inventory_event_args(node), limit).await {
+            Ok((stdout, _)) => (stdout, None),
+            Err(e) => (String::new(), Some(format!("event read failed: {e}"))),
+        };
+        let mut inventory = Inventory::from_raw(node, attributes, raw_events);
+        inventory.errors.extend(failure);
+        if inventory.attributes.is_empty() {
+            let reason = inventory.errors.first().map_or("no error line", String::as_str);
+            return Err(Error::Command(format!("no attributes parsed from chip-tool output: {reason}")));
+        }
+        Ok(inventory)
+    }
 }
 
 #[cfg(test)]
@@ -545,7 +687,7 @@ mod tests {
 
     fn stream(text: &str, sole: Option<NodeId>) -> Vec<StreamEvent> {
         let mut parser = StreamParser::new(1);
-        text.lines().filter_map(|l| parser.feed(l, sole)).collect()
+        text.lines().flat_map(|l| parser.feed(l, sole)).collect()
     }
 
     #[test]
@@ -579,6 +721,62 @@ mod tests {
             config().subscribe_line(5),
             "thermostat subscribe-by-id 0x0000,0x0012,0x001C 5 300 5 1 --keepSubscriptions 1 --auto-resubscribe 1"
         );
+    }
+
+    #[test]
+    fn builds_extra_subscribe_and_inventory_lines() {
+        let c = config();
+        assert_eq!(
+            c.subscribe_lines(5),
+            vec![
+                "thermostat subscribe-by-id 0x0000,0x0012,0x001C 5 300 5 1 --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "thermostat subscribe-by-id 0x0008,0x0010,0x0029 5 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "powersource subscribe-by-id 0x000B,0x000C,0x000E 5 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "threadnetworkdiagnostics subscribe-by-id 0x0001,0x0007 5 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+            ]
+        );
+        let tail = ["--storage-directory", "/var/lib/heatd/chip", "--paa-trust-store-path", "/opt/paa"];
+        let expect = |head: &[&str]| head.iter().chain(tail.iter()).map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(c.inventory_attribute_args(5), expect(&["any", "read-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF"]));
+        assert_eq!(c.inventory_event_args(5), expect(&["any", "read-event-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF"]));
+    }
+
+    #[test]
+    fn records_battery_demand_and_thread_parent_from_the_stream() {
+        let events = stream(include_str!("../tests/fixtures/subscribe_extras.txt"), Some(5));
+        let reports: Vec<_> = events.into_iter().filter_map(|e| if let StreamEvent::Report(r) = e { Some(r) } else { None }).collect();
+        assert_eq!(
+            pairs(&reports),
+            vec![
+                (5, "pi_heating_demand", 35.0),
+                (5, "local_temperature_calibration", -0.5),
+                (5, "thermostat_running_state", 1.0),
+                (5, "bat_voltage", 2950.0),
+                (5, "bat_percent_remaining", 95.0),
+                (5, "bat_charge_level", 0.0),
+                (5, "routing_role", 2.0),
+                (5, "thread_parent_rssi", -61.0),
+                (5, "thread_parent_last_rssi", -63.0),
+                (5, "thread_parent_lqi", 3.0),
+                (5, "local_temperature", 21.5),
+            ]
+        );
+        assert_eq!(reports[7].endpoint, 0);
+    }
+
+    #[test]
+    fn unsupported_subscription_paths_are_logged_once() {
+        let hub = Hub::default();
+        let message = "Response Failure: IM Error 0x00000581: General error: 0x81 (UNSUPPORTED_CLUSTER)";
+        assert_eq!(hub.finish_write(Err(message.into())).as_deref(), Some(message));
+        assert!(hub.logged.lock().unwrap().is_empty());
+        hub.log_once(message);
+        hub.log_once(message);
+        assert_eq!(hub.logged.lock().unwrap().len(), 1);
+        let (tx, mut rx) = oneshot::channel();
+        *hub.pending.lock().unwrap() = Some(tx);
+        assert_eq!(hub.finish_write(Err("x".into())), None);
+        assert_eq!(rx.try_recv().unwrap(), Err("x".to_string()));
     }
 
     #[test]

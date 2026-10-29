@@ -1,0 +1,33 @@
+[0;32m[1761581000.001] [4821:4825] [EM] >>> [E:1r S:2 M:3 (Ack:4)] (S) Msg RX from 1:0000000000000005 [B2C3] --- Type 0001:05 (IM:ReportData) (B:300)[0m
+[0;32m[1761581000.002] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0008 DataVersion: 9[0m
+[0;32m[1761581000.003] [4821:4825] [TOO]   PIHeatingDemand: 35[0m
+[0;32m[1761581000.004] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0010 DataVersion: 9[0m
+[0;32m[1761581000.005] [4821:4825] [TOO]   LocalTemperatureCalibration: -5[0m
+[0;32m[1761581000.006] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0029 DataVersion: 9[0m
+[0;32m[1761581000.007] [4821:4825] [TOO]   ThermostatRunningState: 1[0m
+[0;32m[1761581000.008] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000B DataVersion: 9[0m
+[0;32m[1761581000.009] [4821:4825] [TOO]   BatVoltage: 2950[0m
+[0;32m[1761581000.010] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000C DataVersion: 9[0m
+[0;32m[1761581000.011] [4821:4825] [TOO]   BatPercentRemaining: 190[0m
+[0;32m[1761581000.012] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000E DataVersion: 9[0m
+[0;32m[1761581000.013] [4821:4825] [TOO]   BatChargeLevel: 0[0m
+[0;32m[1761581000.014] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0001 DataVersion: 9[0m
+[0;32m[1761581000.015] [4821:4825] [TOO]   RoutingRole: 2[0m
+[0;32m[1761581000.016] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0007 DataVersion: 9[0m
+[0;32m[1761581000.017] [4821:4825] [TOO]   NeighborTable: 2 entries[0m
+[0;32m[1761581000.018] [4821:4825] [TOO]     [1]: {[0m
+[0;32m[1761581000.019] [4821:4825] [TOO]       Rloc16: 20481[0m
+[0;32m[1761581000.020] [4821:4825] [TOO]       Lqi: 2[0m
+[0;32m[1761581000.021] [4821:4825] [TOO]       AverageRssi: -80[0m
+[0;32m[1761581000.022] [4821:4825] [TOO]       LastRssi: -82[0m
+[0;32m[1761581000.023] [4821:4825] [TOO]       IsChild: true[0m
+[0;32m[1761581000.024] [4821:4825] [TOO]      }[0m
+[0;32m[1761581000.025] [4821:4825] [TOO]     [2]: {[0m
+[0;32m[1761581000.026] [4821:4825] [TOO]       Rloc16: 20480[0m
+[0;32m[1761581000.027] [4821:4825] [TOO]       Lqi: 3[0m
+[0;32m[1761581000.028] [4821:4825] [TOO]       AverageRssi: -61[0m
+[0;32m[1761581000.029] [4821:4825] [TOO]       LastRssi: -63[0m
+[0;32m[1761581000.030] [4821:4825] [TOO]       IsChild: false[0m
+[0;32m[1761581000.031] [4821:4825] [TOO]      }[0m
+[0;32m[1761581000.032] [4821:4825] [TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_0000 DataVersion: 9[0m
+[0;32m[1761581000.033] [4821:4825] [TOO]   LocalTemperature: 2150[0m
