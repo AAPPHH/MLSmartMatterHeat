@@ -160,7 +160,7 @@ def vocabulary(scans, cfg):
 
 def transitions(rooms, links, cfg):
     w = {r: {q: cfg["weight_other"] for q in rooms if q != r} for r in rooms}
-    for a, b, kind in links:
+    for a, b, kind in list(links) + [tuple(l) for l in cfg.get("default_links", [])]:
         if a in w and b in w:
             w[a][b] = w[b][a] = max(w[a][b], cfg["weight_link"].get(kind, cfg["weight_other"]))
     out = {}

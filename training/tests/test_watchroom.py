@@ -130,3 +130,28 @@ def test_train_without_meta(tmp_path, config):
     meta = json.loads((train(config, lake, tmp_path / "m", version="v2") / "model.json").read_text())
     row = meta["smoothing"]["transition"]["bad"]
     assert row["wohnzimmer"] == pytest.approx(row["kueche"])
+
+
+def test_keiner_is_regular_class_with_default_adjacency(config, tmp_path):
+    from heattrain.eval import evaluate
+    from heattrain.watchroom import Scan, Trainer, export
+    rng = np.random.default_rng(1)
+    bases = {"flur": -45.0, "wohnzimmer": -60.0, "bad": -75.0, "keiner": -90.0}
+    scans = [Scan(1e9 + i * 60 + 86400 * (i % 4), "d", {"aa": b + rng.normal(0, 2), "bb": -60.0 + k * 7 + rng.normal(0, 2)}, room, "rest")
+             for k, (room, b) in enumerate(bases.items()) for i in range(60)]
+    cfg = {**config, "min_sender_scans": 1, "min_sender_days": 1, "min_state_scans": 10, "min_state_room_scans": 3}
+    fit = Trainer(cfg).fit(scans, [])
+    assert fit["rooms"] == ["bad", "flur", "keiner", "wohnzimmer"] and fit["n_labels"]["keiner"] == 60
+    tr = fit["transition"]["keiner"]
+    assert tr["flur"] == pytest.approx(tr["wohnzimmer"]) and tr["flur"] > 2 * tr["bad"]
+    m = Matcher(export(fit, cfg, tmp_path, "k", {}))
+    res = evaluate(m, scans)
+    assert "keiner" in m.meta["rooms"] and res["per_room"]["keiner"]["support"] == 60 and res["per_room"]["keiner"]["recall"] > 0.5
+
+
+def test_default_links_are_config_only():
+    cfg = {"stay_prob": 0.9, "weight_link": {"open": 8.0}, "weight_other": 1.0, "default_links": [["keiner", "flur", "open"]]}
+    tr = transitions(["flur", "keiner", "bad"], [], cfg)
+    assert tr["keiner"]["flur"] > tr["keiner"]["bad"]
+    plain = transitions(["flur", "keiner", "bad"], [], {**cfg, "default_links": []})["keiner"]
+    assert plain["flur"] == pytest.approx(plain["bad"])
