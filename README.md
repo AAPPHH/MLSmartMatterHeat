@@ -162,6 +162,19 @@ sudo systemctl stop heatd                                # Pflicht: sonst "stop 
 sudo systemctl start heatd
 ```
 
+**Inventar:** Direkt nach dem Commissioning liest `inventory` alle Attribute und Ereignisse eines Thermostats (chip-tool Wildcard-Reads) und legt sie unter `data/inventory/node-<n>-<zeit>/` ab: `raw_attributes.log`, `raw_events.log`, `inventory.json` und `inventory.md` (je Endpoint und Cluster eine Tabelle mit Wert und Schreibbarkeit, dazu Features, Befehle, Batterie, Thread-Nachbarn mit RSSI/LQI, Zähler und Ereignisse). Herstellerspezifische Cluster (ab 0xFC00 oder mit Vendor-Präfix) bleiben erhalten und sind mit "vendor" markiert. Auch das braucht die Sperre, also `heatd` vorher stoppen:
+
+```bash
+cd ~/MLSmartMatterHeat/deploy/docker
+docker compose stop heatd
+docker compose run --rm heatd inventory 5                       # schreibt nach ./data/inventory/node-5-<zeit>/ (Container: /data/inventory)
+docker compose up -d heatd
+```
+
+systemd: `./target/release/heatd inventory 5` (Pfad relativ zu `db_path`, also `data/inventory/`). Ein Lauf dauert bis zu `3 × timeout_s`; ein schlafendes Thermostat braucht eventuell einen zweiten Versuch.
+
+Im Betrieb zeichnet `heatd` zusätzlich dauerhaft auf (Tabelle `readings`): `pi_heating_demand`, `thermostat_running_state`, `local_temperature_calibration`, Batterie (`bat_voltage` in mV, `bat_percent_remaining` in %, `bat_charge_level`), `routing_role` und RSSI/LQI des Thread-Parents (`thread_parent_rssi`, `thread_parent_last_rssi`, `thread_parent_lqi`). Nicht unterstützte Attribute werden einmal im Log gemeldet und übersprungen.
+
 Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen. Das Commissioning darf bis zu 180 s dauern (`commission_timeout_s`).
 
 Nach dem ersten Thermostat startest du `heatd` und prüfst mit `journalctl -u heatd -f` (Docker: `docker compose logs -f heatd`) und `curl localhost:8080/api/state`, ob Temperaturen ankommen. Das ist der erste echte Test des dauerhaften chip-tool-Prozesses.
