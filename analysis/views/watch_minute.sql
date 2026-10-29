@@ -39,7 +39,7 @@ windowed AS (
   SELECT g.m, g.t, g.te, a.skin_temp,
     a.hr_sum / nullif(a.hr_n, 0) AS hr, a.mo_sum / nullif(a.mo_n, 0) AS motion, coalesce(r.n, 0) AS n_rssi,
     sum(a.hr_sum) OVER w / nullif(sum(a.hr_n) OVER w, 0) AS hr_mean_10,
-    sqrt(greatest(sum(a.hr_sq) OVER w / nullif(sum(a.hr_n) OVER w, 0) - power(sum(a.hr_sum) OVER w / nullif(sum(a.hr_n) OVER w, 0), 2), 0)) AS hr_std_10,
+    CASE WHEN sum(a.hr_n) OVER w > 0 THEN sqrt(greatest(sum(a.hr_sq) OVER w / sum(a.hr_n) OVER w - power(sum(a.hr_sum) OVER w / sum(a.hr_n) OVER w, 2), 0)) END AS hr_std_10,
     sum(a.mo_sum) OVER w / nullif(sum(a.mo_n) OVER w, 0) AS motion_10
   FROM grid g LEFT JOIN minute_agg a ON a.m = g.m LEFT JOIN rssi_n r ON r.m = g.m
   WINDOW w AS (ORDER BY g.m ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)

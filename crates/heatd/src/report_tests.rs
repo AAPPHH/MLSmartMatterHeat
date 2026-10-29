@@ -274,3 +274,126 @@ fn report_time_is_ten_past_three() {
     assert_eq!(secs_until_report(t(3, 10)), 86_400);
     assert_eq!(secs_until_report(t(23, 10)), 4 * 3600);
 }
+
+const BASE: i64 = 600;
+
+fn raw(minute: i64, sensor: Option<&str>, value: f32) -> WatchRaw {
+    WatchRaw { ts: at(minute), device: "watch".into(), batch_id: 1, sensor_type: sensor.map(Into::into), value: Some(value), ..Default::default() }
+}
+
+fn scan_row(ts: i64, sender: &str, rssi: i8, legacy: bool) -> WatchRaw {
+    WatchRaw { ts, sender: sender.into(), rssi, device: "watch".into(), batch_id: 1, sensor_type: (!legacy).then(|| "rssi".into()), value: (!legacy).then_some(rssi as f32), ..Default::default() }
+}
+
+fn watch_lake(root: &Path) {
+    let clock = start() + 12 * HOUR_US;
+    let sink = Sink::open_with_clock(LakeConfig::new(root), Arc::new(move || clock)).unwrap();
+    let m = |k: i64| BASE + k;
+    sink.append(raw(m(0), Some("offbody"), 1.0)).unwrap();
+    sink.append(raw(m(0), Some("charging"), 0.0)).unwrap();
+    sink.append(raw(m(0), Some("battery"), 90.0)).unwrap();
+    for k in 0..10 {
+        sink.append(raw(m(k), Some("hr"), 60.0)).unwrap();
+        sink.append(raw(m(k), Some("motion"), 0.1)).unwrap();
+        sink.append(raw(m(k), Some("temp"), 33.5)).unwrap();
+    }
+    for (k, v) in [(20, 0.0), (25, 1.0)] {
+        sink.append(raw(m(k), Some("offbody"), v)).unwrap();
+    }
+    for (k, v) in [(40, 1.0), (50, 0.0)] {
+        sink.append(raw(m(k), Some("charging"), v)).unwrap();
+    }
+    sink.append(raw(m(30), Some("battery"), 80.0)).unwrap();
+    for k in 100..=110 {
+        sink.append(raw(m(k), Some("hr"), 120.0)).unwrap();
+    }
+    sink.append(raw(1400, Some("hr"), 55.0)).unwrap();
+    sink.append(raw(1400, Some("motion"), 0.1)).unwrap();
+    sink.append(raw(1405, Some("hr"), 55.0)).unwrap();
+    sink.append(raw(1405, Some("motion"), 2.0)).unwrap();
+    for (ts, aps) in [(at(m(10)), vec![("aa", -50), ("bb", -70)]), (at(m(11)), vec![("aa", -60)]), (at(m(12)), vec![("aa", -55)]), (at(m(12)) + 10_000_000, vec![("bb", -75), ("aa", -65)])] {
+        for (sender, rssi) in aps {
+            sink.append(scan_row(ts, sender, rssi, false)).unwrap();
+        }
+    }
+    sink.append(scan_row(at(m(14)), "cc", -33, true)).unwrap();
+    let label = |ts: i64, room: &str, source: &str, window: Option<(i64, i64)>| Label { ts, from_ts: window.map(|w| w.0), to_ts: window.map(|w| w.1), room: room.into(), source: source.into(), ..Default::default() };
+    sink.append(label(at(m(15)), "a", "watch", Some((at(m(10)), at(m(11)))))).unwrap();
+    sink.append(label(at(m(12)), "b", "watch", None)).unwrap();
+    sink.append(label(at(m(13)), "c", "override", None)).unwrap();
+    sink.append(label(at(m(13)), "d", "model", None)).unwrap();
+    sink.append(WatchInference { ts: at(m(10)), matcher: "room".into(), template_id: "all".into(), abstained: true, reason: Some("low_confidence".into()), state: "rest".into(), features_hash: "0".into(), model_version: "v1".into(), ..Default::default() }).unwrap();
+    sink.append(WatchInference { ts: at(m(11)), matcher: "room".into(), template_id: "all".into(), result_room: Some("a".into()), state: "rest".into(), features_hash: "1".into(), model_version: "v1".into(), confidence: 0.9, ..Default::default() }).unwrap();
+    sink.roll_day(day()).unwrap();
+    sink.close().unwrap();
+}
+
+fn minute_query(db: &LakeDb, minute: i64, columns: &str) -> duckdb::Result<(String, Option<i64>, Option<f64>, Option<f64>)> {
+    db.conn.query_row(&format!("SELECT {columns} FROM watch_minute WHERE epoch_us(t) = {}", start() + minute * MIN), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+}
+
+#[test]
+fn watch_minute_view_classifies_states_and_derives_features() {
+    let dir = tempfile::tempdir().unwrap();
+    watch_lake(dir.path());
+    let state = crate::config::WatchState::default();
+    let db = open_watch_views(dir.path(), day(), day(), &state, 0).unwrap();
+    let count: i64 = db.conn.query_row("SELECT count(*) FROM watch_minute", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1440);
+    let at = |k: i64| BASE + k;
+    let cols = "state, min_since_onbody_change::BIGINT, hr_mean_10, hr_std_10";
+    assert_eq!(minute_query(&db, at(5), cols).unwrap(), ("rest".into(), None, Some(60.0), Some(0.0)));
+    assert_eq!(minute_query(&db, at(22), cols).unwrap().0, "offbody");
+    assert_eq!(minute_query(&db, at(22), cols).unwrap().1, Some(2));
+    assert_eq!(minute_query(&db, at(30), cols).unwrap().1, Some(5));
+    assert_eq!(minute_query(&db, at(27), cols).unwrap(), ("rest".into(), Some(2), None, None));
+    assert_eq!(minute_query(&db, at(45), "state, min_since_charge_end::BIGINT, battery_pct, 0.0").unwrap(), ("charging".into(), None, Some(80.0), Some(0.0)));
+    assert_eq!(minute_query(&db, at(55), "state, min_since_charge_end::BIGINT, battery_pct, 0.0").unwrap().1, Some(5));
+    assert_eq!(minute_query(&db, at(105), cols).unwrap().0, "active");
+    assert_eq!(minute_query(&db, 1400, cols).unwrap().0, "sleep");
+    assert_eq!(minute_query(&db, 1405, "state, 0, motion_10, hr").unwrap().0, "active");
+    assert_eq!(minute_query(&db, at(5), "state, n_rssi::BIGINT, skin_temp, tod_sin").unwrap().2, Some(33.5));
+    let (_, n, ..) = minute_query(&db, at(12), "state, n_rssi::BIGINT, 0.0, 0.0").unwrap();
+    assert_eq!(n, Some(3));
+    let (_, _, sin, cos) = minute_query(&db, 360, "state, 0, tod_sin, tod_cos").unwrap();
+    assert!((sin.unwrap() - 1.0).abs() < 1e-9 && cos.unwrap().abs() < 1e-9);
+    let shifted = open_watch_views(dir.path(), day(), day(), &state, 840).unwrap();
+    assert_eq!(minute_query(&shifted, at(5), cols).unwrap().0, "sleep");
+    let strict = crate::config::WatchState { hr_rest_max: 50.0, hr_active_min: 58.0, ..state };
+    let tuned = open_watch_views(dir.path(), day(), day(), &strict, 0).unwrap();
+    assert_eq!(minute_query(&tuned, at(5), cols).unwrap().0, "active");
+    assert_eq!(minute_query(&tuned, 1400, cols).unwrap().0, "rest");
+}
+
+#[test]
+fn watch_room_calib_view_joins_fingerprint_and_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    watch_lake(dir.path());
+    let db = open_watch_views(dir.path(), day(), day(), &crate::config::WatchState::default(), 0).unwrap();
+    let calib = |k: i64| -> (Option<i64>, Option<String>, Option<String>, Option<String>) {
+        db.conn
+            .query_row(&format!("SELECT n_aps::BIGINT, label_room, label_source, to_json(rssi)::VARCHAR FROM watch_room_calib WHERE epoch_us(t) = {}", start() + (BASE + k) * MIN), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+    };
+    assert_eq!(calib(10), (Some(2), Some("a".into()), Some("watch".into()), Some(r#"[{"sender":"aa","rssi":-50},{"sender":"bb","rssi":-70}]"#.into())));
+    assert_eq!(calib(11), (Some(1), Some("a".into()), Some("watch".into()), Some(r#"[{"sender":"aa","rssi":-60}]"#.into())));
+    assert_eq!(calib(12), (Some(2), Some("b".into()), Some("watch".into()), Some(r#"[{"sender":"aa","rssi":-65},{"sender":"bb","rssi":-75}]"#.into())));
+    assert_eq!(calib(13), (None, None, None, None));
+    assert_eq!(calib(14).0, Some(1));
+    assert_eq!(calib(14).1, None);
+    let total: i64 = db.conn.query_row("SELECT count(*) FROM watch_room_calib", [], |r| r.get(0)).unwrap();
+    assert_eq!(total, 1440);
+}
+
+#[test]
+fn daily_report_has_a_watch_section() {
+    let dir = tempfile::tempdir().unwrap();
+    watch_lake(dir.path());
+    let (md, s) = build(dir.path(), day()).unwrap();
+    assert!(md.contains("## Watch") && md.contains("| room | rest | 2 | 1 | 50.0 % |"), "{md}");
+    assert!(md.contains("Abstain reasons: low_confidence 1."), "{md}");
+    assert!(md.contains("battery 2") && md.contains("hr 23") && md.contains("rssi 7"), "{md}");
+    assert_eq!((s.watch_inferences, s.watch_abstained), (2, 1));
+    assert!(md.contains("Watch scans: 7 access-point rows"), "{md}");
+    assert!((s.watch_battery_per_h.unwrap() - 20.0).abs() < 1e-6);
+}
