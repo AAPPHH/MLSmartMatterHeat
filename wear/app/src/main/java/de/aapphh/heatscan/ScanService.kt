@@ -33,6 +33,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -69,6 +70,9 @@ class ScanService : Service() {
     private var lastScanRequestAt = Long.MIN_VALUE / 4
     private var loggedMode: Mode? = null
     private val flusher = Flusher()
+    private val gate = RouteGate()
+    private var sampler: SensorSampler? = null
+    private val appVersion by lazy { try { packageManager.getPackageInfo(packageName, 0).versionName.orEmpty() } catch (e: Exception) { "-" } }
     private val flushPending = AtomicBoolean(false)
     @Volatile private var offBody: Boolean? = null
     @Volatile private var lastException = ""
@@ -88,6 +92,7 @@ class ScanService : Service() {
             val off = e.values[0] == 0f
             if (offBody != off) Trace.i("offbody", "off" to off)
             offBody = off
+            sampler?.onOffBody(e, off)
         }
 
         override fun onAccuracyChanged(s: Sensor?, a: Int) {}
@@ -120,13 +125,17 @@ class ScanService : Service() {
                 WifiManager.SCAN_RESULTS_AVAILABLE_ACTION -> collect()
                 Intent.ACTION_SCREEN_ON -> {
                     Trace.i("screen_on", "queue" to queue.size)
+                    sampler?.flushFifo()
                     flush("screen_on")
                     onWake("screen_on", power.isDeviceIdleMode)
                 }
                 Intent.ACTION_POWER_CONNECTED -> {
                     Trace.i("charger", "queue" to queue.size)
+                    sampler?.flushFifo()
+                    sampler?.onPower()
                     flush("charger")
                 }
+                Intent.ACTION_POWER_DISCONNECTED -> sampler?.onPower()
                 PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED, PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
                     Trace.i("power_change", "action" to i.action, "doze" to power.isDeviceIdleMode, "saver" to power.isPowerSaveMode, "power" to powerState(), "queue" to queue.size)
                     if (!power.isDeviceIdleMode) {
@@ -203,9 +212,14 @@ class ScanService : Service() {
                 addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
                 addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
                 addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
             }, RECEIVER_NOT_EXPORTED)
+            sampler = SensorSampler(this, sensors, store, handler, appVersion) { enqueueMeta(it) }.also {
+                it.start()
+                it.inventory()?.let { inv -> enqueueMeta(inv) }
+            }
             store.running = true
             Trace.i("service_started", "queue" to queue.size, "doze" to power.isDeviceIdleMode, "saver" to power.isPowerSaveMode, "bgLoc" to ScanStarter.bgLocation(this), "whitelist" to power.isIgnoringBatteryOptimizations(packageName))
             Trace.i("policy", "adaptive" to adaptive, "step" to (step != null), "wakeStep" to (wakeStep != null), "triggers" to triggers.size, "offBodySensor" to (offBodySensor != null))
@@ -222,6 +236,8 @@ class ScanService : Service() {
             alarms.cancel(alarmIntent)
             releaseSensors()
             sensors.unregisterListener(offBodyListener)
+            sampler?.stop()
+            sampler = null
             try { unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregister", e) }
             try { cm.unregisterNetworkCallback(netCallback) } catch (e: Exception) { Log.w(TAG, "unregister net", e) }
             wake?.let { if (it.isHeld) it.release() }
@@ -252,6 +268,26 @@ class ScanService : Service() {
         flush("alarm")
     }
 
+    fun refreshSensors() {
+        handler.post { sampler?.restart() }
+    }
+
+    fun onLabel() {
+        handler.post { sampler?.onLabel() }
+    }
+
+    private fun enqueueMeta(entry: JSONObject) {
+        try {
+            io.execute {
+                val dropped = queue.add(entry, System.currentTimeMillis())
+                Trace.i("enqueue", "kind" to entry.optString("kind"), "queue" to queue.size, "dropped" to dropped)
+                flush(entry.optString("kind"))
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "meta enqueue rejected", e)
+        }
+    }
+
     private fun powerState() = PowerState.of(power.isPowerSaveMode, power.isDeviceIdleMode, offBody)
 
     private fun motion(at: Long) {
@@ -266,6 +302,7 @@ class ScanService : Service() {
 
     private fun tick() {
         val now = SystemClock.elapsedRealtime()
+        sampler?.closeIfDue()
         val before = policy.mode
         if (policy.onTick(now)) scan(policy.mode.sleeps || now - lastEnqueueAt >= ScanConfig.HEARTBEAT_MS)
         if (Wake.settled(before, policy.mode)) promptNoScan("settled", false)
@@ -429,13 +466,13 @@ class ScanService : Service() {
             beatPending = false
             handler.removeCallbacks(beatTimeout)
             val ts = Capture.wallMs(System.currentTimeMillis(), now, newest)
-            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual)
+            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual, newest * 1000)
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
         }
     }
 
-    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false) {
+    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false, elapsedNs: Long? = null) {
         lastEnqueueAt = SystemClock.elapsedRealtime()
         val state = powerState()
         val motion = policy.mode.motion
@@ -447,7 +484,7 @@ class ScanService : Service() {
             io.execute {
                 val wall = System.currentTimeMillis()
                 val d = if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
-                val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId())
+                val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId(), elapsedNs)
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
@@ -495,13 +532,47 @@ class ScanService : Service() {
         else if (store.stay { it.refresh(ts, now, room) }) Prompter.refresh(this, store)
     }
 
-    private fun sendLabel(server: String, e: JSONObject, net: Network?): Int = try {
-        Poster.send(server, "/api/label", LabelEvent.body(e), net).code
+    private fun plain(server: String, path: String, body: String, net: Network?): Int = try {
+        Poster.send(server, path, body, net).code
     } catch (ex: Exception) {
         lastException = ex.javaClass.simpleName
         store.lastError = ex.toString()
-        Trace.w("post", ex, "path" to "/api/label")
+        Trace.w("post", ex, "path" to path)
         -1
+    }
+
+    private fun sendLabel(server: String, e: JSONObject, net: Network?): Int {
+        val c = plain(server, Measure.PATH_LABEL, LabelEvent.watchBody(e), net)
+        return if (c in Measure.FALLBACK_CODES) plain(server, "/api/label", LabelEvent.body(e), net) else c
+    }
+
+    private fun sendMeta(server: String, e: JSONObject, net: Network?): Int {
+        val c = if (MeasureBatch.isMeasure(e)) plain(server, Measure.PATH, MeasureBatch.body(e), net) else plain(server, Measure.PATH_SENSORS, Inventory.body(e), net)
+        return if (c in Measure.FALLBACK_CODES) 404 else c
+    }
+
+    private fun sendScan(server: String, e: JSONObject, net: Network?): Int {
+        val now = SystemClock.elapsedRealtime()
+        val m = if (gate.allow(now)) MeasureBatch.fromScan(e, appVersion, System.currentTimeMillis(), now) else null
+        if (m != null) {
+            val c = send(server, Measure.PATH, m.toString(), net)
+            if (c !in Measure.FALLBACK_CODES) return c
+            gate.fail(now)
+            Trace.i("measure_fallback", "code" to c)
+        }
+        return send(server, "/api/scan", e.toString(), net)
+    }
+
+    private fun sendScans(server: String, a: JSONArray, net: Network?): Int {
+        val rest = JSONArray()
+        for (i in 0 until a.length()) {
+            val e = a.getJSONObject(i)
+            if ((e.optJSONArray("aps")?.length() ?: 0) > 0) {
+                val c = sendScan(server, e, net)
+                if (c !in 200..299) return c
+            } else rest.put(e)
+        }
+        return if (rest.length() == 0) 200 else send(server, "/api/scans", JSONObject().put("scans", rest).toString(), net)
     }
 
     private fun runFlush(reason: String) {
@@ -513,9 +584,10 @@ class ScanService : Service() {
         val r = try {
             flusher.run(
                 queue, System.currentTimeMillis(),
-                { a -> send(server, "/api/scans", JSONObject().put("scans", a).toString(), net) },
-                { e -> send(server, "/api/scan", e.toString(), net) },
-                { e -> sendLabel(server, e, net) }
+                { a -> sendScans(server, a, net) },
+                { e -> sendScan(server, e, net) },
+                { e -> sendLabel(server, e, net) },
+                { e -> sendMeta(server, e, net) }
             )
         } finally {
             lock?.let { if (it.isHeld) it.release() }
@@ -668,6 +740,7 @@ object LabelRecorder {
         store.refreshTile()
         Prompter.confirm(c, room)
         Trace.i("label", "room" to room, "from" to from, "to" to to)
+        ScanService.instance?.onLabel()
         ScanService.instance?.flush("label")
     }
 
@@ -708,7 +781,7 @@ object ScanStarter {
         Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION,
         Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACTIVITY_RECOGNITION,
         Diag.LOCAL_NETWORK.takeIf { Build.VERSION.SDK_INT >= Diag.LOCAL_NETWORK_SDK }
-    ).filter { c.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+    ).plus(Health.requestable(Build.VERSION.SDK_INT)).filter { c.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
 
     fun bgLocation(c: Context): Boolean = c.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
 
@@ -721,6 +794,9 @@ object ScanStarter {
         "lastFreshScan" to Footer.fresh(Store(c).lastFreshAt),
         "rejected" to Store(c).rejected,
         "queue" to ScanQueue.get(c).size,
+        "sensors" to Store(c).sensorNote.replace(' ', ','),
+        "battPctH" to Store(c).battPerHour.let { if (it.isNaN()) "-" else "%.2f".format(Locale.US, it) },
+        "samplePeriodS" to Store(c).samplePeriodS,
         "bgLoc" to bgLocation(c),
         "idleWhitelist" to c.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(c.packageName),
         "exactAlarm" to (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && c.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()),
@@ -821,6 +897,7 @@ class DebugReceiver : BroadcastReceiver() {
                 i.getStringExtra("server")?.let { store.server = it }
                 i.getStringExtra("home")?.let { store.home = it }
                 i.getStringExtra("device")?.let { store.device = it }
+                i.getStringExtra("sample_period_s")?.toIntOrNull()?.takeIf { it in 10..3600 }?.let { store.samplePeriodS = it; ScanService.instance?.refreshSensors() }
                 Trace.i("config", "server" to store.server, "home" to store.home, "device" to store.device)
             }
             ACTION_START -> {

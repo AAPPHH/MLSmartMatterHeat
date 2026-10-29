@@ -1267,4 +1267,214 @@ class CoreTest {
         assertEquals("pausiert", Footer.line("1", true, 0, true, "12:00", 2))
         assertEquals("12:34 · OK · Q3 · S12:30 · R2", Footer.line("12:34", true, 3, false, "12:30", 2))
     }
+
+    private val measureExample = JSONObject(javaClass.classLoader!!.getResource("measurement_example.json")!!.readText())
+
+    private fun kinds(o: JSONObject): Map<String, String> =
+        o.keys().asSequence().associateWith { k -> o.get(k).let { if (it is Number) (if (it is Int || it is Long) "Int" else "Dec") else it.javaClass.simpleName } }
+
+    private fun sample(i: Int) = Sample(i * 1_000_000_000L, 1000L + i, "temp", "skin", 33.0 + i, "C")
+
+    @Test
+    fun batcherClosesAtFiftySamples() {
+        val b = Batcher()
+        for (i in 1..49) assertEquals(null, b.add(sample(i), 0L))
+        assertEquals(50, b.add(sample(50), 10L)!!.size)
+        assertEquals(0, b.size)
+        assertEquals(null, b.due(Long.MAX_VALUE / 2))
+    }
+
+    @Test
+    fun batcherClosesAfterFiveMinutesFromFirstSample() {
+        val b = Batcher()
+        b.add(sample(1), 1_000L)
+        b.add(sample(2), 200_000L)
+        assertEquals(null, b.due(300_999L))
+        assertEquals(2, b.due(301_000L)!!.size)
+        b.add(sample(3), 400_000L)
+        assertEquals(null, b.due(600_000L))
+        assertEquals(1, b.due(700_000L)!!.size)
+    }
+
+    @Test
+    fun measurementPayloadMatchesContract() {
+        val samples = listOf(
+            Sample(80799000000000, 1761580799000, "temp", "skin_temperature", 33.4, "C"),
+            Sample(80790000000000, 1761580790000, "rssi", "wifi", -61.0, "dBm", "aa:bb:cc:00:00:01", null, 2437)
+        )
+        val built = MeasureBatch.build("pixel-watch", 1761580800500123, 1761580800000, 1761500000000, "2.4", samples, 0.42)
+        assertEquals(kinds(measureExample), kinds(built))
+        val ex = measureExample.getJSONArray("samples")
+        assertEquals(kinds(ex.getJSONObject(0)), kinds(built.getJSONArray("samples").getJSONObject(0)))
+        assertEquals(kinds(ex.getJSONObject(6)), kinds(built.getJSONArray("samples").getJSONObject(1)))
+        assertEquals(setOf("elapsed_ns", "ts", "sensor_type", "sensor_name", "value", "unit"), built.getJSONArray("samples").getJSONObject(0).keys().asSequence().toSet())
+        assertFalse(MeasureBatch.build("d", 1, 2, 3, "v", samples).has("battery_pct_per_h"))
+        assertFalse(MeasureBatch.build("d", 1, 2, 3, "v", samples, Double.NaN).has("battery_pct_per_h"))
+    }
+
+    @Test
+    fun measureEntryRoundTripsThroughQueueFileWithoutMetaKeys() {
+        val f = File.createTempFile("queue", ".jsonl")
+        try {
+            val q = ScanQueue(f, 100, Long.MAX_VALUE)
+            q.add(MeasureBatch.entry(MeasureBatch.build("w", 7, 5_000, 1, "2.4", listOf(sample(1)))), 5_000)
+            val again = ScanQueue(f, 100, Long.MAX_VALUE).peek(10, 5_000)
+            assertEquals(1, again.size)
+            assertTrue(MeasureBatch.isMeasure(again[0].json))
+            val body = JSONObject(MeasureBatch.body(again[0].json))
+            assertEquals(setOf("device", "batch_id", "sent_ts", "clock_offset_ms", "app_version", "samples"), body.keys().asSequence().toSet())
+            assertEquals(7L, body.getLong("batch_id"))
+        } finally {
+            f.delete()
+        }
+    }
+
+    @Test
+    fun scanBecomesRssiRowsWithStableBatchId() {
+        val e = Payload.build(1_000_000L, "w", null, aps, "still", "normal", false, "w-abc-000123", 900_000_000_000L)
+        val a = MeasureBatch.fromScan(e, "2.4", 2_000_000L, 5_000L)!!
+        val b = MeasureBatch.fromScan(e, "2.4", 9_000_000L, 7_000L)!!
+        assertEquals(a.getLong("batch_id"), b.getLong("batch_id"))
+        assertEquals(1_000_000L * 1000 + 123, a.getLong("batch_id"))
+        assertEquals(1_000_000L - 900_000L, a.getLong("clock_offset_ms"))
+        val s = a.getJSONArray("samples")
+        assertEquals(4, s.length())
+        assertEquals("rssi", s.getJSONObject(0).getString("sensor_type"))
+        assertEquals("aa:bb:cc:00:00:01", s.getJSONObject(0).getString("sender"))
+        assertEquals(-45.0, s.getJSONObject(0).getDouble("value"), 0.0)
+        assertEquals(2412, s.getJSONObject(0).getInt("freq"))
+        assertEquals(900_000_000_000L, s.getJSONObject(0).getLong("elapsed_ns"))
+        assertEquals("still", a.getString("motion"))
+        assertEquals("w-abc-000123", a.getString("id"))
+        assertEquals(null, MeasureBatch.fromScan(Payload.build(1L, "w", null, emptyList()), "2.4", 1L, 1L))
+        assertFalse(Payload.build(1L, "w", null, emptyList()).has("elapsed_ns"))
+    }
+
+    @Test
+    fun measurementReplyIsTreatedLikeScanReply() {
+        val body = MeasureBatch.fromScan(Payload.build(5_000L, "w", null, aps), "2.4", 6_000L, 1L)!!.toString()
+        assertTrue(ReplyJson.postedAps(body))
+        assertEquals(5_000L, ReplyJson.lastTs(body))
+        assertFalse(ReplyJson.postedAps(MeasureBatch.build("w", 1, 2, 3, "v", listOf(sample(1))).toString()))
+    }
+
+    @Test
+    fun accelerometerVarianceIsEmittedPerInterval() {
+        val v = AccelVar(60_000_000_000L, 3)
+        val s = 1_000_000_000L
+        val out = ArrayList<Pair<Long, Double>>()
+        for (i in 0 until 60) v.add(i * s, if (i % 2 == 0) 9.0 else 11.0)?.let { out.add(it) }
+        assertTrue(out.isEmpty())
+        v.add(60 * s, 10.0)?.let { out.add(it) }
+        assertEquals(1, out.size)
+        assertEquals(60 * s, out[0].first)
+        assertEquals(1.0, out[0].second, 1e-9)
+        for (i in 61 until 62) v.add(i * s, 10.0)?.let { out.add(it) }
+        assertEquals(1, out.size)
+        assertEquals(null, v.add(120 * s, 10.0))
+    }
+
+    @Test
+    fun permissionDegradeDecisions() {
+        assertEquals(HealthPlan(true, true, "hr=ok skin=ok"), Health.plan(true, true, true, true))
+        assertEquals(HealthPlan(false, true, "hr=Recht verweigert skin=ok"), Health.plan(true, false, true, true))
+        assertEquals(HealthPlan(true, false, "hr=ok skin=Recht verweigert"), Health.plan(true, true, true, false))
+        assertEquals(HealthPlan(false, false, "hr=Sensor fehlt skin=Sensor fehlt"), Health.plan(false, true, false, false))
+        assertEquals(listOf(Health.HR, Health.SKIN), Health.requestable(36))
+        assertEquals(emptyList<String>(), Health.requestable(35))
+    }
+
+    @Test
+    fun drainMeterNeedsAnHourAndResetsOnCharging() {
+        val d = DrainMeter()
+        val h = 3_600_000L
+        d.onReading(0, 80.0, false)
+        d.onReading(h / 2, 79.0, false)
+        assertEquals(null, d.perHour)
+        d.onReading(2 * h, 77.0, false)
+        assertEquals(1.5, d.perHour!!, 1e-9)
+        d.onReading(3 * h, 90.0, true)
+        assertEquals(null, d.perHour)
+        d.onReading(5 * h, 88.0, false)
+        assertEquals(1.0, d.perHour!!, 1e-9)
+    }
+
+    @Test
+    fun skinSensorIsFoundByTypeOrStringTypePreferringNonWakeup() {
+        val all = listOf(
+            SensorInfo("acc", 1, "android.sensor.accelerometer", "g", 0.1, 8.0, false),
+            SensorInfo("skin wake", 65555, Measure.SKIN_STRING, "g", 0.01, 50.0, true),
+            SensorInfo("skin", 12345, Measure.SKIN_STRING, "g", 0.01, 50.0, false)
+        )
+        assertEquals(2, Inventory.pick(all, Measure.SKIN_TYPE, Measure.SKIN_STRING))
+        assertEquals(1, Inventory.pick(all.take(2), Measure.SKIN_TYPE, Measure.SKIN_STRING))
+        assertEquals(-1, Inventory.pick(all.take(1), Measure.SKIN_TYPE, Measure.SKIN_STRING))
+        assertEquals(-1, Inventory.pick(all, 21))
+    }
+
+    @Test
+    fun inventoryEntryAndHashChangeOnlyOnChange() {
+        val a = listOf(SensorInfo("acc", 1, "s", "v", 0.1, 8.0, false))
+        val e = Inventory.entry("w", 5, "2.4", a)
+        assertTrue(Inventory.isSensors(e))
+        val body = JSONObject(Inventory.body(e))
+        assertEquals(setOf("device", "app_version", "sensors"), body.keys().asSequence().toSet())
+        assertEquals(setOf("name", "android_type", "string_type", "vendor", "resolution", "max_range"), body.getJSONArray("sensors").getJSONObject(0).keys().asSequence().toSet())
+        assertEquals(Inventory.hash("2.4", a), Inventory.hash("2.4", a.toList()))
+        assertTrue(Inventory.hash("2.4", a) != Inventory.hash("2.5", a))
+        assertTrue(Inventory.hash("2.4", a) != Inventory.hash("2.4", a + a))
+    }
+
+    @Test
+    fun flusherRoutesMeasureEntriesAndParksOnServerWithoutEndpoint() {
+        val q = ScanQueue(null, 100, 1_000_000)
+        q.add(MeasureBatch.entry(MeasureBatch.build("w", 1, 10, 0, "v", listOf(sample(1)))), 10)
+        q.add(Inventory.entry("w", 11, "v", emptyList()), 11)
+        q.add(Payload.build(12, "w", null, aps), 12)
+        val metas = ArrayList<String>()
+        val r = Flusher(10).run(q, 20, { 200 }, { 200 }, { 200 }, { metas.add(it.getString("kind")); 404 })
+        assertEquals(listOf("measure", "sensors"), metas)
+        assertEquals(1, r.sent)
+        assertEquals(2, r.deferred)
+        assertEquals(2, q.size)
+        val ok = Flusher(10).run(q, 20, { 200 }, { 200 }, { 200 }, { 200 })
+        assertEquals(2, ok.sent)
+        assertEquals(0, q.size)
+    }
+
+    @Test
+    fun watchLabelBodyCarriesRoomAndSource() {
+        val b = JSONObject(LabelEvent.watchBody(LabelEvent.entry("w", 100, 200, "bad")))
+        assertEquals("bad", b.getString("room"))
+        assertEquals("watch", b.getString("source"))
+        assertEquals(200L, b.getLong("ts"))
+        assertEquals(100L, b.getLong("from"))
+        assertFalse(b.has("label"))
+    }
+
+    @Test
+    fun batchIdsAreStableAndDisjointBetweenSensorAndScan() {
+        assertEquals(BatchId.sensor(5, 7), BatchId.sensor(5, 7))
+        assertTrue(BatchId.sensor(5, 7) != BatchId.sensor(5, 8))
+        assertTrue(BatchId.sensor(5, 499) % 1000 >= 500)
+        assertTrue(BatchId.scan(5, "w-x-000499") % 1000 < 500)
+        assertEquals(5000L, BatchId.scan(5, null))
+    }
+
+    @Test
+    fun routeGateBlocksForAnHourAfterFailure() {
+        val g = RouteGate(1000)
+        assertTrue(g.allow(0))
+        g.fail(10)
+        assertFalse(g.allow(500))
+        assertTrue(g.allow(1010))
+    }
+
+    @Test
+    fun batteryReadings() {
+        assertEquals(50.0, BatteryRead.pct(50, 100)!!, 0.0)
+        assertEquals(null, BatteryRead.pct(-1, 100))
+        assertTrue(BatteryRead.charging(1, 3))
+        assertFalse(BatteryRead.charging(0, 3))
+    }
 }

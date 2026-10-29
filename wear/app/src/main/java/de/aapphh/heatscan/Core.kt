@@ -51,6 +51,8 @@ object LabelEvent {
 
     fun isLabel(o: JSONObject) = o.optString("kind") == KIND
 
+    fun watchBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("to")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("room", o.getString("label")).put("source", "watch").toString()
+
     fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).toString()
 }
 
@@ -403,15 +405,19 @@ object ReplyJson {
         )
     } catch (e: Exception) { Reply(null, emptyList(), emptyList(), false) }
 
+    private fun rssiTs(o: JSONObject): List<Long> = o.optJSONArray("samples")?.let { a ->
+        (0 until a.length()).map { a.getJSONObject(it) }.filter { it.optString("sensor_type") == "rssi" }.map { it.getLong("ts") }
+    } ?: emptyList()
+
     fun postedAps(body: String): Boolean = try {
         val o = JSONObject(body)
         val last = o.optJSONArray("scans")?.let { if (it.length() > 0) it.getJSONObject(it.length() - 1) else null } ?: o
-        (last.optJSONArray("aps")?.length() ?: 0) > 0
+        (last.optJSONArray("aps")?.length() ?: 0) > 0 || rssiTs(o).isNotEmpty()
     } catch (e: Exception) { false }
 
     fun lastTs(body: String): Long? = try {
         val o = JSONObject(body)
-        (o.optJSONArray("scans")?.let { if (it.length() > 0) it.getJSONObject(it.length() - 1) else null } ?: o).optLong("ts").takeIf { it > 0L }
+        rssiTs(o).maxOrNull() ?: (o.optJSONArray("scans")?.let { if (it.length() > 0) it.getJSONObject(it.length() - 1) else null } ?: o).optLong("ts").takeIf { it > 0L }
     } catch (e: Exception) { null }
 
     fun keeps(r: Reply, postedAps: Boolean): Boolean = !r.hasRooms || postedAps
@@ -619,11 +625,12 @@ object Summary {
 object Payload {
     fun build(
         ts: Long, device: String, label: String?, aps: List<Ap>,
-        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null
+        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
         .also { if (id != null) it.put("id", id) }
+        .also { if (elapsedNs != null) it.put("elapsed_ns", elapsedNs) }
         .put("label", label ?: JSONObject.NULL)
         .put("motion", motion ?: JSONObject.NULL)
         .put("power", power ?: JSONObject.NULL)
@@ -769,7 +776,7 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
 
     private fun settled(c: Int) = accepted(c) || rejected(c)
 
-    fun run(queue: ScanQueue, now: Long, sendBatch: (JSONArray) -> Int, sendOne: (JSONObject) -> Int, sendLabel: (JSONObject) -> Int = { 200 }): FlushResult {
+    fun run(queue: ScanQueue, now: Long, sendBatch: (JSONArray) -> Int, sendOne: (JSONObject) -> Int, sendLabel: (JSONObject) -> Int = { 200 }, sendMeta: (JSONObject) -> Int = { 200 }): FlushResult {
         var sent = 0
         var code = 0
         val parked = HashSet<Long>()
@@ -777,8 +784,8 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
             while (true) {
                 val head = queue.peek(batch, now)
                 if (head.isEmpty() || head[0].seq in parked) break
-                if (LabelEvent.isLabel(head[0].json)) {
-                    val c = sendLabel(head[0].json)
+                if (Special.isSpecial(head[0].json)) {
+                    val c = if (LabelEvent.isLabel(head[0].json)) sendLabel(head[0].json) else sendMeta(head[0].json)
                     if (c == 404) {
                         parked.add(queue.defer(head[0].seq))
                         if (sent == 0 && parked.size == queue.size) code = c
@@ -790,7 +797,7 @@ class Flusher(private val maxBatch: Int = ScanConfig.BATCH) {
                     if (accepted(code)) sent++
                     continue
                 }
-                val items = head.takeWhile { !LabelEvent.isLabel(it.json) }
+                val items = head.takeWhile { !Special.isSpecial(it.json) }
                 if (!singleOnly) {
                     code = sendBatch(JSONArray().also { a -> items.forEach { a.put(it.json) } })
                     if (accepted(code)) {
@@ -870,6 +877,23 @@ class Store(private val ctx: Context) {
     var queueFormat: Int
         get() = sp.getInt("queueFormat", 0)
         set(v) = sp.edit().putInt("queueFormat", v).apply()
+    var samplePeriodS: Int
+        get() = sp.getInt("samplePeriodS", Measure.PERIOD_S)
+        set(v) = sp.edit().putInt("samplePeriodS", v).apply()
+    var sensorNote: String
+        get() = sp.getString("sensorNote", "-") ?: "-"
+        set(v) = sp.edit().putString("sensorNote", v).apply()
+    var sensorsHash: String
+        get() = sp.getString("sensorsHash", "") ?: ""
+        set(v) = sp.edit().putString("sensorsHash", v).apply()
+    var battPerHour: Float
+        get() = sp.getFloat("battPerHour", Float.NaN)
+        set(v) = sp.edit().putFloat("battPerHour", v).apply()
+    fun nextBatchSeq(): Long = synchronized(Store::class.java) {
+        val n = sp.getLong("batchSeq", 0L) + 1
+        sp.edit().putLong("batchSeq", n).commit()
+        n
+    }
     var labels404: Long
         get() = sp.getLong("labels404", 0L)
         set(v) = sp.edit().putLong("labels404", v).apply()

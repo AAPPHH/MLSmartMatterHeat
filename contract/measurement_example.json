@@ -1,0 +1,17 @@
+{
+  "device": "pixel-watch",
+  "batch_id": 1761580800500123,
+  "sent_ts": 1761580800000,
+  "clock_offset_ms": 1761500000000,
+  "app_version": "2.4",
+  "battery_pct_per_h": 0.42,
+  "samples": [
+    {"elapsed_ns": 80799000000000, "ts": 1761580799000, "sensor_type": "temp", "sensor_name": "skin_temperature", "value": 33.4, "unit": "C"},
+    {"elapsed_ns": 80799000000000, "ts": 1761580799000, "sensor_type": "hr", "sensor_name": "heart_rate", "value": 64.0, "unit": "bpm"},
+    {"elapsed_ns": 80760000000000, "ts": 1761580760000, "sensor_type": "motion", "sensor_name": "accelerometer", "value": 0.012, "unit": "m2/s4"},
+    {"elapsed_ns": 80700000000000, "ts": 1761580700000, "sensor_type": "offbody", "sensor_name": "low_latency_offbody", "value": 0.0, "unit": "bool"},
+    {"elapsed_ns": 80800000000000, "ts": 1761580800000, "sensor_type": "battery", "sensor_name": "battery", "value": 81.0, "unit": "%"},
+    {"elapsed_ns": 80800000000000, "ts": 1761580800000, "sensor_type": "charging", "sensor_name": "battery", "value": 0.0, "unit": "bool"},
+    {"elapsed_ns": 80790000000000, "ts": 1761580790000, "sensor_type": "rssi", "sensor_name": "wifi", "value": -61.0, "unit": "dBm", "sender": "aa:bb:cc:00:00:01", "freq": 2437}
+  ]
+}

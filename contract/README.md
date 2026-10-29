@@ -24,6 +24,32 @@ Berechnung per Okklusion, modellunabhängig: pro BSSID des Scans aus dem Vokabul
 
 Batch für gepufferte Scans: `{"scans": [...]}`, Elemente wie bei `/api/scan` (`batch_example.json`). Antwort `200` mit `{"stored": <aps gesamt>, "accepted": <anzahl scans>, "duplicates": <anzahl wiederholter ids>, "room": <raum der Vorhersage mit dem größten ts im Batch oder null>}`. Die Reihenfolge der Elemente ist beliebig.
 
+## `POST /watch/measurement` (Sensor- und WLAN-Messungen der Uhr)
+
+Body wie `measurement_example.json`: `{"device","batch_id","sent_ts","clock_offset_ms","app_version","samples":[...]}`. `batch_id` ist eine Zahl (i64), stabil über Wiederholungen; `(device, batch_id)` ist der Idempotenzschlüssel (eine wiederholte `batch_id` wird mit `200` angenommen, aber nicht erneut gespeichert). `sent_ts` ist die Uhrzeit (Epoch ms) beim Bilden des Batches, `clock_offset_ms = Wanduhr_ms - elapsedRealtime_ms` zum selben Zeitpunkt; damit gilt für jedes Sample `ts ≈ elapsed_ns / 1e6 + clock_offset_ms`. Optional: `battery_pct_per_h` (Akkuverbrauch der Uhr in Prozentpunkten pro Stunde, gleitend über mindestens 1 h ohne Laden, fehlt sonst) und, nur bei WLAN-Batches, `id`, `motion`, `power`, `away`, `queued` mit der Bedeutung wie bei `/api/scan` (heatd schreibt dafür `device_state`).
+
+Jedes Sample: `elapsed_ns` (`SensorEvent.timestamp` bzw. bei WLAN-Scans `ScanResult.timestamp`; fehlt bei alten Einträgen), `ts` (Epoch ms), `sensor_type`, `sensor_name`, `value`, `unit`; optional `sender` (BSSID klein), `channel`, `freq` (MHz).
+
+| sensor_type | Quelle | unit | Takt |
+|---|---|---|---|
+| `temp` | Hauttemperatur (`com.google.sensor.skin_temperature`, Typ 65555) | `C` | 60 s, Hardware-Batching |
+| `hr` | Herzfrequenz | `bpm` | 60 s, Hardware-Batching |
+| `motion` | Varianz des Betrags der Beschleunigung je 60-s-Intervall (Accelerometer 1 Hz, Hardware-Batching) | `m2/s4` | 60 s |
+| `offbody` | Low-Latency-Off-Body (`1` = Uhr nicht am Arm) | `bool` | bei Änderung |
+| `battery` | Akkustand | `%` | je Batch und bei Lade-Wechsel |
+| `charging` | Ladeflag | `bool` | je Batch und bei Lade-Wechsel |
+| `rssi` | WLAN-Scan, eine Zeile je Access Point (`sender`, `freq`, `value` = RSSI) | `dBm` | ereignisgesteuert wie bisher |
+
+Batches schließt die Uhr nach 5 Minuten oder 50 Samples, beim Raum-Tipp sofort. Sie liegen in der dauerhaften Warteschlange (kein Verlust bei Netzfehler oder Neustart; nur der noch offene Batch, höchstens 5 Minuten, geht bei einem harten Absturz verloren). Antwort `200` mit `{"stored": <anzahl>, "batch_id": <id>}`, bei Wiederholung `{"stored": 0, "duplicate": true}`. Scans mit Access Points schickt die Uhr nur noch hierhin (Antwort darf wie bei `/api/scan` `room`, `rooms`, `probability` enthalten); Heartbeats ohne APs und Away-Einträge gehen weiter an `/api/scan(s)`. Antwortet der Server mit `400/404/405/422`, fällt die Uhr eine Stunde lang auf `/api/scan` zurück. Einträge für `/watch/measurement` und `/watch/sensors` bleiben bei `400/404/405/422` in der Warteschlange (zurückgestellt) und gehen nach einem Server-Update ein.
+
+## `POST /watch/sensors`
+
+Sensorinventar beim Start und bei Änderung (Sensorliste oder `app_version`): `{"device","ts","app_version","sensors":[{"name","android_type","string_type","vendor","resolution","max_range"}]}` (Tabelle `watch_sensors`).
+
+## `POST /watch/label`
+
+`{"device","ts","from","to","room","source":"watch"}` mit den Regeln von `/api/label` (`room` entspricht `label`). Die Uhr fällt bei `400/404/405/422` auf `/api/label` zurück.
+
 ## `POST /api/label`
 
 Nachträgliches Etikettieren (`label_example.json`): `{"device": <string>, "from": <epoch ms>, "to": <epoch ms>, "label": <string>}`. `label` muss `^[a-z_]{1,32}$` entsprechen, `from <= to` und `to - from <= 3600000`, sonst `400` mit `{"error": ...}`. heatd setzt `scans.label = label` für alle Zeilen des Geräts mit `ts` in `[from, to]` (beide Grenzen inklusive, `ts` wie bei `/api/scan` als Millisekunden nach TIMESTAMP gewandelt). Überschreiben ist gewollt: die letzte Korrektur gewinnt. Antwort `200` mit `{"labelled": <anzahl verschiedener scan_id>}`; idempotent. Raum-IDs der Uhr bleiben `kueche`, `wohnzimmer`, `flur`, `bad`, `schlafzimmer`.
