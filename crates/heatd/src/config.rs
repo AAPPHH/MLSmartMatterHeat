@@ -415,6 +415,15 @@ name = 'a'").is_err());
         let config = Config::parse("").unwrap();
         assert_eq!(config.db_path, "data/heatd.duckdb");
         assert_eq!(config.controller, ControllerKind::ChipTool);
+        assert_eq!((config.watchmatch.enabled, config.watchmatch.model_dir.as_str(), config.watchmatch.model_version.as_str(), config.watchmatch.state.sleep_minutes().unwrap()), (false, "/models/watchroom", "latest", (1380, 420)));
+        let tuned = Config::parse("[watchmatch]
+enabled = true
+[watchmatch.state]
+hr_rest_max = 70
+sleep_hours = '22-6'").unwrap();
+        assert_eq!((tuned.watchmatch.enabled, tuned.watchmatch.state.hr_rest_max, tuned.watchmatch.state.hr_active_min, tuned.watchmatch.state.sleep_minutes().unwrap()), (true, 70.0, 100.0, (1320, 360)));
+        assert!(Config::parse("[watchmatch.state]
+sleep_hours = 'never'").is_err());
         let chip = config.chip_tool.to_controller_config();
         assert_eq!((chip.storage_dir, chip.bypass_attestation, chip.commission_timeout_s), (None, false, 180));
         assert_eq!(chip.paa_trust_store.as_deref(), Some("/home/aapphh/snap/chip-tool/common/paa-root-certs"));

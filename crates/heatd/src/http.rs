@@ -1216,5 +1216,132 @@ nodes = [6]
         assert_eq!((column(&l, "room")[watch[2]].as_deref(), column(&l, "from_ts")[watch[2]].as_deref(), column(&l, "to_ts")[watch[2]].as_deref()), (Some("flur"), Some("3000000"), Some("4000000")));
         assert_eq!(call(&h.state, "POST", "/watch/label", label_body("pixel-watch", 0, 10, "Bad")).await.0, StatusCode::BAD_REQUEST);
     }
-}
 
+    fn matcher_harness(model_dir: &str) -> Harness {
+        let head = format!("away_guard_minutes = 0\n[watchmatch]\nenabled = true\nmodel_dir = '{}'\nscan_fresh_s = 600\n", model_dir.replace('\\', "/"));
+        harness_with(false, &head, "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms]]\nname = 'schlafzimmer'\nnodes = [6]\n")
+    }
+
+    fn fixture_models() -> String {
+        format!("{FIXTURES}/watchroom")
+    }
+
+    fn long_body(batch: u64, ts: i64, rssi: [i64; 3]) -> Value {
+        let mut samples: Vec<Value> = rssi
+            .iter()
+            .enumerate()
+            .map(|(i, r)| json!({"elapsed_ns": 1_000 + i as i64, "ts": ts, "sensor_type": "rssi", "sensor_name": "wifi", "value": r, "unit": "dBm", "sender": format!("AA:BB:CC:00:00:0{}", i + 1), "freq": 2437}))
+            .collect();
+        samples.push(json!({"elapsed_ns": 2_000, "ts": ts, "sensor_type": "hr", "sensor_name": "hr", "value": 64.0, "unit": "bpm"}));
+        samples.push(json!({"elapsed_ns": 3_000, "ts": ts, "sensor_type": "battery", "value": 80}));
+        samples.push(json!({"elapsed_ns": 4_000, "ts": ts, "sensor_type": "temp", "value": 33.4, "unit": "C"}));
+        json!({"device": "pixel-watch", "batch_id": batch, "sent_ts": ts, "clock_offset_ms": -120, "app_version": "1.4", "samples": samples})
+    }
+
+    #[tokio::test]
+    async fn long_format_is_stored_idempotently_and_feeds_the_matcher() {
+        let h = matcher_harness(&fixture_models());
+        let now = now_ms();
+        let body = long_body(7, now, [-40, -60, -90]).to_string();
+        let (status, resp) = call(&h.state, "POST", "/watch/measurement", Some(body.clone())).await;
+        assert_eq!((status, resp), (StatusCode::OK, json!({"stored": 6, "batch_id": 7})));
+        let (_, again) = call(&h.state, "POST", "/watch/measurement", Some(body)).await;
+        assert_eq!(again, json!({"stored": 0, "duplicate": true, "batch_id": 7}));
+        let raw = lake_rows(&h, "watch_raw");
+        assert_eq!(some(&column(&raw, "sensor_type")), ["rssi", "rssi", "rssi", "hr", "battery", "temp"].map(String::from).to_vec());
+        assert_eq!(some(&column(&raw, "sender"))[..4], ["aa:bb:cc:00:00:01", "aa:bb:cc:00:00:02", "aa:bb:cc:00:00:03", ""].map(String::from));
+        assert_eq!(some(&column(&raw, "rssi"))[..4], ["-40", "-60", "-90", "0"].map(String::from));
+        assert_eq!((column(&raw, "value")[3].as_deref(), column(&raw, "clock_offset_ms")[0].as_deref(), column(&raw, "elapsed_ns")[1].as_deref(), column(&raw, "channel")[0].as_deref(), column(&raw, "unit")[0].as_deref()), (Some("64.0"), Some("-120"), Some("1001"), Some("6"), Some("dBm")));
+        let inference = lake_rows(&h, "watch_inference");
+        assert_eq!((some(&column(&inference, "result_room")), some(&column(&inference, "matcher")), some(&column(&inference, "state"))), (vec!["wohnzimmer".to_string()], vec!["room".to_string()], vec!["rest".to_string()]));
+        let presence = crate::rules::current_presence(&h.state, now_ms()).unwrap().unwrap();
+        assert_eq!(presence.room.as_deref(), Some("wohnzimmer"));
+        assert_eq!(presence.occupancy(&h.state.config), crate::rules::Occupancy::Room("wohnzimmer"));
+        let (_, health) = call(&h.state, "GET", "/health", None).await;
+        assert_eq!((health["watch"]["model_version"].clone(), health["watch"]["abstain"][0]["total"].clone(), health["watch"]["samples"]["hr"].clone(), health["watch"]["samples"]["rssi"].clone()), (json!("v1"), json!(1), json!(1), json!(3)));
+        let (_, metrics) = call_text(&h.state, "/metrics").await;
+        assert!(metrics.contains("heatd_watch_inference_total{matcher=\"room\",state=\"rest\"} 1") && metrics.contains("heatd_watch_samples_total{sensor_type=\"hr\"} 1"), "{metrics}");
+        let (status, _) = call(&h.state, "POST", "/watch/measurement", Some(long_body(8, now + 1000, [-75, -45, -60]).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        let moved = crate::rules::current_presence(&h.state, now_ms()).unwrap().unwrap();
+        assert_eq!(moved.room.as_deref(), Some("schlafzimmer"));
+    }
+
+    async fn call_text(state: &AppState, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        let status = response.status();
+        (status, String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn long_format_rejects_bad_samples_and_accepts_string_batch_ids() {
+        let h = matcher_harness(&fixture_models());
+        let now = now_ms();
+        let mut bad = long_body(1, now, [-40, -60, -90]);
+        bad["samples"][3]["sensor_type"] = json!("magnetometer");
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(bad.to_string())).await.0, StatusCode::BAD_REQUEST);
+        let mut nosender = long_body(1, now, [-40, -60, -90]);
+        nosender["samples"][0].as_object_mut().unwrap().remove("sender");
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(nosender.to_string())).await.0, StatusCode::BAD_REQUEST);
+        let mut missing = long_body(1, now, [-40, -60, -90]);
+        missing["samples"][0].as_object_mut().unwrap().remove("value");
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(missing.to_string())).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut named = long_body(1, now, [-40, -60, -90]);
+        named["batch_id"] = json!("pixel-watch-000123");
+        let (status, first) = call(&h.state, "POST", "/watch/measurement", Some(named.to_string())).await;
+        assert_eq!((status, first["stored"].clone()), (StatusCode::OK, json!(6)));
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(named.to_string())).await.1["duplicate"], json!(true));
+        assert_eq!(lake_rows(&h, "watch_raw").iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+        assert!(h.state.storage.seen_id("pixel-watch", "batch:pixel-watch-000123").unwrap());
+        let mut negative = long_body(1, now, [-40, -60, -90]);
+        negative["batch_id"] = json!(-4);
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(negative.to_string())).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn watch_sensors_are_stored() {
+        let h = harness(false);
+        let body = json!({"app_version": "1.4", "sensors": [
+            {"name": "com.google.sensor.skin_temperature", "type": 65555, "vendor": "Google", "resolution": 0.01, "maxRange": 60.0},
+            {"sensor_name": "Heart Rate", "android_type": 21}]});
+        let (status, resp) = call(&h.state, "POST", "/watch/sensors", Some(body.to_string())).await;
+        assert_eq!((status, resp), (StatusCode::OK, json!({"stored": 2})));
+        let rows = lake_rows(&h, "watch_sensors");
+        assert_eq!((some(&column(&rows, "sensor_name")), some(&column(&rows, "android_type")), some(&column(&rows, "app_version"))), (vec!["com.google.sensor.skin_temperature".to_string(), "Heart Rate".into()], vec!["65555".to_string(), "21".into()], vec!["1.4".to_string(); 2]));
+        assert_eq!((column(&rows, "vendor")[1].clone(), column(&rows, "max_range")[0].as_deref()), (None, Some("60.0")));
+        assert_eq!(call(&h.state, "POST", "/watch/sensors", Some(json!({"sensors": []}).to_string())).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_model_abstains_and_presence_falls_back() {
+        let empty = tempfile::tempdir().unwrap();
+        let h = matcher_harness(empty.path().to_str().unwrap());
+        let now = now_ms();
+        let (status, _) = call(&h.state, "POST", "/watch/measurement", Some(long_body(1, now, [-40, -60, -90]).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        let inference = lake_rows(&h, "watch_inference");
+        assert_eq!((some(&column(&inference, "reason")), some(&column(&inference, "abstained")), some(&column(&inference, "model_version"))), (vec!["no_model".to_string()], vec!["true".to_string()], vec!["none".to_string()]));
+        assert!(!h.state.watchmatch.active());
+        assert!(crate::rules::current_presence(&h.state, now_ms()).unwrap().is_none());
+        call(&h.state, "POST", "/api/scan", Some(scan_at(now + 1000, json!({})))).await;
+        let legacy = crate::rules::current_presence(&h.state, now_ms()).unwrap().unwrap();
+        assert!(legacy.room.is_none());
+        let (_, health) = call(&h.state, "GET", "/health", None).await;
+        assert_eq!(health["watch"]["abstain"][0]["abstained"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn legacy_scan_and_phase_one_body_feed_the_matcher_too() {
+        let h = matcher_harness(&fixture_models());
+        let now = now_ms();
+        let phase_one = json!({"device": "w", "ts": now, "id": "m-9", "measurements": [
+            {"sender": "aa:bb:cc:00:00:01", "rssi": -75}, {"sender": "aa:bb:cc:00:00:02", "rssi": -45}, {"sender": "aa:bb:cc:00:00:03", "rssi": -60}]});
+        call(&h.state, "POST", "/watch/measurement", Some(phase_one.to_string())).await;
+        let raw = lake_rows(&h, "watch_raw");
+        assert_eq!((some(&column(&raw, "sensor_type")), column(&raw, "value")[0].as_deref()), (vec!["rssi".to_string(); 3], Some("-75.0")));
+        assert_eq!(h.state.watchmatch.effective(now_ms()).unwrap().unwrap().0, "schlafzimmer");
+        call(&h.state, "POST", "/api/scan", Some(scan_at(now + 2000, json!({"device": "pixel-watch"})))).await;
+        assert_eq!(lake_rows(&h, "watch_inference").iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+}

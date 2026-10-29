@@ -100,6 +100,9 @@ async fn phase1_acceptance_simulated_day() {
     let label = serde_json::json!({"device": "pixel-watch", "from": midnight() / 1000, "to": midnight() / 1000 + 600_000, "label": "a"});
     assert_eq!(post(&state, "/api/label", label.to_string()).await, axum::http::StatusCode::OK);
     sink.append(Label { ts: midnight() + 12 * HOUR, room: "b".into(), source: "manual".into(), ..Default::default() }).unwrap();
+    let sensors = serde_json::json!({"app_version": "1", "sensors": [{"name": "skin", "type": 65555}]});
+    assert_eq!(post(&state, "/watch/sensors", sensors.to_string()).await, axum::http::StatusCode::OK);
+    sink.append(lake::WatchInference { ts: midnight() + 12 * HOUR, matcher: "room".into(), template_id: "none".into(), abstained: true, reason: Some("no_model".into()), state: "rest".into(), features_hash: "0".into(), model_version: "none".into(), ..Default::default() }).unwrap();
     let before: Vec<(Table, i64)> = Table::ALL.into_iter().map(|t| (t, raw_rows(&sink, t))).collect();
     for (t, n) in &before {
         assert!(*n > 0, "{} empty", t.name());
