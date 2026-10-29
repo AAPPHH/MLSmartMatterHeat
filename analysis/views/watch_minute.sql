@@ -22,7 +22,7 @@ params AS (
     coalesce(getvariable('sleep_to_min'), 420)::BIGINT AS sleep_to, coalesce(getvariable('local_offset_min'), 0)::BIGINT AS tz
 ),
 sig AS (
-  SELECT epoch_us(ts) AS us, epoch_us(ts) // 60000000 AS m, sensor_type, value::DOUBLE AS value FROM watch_raw WHERE sensor_type IN ('temp', 'hr', 'offbody', 'motion', 'battery', 'charging') AND value IS NOT NULL
+  SELECT epoch_us(ts) AS us, epoch_us(ts) // 60000000 AS m, sensor_type, value::DOUBLE AS value FROM watch_raw WHERE device IS DISTINCT FROM 'minix-anchor' AND sensor_type IN ('temp', 'hr', 'offbody', 'motion', 'battery', 'charging') AND value IS NOT NULL
 ),
 minute_agg AS (
   SELECT m,
@@ -32,7 +32,7 @@ minute_agg AS (
   FROM sig GROUP BY m
 ),
 rssi_n AS (
-  SELECT epoch_us(ts) // 60000000 AS m, count(*) AS n FROM watch_raw WHERE coalesce(sensor_type, 'rssi') = 'rssi' GROUP BY 1
+  SELECT epoch_us(ts) // 60000000 AS m, count(*) AS n FROM watch_raw WHERE device IS DISTINCT FROM 'minix-anchor' AND coalesce(sensor_type, 'rssi') = 'rssi' GROUP BY 1
 ),
 grid AS (SELECT m, m * 60000000 AS t, m * 60000000 + 59999999 AS te FROM params, range(params.m0 - 9, params.m1) AS g(m)),
 windowed AS (

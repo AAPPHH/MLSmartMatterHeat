@@ -276,7 +276,7 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
         md.push('\n');
     }
-    let watch = rows(c, &format!("SELECT count(*), avg(rssi) FILTER (WHERE epoch_us(ts) < {mid}), avg(rssi) FILTER (WHERE epoch_us(ts) >= {mid}) FROM watch_raw WHERE coalesce(sensor_type, 'rssi') = 'rssi' AND {day}"), |r| {
+    let watch = rows(c, &format!("SELECT count(*), avg(rssi) FILTER (WHERE epoch_us(ts) < {mid}), avg(rssi) FILTER (WHERE epoch_us(ts) >= {mid}) FROM watch_raw WHERE coalesce(sensor_type, 'rssi') = 'rssi' AND device IS DISTINCT FROM 'minix-anchor' AND {day}"), |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, Option<f64>>(2)?))
     })?;
     if let Some((n, a, b)) = watch.into_iter().next() {
@@ -314,7 +314,7 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         let reasons = rows(c, &format!("SELECT reason, count(*) FROM watch_inference WHERE abstained AND {day} GROUP BY reason ORDER BY reason"), |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)))?;
         let _ = writeln!(md, "\nAbstain reasons: {}.\n", reasons.iter().map(|(k, n)| format!("{} {n}", k.as_deref().unwrap_or("-"))).collect::<Vec<_>>().join(", "));
     }
-    let samples = rows(c, &format!("SELECT coalesce(sensor_type, 'rssi'), count(*) FROM watch_raw WHERE {day} GROUP BY 1 ORDER BY 1"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let samples = rows(c, &format!("SELECT coalesce(sensor_type, 'rssi'), count(*) FROM watch_raw WHERE device IS DISTINCT FROM 'minix-anchor' AND {day} GROUP BY 1 ORDER BY 1"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let _ = writeln!(md, "Sensor samples: {}.\n", if samples.is_empty() { "none".into() } else { samples.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ") });
     let battery = rows(
         c,

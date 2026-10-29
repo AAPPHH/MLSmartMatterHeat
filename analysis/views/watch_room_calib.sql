@@ -9,7 +9,7 @@
 CREATE OR REPLACE VIEW watch_room_calib AS
 WITH
 scans AS (
-  SELECT epoch_us(ts) // 60000000 AS m, epoch_us(ts) AS us, sender, rssi::INTEGER AS rssi FROM watch_raw WHERE coalesce(sensor_type, 'rssi') = 'rssi'
+  SELECT epoch_us(ts) // 60000000 AS m, epoch_us(ts) AS us, sender, rssi::INTEGER AS rssi FROM watch_raw WHERE device IS DISTINCT FROM 'minix-anchor' AND coalesce(sensor_type, 'rssi') = 'rssi'
 ),
 last_scan AS (SELECT m, max(us) AS scan_us FROM scans GROUP BY m),
 fingerprint AS (
