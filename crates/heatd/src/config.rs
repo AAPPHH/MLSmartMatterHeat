@@ -213,12 +213,14 @@ pub struct WatchMatchSection {
     pub scan_fresh_s: i64,
     pub labels_since: Option<String>,
     pub label_target: usize,
+    pub label_tolerance_s: i64,
+    pub anchor_devices: Vec<String>,
     pub state: WatchState,
 }
 
 impl Default for WatchMatchSection {
     fn default() -> Self {
-        Self { enabled: false, model_dir: "/models/watchroom".into(), model_version: "latest".into(), scan_fresh_s: 180, labels_since: None, label_target: 10, state: WatchState::default() }
+        Self { enabled: false, model_dir: "/models/watchroom".into(), model_version: "latest".into(), scan_fresh_s: 180, labels_since: None, label_target: 10, label_tolerance_s: 30, anchor_devices: Vec::new(), state: WatchState::default() }
     }
 }
 

@@ -86,6 +86,8 @@ pub struct ScanBody {
     pub away: bool,
     #[serde(default)]
     pub bedtime: Option<bool>,
+    #[serde(default)]
+    pub heat: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +315,7 @@ mod tests {
             power: None,
             away: false,
             bedtime: None,
+            heat: None,
             aps: vec![
                 AccessPoint { bssid: "AA:BB:CC:00:00:01".into(), rssi: -45, freq: 2412 },
                 AccessPoint { bssid: "aa:bb:cc:00:00:02".into(), rssi: -67, freq: 5180 },

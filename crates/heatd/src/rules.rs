@@ -493,10 +493,11 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     if let Some((room, _)) = step.pending.as_ref().filter(|_| fresh) {
         for want in wants.iter().filter(|w| &w.room == room && w.reason != "window_open") {
             let old = current(&state.commanded.lock().unwrap(), want.node);
-            if old.is_some_and(|o| (o - state.config.occupied_setpoint).abs() < state.config.setpoint_deadband) {
+            let target = clamp_setpoint(&readings, want.node, state.config.occupied_setpoint);
+            if old.is_some_and(|o| (o - target).abs() < state.config.setpoint_deadband) {
                 continue;
             }
-            let wanted = Desired { setpoint: clamp_setpoint(&readings, want.node, state.config.occupied_setpoint), reason: "occupied", rule: "presence", ..want.clone() };
+            let wanted = Desired { setpoint: target, reason: "occupied", rule: "presence", ..want.clone() };
             log("decision", state.sink.append(deferred_row(state, &wanted, now_ms, old, &readings, presence.as_ref(), "debounce")));
         }
     }

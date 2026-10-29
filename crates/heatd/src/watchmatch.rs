@@ -17,7 +17,7 @@ pub const NO_MODEL: &str = "none";
 const SIGNAL_KEEP_MS: i64 = 1_800_000;
 const NO_SCAN_AFTER_MS: i64 = 120_000;
 const HISTORY_KEEP: usize = 32;
-const RELOAD_EVERY_TICKS: u64 = 60;
+const RELOAD_EVERY_TICKS: u64 = 5;
 const MAX_STEPS: f64 = 60.0;
 const BELIEF_FLOOR: f64 = 1e-4;
 const DRIFT_RISE: f64 = 1.5;
@@ -474,8 +474,12 @@ impl WatchMatch {
         Ok(true)
     }
 
+    pub fn is_anchor(&self, device: &str) -> bool {
+        self.cfg.anchor_devices.iter().any(|a| a == device)
+    }
+
     pub fn signals(&self, device: &str, signals: impl IntoIterator<Item = (i64, Signal)>) {
-        if !self.cfg.enabled {
+        if !self.cfg.enabled || self.is_anchor(device) {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
@@ -493,7 +497,7 @@ impl WatchMatch {
     }
 
     fn scan_ranked(&self, device: &str, ts_ms: i64, now_ms: i64, minute: u32, aps: &[(String, i32)]) -> Option<(WatchInference, Vec<(String, f64)>)> {
-        if !self.cfg.enabled || aps.is_empty() || now_ms - ts_ms > self.cfg.scan_fresh_s * 1000 {
+        if !self.cfg.enabled || self.is_anchor(device) || aps.is_empty() || now_ms - ts_ms > self.cfg.scan_fresh_s * 1000 {
             return None;
         }
         let mut inner = self.inner.lock().unwrap();
@@ -589,6 +593,9 @@ impl WatchMatch {
     }
 
     pub fn note_stay(&self, device: &str, ts_ms: i64, label: Option<&str>) {
+        if self.is_anchor(device) {
+            return;
+        }
         let mut inner = self.inner.lock().unwrap();
         match label.filter(|l| !l.is_empty()) {
             Some(l) if inner.stays.get(device).is_none_or(|s| ts_ms >= s.1) => {

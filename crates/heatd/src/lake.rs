@@ -128,7 +128,7 @@ impl Table {
             ],
             Table::Labels => vec![
                 tsf("ts", false), tsf("from_ts", true), tsf("to_ts", true), fld("room", dict(), false), fld("source", dict(), false), fld("device", dict(), true),
-                fld("confidence", DataType::Float32, true), fld("model_id", DataType::Utf8, true), fld("probs", DataType::Utf8, true),
+                fld("confidence", DataType::Float32, true), fld("model_id", DataType::Utf8, true), fld("probs", DataType::Utf8, true), fld("heat", DataType::Boolean, true),
             ],
             Table::WatchRaw => vec![
                 tsf("ts", false), tsf("device_ts", true), fld("sender", dict(), false), fld("rssi", DataType::Int8, false), fld("channel", DataType::UInt8, true), fld("batch_id", DataType::UInt64, false),
@@ -398,6 +398,7 @@ pub struct Label {
     pub confidence: Option<f32>,
     pub model_id: Option<String>,
     pub probs: Option<String>,
+    pub heat: Option<bool>,
 }
 
 impl Row for Label {
@@ -405,7 +406,7 @@ impl Row for Label {
     fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
         let cols = vec![
             ts_col(rows, |r| Some(r.ts)), ts_col(rows, |r| r.from_ts), ts_col(rows, |r| r.to_ts), dict_col(rows, |r| Some(&r.room)), dict_col(rows, |r| Some(&r.source)),
-            dict_col(rows, |r| r.device.as_deref()), prim::<Float32Type, _>(rows, |r| r.confidence), str_col(rows, |r| r.model_id.as_deref()), str_col(rows, |r| r.probs.as_deref()),
+            dict_col(rows, |r| r.device.as_deref()), prim::<Float32Type, _>(rows, |r| r.confidence), str_col(rows, |r| r.model_id.as_deref()), str_col(rows, |r| r.probs.as_deref()), bool_col(rows, |r| r.heat),
         ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }

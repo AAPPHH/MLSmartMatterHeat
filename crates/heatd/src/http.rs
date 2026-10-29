@@ -76,6 +76,8 @@ struct LabelBody {
     to: i64,
     #[serde(alias = "room")]
     label: String,
+    #[serde(default)]
+    heat: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +169,19 @@ fn merge(response: &mut Value, extra: Value) {
 }
 
 fn ingest(state: &AppState, body: &ScanBody, received: i64, raw: bool) -> Result<Outcome, ApiError> {
+    if state.watchmatch.is_anchor(&body.device) {
+        if body.id.as_ref().is_some_and(|id| !state.storage.claim_id(&body.device, id).unwrap_or(true)) {
+            return Ok(Outcome { stored: 0, duplicate: true, room: None, explanation: Explanation::default(), matched: None });
+        }
+        if raw {
+            let batch = state.next_batch();
+            let aps = body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok()));
+            if let Err(e) = raw_rows(state, &body.device, body.ts.min(received), None, received, batch, aps) {
+                eprintln!("watch_raw: {e}");
+            }
+        }
+        return Ok(Outcome { stored: body.aps.len(), duplicate: false, room: None, explanation: Explanation::default(), matched: None });
+    }
     let mut body = body.clone();
     if body.ts > received + MAX_FUTURE_MS {
         eprintln!("scan ts from {} is {} ms in the future, clamped to received_at", body.device, body.ts - received);
@@ -216,13 +231,14 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
             eprintln!("watch_raw: {e}");
         }
     }
+    let heat = body.heat.unwrap_or(true);
     if let Some(label) = body.label.as_deref().filter(|l| !l.is_empty()) {
-        let row = Label { ts: body.ts * 1000, room: label.into(), source: "watch".into(), device: Some(body.device.clone()), ..Default::default() };
+        let row = Label { ts: body.ts * 1000, room: label.into(), source: "watch".into(), device: Some(body.device.clone()), heat: Some(heat), ..Default::default() };
         if let Err(e) = state.sink.append(row) {
             eprintln!("labels: {e}");
         }
     }
-    if !body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty()) {
+    if heat && (!body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty())) {
         state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref());
     }
     let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "away": body.away, "bedtime": body.bedtime, "id": body.id});
@@ -284,6 +300,8 @@ struct LongBody {
     #[serde(default)]
     bedtime: Option<bool>,
     #[serde(default)]
+    heat: Option<bool>,
+    #[serde(default)]
     queued: Option<bool>,
 }
 
@@ -303,6 +321,7 @@ impl LongBody {
             power: self.power,
             away: self.away.unwrap_or(false),
             bedtime: self.bedtime,
+            heat: self.heat,
         })
     }
 }
@@ -411,6 +430,12 @@ async fn watch_long(state: AppState, body: LongBody) -> ApiResult {
     }
     let rows = long_rows(&body, batch, received)?;
     let stored = rows.len();
+    if state.watchmatch.is_anchor(&body.device) {
+        state.sink.append_many(rows)?;
+        flushed(&state, Table::WatchRaw).await?;
+        state.storage.claim_id(&body.device, &key)?;
+        return Ok(Json(json!({"stored": stored, "batch_id": batch, "anchor": true})));
+    }
     let scan = body.scan_body(received).map(|s| ingest(&state, &s, received, false)).transpose()?;
     state.sink.append_many(rows)?;
     flushed(&state, Table::WatchRaw).await?;
@@ -451,8 +476,12 @@ async fn watch_measurement(State(state): State<AppState>, Json(value): Json<Valu
     if let Some(id) = &body.id {
         state.storage.claim_id(&body.device, id)?;
     }
-    state.status.watch_samples("rssi", stored as u64);
     let mut response = json!({"stored": stored, "batch_id": batch});
+    if state.watchmatch.is_anchor(&body.device) {
+        response["anchor"] = json!(true);
+        return Ok(Json(response));
+    }
+    state.status.watch_samples("rssi", stored as u64);
     if let Some(m) = state.watchmatch.scan_match(&body.device, ts, received, &pairs) {
         response["match"] = m;
     }
@@ -584,14 +613,19 @@ async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> 
     Ok(Json(json!({"window_open": open.iter().collect::<Vec<_>>()})))
 }
 
-const LABEL_DEDUP_US: i64 = 3_000_000;
+const LABEL_DEDUP_US: i64 = 35_000_000;
 
 fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<String, usize>> {
+    use arrow::array::Array;
     state.sink.flush()?;
+    let max_span_us = 2 * state.config.watchmatch.label_tolerance_s * 1_000_000;
     let mut rows: Vec<(i64, String)> = Vec::new();
     for batch in crate::context::read_raw(state.sink.root(), Table::Labels, None)? {
-        let (ts, room, source) = (crate::context::ts_column(&batch, "ts")?, crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
-        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && ts.value(i) >= since_us).map(|i| (ts.value(i), room.value(i).to_string())));
+        let (ts, from, to) = (crate::context::ts_column(&batch, "ts")?, crate::context::ts_column(&batch, "from_ts")?, crate::context::ts_column(&batch, "to_ts")?);
+        let (room, source) = (crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
+        let at = |i: usize| if to.is_null(i) { ts.value(i) } else { to.value(i) };
+        let retroactive = |i: usize| !from.is_null(i) && !to.is_null(i) && to.value(i) - from.value(i) > max_span_us;
+        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && at(i) >= since_us && !retroactive(i)).map(|i| (at(i), room.value(i).to_string())));
     }
     rows.sort();
     let mut last: HashMap<String, i64> = HashMap::new();
@@ -624,8 +658,11 @@ async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> Ap
         return Err(ApiError::bad("range must satisfy from <= to and to - from <= 3600000"));
     }
     let labelled = state.storage.relabel(&body.device, body.from, body.to, &body.label)?;
-    state.watchmatch.note_stay(&body.device, body.to.min(now_ms()), Some(&body.label));
-    let row = Label { ts: lake::now_us(), from_ts: Some(body.from * 1000), to_ts: Some(body.to * 1000), room: body.label.clone(), source: "watch".into(), device: Some(body.device.clone()), ..Default::default() };
+    let heat = body.heat.unwrap_or(true);
+    if heat {
+        state.watchmatch.note_stay(&body.device, body.to.min(now_ms()), Some(&body.label));
+    }
+    let row = Label { ts: lake::now_us(), from_ts: Some(body.from * 1000), to_ts: Some(body.to * 1000), room: body.label.clone(), source: "watch".into(), device: Some(body.device.clone()), heat: Some(heat), ..Default::default() };
     if let Err(e) = state.sink.append(row) {
         eprintln!("labels: {e}");
     }
@@ -955,17 +992,102 @@ label_target = 2
         assert_eq!(status, StatusCode::OK);
         assert_eq!((body["target"].clone(), body["since"].clone(), body["done"].clone()), (json!(2), json!(iso), json!(false)));
         assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 0}, {"room": "bad", "n": 0}, {"room": "flur", "n": 0}]));
-        for (offset, room) in [(-60_000, "bad"), (1_000, "bad"), (2_000, "bad"), (10_000, "bad"), (1_000, "wohnzimmer"), (20_000, "flur"), (30_000, "diele")] {
+        for (offset, room) in [(-60_000, "bad"), (1_000, "bad"), (2_000, "bad"), (50_000, "bad"), (1_000, "wohnzimmer"), (20_000, "flur"), (30_000, "diele")] {
             call(&h.state, "POST", "/api/scan", Some(scan_at(since + offset, json!({"label": room})))).await;
         }
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
         assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 1}, {"room": "bad", "n": 2}, {"room": "flur", "n": 1}]));
         assert_eq!(body["done"], json!(false));
-        for (offset, room) in [(40_000, "wohnzimmer"), (50_000, "flur")] {
+        for (offset, room) in [(40_000, "wohnzimmer"), (60_000, "flur")] {
             call(&h.state, "POST", "/api/scan", Some(scan_at(since + offset, json!({"label": room})))).await;
         }
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
         assert_eq!(body["done"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn label_progress_counts_one_per_tap_on_to_ts_and_ignores_retroactive_ranges() {
+        let now = now_ms();
+        let iso = chrono::DateTime::from_timestamp_millis(now - 3_600_000).unwrap().to_rfc3339();
+        let h = harness_with(false, "away_guard_minutes = 0
+", &format!("[[rooms]]
+name = 'bad'
+nodes = [7]
+[[rooms]]
+name = 'flur'
+nodes = [8]
+[watchmatch]
+labels_since = '{iso}'
+label_target = 2
+"));
+        let tap = |room: &str, at: i64, half: i64| call(&h.state, "POST", "/watch/label", label_body("pixel-watch", at - half, at + half, room));
+        tap("bad", now - 1_800_000, 1_000).await;
+        tap("bad", now - 1_800_000 + 20_000, 1_000).await;
+        tap("bad", now - 1_800_000 + 25_000, 1_000).await;
+        tap("bad", now - 1_000_000, 1_000).await;
+        tap("flur", now - 900_000, 100_000).await;
+        tap("flur", now - 800_000, 1_000).await;
+        tap("flur", now - 7_200_000, 1_000).await;
+        let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
+        assert_eq!(body["rooms"], json!([{"room": "bad", "n": 2}, {"room": "flur", "n": 1}]));
+    }
+
+    #[tokio::test]
+    async fn heat_false_labels_are_stored_but_never_occupy_or_bypass() {
+        let h = stay_harness();
+        let now = now_ms();
+        let heat_off = |extra: Value| {
+            let mut v = json!({"device": "pixel-watch", "heat": false});
+            extra.as_object().unwrap().iter().for_each(|(k, x)| v[k] = x.clone());
+            v.to_string()
+        };
+        assert_eq!(call(&h.state, "POST", "/api/label", Some(heat_off(json!({"from": now - 2_000, "to": now, "label": "wohnzimmer"})))).await.0, StatusCode::OK);
+        assert_eq!(call(&h.state, "POST", "/watch/label", Some(heat_off(json!({"from": now - 2_000, "to": now, "room": "wohnzimmer"})))).await.0, StatusCode::OK);
+        call(&h.state, "POST", "/api/scan", Some(heat_off(json!({"ts": now, "label": "wohnzimmer", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]})))).await;
+        assert!(h.state.watchmatch.stay().is_none());
+        assert_eq!(wanted(&h, now)[0].2, "default");
+        let labels = lake_rows(&h, "labels");
+        assert_eq!(some(&column(&labels, "heat")), vec!["false".to_string(); 3]);
+        call(&h.state, "POST", "/api/label", label_body("pixel-watch", now - 2_000, now, "wohnzimmer")).await;
+        assert_eq!(wanted(&h, now)[0].2, "occupied");
+        assert_eq!(some(&column(&lake_rows(&h, "labels"), "heat"))[3], "true");
+    }
+
+    #[tokio::test]
+    async fn anchor_scans_land_in_watch_raw_and_touch_nothing_else() {
+        let head = format!("away_guard_minutes = 0
+[watchmatch]
+enabled = true
+model_dir = '{}'
+scan_fresh_s = 600
+anchor_devices = ['minix-anchor']
+", fixture_models().replace('\\', "/"));
+        let h = harness_with(false, &head, "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+[[rooms]]
+name = 'schlafzimmer'
+nodes = [6]
+");
+        let now = now_ms();
+        let aps = json!([{"bssid": "aa:bb:cc:00:00:01", "rssi": -40, "freq": 2437}]);
+        let (status, body) = call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "minix-anchor", "label": "wohnzimmer", "id": "a-1", "aps": aps}).to_string())).await;
+        assert_eq!((status, body["stored"].clone()), (StatusCode::OK, json!(1)));
+        assert_eq!(call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "minix-anchor", "id": "a-1", "aps": aps}).to_string())).await.1["duplicate"], json!(true));
+        let mut long = long_body(77, now + 1000, [-40, -60, -90]);
+        long["device"] = json!("minix-anchor");
+        long["label"] = json!("wohnzimmer");
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(long.to_string())).await.1["anchor"], json!(true));
+        let short = json!({"device": "minix-anchor", "ts": now + 2000, "measurements": [{"sender": "aa:bb:cc:00:00:02", "rssi": -55}]});
+        assert!(call(&h.state, "POST", "/watch/measurement", Some(short.to_string())).await.1.get("match").is_none());
+        let raw = lake_rows(&h, "watch_raw");
+        assert_eq!(some(&column(&raw, "device")).iter().filter(|d| *d == "minix-anchor").count(), raw.iter().map(|b| b.num_rows()).sum::<usize>());
+        assert!(raw.iter().map(|b| b.num_rows()).sum::<usize>() >= 8);
+        assert!(lake_rows(&h, "watch_inference").is_empty() && lake_rows(&h, "labels").is_empty());
+        assert!(h.state.storage.device_statuses().unwrap().is_empty() && h.state.storage.last_predictions().unwrap().is_empty());
+        assert_eq!(h.state.storage.count("scans").unwrap(), 0);
+        assert!(h.state.watchmatch.stay().is_none() && h.state.watchmatch.effective(now_ms()).unwrap().is_none());
+        assert!(!h.state.tracker.lock().unwrap().confirmed("minix-anchor"));
     }
 
     #[tokio::test]
@@ -1336,6 +1458,25 @@ nodes = [5]
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0), (5, 18.0)]);
         assert_eq!(extras(&h, "debounce"), 1);
         assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "occupancy_end"));
+    }
+
+    #[tokio::test]
+    async fn debounce_compares_against_the_clamped_occupied_setpoint() {
+        let h = harness_with(true, "away_guard_minutes = 0
+occupied_setpoint = 30.0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let t0 = now_ms();
+        h.state.latest.update(5, "max_heat_setpoint_limit", 25.0, t0);
+        h.state.latest.update(5, "occupied_heating_setpoint", 25.0, t0);
+        call(&h.state, "POST", "/api/scan", Some(scan_at(t0, json!({})))).await;
+        for m in 0..5 {
+            control_step(&h.state, noon, t0 + m * 60_000).await.unwrap();
+        }
+        assert_eq!(extras(&h, "debounce"), 0);
     }
 
     #[tokio::test]

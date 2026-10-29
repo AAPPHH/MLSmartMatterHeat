@@ -57,6 +57,8 @@ model_version = "latest"
 scan_fresh_s = 180
 labels_since = "2026-10-29T20:28:00+01:00"
 label_target = 10
+label_tolerance_s = 30
+anchor_devices = ["minix-anchor"]
 
 [watchmatch.state]
 hr_rest_max = 70
