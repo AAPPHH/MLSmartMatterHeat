@@ -1,6 +1,7 @@
 use crate::{
-    centi_degrees, AttributeReport, Error, Inventory, MatterController, NodeId, Result, ThermostatState, LOCAL_TEMPERATURE,
-    OCCUPIED_HEATING_SETPOINT, SYSTEM_MODE,
+    centi_degrees, AttributeReport, CaptureItem, CaptureParser, Error, Inventory, MatterController, NodeId, RawAttribute, Result, ThermostatState, TypedValue,
+    BAT_PERCENT_REMAINING, LOCAL_TEMPERATURE, OCCUPIED_HEATING_SETPOINT, PI_HEATING_DEMAND, POWER_SOURCE_CLUSTER, SOURCE_POLL, SOURCE_SUBSCRIPTION, SYSTEM_MODE,
+    THERMOSTAT_CLUSTER,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -20,6 +21,8 @@ struct MockNode {
 struct Inner {
     nodes: BTreeMap<NodeId, MockNode>,
     subscribers: Vec<(NodeId, Sender<AttributeReport>)>,
+    captures: Vec<(NodeId, Sender<CaptureItem>)>,
+    poll_failing: bool,
     setpoint_writes: Vec<(NodeId, f64)>,
 }
 
@@ -35,6 +38,26 @@ impl MockController {
 
     pub fn add_node(&self, node: NodeId, temperature: f64, setpoint: f64) {
         self.inner.lock().unwrap().nodes.insert(node, MockNode { temperature, setpoint, mode: MODE_HEAT });
+    }
+
+    pub fn push_capture(&self, node: NodeId, item: CaptureItem) {
+        Self::send_capture(&self.inner.lock().unwrap(), node, item);
+    }
+
+    pub fn set_poll_failing(&self, failing: bool) {
+        self.inner.lock().unwrap().poll_failing = failing;
+    }
+
+    fn send_capture(inner: &Inner, node: NodeId, item: CaptureItem) {
+        inner.captures.iter().filter(|(n, _)| *n == node).for_each(|(_, tx)| {
+            let _ = tx.try_send(item.clone());
+        });
+    }
+
+    fn attribute_item(&self, node: NodeId, cluster: u32, id: u32, name: &str, raw_value: f64, source: &'static str) -> CaptureItem {
+        let value = TypedValue::from_json(&serde_json::json!(raw_value.round() as i64));
+        let raw = format!("  {name}: {}", value.v_i64.unwrap_or(0)).into_bytes();
+        CaptureItem::Attribute(RawAttribute { node, endpoint: self.endpoint, cluster, attribute: id, name: name.into(), raw, value, source })
     }
 
     pub fn setpoint_writes(&self) -> Vec<(NodeId, f64)> {
@@ -74,6 +97,8 @@ impl MockController {
 ")));
         };
         put(0, 0x28, 0x01, &["  VendorName: \"Mock\""]);
+        put(0, 0x28, 0x09, &["  SoftwareVersion: 1"]);
+        put(0, 0x28, 0x0A, &["  SoftwareVersionString: \"mock-1\""]);
         put(ep, 0x201, 0x00, &[&format!("  LocalTemperature: {}", centi_degrees(state.temperature))]);
         put(ep, 0x201, 0x08, &["  PIHeatingDemand: 30"]);
         put(ep, 0x201, 0x12, &[&format!("  OccupiedHeatingSetpoint: {}", centi_degrees(state.setpoint))]);
@@ -95,6 +120,9 @@ impl MockController {
 
     fn publish(&self, inner: &mut Inner, node: NodeId, attribute: &str, value: f64) {
         let report = AttributeReport { node, endpoint: self.endpoint, attribute: attribute.to_string(), value };
+        if let Some(spec) = [&LOCAL_TEMPERATURE, &OCCUPIED_HEATING_SETPOINT, &SYSTEM_MODE].into_iter().find(|s| s.snake == attribute) {
+            Self::send_capture(inner, node, self.attribute_item(node, THERMOSTAT_CLUSTER, spec.id, spec.pascal, value * spec.scale, SOURCE_SUBSCRIPTION));
+        }
         inner.subscribers.retain(|(n, tx)| {
             if *n == node {
                 let _ = tx.try_send(report.clone());
@@ -146,6 +174,38 @@ impl MatterController for MockController {
         }
         inner.subscribers.push((node, tx));
         Ok(rx)
+    }
+
+    async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner.nodes.get(&node).ok_or(Error::UnknownNode(node))?;
+        let (tx, rx) = channel(4096);
+        for item in CaptureParser::new().feed_all(&self.raw_attributes(state), Some(node)) {
+            let _ = tx.try_send(item);
+        }
+        let _ = tx.try_send(CaptureItem::Subscribed { node: Some(node) });
+        inner.captures.retain(|(n, _)| *n != node);
+        inner.captures.push((node, tx));
+        Ok(rx)
+    }
+
+    async fn poll(&self, node: NodeId) -> Result<usize> {
+        let inner = self.inner.lock().unwrap();
+        let state = inner.nodes.get(&node).ok_or(Error::UnknownNode(node))?;
+        if inner.poll_failing {
+            return Err(Error::Command(format!("no poll response from node {node}")));
+        }
+        let values = [
+            (THERMOSTAT_CLUSTER, &LOCAL_TEMPERATURE, state.temperature),
+            (THERMOSTAT_CLUSTER, &OCCUPIED_HEATING_SETPOINT, state.setpoint),
+            (THERMOSTAT_CLUSTER, &PI_HEATING_DEMAND, 30.0 / PI_HEATING_DEMAND.scale),
+            (THERMOSTAT_CLUSTER, &SYSTEM_MODE, state.mode),
+            (POWER_SOURCE_CLUSTER, &BAT_PERCENT_REMAINING, 45.0),
+        ];
+        for (cluster, spec, value) in values {
+            Self::send_capture(&inner, node, self.attribute_item(node, cluster, spec.id, spec.pascal, value * spec.scale, SOURCE_POLL));
+        }
+        Ok(values.len())
     }
 
     async fn inventory(&self, node: NodeId) -> Result<Inventory> {

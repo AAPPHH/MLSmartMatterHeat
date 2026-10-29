@@ -1,6 +1,7 @@
+use crate::capture::{CaptureItem, CaptureParser, SOURCE_POLL};
 use crate::{
     centi_degrees, parse_number, AttributeReport, AttributeSpec, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
-    NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
+    NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -23,6 +24,9 @@ const LOCK_FILE: &str = "heatd.lock";
 const INVENTORY_TIMEOUT_FACTOR: u64 = 3;
 const WILDCARD: &str = "0xFFFFFFFF";
 const WILDCARD_ENDPOINT: &str = "0xFFFF";
+const CAPTURE_QUEUE: usize = 4096;
+const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_GRACE: Duration = Duration::from_secs(2);
 
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
@@ -66,7 +70,7 @@ impl Default for ChipToolConfig {
             paa_trust_store: Some("/home/aapphh/snap/chip-tool/common/paa-root-certs".into()),
             bypass_attestation: false,
             endpoint: 1,
-            subscribe_min_s: 5,
+            subscribe_min_s: 1,
             subscribe_max_s: 300,
             timeout_s: 90,
             commission_timeout_s: 180,
@@ -126,36 +130,27 @@ impl ChipToolConfig {
     }
 
     pub fn subscribe_line(&self, node: NodeId) -> String {
-        let ids: Vec<String> = WATCHED.iter().map(|s| format!("0x{:04X}", s.id)).collect();
+        self.wildcard_line("subscribe-by-id", node)
+    }
+
+    pub fn event_subscribe_line(&self, node: NodeId) -> String {
+        self.wildcard_line("subscribe-event-by-id", node)
+    }
+
+    fn wildcard_line(&self, command: &str, node: NodeId) -> String {
         format!(
-            "thermostat subscribe-by-id {} {} {} {} {} --keepSubscriptions 1 --auto-resubscribe 1",
-            ids.join(","),
-            self.subscribe_min_s,
-            self.subscribe_max_s,
-            node,
-            self.endpoint
+            "any {command} {WILDCARD} {WILDCARD} {} {} {node} {WILDCARD_ENDPOINT} --keepSubscriptions 1 --auto-resubscribe 1",
+            self.subscribe_min_s, self.subscribe_max_s
         )
     }
 
-    pub fn extra_subscribe_lines(&self, node: NodeId) -> Vec<String> {
-        EXTRA_SUBSCRIPTIONS
-            .iter()
-            .map(|group| {
-                let ids: Vec<String> = group.attributes.iter().map(|s| format!("0x{:04X}", s.id)).collect();
-                format!(
-                    "{} subscribe-by-id {} {} {} {} {WILDCARD_ENDPOINT} --keepSubscriptions 1 --auto-resubscribe 1",
-                    group.cluster,
-                    ids.join(","),
-                    self.subscribe_min_s,
-                    self.subscribe_max_s,
-                    node
-                )
-            })
-            .collect()
+    pub fn subscribe_lines(&self, node: NodeId) -> Vec<String> {
+        vec![self.subscribe_line(node), self.event_subscribe_line(node)]
     }
 
-    pub fn subscribe_lines(&self, node: NodeId) -> Vec<String> {
-        std::iter::once(self.subscribe_line(node)).chain(self.extra_subscribe_lines(node)).collect()
+    pub fn poll_line(&self, node: NodeId) -> String {
+        let hex = |f: fn(&(u32, u32)) -> u32| POLL_ATTRIBUTES.iter().map(|p| format!("0x{:04X}", f(p))).collect::<Vec<_>>().join(",");
+        format!("any read-by-id {} {} {node} {WILDCARD_ENDPOINT}", hex(|p| p.0), hex(|p| p.1))
     }
 
     pub fn inventory_attribute_args(&self, node: NodeId) -> Vec<String> {
@@ -238,7 +233,7 @@ pub(crate) fn is_failure(line: &str) -> bool {
         || status_code(line, "status = 0x").is_some_and(|c| c != 0)
 }
 
-fn rx_peer(line: &str) -> Option<NodeId> {
+pub(crate) fn rx_peer(line: &str) -> Option<NodeId> {
     let token = line.split_once("Msg RX from ")?.1.split_whitespace().next()?;
     NodeId::from_str_radix(token.split_once(':')?.1, 16).ok()
 }
@@ -413,23 +408,35 @@ fn output_tail(output: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+struct PollWindow {
+    node: NodeId,
+    paths: HashSet<(u32, u32)>,
+    done: Sender<()>,
+}
+
 #[derive(Default)]
 struct Hub {
     subs: Mutex<Vec<(NodeId, Sender<AttributeReport>)>>,
+    captures: Mutex<Vec<(NodeId, Sender<CaptureItem>)>>,
+    sent: Mutex<HashSet<NodeId>>,
+    poll: Mutex<Option<PollWindow>>,
     pending: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
     logged: Mutex<HashSet<String>>,
 }
 
 impl Hub {
-    fn sole_node(&self) -> Option<NodeId> {
-        match self.subs.lock().unwrap().as_slice() {
-            [(node, _)] => Some(*node),
-            _ => None,
-        }
+    fn nodes(&self) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = self.subs.lock().unwrap().iter().map(|(n, _)| *n).chain(self.captures.lock().unwrap().iter().map(|(n, _)| *n)).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
     }
 
-    fn nodes(&self) -> Vec<NodeId> {
-        self.subs.lock().unwrap().iter().map(|(n, _)| *n).collect()
+    fn sole_node(&self) -> Option<NodeId> {
+        match self.nodes().as_slice() {
+            [node] => Some(*node),
+            _ => None,
+        }
     }
 
     fn finish_write(&self, result: std::result::Result<(), String>) -> Option<String> {
@@ -457,6 +464,27 @@ impl Hub {
             }
         }
     }
+
+    fn mark_poll(&self, item: &mut CaptureItem) {
+        let CaptureItem::Attribute(a) = item else { return };
+        let mut guard = self.poll.lock().unwrap();
+        if let Some(window) = guard.as_mut().filter(|w| w.node == a.node) {
+            if window.paths.remove(&(a.cluster, a.attribute)) {
+                a.source = SOURCE_POLL;
+                let _ = window.done.try_send(());
+            }
+        }
+    }
+
+    async fn emit(&self, mut item: CaptureItem) {
+        self.mark_poll(&mut item);
+        let targets: Vec<(NodeId, Sender<CaptureItem>)> = self.captures.lock().unwrap().iter().filter(|(n, _)| item.node().is_none_or(|i| i == *n)).cloned().collect();
+        for (node, tx) in targets {
+            if tx.send(item.clone()).await.is_err() {
+                self.captures.lock().unwrap().retain(|(n, t)| *n != node || !t.same_channel(&tx));
+            }
+        }
+    }
 }
 
 struct Session {
@@ -464,6 +492,7 @@ struct Session {
     hub: Hub,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     write_gate: tokio::sync::Mutex<()>,
+    poll_gate: tokio::sync::Mutex<()>,
     ready: watch::Sender<bool>,
 }
 
@@ -487,14 +516,14 @@ impl Session {
         {
             let mut guard = self.stdin.lock().await;
             let stdin = guard.insert(stdin);
+            self.hub.sent.lock().unwrap().clear();
             for node in self.hub.nodes() {
-                for line in self.config.subscribe_lines(node) {
-                    Self::send(stdin, &line).await?;
-                }
+                self.start_node(stdin, node).await?;
             }
         }
         self.ready.send_replace(true);
         let mut parser = StreamParser::new(self.config.endpoint);
+        let mut capture = CaptureParser::new();
         let mut reader = BufReader::new(stdout);
         let mut buf = Vec::new();
         let result = loop {
@@ -503,7 +532,11 @@ impl Session {
                 Ok(0) => break Ok(()),
                 Err(e) => break Err(Error::from(e)),
                 Ok(_) => {
-                    for event in parser.feed(&String::from_utf8_lossy(&buf), self.hub.sole_node()) {
+                    let text = String::from_utf8_lossy(&buf);
+                    for item in capture.feed(&text, self.hub.sole_node()) {
+                        self.hub.emit(item).await;
+                    }
+                    for event in parser.feed(&text, self.hub.sole_node()) {
                         match event {
                             StreamEvent::Report(report) => self.hub.dispatch(report).await,
                             StreamEvent::Write(result) => {
@@ -516,6 +549,9 @@ impl Session {
                 }
             }
         };
+        for item in capture.finish() {
+            self.hub.emit(item).await;
+        }
         self.ready.send_replace(false);
         *self.stdin.lock().await = None;
         self.hub.finish_write(Err("chip-tool interactive session ended".into()));
@@ -533,27 +569,74 @@ impl Session {
             if started.elapsed() > HEALTHY_AFTER {
                 backoff = BACKOFF_START;
             }
+            self.hub.emit(CaptureItem::SubscriptionLost { node: None, reason: "chip-tool interactive session ended".into(), backoff_s: Some(backoff.as_secs()) }).await;
             sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }
     }
 
-    async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>> {
-        let (tx, rx) = channel(64);
-        let mut guard = self.stdin.lock().await;
-        let known = {
-            let mut subs = self.hub.subs.lock().unwrap();
-            let known = subs.iter().any(|(n, _)| *n == node);
-            subs.retain(|(n, _)| *n != node);
-            subs.push((node, tx));
-            known
-        };
-        if let (Some(stdin), false) = (guard.as_mut(), known) {
+    async fn start_node(&self, stdin: &mut ChildStdin, node: NodeId) -> Result<()> {
+        if self.hub.sent.lock().unwrap().insert(node) {
             for line in self.config.subscribe_lines(node) {
                 Self::send(stdin, &line).await?;
             }
         }
+        Ok(())
+    }
+
+    async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>> {
+        let (tx, rx) = channel(64);
+        let mut guard = self.stdin.lock().await;
+        {
+            let mut subs = self.hub.subs.lock().unwrap();
+            subs.retain(|(n, _)| *n != node);
+            subs.push((node, tx));
+        }
+        if let Some(stdin) = guard.as_mut() {
+            self.start_node(stdin, node).await?;
+        }
         Ok(rx)
+    }
+
+    async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>> {
+        let (tx, rx) = channel(CAPTURE_QUEUE);
+        let mut guard = self.stdin.lock().await;
+        {
+            let mut captures = self.hub.captures.lock().unwrap();
+            captures.retain(|(n, _)| *n != node);
+            captures.push((node, tx));
+        }
+        if let Some(stdin) = guard.as_mut() {
+            self.start_node(stdin, node).await?;
+        }
+        Ok(rx)
+    }
+
+    async fn poll(&self, node: NodeId) -> Result<usize> {
+        let _gate = self.poll_gate.lock().await;
+        let (done, mut received) = channel(POLL_ATTRIBUTES.len() + 1);
+        *self.hub.poll.lock().unwrap() = Some(PollWindow { node, paths: POLL_ATTRIBUTES.iter().copied().collect(), done });
+        let sent = match self.stdin.lock().await.as_mut() {
+            Some(stdin) => Self::send(stdin, &self.config.poll_line(node)).await,
+            None => Err(Error::Command("chip-tool interactive session not ready".into())),
+        };
+        let mut got = 0;
+        if sent.is_ok() {
+            let mut wait = POLL_TIMEOUT;
+            while got < POLL_ATTRIBUTES.len() {
+                if !matches!(timeout(wait, received.recv()).await, Ok(Some(()))) {
+                    break;
+                }
+                got += 1;
+                wait = POLL_GRACE;
+            }
+        }
+        self.hub.poll.lock().unwrap().take();
+        sent?;
+        if got == 0 {
+            return Err(Error::Command(format!("no poll response from node {node} within {}s", POLL_TIMEOUT.as_secs())));
+        }
+        Ok(got)
     }
 
     async fn write(&self, node: NodeId, celsius: f64) -> Result<()> {
@@ -600,6 +683,7 @@ impl ChipToolController {
             hub: Hub::default(),
             stdin: Default::default(),
             write_gate: Default::default(),
+            poll_gate: Default::default(),
             ready: watch::channel(false).0,
         });
         tokio::spawn(session.clone().supervise());
@@ -652,6 +736,20 @@ impl MatterController for ChipToolController {
         match &self.session {
             Some(session) => session.subscribe(node).await,
             None => Err(Error::Command("subscribe needs a serving controller".into())),
+        }
+    }
+
+    async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>> {
+        match &self.session {
+            Some(session) => session.capture(node).await,
+            None => Err(Error::Command("capture needs a serving controller".into())),
+        }
+    }
+
+    async fn poll(&self, node: NodeId) -> Result<usize> {
+        match &self.session {
+            Some(session) => session.poll(node).await,
+            None => Err(Error::Command("poll needs a serving controller".into())),
         }
     }
 
@@ -716,25 +814,23 @@ mod tests {
     }
 
     #[test]
-    fn builds_subscribe_line() {
-        assert_eq!(
-            config().subscribe_line(5),
-            "thermostat subscribe-by-id 0x0000,0x0012,0x001C 5 300 5 1 --keepSubscriptions 1 --auto-resubscribe 1"
-        );
-    }
-
-    #[test]
-    fn builds_extra_subscribe_and_inventory_lines() {
+    fn builds_wildcard_subscribe_and_poll_lines() {
         let c = config();
+        assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 1 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
         assert_eq!(
             c.subscribe_lines(5),
             vec![
-                "thermostat subscribe-by-id 0x0000,0x0012,0x001C 5 300 5 1 --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-                "thermostat subscribe-by-id 0x0008,0x0010,0x0029 5 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-                "powersource subscribe-by-id 0x000B,0x000C,0x000E 5 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-                "threadnetworkdiagnostics subscribe-by-id 0x0001,0x0007 5 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 1 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "any subscribe-event-by-id 0xFFFFFFFF 0xFFFFFFFF 1 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
             ]
         );
+        assert_eq!(c.poll_line(5), "any read-by-id 0x0201,0x0201,0x0201,0x0201,0x002F 0x0000,0x0012,0x0008,0x001C,0x000C 5 0xFFFF");
+        assert_eq!(ChipToolConfig::default().subscribe_min_s, 1);
+    }
+
+    #[test]
+    fn builds_inventory_lines() {
+        let c = config();
         let tail = ["--storage-directory", "/var/lib/heatd/chip", "--paa-trust-store-path", "/opt/paa"];
         let expect = |head: &[&str]| head.iter().chain(tail.iter()).map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(c.inventory_attribute_args(5), expect(&["any", "read-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF"]));
@@ -893,5 +989,44 @@ mod tests {
         drop(first);
         assert!(config.lock_storage().is_ok());
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod hub_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn marks_poll_responses_and_broadcasts_lifecycle() {
+        let hub = Hub::default();
+        let (tx5, mut rx5) = channel(64);
+        let (tx6, mut rx6) = channel(64);
+        hub.captures.lock().unwrap().extend([(5, tx5), (6, tx6)]);
+        let (done, mut received) = channel(8);
+        *hub.poll.lock().unwrap() = Some(PollWindow { node: 5, paths: POLL_ATTRIBUTES.iter().copied().collect(), done });
+        for item in CaptureParser::new().feed_all(include_str!("../tests/fixtures/subscribe_stream.txt"), Some(5)) {
+            hub.emit(item).await;
+        }
+        let mut sources = Vec::new();
+        while let Ok(CaptureItem::Attribute(a)) = rx5.try_recv() {
+            sources.push((a.attribute, a.source));
+        }
+        assert!(sources.contains(&(0x0000, "poll")), "{sources:?}");
+        assert!(received.try_recv().is_ok());
+        assert!(rx6.try_recv().is_err());
+        hub.emit(CaptureItem::SubscriptionLost { node: None, reason: "gone".into(), backoff_s: Some(2) }).await;
+        assert!(matches!(rx5.try_recv(), Ok(CaptureItem::SubscriptionLost { backoff_s: Some(2), .. })));
+        assert!(matches!(rx6.try_recv(), Ok(CaptureItem::SubscriptionLost { .. })));
+    }
+
+    #[test]
+    fn nodes_union_covers_both_channels() {
+        let hub = Hub::default();
+        let (a, _) = channel::<AttributeReport>(1);
+        let (b, _) = channel::<CaptureItem>(1);
+        hub.subs.lock().unwrap().push((5, a));
+        assert_eq!(hub.sole_node(), Some(5));
+        hub.captures.lock().unwrap().push((6, b));
+        assert_eq!((hub.nodes(), hub.sole_node()), (vec![5, 6], None));
     }
 }

@@ -142,24 +142,6 @@ pub fn spawn_background(state: AppState) {
             }
         }
     });
-    for node in state.config.all_nodes() {
-        let state = state.clone();
-        tokio::spawn(async move {
-            loop {
-                match state.controller.subscribe(node).await {
-                    Ok(mut rx) => {
-                        while let Some(report) = rx.recv().await {
-                            if let Err(e) = state.storage.insert_reading(now_ms(), report.node, report.endpoint, &report.attribute, report.value) {
-                                eprintln!("store reading: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("subscribe node {node}: {e}"),
-                }
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            }
-        });
-    }
 }
 
 #[cfg(test)]

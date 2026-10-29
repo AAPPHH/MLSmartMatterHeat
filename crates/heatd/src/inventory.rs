@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
 use matter_controller::{
     command_name, event_name, hex_id, thermostat_features, AttributeRecord, Inventory, ACCEPTED_COMMAND_LIST, EVENT_LIST, FEATURE_MAP, GENERATED_COMMAND_LIST,
-    NEIGHBOR_TABLE, POWER_SOURCE_CLUSTER, ROUTE_TABLE, THERMOSTAT_CLUSTER, THREAD_DIAGNOSTICS_CLUSTER,
+    MatterController, NEIGHBOR_TABLE, POWER_SOURCE_CLUSTER, ROUTE_TABLE, THERMOSTAT_CLUSTER, THREAD_DIAGNOSTICS_CLUSTER,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+pub const BASIC_INFORMATION_CLUSTER: u32 = 0x0028;
+pub const SOFTWARE_VERSION: u32 = 0x0009;
+pub const SOFTWARE_VERSION_STRING: u32 = 0x000A;
 
 const CELL_LIMIT: usize = 200;
 const ROLES: [&str; 7] = ["Unspecified", "Unassigned", "SleepyEndDevice", "EndDevice", "REED", "Router", "Leader"];
@@ -16,17 +20,57 @@ const REPLACEABILITY: [&str; 4] = ["Unspecified", "NotReplaceable", "UserReplace
 const NEIGHBOR_COLUMNS: [&str; 10] = ["Rloc16", "IsChild", "Lqi", "AverageRssi", "LastRssi", "FrameErrorRate", "MessageErrorRate", "RxOnWhenIdle", "FullThreadDevice", "Age"];
 const ROUTE_COLUMNS: [&str; 9] = ["Rloc16", "RouterId", "NextHop", "PathCost", "LQIIn", "LQIOut", "Age", "Allocated", "LinkEstablished"];
 
-pub fn report_dir(db_path: &str, node: u64, stamp: &str) -> PathBuf {
-    Path::new(db_path).parent().unwrap_or_else(|| Path::new("")).join("inventory").join(format!("node-{node}-{stamp}"))
+pub fn firmware(inventory: &Inventory) -> String {
+    let text = |v: &Value| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    [SOFTWARE_VERSION_STRING, SOFTWARE_VERSION].iter().find_map(|&a| inventory.value(BASIC_INFORMATION_CLUSTER, a).and_then(text)).unwrap_or_else(|| "unknown".into())
 }
 
-pub fn write_report(dir: &Path, inventory: &Inventory, generated: &str) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    std::fs::write(dir.join("raw_attributes.log"), &inventory.raw_attributes)?;
-    std::fs::write(dir.join("raw_events.log"), &inventory.raw_events)?;
-    std::fs::write(dir.join("inventory.json"), serde_json::to_string_pretty(inventory)?)?;
-    std::fs::write(dir.join("inventory.md"), render_markdown(inventory, generated))?;
-    Ok(())
+pub fn sanitize(fw: &str) -> String {
+    fw.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+') { c } else { '_' }).collect()
+}
+
+pub fn stem(node: u64, fw: &str) -> String {
+    format!("{node}_{}", sanitize(fw))
+}
+
+pub fn exists(dir: &Path, node: u64, fw: &str) -> bool {
+    dir.join(format!("{}.json", stem(node, fw))).exists()
+}
+
+pub fn latest_firmware(dir: &Path, node: u64) -> Option<String> {
+    let prefix = format!("{node}_");
+    let newest = std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).filter_map(|e| {
+        let name = e.file_name().into_string().ok()?;
+        let fw = name.strip_prefix(&prefix)?.strip_suffix(".json")?.to_string();
+        Some((e.metadata().ok()?.modified().ok()?, fw))
+    });
+    newest.max().map(|(_, fw)| fw)
+}
+
+pub fn write_report(dir: &Path, inventory: &Inventory, generated: &str) -> Result<PathBuf> {
+    let fw = firmware(inventory);
+    let stem = stem(inventory.node, &fw);
+    let raw = dir.join("raw");
+    std::fs::create_dir_all(&raw).with_context(|| format!("create {}", raw.display()))?;
+    std::fs::write(raw.join(format!("{stem}.attributes.log")), &inventory.raw_attributes)?;
+    std::fs::write(raw.join(format!("{stem}.events.log")), &inventory.raw_events)?;
+    let mut json = serde_json::to_value(inventory)?;
+    json["fw"] = Value::String(fw);
+    json["generated"] = Value::String(generated.to_string());
+    std::fs::write(dir.join(format!("{stem}.md")), render_markdown(inventory, generated))?;
+    let path = dir.join(format!("{stem}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+    Ok(path)
+}
+
+pub async fn capture(controller: &dyn MatterController, dir: &Path, node: u64) -> Result<(PathBuf, Inventory)> {
+    let inventory = controller.inventory(node).await?;
+    let path = write_report(dir, &inventory, &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))?;
+    Ok((path, inventory))
 }
 
 fn plain(value: &Value) -> String {
@@ -244,7 +288,7 @@ pub fn render_markdown(inventory: &Inventory, generated: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matter_controller::{MatterController, MockController};
+    use matter_controller::MockController;
 
     fn fixture() -> Inventory {
         Inventory::from_raw(
@@ -294,19 +338,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_the_four_report_files() {
+    async fn writes_node_and_firmware_named_files() {
         let mock = MockController::new(1);
         mock.add_node(5, 21.0, 20.0);
-        let inventory = mock.inventory(5).await.unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let dir = report_dir(tmp.path().join("heatd.duckdb").to_str().unwrap(), 5, "20261029-100000");
-        assert!(dir.ends_with("inventory/node-5-20261029-100000") || dir.ends_with("inventory\\node-5-20261029-100000"));
-        write_report(&dir, &inventory, "now").unwrap();
-        let json: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("inventory.json")).unwrap()).unwrap();
-        assert_eq!(json["node"], 5);
+        let dir = tmp.path().join("inventory");
+        let (path, inventory) = capture(&mock, &dir, 5).await.unwrap();
+        assert_eq!(firmware(&inventory), "mock-1");
+        assert_eq!(path, dir.join("5_mock-1.json"));
+        let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((json["node"].clone(), json["fw"].clone()), (5.into(), "mock-1".into()));
         assert!(json["attributes"].as_array().unwrap().len() > 5 && json["events"].as_array().unwrap().len() == 1);
-        assert!(std::fs::read_to_string(dir.join("raw_attributes.log")).unwrap().contains("LocalTemperature: 2100"));
-        assert!(std::fs::read_to_string(dir.join("raw_events.log")).unwrap().contains("Event 0x0000_0000"));
-        assert!(std::fs::read_to_string(dir.join("inventory.md")).unwrap().contains("# Inventar Node 5"));
+        assert!(json["attributes"].as_array().unwrap().iter().any(|a| a["vendor"] == true && a["writable"].is_null()));
+        assert!(std::fs::read_to_string(dir.join("raw/5_mock-1.attributes.log")).unwrap().contains("LocalTemperature: 2100"));
+        assert!(std::fs::read_to_string(dir.join("raw/5_mock-1.events.log")).unwrap().contains("Event 0x0000_0000"));
+        assert!(std::fs::read_to_string(dir.join("5_mock-1.md")).unwrap().contains("# Inventar Node 5"));
+        assert!(exists(&dir, 5, "mock-1") && !exists(&dir, 5, "mock-2") && !exists(&dir, 6, "mock-1"));
+        assert_eq!(latest_firmware(&dir, 5).as_deref(), Some("mock-1"));
+        assert_eq!(latest_firmware(&dir, 6), None);
+        assert_eq!(stem(7, "1.2/3 beta"), "7_1.2_3_beta");
     }
 }
