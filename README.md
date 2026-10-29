@@ -162,18 +162,20 @@ sudo systemctl stop heatd                                # Pflicht: sonst "stop 
 sudo systemctl start heatd
 ```
 
-**Inventar:** Direkt nach dem Commissioning liest `inventory` alle Attribute und Ereignisse eines Thermostats (chip-tool Wildcard-Reads) und legt sie unter `data/inventory/node-<n>-<zeit>/` ab: `raw_attributes.log`, `raw_events.log`, `inventory.json` und `inventory.md` (je Endpoint und Cluster eine Tabelle mit Wert und Schreibbarkeit, dazu Features, Befehle, Batterie, Thread-Nachbarn mit RSSI/LQI, Zähler und Ereignisse). Herstellerspezifische Cluster (ab 0xFC00 oder mit Vendor-Präfix) bleiben erhalten und sind mit "vendor" markiert. Auch das braucht die Sperre, also `heatd` vorher stoppen:
+**Inventar:** Direkt nach dem Commissioning liest `inventory` alle Attribute und Ereignisse eines Thermostats (chip-tool Wildcard-Reads) und legt sie in `inventory_dir` (Standard `inventory/`, Docker `/data/inventory`) ab: `<node>_<firmware>.json`, `<node>_<firmware>.md` (je Endpoint und Cluster eine Tabelle mit Wert und Schreibbarkeit, dazu Features, Befehle, Batterie, Thread-Nachbarn mit RSSI/LQI, Zähler und Ereignisse) sowie die Rohlogs unter `inventory/raw/`. `<firmware>` ist die SoftwareVersionString des Geräts. Herstellerspezifische Cluster (ab 0xFC00 oder mit Vendor-Präfix) bleiben erhalten und sind mit "vendor" markiert. Der Befehl braucht die Sperre, also `heatd` vorher stoppen:
 
 ```bash
 cd ~/MLSmartMatterHeat/deploy/docker
 docker compose stop heatd
-docker compose run --rm heatd inventory 5                       # schreibt nach ./data/inventory/node-5-<zeit>/ (Container: /data/inventory)
+docker compose run --rm heatd inventory 5                       # schreibt /data/inventory/5_<firmware>.json und .md
 docker compose up -d heatd
 ```
 
-systemd: `./target/release/heatd inventory 5` (Pfad relativ zu `db_path`, also `data/inventory/`). Ein Lauf dauert bis zu `3 × timeout_s`; ein schlafendes Thermostat braucht eventuell einen zweiten Versuch.
+systemd: `./target/release/heatd inventory 5`. Ein Lauf dauert bis zu `3 × timeout_s`; ein schlafendes Thermostat braucht eventuell einen zweiten Versuch. Im laufenden `heatd` wird das Inventar nach einem Firmware-Wechsel (BasicInformation SoftwareVersion oder SoftwareVersionString) automatisch neu erzeugt, ohne `heatd` zu stoppen.
 
-Im Betrieb zeichnet `heatd` zusätzlich dauerhaft auf (Tabelle `readings`): `pi_heating_demand`, `thermostat_running_state`, `local_temperature_calibration`, Batterie (`bat_voltage` in mV, `bat_percent_remaining` in %, `bat_charge_level`), `routing_role` und RSSI/LQI des Thread-Parents (`thread_parent_rssi`, `thread_parent_last_rssi`, `thread_parent_lqi`). Nicht unterstützte Attribute werden einmal im Log gemeldet und übersprungen.
+**Matter-Erfassung:** Pro Node abonniert `heatd` per chip-tool alle Attribute und Events (`any subscribe-by-id` / `any subscribe-event-by-id`, 1 bis 300 s) und schreibt jeden Report unverändert in die Lake-Tabellen `attribute_reports` und `events` (siehe `docs/data-foundation.md`, Abschnitt "Abweichungen": Rohwert ist der von chip-tool gedruckte Text, nicht TLV). Zusätzlich fragt ein 60-s-Poll LocalTemperature, OccupiedHeatingSetpoint, PIHeatingDemand, SystemMode und BatPercentRemaining ab (`source=poll`); bei Fehlschlägen wird die Pause bis auf 16 Minuten verdoppelt und ein `poll_failed`-Event geschrieben. Abriss und Wiederaufbau der Subscription, StartUp/ShutDown und Firmware-Wechsel landen als Zeilen in `events`.
+
+Im Betrieb liegen zusätzlich folgende Werte im Speicher (`/api/state`) und in `attribute_reports`: `pi_heating_demand`, `thermostat_running_state`, `local_temperature_calibration`, Batterie (`bat_voltage` in mV, `bat_percent_remaining` in %, `bat_charge_level`), `routing_role` und RSSI/LQI des Thread-Parents (`thread_parent_rssi`, `thread_parent_last_rssi`, `thread_parent_lqi`). Nicht unterstützte Attribute werden einmal im Log gemeldet und übersprungen.
 
 Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen. Das Commissioning darf bis zu 180 s dauern (`commission_timeout_s`).
 

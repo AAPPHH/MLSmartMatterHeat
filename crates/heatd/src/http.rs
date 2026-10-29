@@ -17,6 +17,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub storage: Arc<Storage>,
     pub sink: crate::lake::Sink,
+    pub latest: crate::capture::Latest,
     pub model: Option<Arc<RoomModel>>,
     pub controller: Arc<dyn MatterController>,
     pub windows: Arc<Mutex<HashSet<String>>>,
@@ -143,7 +144,7 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
 }
 
 async fn api_state(State(state): State<AppState>) -> ApiResult {
-    let readings = state.storage.last_readings()?;
+    let readings = state.latest.all();
     let setpoints = state.storage.last_setpoints()?;
     let windows = state.windows.lock().unwrap().clone();
     let commanded = state.commanded.lock().unwrap().clone();
@@ -236,6 +237,7 @@ mod tests {
         let state = AppState {
             storage: Arc::new(Storage::open(&config.db_path).unwrap()),
             sink: crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap(),
+            latest: Default::default(),
             config: Arc::new(config),
             model,
             controller: mock.clone(),

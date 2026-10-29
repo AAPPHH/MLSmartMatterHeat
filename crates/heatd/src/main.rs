@@ -1,3 +1,4 @@
+mod capture;
 mod config;
 mod http;
 mod infer;
@@ -175,6 +176,7 @@ async fn serve(config: Config) -> Result<()> {
     lake::spawn_background(sink.clone());
     let state = http::AppState {
         sink: sink.clone(),
+        latest: Default::default(),
         storage: Arc::new(storage::Storage::open(&config.db_path)?),
         model,
         controller,
@@ -183,6 +185,7 @@ async fn serve(config: Config) -> Result<()> {
         config: Arc::new(config),
     };
     rules::spawn_background(state.clone());
+    capture::spawn(state.clone(), capture::Timing::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);
     axum::serve(listener, http::router(state)).with_graceful_shutdown(shutdown_signal()).await?;
@@ -222,13 +225,9 @@ async fn controller_command(config: Config, args: &[String]) -> Result<()> {
             println!("{state:#?}");
         }
         [cmd, node] if cmd == "inventory" => {
-            let node: u64 = node.parse()?;
-            let inventory = controller.inventory(node).await?;
-            let now = chrono::Utc::now();
-            let dir = inventory::report_dir(&config.db_path, node, &now.format("%Y%m%d-%H%M%S").to_string());
-            inventory::write_report(&dir, &inventory, &now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))?;
+            let (path, inventory) = inventory::capture(controller.as_ref(), Path::new(&config.inventory_dir), node.parse()?).await?;
             println!("{} attributes, {} events, {} warnings", inventory.attributes.len(), inventory.events.len(), inventory.errors.len());
-            println!("{}", dir.display());
+            println!("{}", path.display());
         }
         [cmd, node, celsius] if cmd == "set" => {
             controller.write_heating_setpoint(node.parse()?, celsius.parse()?).await?;

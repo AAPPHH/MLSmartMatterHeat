@@ -1,6 +1,7 @@
 listen = "0.0.0.0:8080"
 db_path = "/data/heatd.duckdb"
 data_dir = "/data"
+inventory_dir = "/data/inventory"
 snapshot_path = "/data/snapshot.duckdb"
 dataset_path = "/secrets/thread_dataset.hex"
 model_path = "/models/room_model.onnx"

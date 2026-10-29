@@ -86,7 +86,7 @@ fw: dict<utf8>
 ```
 
 - `dtype` values: `int`, `uint`, `float`, `bool`, `string`, `bytes`, `null`, `struct`, `list`, `unknown`. The decoded value goes into exactly one of `v_i64` (int; uint if it fits), `v_f64`, `v_bool`, `v_str` (string; decimal text for uint above i64::MAX; JSON text for struct/list), `v_bin` (bytes); all null for `null`/`unknown`.
-- `value_raw`: the unmodified TLV bytes of the value as received (empty when the source has none, e.g. poll via text output, or legacy). Vendor-specific clusters/attributes (Eurotronic) are stored the same way without interpretation; anything undecodable has `dtype=unknown` and `value_raw`.
+- `value_raw`: see "Abweichungen" below: for live Matter capture this is the exact text chip-tool printed for the value (UTF-8), not TLV; empty for legacy rows. Vendor-specific clusters/attributes (Eurotronic) are stored the same way without interpretation; anything undecodable has `dtype=unknown` and `value_raw`.
 - `fw`: firmware/software version string of the node at report time (`unknown` if not known yet, `legacy` for migrated rows).
 
 ### events
@@ -122,12 +122,12 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 
 | kind | meaning | source | node | detail JSON |
 |---|---|---|---|---|
-| matter_event | Matter event report from a device | subscription / read | yes | none (value columns used) |
-| subscription_lost | wildcard subscription of a node dropped | heatd | yes | reason, silent_s |
-| resubscribed | subscription re-established | heatd | yes | attempt, backoff_s, downtime_s |
+| matter_event | Matter event report from a device | subscription | yes | name, timestamp (device-printed event timestamp text) |
+| subscription_lost | wildcard subscription of a node dropped (chip-tool log marker or interactive session ended) | heatd | yes | reason, silent_s, backoff_s (session restart delay, if the whole session ended) |
+| resubscribed | subscription re-established (log marker, or first report after the loss) | heatd | yes | attempt, downtime_s, via (marker or report) |
 | startup | heatd start (source heatd, node null) or device StartUp event (source subscription, node set) | heatd / subscription | no / yes | heatd: commit, schema_version |
 | shutdown | heatd graceful stop, or device ShutDown event | heatd / subscription | no / yes | |
-| fw_change | node firmware changed (triggers `heatd inventory`) | heatd | yes | old, new |
+| fw_change | BasicInformation SoftwareVersion / SoftwareVersionString changed (triggers an automatic inventory re-run) | heatd | yes | old, new, old_version, new_version |
 | experiment_start | exploration experiment begins | heatd | yes | type, setpoint, duration_min, room |
 | experiment_end | experiment finished normally | heatd | yes | room |
 | experiment_abort | experiment aborted (manual override, window open, frost, error) | heatd | yes | reason, room |
@@ -136,6 +136,7 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 | presence_leave | user left | heatd | no | source, device |
 | roll_ok | a table/day was rolled to Parquet | heatd | no | date, table, rows, partitions |
 | roll_failed | a table/day failed to roll | heatd | no | date, table, error |
+| poll_failed | 60 s core-attribute poll got no response (backoff applies) | heatd | yes | error, consecutive, next_poll_s |
 | watch_state | watch heartbeat state (migrated legacy device_state; new code may keep emitting it) | watch / legacy | no | device, motion, power, queued, n_aps, away, id |
 
 `experiment_id` links experiment_* events to `decisions.experiment_id`. `source` values: `subscription`, `poll`, `read`, `heatd`, `watch`, `legacy`.
@@ -230,6 +231,18 @@ key: dict<utf8>
 value: utf8
 valid_from: timestamp[us,UTC]
 ```
+
+## Abweichungen
+
+Deviations from `docs/phase1-spec.md` section 1 (Matter capture), all caused by chip-tool v1.5.1.0 being the only Matter client:
+
+- **No raw TLV.** chip-tool prints decoded values only. The encoded report payload is not reachable from its stdout (interactive mode with `--trace_decode` / `--trace-to json:` would write the decoded message tree, and the raw bytes only appear in secure-channel debug logs before decryption, which are neither stable nor attributable to a single attribute). Therefore `attribute_reports.value_raw` and `events.value_raw` hold the exact printed value text as UTF-8 bytes: the lines chip-tool printed after the `Endpoint: ... Cluster: ... Attribute|Event ...` header, with the log prefix removed and indentation and newlines kept (example: `  BatPercentRemaining: 190`, structs and lists multi-line). `dtype` keeps the decoded type (`int`, `uint`, `float`, `bool`, `string`, `list`, `struct`, `null`); it does not mark the raw column as text, because every live row has text there. Phase 2 must not parse `value_raw` as TLV; legacy rows have it empty.
+- **`uint` is rare.** chip-tool prints no signedness, so every integer that fits `i64` is `int`; `uint` is used only above `i64::MAX` (decimal text in `v_str`). Octet strings are not distinguished from strings (no `bytes` rows from live capture; `v_bin` stays null).
+- **Unknown and vendor data.** Vendor clusters or attributes (ids above `0xFFFF`, i.e. with vendor prefix, or in `0xFC00..0xFFF7`) and anything chip-tool prints without a name (`TLV`, `Unknown`) are stored with `dtype=unknown`, all `v_*` null and the printed text in `value_raw`, uninterpreted.
+- **Event device timestamp.** `device_ts` is only set when chip-tool prints an epoch timestamp (`Epoch ...` in ms). Devices usually report system time (ms since boot), which cannot be mapped to UTC; that text is kept in `detail.timestamp` and `device_ts` is null.
+- **Subscription lifecycle** is derived from chip-tool log lines (`Subscription Liveness timeout`, `Will try to resubscribe`, `SubscribeResponse is received`; matched case-insensitively in `matter-controller/src/capture.rs`) and from the interactive session ending (exponential backoff 1 s to 60 s). These strings are not yet verified against a live chip-tool 1.5.1.0 log; as a safety net heatd treats the first report after a loss as the resubscribe (`via=report`). Wildcard attribute and event subscriptions are two chip-tool subscriptions per node, so a loss may be logged once per subscription state change, not per subscription.
+- **Poll** runs through the interactive chip-tool session (one `any read-by-id` line with the five core paths, reusing the established CASE session) every 60 s per node; responses are tagged `source=poll`. After a failed poll the next one is delayed 120 s, 240 s, ... up to 960 s (`poll_failed` events); it resets after a success. No poll runs while an automatic inventory is in progress.
+- **Automatic inventory** runs a separate one-shot chip-tool process next to the interactive session (the CLI `heatd inventory` needs the storage lock and heatd stopped; the automatic run does not). Output: `inventory/<node>_<fw>.json`, `.md` and raw logs under `inventory/raw/` in `inventory_dir` (default `inventory`), `fw` = SoftwareVersionString, else SoftwareVersion.
 
 ## Public API
 
