@@ -162,7 +162,7 @@ class MainActivity : ComponentActivity() {
                         }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,
-                        Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected)
+                        Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected), store.match
                     )
                 }
             }
@@ -247,7 +247,7 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, o
 }
 
 @Composable
-internal fun DataPage(stored: List<RoomP>, colors: Map<String, Slot>, named: List<NamedAp>, replyAps: List<Ap>, guess: String?, probability: Float?, footer: String) {
+internal fun DataPage(stored: List<RoomP>, colors: Map<String, Slot>, named: List<NamedAp>, replyAps: List<Ap>, guess: String?, probability: Float?, footer: String, match: Match? = null) {
     val rooms = Rings.order(stored)
     val palette = Rings.palette(rooms)
     val legend = Legend.aps(palette, replyAps, named)
@@ -281,7 +281,12 @@ internal fun DataPage(stored: List<RoomP>, colors: Map<String, Slot>, named: Lis
             }
         }
         Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
-            if (stored.isNotEmpty()) {
+            if (match != null) {
+                val tone = if (match.abstained) CAPTION else SELECTED
+                Text(MatchView.title(match), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = tone, maxLines = 1)
+                Text(MatchView.sub(match), fontSize = Rings.SUB_SP.sp, lineHeight = (Rings.SUB_SP * Rings.LINE_H).sp, color = tone, maxLines = 1)
+                if (match.top.isNotEmpty()) Text(MatchView.top(match), Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.LINE_SP.sp, lineHeight = (Rings.LINE_SP * Rings.LINE_H).sp, color = LEGEND, maxLines = 1)
+            } else if (stored.isNotEmpty()) {
                 val shown = guess ?: rooms[0].room
                 Text(Rings.name(shown), fontSize = Rings.NAME_SP.sp, lineHeight = (Rings.NAME_SP * Rings.LINE_H).sp, fontWeight = FontWeight.Bold, color = SELECTED, maxLines = 1)
                 Text("${((probability ?: rooms[0].p) * 100f).roundToInt()} % sicher", Modifier.padding(bottom = Rings.SUB_GAP.dp), fontSize = Rings.SUB_SP.sp, lineHeight = (Rings.SUB_SP * Rings.LINE_H).sp, color = SELECTED, maxLines = 1)
