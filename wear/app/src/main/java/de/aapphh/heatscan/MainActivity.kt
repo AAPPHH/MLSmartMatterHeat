@@ -28,6 +28,10 @@ import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -114,33 +118,58 @@ class MainActivity : ComponentActivity() {
         }
         val pager = rememberPagerState { 2 }
         var tapped by remember { mutableStateOf<String?>(null) }
-        val saved = tapped?.let { Prompt.measured(it, version.let { _ -> store.manual }) }
-        val waiting = saved != null && store.manual == "wait"
-        LaunchedEffect(saved) {
-            if (saved != null && !waiting) {
+        var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+        val state = version.let { store.manual }
+        val until = version.let { store.manualUntil }
+        val locked = Tap.locked(state, until, now)
+        val view = tapped?.let { Tap.view(state, it, until, now) }
+        val kind = view?.kind
+        val haptic = LocalHapticFeedback.current
+        LaunchedEffect(locked, tapped) {
+            while (locked || tapped != null) {
+                now = System.currentTimeMillis()
+                delay(500)
+            }
+        }
+        LaunchedEffect(kind) {
+            if (kind != null && kind != TapKind.WAIT) {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                if (kind == TapKind.THROTTLED || kind == TapKind.FAILED) {
+                    delay(250)
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                }
                 if (prompt) {
                     delay(2000)
                     finish()
                 } else {
-                    delay(Prompt.DONE_TIMEOUT_MS)
+                    delay(Tap.SHOW_MS)
                     tapped = null
                 }
             }
         }
         Box(Modifier.fillMaxSize()) {
-            (saved ?: Prompt.title(intent.getBooleanExtra("change", false)).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
+            val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
+            (hint ?: Prompt.title(intent.getBooleanExtra("change", false)).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = Color.White, maxLines = 1) }
             HorizontalPager(pager, Modifier.fillMaxSize()) { page ->
                 key(version) {
                     if (page == 0) {
                         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
-                        RoomsPage(hot, ringed) {
-                            LabelRecorder.measure(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
-                            tapped = it
+                        RoomsPage(hot, ringed, locked) {
+                            if (!Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
+                                LabelRecorder.measure(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
+                                tapped = it
+                            }
                         }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,
                         Footer.line(store.postHm, store.postOk, ScanQueue.get(this@MainActivity).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected)
                     )
+                }
+            }
+            view?.let {
+                Column(Modifier.fillMaxSize().background(TapColors.of(it.kind)).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+                    Text(it.title, fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                    if (it.sub.isNotEmpty()) Text(it.sub, Modifier.padding(top = 6.dp), fontSize = 12.sp, color = Color.White, textAlign = TextAlign.Center)
                 }
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -153,7 +182,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, onTap: (String) -> Unit) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val dDp = minOf(maxWidth, maxHeight)
         Canvas(
@@ -205,7 +234,7 @@ internal fun RoomsPage(hot: String?, ringed: String?, onTap: (String) -> Unit) {
             val isCenter = room == Quarters.CENTER
             val a = Math.toRadians(Quarters.mid(room) - 90.0)
             val r = if (isCenter) 0f else Quarters.labelR(room) * dDp.value
-            val ink = if (room == hot) INK else Color.White
+            val ink = if (room == hot) INK else if (locked) CAPTION else Color.White
             Column(
                 Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -279,3 +308,12 @@ private val INK = Color(0xFF111111)
 private val TRACK = Color(0xFF262626)
 private val CAPTION = Color(0xFFA8A8A8)
 private val LEGEND = Color(0xFFD0D0D0)
+
+private object TapColors {
+    fun of(k: TapKind) = when (k) {
+        TapKind.OK, TapKind.QUEUED -> Color(0xFF1B7F3B)
+        TapKind.THROTTLED -> Color(0xFFB36B00)
+        TapKind.FAILED -> Color(0xFFB3261E)
+        TapKind.WAIT -> Color(0xFF202020)
+    }
+}

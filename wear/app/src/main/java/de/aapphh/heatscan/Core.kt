@@ -78,13 +78,59 @@ object Prompt {
     fun caption(room: String, guess: String?): String = if (room == Defaults.NONE) "Keiner" else (if (room == guess) "● " else "") + Rings.name(room)
 
     fun done(room: String) = "✓ Gespeichert: " + Rings.name(room)
+}
 
-    fun measured(room: String, state: String) = when (state) {
-        "wait" -> "Messe …"
-        "ok" -> done(room) + " · Messung ok"
-        "rejected" -> done(room) + " · Messung abgelehnt, gilt für die nächste"
-        else -> done(room)
+enum class Verdict { FRESH, STALE, EMPTY }
+
+enum class TapKind { WAIT, OK, QUEUED, THROTTLED, FAILED }
+
+data class TapView(val kind: TapKind, val title: String, val sub: String = "")
+
+object Tap {
+    const val FALLBACK_WAIT_S = 30
+    const val GAP_WAIT_S = 2
+    const val SHOW_MS = 4_000L
+    const val ACK_WAIT_MS = 15_000L
+    const val WAIT = "wait"
+    const val OK = "ok"
+    const val QUEUED = "queued"
+    const val THROTTLED = "throttled"
+    const val FAILED = "failed:"
+
+    fun verdict(updated: Boolean, count: Int, newestUs: Long, tapElapsedMs: Long): Verdict = when {
+        count == 0 -> Verdict.EMPTY
+        !updated || newestUs / 1000 < tapElapsedMs -> Verdict.STALE
+        else -> Verdict.FRESH
     }
+
+    fun waitS(starts: List<Long>, now: Long, fallbackS: Int): Int {
+        val live = starts.filter { now - it < ScanConfig.SCAN_WINDOW_MS }.sorted()
+        if (live.size < ScanConfig.SCAN_WINDOW_MAX) return fallbackS
+        val free = live[live.size - ScanConfig.SCAN_WINDOW_MAX] + ScanConfig.SCAN_WINDOW_MS
+        return maxOf(1, ((free - now + 999) / 1000).toInt())
+    }
+
+    fun remainingS(untilMs: Long, nowMs: Long): Int = maxOf(0L, (untilMs - nowMs + 999) / 1000).toInt()
+
+    fun ack(code: Int, remaining: Int, deferred: Int): String? = when {
+        code == -1 -> QUEUED
+        code in 200..299 && deferred > 0 -> QUEUED
+        code in 200..299 -> if (remaining == 0) OK else null
+        else -> FAILED + "Server HTTP $code"
+    }
+
+    fun failed(reason: String) = FAILED + reason
+
+    fun view(state: String, room: String, untilMs: Long, nowMs: Long): TapView? = when {
+        state == WAIT -> TapView(TapKind.WAIT, "Messe…")
+        state == OK -> TapView(TapKind.OK, "✓ Messung gespeichert – " + Rings.name(room))
+        state == QUEUED -> TapView(TapKind.QUEUED, "✓ Gespeichert (wird gesendet)", Rings.name(room))
+        state == THROTTLED -> TapView(TapKind.THROTTLED, "Zu schnell – in ${maxOf(1, remainingS(untilMs, nowMs))} s nochmal tippen")
+        state.startsWith(FAILED) -> TapView(TapKind.FAILED, "Fehlgeschlagen – erneut versuchen", state.removePrefix(FAILED))
+        else -> null
+    }
+
+    fun locked(state: String, untilMs: Long, nowMs: Long) = state == WAIT || (state == THROTTLED && remainingS(untilMs, nowMs) > 0)
 }
 
 object Fingerprint {
@@ -921,6 +967,9 @@ class Store(private val ctx: Context) {
     var manual: String
         get() = sp.getString("manual", "") ?: ""
         set(v) = sp.edit().putString("manual", v).apply()
+    var manualUntil: Long
+        get() = sp.getLong("manualUntil", 0L)
+        set(v) = sp.edit().putLong("manualUntil", v).apply()
     var rejected: Int
         get() = sp.getInt("rejected", 0)
         set(v) = sp.edit().putInt("rejected", v).apply()
@@ -1159,6 +1208,8 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
     fun claimWake(now: Long) = mode != Mode.AWAY && claim(now)
 
     fun claimManual(now: Long) = claim(now, ScanConfig.MANUAL_GAP_MS)
+
+    fun starts(): List<Long> = recent.toList()
 
     private fun claim(now: Long, gap: Long = ScanConfig.MIN_GAP_MS): Boolean {
         if (now - lastScanAt < gap) return false

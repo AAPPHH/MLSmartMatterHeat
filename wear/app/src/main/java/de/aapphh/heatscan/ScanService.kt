@@ -122,7 +122,7 @@ class ScanService : Service() {
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             when (i.action) {
-                WifiManager.SCAN_RESULTS_AVAILABLE_ACTION -> collect()
+                WifiManager.SCAN_RESULTS_AVAILABLE_ACTION -> collect(i.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, true), true)
                 Intent.ACTION_SCREEN_ON -> {
                     Trace.i("screen_on", "queue" to queue.size)
                     sampler?.flushFifo()
@@ -418,36 +418,70 @@ class ScanService : Service() {
     }
 
     private var manualPending = false
-    private val manualTimeout = Runnable { finishManual("rejected") }
+    private var manualAwaiting = false
+    private var manualRoom = ""
+    private var manualTapMs = 0L
+    private val manualTimeout = Runnable { throttleManual() }
+    private val ackTimeout = Runnable { setManual(Tap.QUEUED) }
 
-    private fun finishManual(state: String) {
-        if (!manualPending) return
+    private fun setManual(state: String, until: Long = 0L) {
         manualPending = false
+        manualAwaiting = false
         handler.removeCallbacks(manualTimeout)
+        handler.removeCallbacks(ackTimeout)
+        store.manualUntil = until
         store.manual = state
     }
 
-    fun manualScan() {
+    private fun throttleManual(fallbackS: Int = Tap.FALLBACK_WAIT_S) {
+        if (!manualPending) return
+        val s = Tap.waitS(policy.starts(), SystemClock.elapsedRealtime(), fallbackS)
+        Trace.i("manual_throttled", "waitS" to s)
+        setManual(Tap.THROTTLED, System.currentTimeMillis() + s * 1000L)
+    }
+
+    private fun failManual(reason: String) {
+        Trace.i("manual_failed", "reason" to reason)
+        setManual(Tap.failed(reason))
+    }
+
+    private fun ackManual(code: Int, remaining: Int, deferred: Int) {
+        if (!manualAwaiting) return
+        Tap.ack(code, remaining, deferred)?.let { setManual(it) }
+    }
+
+    fun manualScan(room: String, tapMs: Long) {
         handler.post {
-            if (manualPending) return@post
-            if (!active) return@post run { store.manual = "rejected" }
+            if (manualPending || manualAwaiting) return@post
+            if (!active) return@post failManual("Scan pausiert")
             val now = SystemClock.elapsedRealtime()
-            val ok = policy.claimManual(now) && try { wifi.startScan() } catch (e: Exception) { false }
+            manualPending = true
+            manualRoom = room
+            manualTapMs = tapMs
+            val claimed = policy.claimManual(now)
+            val ok = claimed && try { wifi.startScan() } catch (e: Exception) { false }
             Trace.i("scan_requested", "accepted" to ok, "manual" to true)
             if (ok) {
                 lastScanRequestAt = now
-                manualPending = true
                 handler.postDelayed(manualTimeout, ScanConfig.MANUAL_WAIT_MS)
             } else {
                 store.rejected += 1
-                store.manual = "rejected"
+                throttleManual(if (claimed) Tap.FALLBACK_WAIT_S else Tap.GAP_WAIT_S)
             }
         }
     }
 
-    private fun collect() {
+    private fun collect(updated: Boolean = true, broadcast: Boolean = false) {
         try {
             val results = wifi.scanResults
+            val pending = manualPending && broadcast
+            if (pending) {
+                when (Tap.verdict(updated, results.size, results.maxOfOrNull { it.timestamp } ?: 0L, manualTapMs)) {
+                    Verdict.EMPTY -> return failManual(Diag.emptyScan(getSystemService(LocationManager::class.java).isLocationEnabled, wifi.isWifiEnabled))
+                    Verdict.STALE -> return throttleManual()
+                    Verdict.FRESH -> {}
+                }
+            }
             if (results.isEmpty()) {
                 val lm = getSystemService(LocationManager::class.java)
                 val cause = Diag.emptyScan(lm.isLocationEnabled, wifi.isWifiEnabled)
@@ -456,11 +490,18 @@ class ScanService : Service() {
                 return
             }
             val beat = beatPending
-            val manual = manualPending
+            val manual = pending
             val newest = results.maxOf { it.timestamp }
             if (!dedup.accept(newest)) {
                 Trace.i("scan_result", "count" to results.size, "dedup" to true)
+                if (manual) throttleManual()
                 return
+            }
+            if (manual) {
+                manualPending = false
+                manualAwaiting = true
+                handler.removeCallbacks(manualTimeout)
+                handler.postDelayed(ackTimeout, Tap.ACK_WAIT_MS)
             }
             store.lastFreshAt = System.currentTimeMillis()
             store.rejected = 0
@@ -479,6 +520,7 @@ class ScanService : Service() {
             enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual, newest * 1000)
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
+            if (manualPending) failManual("Fehler beim Lesen")
         }
     }
 
@@ -493,12 +535,12 @@ class ScanService : Service() {
         try {
             io.execute {
                 val wall = System.currentTimeMillis()
+                if (manual) LabelRecorder.record(applicationContext, manualRoom, false)
                 val d = if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
                 val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime())
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
-                if (manual) handler.post { finishManual("ok") }
                 if (d.ask) Prompter.ask(this, store, away, off, d)
                 flush(kind)
             }
@@ -598,6 +640,7 @@ class ScanService : Service() {
             if (r.code != -1) store.lastError = "HTTP ${r.code}"
         }
         Trace.i("flush", "reason" to reason, "batch" to !flusher.singleOnly, "code" to r.code, "sent" to r.sent, "queueBefore" to before, "queue" to queue.size, "okTotal" to store.postsOk, "failedTotal" to store.postsFailed)
+        handler.post { ackManual(r.code, queue.size, r.deferred) }
         store.postOk = ok
         store.postHm = Footer.hm(stamp())
         store.status = stamp() + " " + status + " q" + queue.size
@@ -720,7 +763,7 @@ object LabelRecorder {
         }
     }
 
-    private fun record(c: Context, room: String) {
+    fun record(c: Context, room: String, notify: Boolean = true) {
         if (room !in Defaults.LABELS) return
         val store = Store(c)
         val now = System.currentTimeMillis()
@@ -728,19 +771,19 @@ object LabelRecorder {
         ScanQueue.get(c).add(LabelEvent.entry(store.device, from, to, room), now)
         store.stay { it.confirm(room, now) }
         store.refreshTile()
-        Prompter.confirm(c, room)
+        if (notify) Prompter.confirm(c, room)
         Trace.i("label", "room" to room, "from" to from, "to" to to)
         ScanService.instance?.onLabel()
         ScanService.instance?.flush("label")
     }
 
     fun measure(c: Context, room: String, done: () -> Unit = {}) {
+        val tapMs = SystemClock.elapsedRealtime()
         val store = Store(c)
-        store.manual = "wait"
-        async(c, room) {
-            ScanService.instance?.manualScan() ?: run { store.manual = "rejected" }
-            done()
-        }
+        store.manualUntil = 0L
+        store.manual = Tap.WAIT
+        ScanService.instance?.manualScan(room, tapMs) ?: store.run { manual = Tap.failed("Dienst läuft nicht") }
+        done()
     }
 }
 
