@@ -126,18 +126,6 @@ setpoint = 22.0
 name = "kueche"
 nodes = [8]
 
-[[rooms.schedules]]
-days = ["weekdays"]
-from = "06:30"
-to = "08:00"
-setpoint = 21.0
-
-[[rooms.schedules]]
-days = ["weekdays"]
-from = "17:30"
-to = "20:00"
-setpoint = 21.0
-
 [[rooms]]
 name = "flur"
 exterior = ["front_door"]
