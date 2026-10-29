@@ -169,6 +169,8 @@ class ScanService : Service() {
         power = getSystemService(PowerManager::class.java)
         queue = ScanQueue.get(this)
         alarmIntent = alarmIntent(this)
+        store.learnAt = 0L
+        store.learnPromptAt = 0L
         instance = this
     }
 
@@ -231,6 +233,7 @@ class ScanService : Service() {
     }
 
     override fun onDestroy() {
+        stopLearn("destroy")
         handler.removeCallbacks(tick)
         handler.removeCallbacks(beatTimeout)
         if (active) {
@@ -355,7 +358,7 @@ class ScanService : Service() {
         }
         if (store.mode != policy.mode.label) store.mode = policy.mode.label
         applySensors()
-        if (policy.mode.sleeps) {
+        if (policy.mode.sleeps && store.learnAt == 0L) {
             hold(true)
             val exact = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarms.canScheduleExactAlarms()
             if (exact) alarms.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, now + delay, alarmIntent)
@@ -417,6 +420,111 @@ class ScanService : Service() {
         }
     }
 
+    private var learnPending = false
+    private var learnTapMs = 0L
+    private var learnIdleAt = 0L
+    private val learnTick = object : Runnable {
+        override fun run() {
+            val now = System.currentTimeMillis()
+            when (Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt)) {
+                LearnStep.STOP -> stopLearn("auto")
+                LearnStep.DISCARD -> {
+                    Trace.i("learn_discard")
+                    store.learnPromptAt = 0L
+                    learnIdleAt = now
+                    Prompter.cancel(applicationContext)
+                }
+                LearnStep.SCAN -> learnScan()
+                LearnStep.WAIT -> {}
+            }
+            if (store.learnAt != 0L) handler.postDelayed(this, Learn.TICK_MS)
+        }
+    }
+
+    fun setLearning(on: Boolean) {
+        handler.post {
+            if (!on) return@post stopLearn("button")
+            if (!active || store.learnAt != 0L) return@post
+            store.learnAt = System.currentTimeMillis()
+            store.learnPromptAt = 0L
+            learnIdleAt = 0L
+            learnPending = false
+            Trace.i("learn_start")
+            fetchProgress()
+            handler.removeCallbacks(learnTick)
+            handler.postDelayed(learnTick, Learn.TICK_MS)
+            schedule(SystemClock.elapsedRealtime())
+        }
+    }
+
+    private fun stopLearn(reason: String) {
+        handler.removeCallbacks(learnTick)
+        learnPending = false
+        if (store.learnAt == 0L) return
+        Trace.i("learn_stop", "reason" to reason)
+        store.learnAt = 0L
+        store.learnPromptAt = 0L
+        Prompter.cancel(applicationContext)
+        if (active && reason != "destroy") schedule(SystemClock.elapsedRealtime())
+    }
+
+    private fun fetchProgress() {
+        try {
+            io.execute {
+                try {
+                    val r = Poster.get(store.server, Learn.PATH, network)
+                    if (r.code in 200..299 && Learn.parse(r.text) != null) store.progressText = r.text
+                } catch (e: Exception) {
+                    Trace.w("progress", e)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "progress rejected", e)
+        }
+    }
+
+    private fun learnScan() {
+        val now = SystemClock.elapsedRealtime()
+        learnIdleAt = System.currentTimeMillis()
+        if (!policy.claimManual(now)) return
+        val ok = try { wifi.startScan() } catch (e: Exception) { false }
+        Trace.i("scan_requested", "accepted" to ok, "learn" to true)
+        if (!ok) return
+        lastScanRequestAt = now
+        learnPending = true
+        learnTapMs = now
+    }
+
+    fun learnLabel(room: String) {
+        handler.post {
+            val at = store.learnScanAt
+            if (store.learnPromptAt == 0L || room !in Defaults.LABELS) return@post
+            val wall = System.currentTimeMillis()
+            store.learnPromptAt = 0L
+            learnIdleAt = wall
+            Prompter.cancel(applicationContext)
+            manualPending = false
+            manualAwaiting = true
+            handler.removeCallbacks(manualTimeout)
+            handler.removeCallbacks(ackTimeout)
+            handler.postDelayed(ackTimeout, Tap.ACK_WAIT_MS)
+            store.manualUntil = 0L
+            store.manual = Tap.WAIT
+            try {
+                io.execute {
+                    queue.add(LabelEvent.entry(store.device, at - 1000L, at + 1000L, room), wall)
+                    store.stay { it.confirm(room, wall) }
+                    store.refreshTile()
+                    Trace.i("label", "room" to room, "from" to at - 1000L, "to" to at + 1000L, "learn" to true)
+                    onLabel()
+                    flush("label")
+                }
+            } catch (e: RejectedExecutionException) {
+                failManual("Fehler beim Speichern")
+            }
+        }
+    }
+
     private var manualPending = false
     private var manualAwaiting = false
     private var manualRoom = ""
@@ -447,7 +555,10 @@ class ScanService : Service() {
 
     private fun ackManual(code: Int, remaining: Int, deferred: Int) {
         if (!manualAwaiting) return
-        Tap.ack(code, remaining, deferred)?.let { setManual(it) }
+        Tap.ack(code, remaining, deferred)?.let {
+            setManual(it)
+            if (store.learnAt != 0L) fetchProgress()
+        }
     }
 
     fun manualScan(room: String, tapMs: Long) {
@@ -475,6 +586,11 @@ class ScanService : Service() {
         try {
             val results = wifi.scanResults
             val pending = manualPending && broadcast
+            val learn = learnPending && broadcast && !pending
+            if (learn && Tap.verdict(updated, results.size, results.maxOfOrNull { it.timestamp } ?: 0L, learnTapMs) != Verdict.FRESH) {
+                learnPending = false
+                return
+            }
             if (pending) {
                 when (Tap.verdict(updated, results.size, results.maxOfOrNull { it.timestamp } ?: 0L, manualTapMs)) {
                     Verdict.EMPTY -> return failManual(Diag.emptyScan(getSystemService(LocationManager::class.java).isLocationEnabled, wifi.isWifiEnabled))
@@ -495,6 +611,7 @@ class ScanService : Service() {
             if (!dedup.accept(newest)) {
                 Trace.i("scan_result", "count" to results.size, "dedup" to true)
                 if (manual) throttleManual()
+                if (learn) learnPending = false
                 return
             }
             if (manual) {
@@ -517,14 +634,22 @@ class ScanService : Service() {
             beatPending = false
             handler.removeCallbacks(beatTimeout)
             val ts = Capture.wallMs(System.currentTimeMillis(), now, newest)
-            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual, newest * 1000)
+            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual, newest * 1000, learn)
+            if (learn) {
+                learnPending = false
+                if (home && store.learnAt != 0L) {
+                    store.learnScanAt = ts
+                    store.learnPromptAt = System.currentTimeMillis()
+                    Prompter.askLearn(this)
+                }
+            }
         } catch (e: Exception) {
             Log.w(TAG, "collect failed", e)
             if (manualPending) failManual("Fehler beim Lesen")
         }
     }
 
-    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false, elapsedNs: Long? = null) {
+    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false, elapsedNs: Long? = null, learn: Boolean = false) {
         lastEnqueueAt = SystemClock.elapsedRealtime()
         val state = powerState()
         val motion = policy.mode.motion
@@ -536,7 +661,7 @@ class ScanService : Service() {
             io.execute {
                 val wall = System.currentTimeMillis()
                 if (manual) LabelRecorder.record(applicationContext, manualRoom, false)
-                val d = if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
+                val d = if (learn) Decision() else if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
                 val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime())
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
@@ -692,14 +817,14 @@ object Prompter {
         return Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(c, RoomIcons.RES.getValue(room)), Prompt.caption(room, guess), pi).build()
     }
 
-    private fun post(c: Context, guess: String?, change: Boolean, loud: Boolean, alertAgain: Boolean) {
+    private fun post(c: Context, guess: String?, change: Boolean, loud: Boolean, alertAgain: Boolean, learn: Boolean = false) {
         val b = Notification.Builder(c, if (loud) CHANNEL else QUIET)
-            .setContentTitle(Prompt.title(change))
+            .setContentTitle(Prompt.title(change, learn))
             .setSmallIcon(R.drawable.ic_launcher)
-            .setTimeoutAfter(Prompt.TIMEOUT_MS)
+            .setTimeoutAfter(if (learn) Learn.ANSWER_MS else Prompt.TIMEOUT_MS)
             .setOnlyAlertOnce(!alertAgain)
         val open = PendingIntent.getActivity(
-            c, 1, Intent(c, MainActivity::class.java).putExtra("prompt", true).putExtra("change", change).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            c, 1, Intent(c, MainActivity::class.java).putExtra("prompt", true).putExtra("change", change).putExtra("learn", learn).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         b.setContentIntent(open)
@@ -714,6 +839,7 @@ object Prompter {
     }
 
     fun ask(c: Context, store: Store, away: Boolean, offBody: Boolean, d: Decision) {
+        if (store.learnAt != 0L) return
         try {
             val now = System.currentTimeMillis()
             val loud = Prompt.alert(now, store.lastPromptAlertAt, away, offBody, java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY))
@@ -726,7 +852,16 @@ object Prompter {
         }
     }
 
+    fun askLearn(c: Context) {
+        try {
+            post(c, null, false, true, true, true)
+        } catch (e: Exception) {
+            Trace.w("prompt_failed", e)
+        }
+    }
+
     fun refresh(c: Context, store: Store) {
+        if (store.learnAt != 0L) return
         try {
             val (guess, change, loud) = store.stay { Triple(it.askGuess, it.askChange, it.askLoud) }
             post(c, guess, change, loud, false)
@@ -766,6 +901,7 @@ object LabelRecorder {
     fun record(c: Context, room: String, notify: Boolean = true) {
         if (room !in Defaults.LABELS) return
         val store = Store(c)
+        if (store.learnPromptAt != 0L && ScanService.instance != null) return ScanService.instance!!.learnLabel(room)
         val now = System.currentTimeMillis()
         val (from, to) = LabelEvent.window(store.stay { it.windowStart(now) }, now)
         ScanQueue.get(c).add(LabelEvent.entry(store.device, from, to, room), now)
@@ -780,6 +916,10 @@ object LabelRecorder {
     fun measure(c: Context, room: String, done: () -> Unit = {}) {
         val tapMs = SystemClock.elapsedRealtime()
         val store = Store(c)
+        if (store.learnPromptAt != 0L && ScanService.instance != null) {
+            ScanService.instance?.learnLabel(room)
+            return done()
+        }
         store.manualUntil = 0L
         store.manual = Tap.WAIT
         ScanService.instance?.manualScan(room, tapMs) ?: store.run { manual = Tap.failed("Dienst läuft nicht") }

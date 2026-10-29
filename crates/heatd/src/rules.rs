@@ -432,6 +432,22 @@ fn result_row(proposal: &Decision, reason: &str, error: Option<String>) -> Decis
     row
 }
 
+const SAFE_MIN_C: f64 = 7.5;
+const SAFE_MAX_C: f64 = 28.5;
+
+pub fn setpoint_limits(readings: &[Reading], node: u64) -> (f64, f64) {
+    let find = |attribute: &str| readings.iter().find(|r| r.node == node && r.attribute == attribute).map(|r| r.value).filter(|v| (0.0..=50.0).contains(v));
+    match (find("min_heat_setpoint_limit"), find("max_heat_setpoint_limit")) {
+        (lo, hi) if lo.unwrap_or(SAFE_MIN_C) < hi.unwrap_or(SAFE_MAX_C) => (lo.unwrap_or(SAFE_MIN_C), hi.unwrap_or(SAFE_MAX_C)),
+        _ => (SAFE_MIN_C, SAFE_MAX_C),
+    }
+}
+
+pub fn clamp_setpoint(readings: &[Reading], node: u64, setpoint: f64) -> f64 {
+    let (lo, hi) = setpoint_limits(readings, node);
+    setpoint.clamp(lo, hi)
+}
+
 pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> Result<Vec<Desired>> {
     for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes) {
         log("presence event", state.sink.append(presence_event(&device, transition)));
@@ -459,7 +475,6 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         lifecycle.into_iter().for_each(|life| lifecycle_event(state, life));
         active
     };
-    let readings = state.latest.all();
     let mut written = Vec::new();
     let hold_ms = (state.config.manual_hold_minutes * 60_000.0) as i64;
     let (detected, tap) = presence.as_ref().map_or((None, false), |p| (p.detected(&state.config), p.source == "stay_label"));
@@ -469,7 +484,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         let event = lake::Event::now(kind::OCCUPANCY_END, "heatd").with_detail(json!({"room": room, "from_ms": from, "minutes": (to - from) as f64 / 60_000.0}));
         log("occupancy event", state.sink.append(lake::Event { ts: to * 1000, ..event }));
     }
-    let wants = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring);
+    let readings = state.latest.all();
+    let wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint), ..w }).collect();
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
     };
@@ -480,7 +496,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
             if old.is_some_and(|o| (o - state.config.occupied_setpoint).abs() < state.config.setpoint_deadband) {
                 continue;
             }
-            let wanted = Desired { setpoint: state.config.occupied_setpoint, reason: "occupied", rule: "presence", ..want.clone() };
+            let wanted = Desired { setpoint: clamp_setpoint(&readings, want.node, state.config.occupied_setpoint), reason: "occupied", rule: "presence", ..want.clone() };
             log("decision", state.sink.append(deferred_row(state, &wanted, now_ms, old, &readings, presence.as_ref(), "debounce")));
         }
     }
@@ -796,6 +812,18 @@ setpoint=21.0").unwrap();
         assert_eq!(go(None, &[]), (7.0, "exploration", "exploration", Some("e1".to_string())));
         assert_eq!(go(None, &["wohnzimmer"]), (7.0, "window_open", "window", None));
         assert_eq!(go(device("wohnzimmer", 1.0, Some(Motion::Moving), None, true, 1.0), &[]), (18.0, "away", "presence", None));
+    }
+
+    #[test]
+    fn setpoints_are_clamped_to_device_or_safe_limits() {
+        let reading = |node, attribute: &str, value| Reading { node, attribute: attribute.into(), value, ts: 0 };
+        assert_eq!(setpoint_limits(&[], 5), (7.5, 28.5));
+        let limits = [reading(5, "min_heat_setpoint_limit", 10.0), reading(5, "max_heat_setpoint_limit", 25.0), reading(6, "min_heat_setpoint_limit", 30.0)];
+        assert_eq!(setpoint_limits(&limits, 5), (10.0, 25.0));
+        assert_eq!(setpoint_limits(&limits, 6), (7.5, 28.5));
+        assert_eq!(setpoint_limits(&limits, 7), (7.5, 28.5));
+        assert_eq!([7.0, 8.0, 40.0].map(|v| clamp_setpoint(&[], 5, v)), [7.5, 8.0, 28.5]);
+        assert_eq!(clamp_setpoint(&limits, 5, 8.0), 10.0);
     }
 
     #[test]

@@ -71,7 +71,7 @@ object Prompt {
 
     const val WAKE_GAP_MS = 600_000L
 
-    fun title(change: Boolean) = if (change) "Raum gewechselt? Wo bist du jetzt?" else "Wo bist du?"
+    fun title(change: Boolean, learn: Boolean = false) = if (learn) Learn.TITLE else if (change) "Raum gewechselt? Wo bist du jetzt?" else "Wo bist du?"
 
     fun rooms(guess: String?): List<String> = (if (guess != null && guess in ORDER) listOf(guess) + ORDER.filter { it != guess } else ORDER) + Defaults.NONE
 
@@ -380,6 +380,57 @@ object Wake {
     fun promptAllowed(away: Boolean, offBody: Boolean?, wake: Boolean, interactive: Boolean) = !away && offBody != true && (!wake || interactive)
 
     fun settled(before: Mode, after: Mode) = before == Mode.MOVING && (after == Mode.SETTLING || after == Mode.STILL)
+}
+
+data class Progress(val target: Int, val counts: Map<String, Int>, val done: Boolean)
+
+enum class LearnStep { STOP, DISCARD, WAIT, SCAN }
+
+enum class RoomTone { NORMAL, LOW, DONE }
+
+data class LearnView(val tones: Map<String, RoomTone>, val badges: Map<String, String>)
+
+object Learn {
+    const val ANSWER_MS = 60_000L
+    const val MAX_MS = 3_600_000L
+    const val TICK_MS = 2_000L
+    const val GAP_MS = 5_000L
+    const val PATH = "/api/labels/progress"
+    const val TITLE = "Wo bist du gerade?"
+    const val FINISHED = "Fertig ✓"
+
+    fun parse(text: String?): Progress? = try {
+        val o = JSONObject(text ?: "")
+        val a = o.getJSONArray("rooms")
+        Progress(o.getInt("target"), (0 until a.length()).associate { a.getJSONObject(it).let { r -> r.getString("room") to r.getInt("n") } }, o.getBoolean("done"))
+    } catch (e: Exception) { null }
+
+    fun step(startedAt: Long, now: Long, offBody: Boolean, done: Boolean, promptAt: Long, scanPending: Boolean, idleSince: Long): LearnStep = when {
+        startedAt == 0L -> LearnStep.WAIT
+        offBody || done || Span.ms(now, startedAt) >= MAX_MS -> LearnStep.STOP
+        promptAt != 0L -> if (Span.ms(now, promptAt) >= ANSWER_MS) LearnStep.DISCARD else LearnStep.WAIT
+        scanPending || Span.ms(now, idleSince) < GAP_MS -> LearnStep.WAIT
+        else -> LearnStep.SCAN
+    }
+
+    fun tones(p: Progress?): Map<String, RoomTone> {
+        if (p == null) return emptyMap()
+        val shown = Defaults.ROOMS.filter { it in p.counts }
+        val open = shown.filter { p.counts.getValue(it) < p.target }
+        val low = open.minOfOrNull { p.counts.getValue(it) }
+        return shown.associateWith { if (it !in open) RoomTone.DONE else if (p.counts.getValue(it) == low) RoomTone.LOW else RoomTone.NORMAL }
+    }
+
+    fun badge(p: Progress, room: String): String? = p.counts[room]?.let { if (it >= p.target) "✓ $it/${p.target}" else "$it/${p.target}" }
+
+    fun view(active: Boolean, p: Progress?): LearnView? =
+        if (p == null || !(active || p.done)) null else LearnView(tones(p), Defaults.ROOMS.mapNotNull { r -> badge(p, r)?.let { r to it } }.toMap())
+
+    fun chip(active: Boolean, p: Progress?) = when {
+        active -> "Stopp"
+        p?.done == true -> FINISHED
+        else -> "Lernen"
+    }
 }
 
 object Highlight {
@@ -1002,6 +1053,19 @@ class Store(private val ctx: Context) {
     var lastFreshAt: Long
         get() = sp.getLong("lastFreshAt", 0L)
         set(v) = sp.edit().putLong("lastFreshAt", v).apply()
+    var learnAt: Long
+        get() = sp.getLong("learnAt", 0L)
+        set(v) = sp.edit().putLong("learnAt", v).apply()
+    var learnPromptAt: Long
+        get() = sp.getLong("learnPromptAt", 0L)
+        set(v) = sp.edit().putLong("learnPromptAt", v).apply()
+    var learnScanAt: Long
+        get() = sp.getLong("learnScanAt", 0L)
+        set(v) = sp.edit().putLong("learnScanAt", v).apply()
+    var progressText: String?
+        get() = sp.getString("progress", null)
+        set(v) = sp.edit().putString("progress", v).apply()
+    val progress: Progress? get() = Learn.parse(progressText)
     var manual: String
         get() = sp.getString("manual", "") ?: ""
         set(v) = sp.edit().putString("manual", v).apply()
@@ -1140,6 +1204,19 @@ object Poster {
             val code = conn.responseCode
             val text = (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
             return Reply(code, text)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    fun get(server: String, path: String, network: Network?): Reply {
+        val url = URL(server.trim().trimEnd('/') + path)
+        val conn = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        try {
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            return Reply(code, (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: "")
         } finally {
             conn.disconnect()
         }

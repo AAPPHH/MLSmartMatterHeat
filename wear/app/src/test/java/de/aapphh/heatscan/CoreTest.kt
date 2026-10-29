@@ -1599,4 +1599,72 @@ class CoreTest {
         assertTrue(BatteryRead.charging(1, 3))
         assertFalse(BatteryRead.charging(0, 3))
     }
+
+    private val progressText = """{"target":10,"since":null,"rooms":[{"room":"wohnzimmer","n":10},{"room":"schlafzimmer","n":3},{"room":"bad","n":3},{"room":"kueche","n":7},{"room":"flur","n":4}],"done":false}"""
+
+    @Test
+    fun learnProgressParsing() {
+        val p = Learn.parse(progressText)!!
+        assertEquals(Progress(10, mapOf("wohnzimmer" to 10, "schlafzimmer" to 3, "bad" to 3, "kueche" to 7, "flur" to 4), false), p)
+        assertNull(Learn.parse(null))
+        assertNull(Learn.parse("not json"))
+        assertNull(Learn.parse("""{"target":10}"""))
+        assertTrue(Learn.parse("""{"target":2,"rooms":[],"done":true}""")!!.done)
+    }
+
+    @Test
+    fun learnHighlightsFewestAndDimsDone() {
+        val p = Learn.parse(progressText)!!
+        assertEquals(
+            mapOf("wohnzimmer" to RoomTone.DONE, "schlafzimmer" to RoomTone.LOW, "bad" to RoomTone.LOW, "kueche" to RoomTone.NORMAL, "flur" to RoomTone.NORMAL),
+            Learn.tones(p)
+        )
+        assertEquals("✓ 10/10", Learn.badge(p, "wohnzimmer"))
+        assertEquals("3/10", Learn.badge(p, "bad"))
+        assertNull(Learn.badge(p, Defaults.NONE))
+        assertTrue(Learn.tones(Progress(10, mapOf("bad" to 12, "flur" to 10), true)).values.all { it == RoomTone.DONE })
+        assertEquals(emptyMap<String, RoomTone>(), Learn.tones(null))
+        assertEquals("✓ 12/10", Learn.badge(Progress(10, mapOf("bad" to 12), false), "bad"))
+    }
+
+    @Test
+    fun learnViewAndChip() {
+        val p = Learn.parse(progressText)!!
+        assertNull(Learn.view(false, p))
+        assertNull(Learn.view(true, null))
+        assertEquals("3/10", Learn.view(true, p)!!.badges["bad"])
+        val done = Progress(10, mapOf("bad" to 10), true)
+        assertEquals(RoomTone.DONE, Learn.view(false, done)!!.tones["bad"])
+        assertEquals("Lernen", Learn.chip(false, p))
+        assertEquals("Stopp", Learn.chip(true, p))
+        assertEquals("Fertig ✓", Learn.chip(false, done))
+        assertEquals("Stopp", Learn.chip(true, done))
+    }
+
+    @Test
+    fun learnSchedulingDecisions() {
+        val t0 = 1_000_000L
+        fun step(now: Long, off: Boolean = false, done: Boolean = false, prompt: Long = 0L, pending: Boolean = false, idle: Long = 0L, start: Long = t0) =
+            Learn.step(start, now, off, done, prompt, pending, idle)
+        assertEquals(LearnStep.WAIT, step(t0 + 10_000, start = 0L))
+        assertEquals(LearnStep.SCAN, step(t0 + 10_000))
+        assertEquals(LearnStep.WAIT, step(t0 + 10_000, pending = true))
+        assertEquals(LearnStep.WAIT, step(t0 + 10_000, idle = t0 + 8_000))
+        assertEquals(LearnStep.SCAN, step(t0 + 10_000, idle = t0 + 5_000))
+        assertEquals(LearnStep.WAIT, step(t0 + 30_000, prompt = t0 + 20_000))
+        assertEquals(LearnStep.WAIT, step(t0 + 79_999, prompt = t0 + 20_000))
+        assertEquals(LearnStep.DISCARD, step(t0 + 80_000, prompt = t0 + 20_000))
+        assertEquals(LearnStep.STOP, step(t0 + 10_000, off = true))
+        assertEquals(LearnStep.STOP, step(t0 + 10_000, done = true, prompt = t0 + 5_000))
+        assertEquals(LearnStep.SCAN, step(t0 + Learn.MAX_MS - 1))
+        assertEquals(LearnStep.STOP, step(t0 + Learn.MAX_MS))
+        assertEquals(LearnStep.STOP, step(t0 + Learn.MAX_MS, prompt = t0 + Learn.MAX_MS - 5_000))
+    }
+
+    @Test
+    fun learnPromptTitle() {
+        assertEquals("Wo bist du gerade?", Prompt.title(false, true))
+        assertEquals("Wo bist du gerade?", Prompt.title(true, true))
+        assertEquals("Wo bist du?", Prompt.title(false))
+    }
 }
