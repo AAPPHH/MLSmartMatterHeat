@@ -17,6 +17,7 @@ CONFIG = {
     "cv_folds": 4, "min_coverage": 0.8, "holdout_frac": 0.3,
     "hmm": {"stay_prob": 0.95, "weight_link": {"wall": 6.0, "open": 8.0, "ceiling": 3.0}, "weight_other": 1.0,
             "default_links": [["keiner", "flur", "open"], ["keiner", "wohnzimmer", "open"]]},
+    "feature_version": 2, "history_s": 300.0, "history_scans": 5,
     "parity_rows": 500, "parity_tol": 1e-5,
     "thermal": {
         "timezone": "Europe/Berlin", "dt_s": 60.0, "night_hours": [22, 5], "min_night_steps": 120, "temp_valid": [0.0, 45.0],

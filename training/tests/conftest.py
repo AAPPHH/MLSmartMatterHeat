@@ -16,6 +16,7 @@ SYNTH = {
               {"a": "schlafzimmer", "b": "bad", "kind": "wall", "partial": False}, {"a": "kueche", "b": "bad", "kind": "wall", "partial": False}],
 }
 TRANSIENT = "de:ad:be:ef:00:01"
+FREQ = (2437, 5200, 6055)
 
 
 def bssid(i):
@@ -84,7 +85,7 @@ def write_table(root, name, rows, schema, key):
 
 UTC = pa.timestamp("us", tz="UTC")
 LEGACY = pa.schema([("ts", UTC), ("sender", pa.string()), ("rssi", pa.int8()), ("batch_id", pa.uint64()), ("device", pa.string())])
-MODERN = pa.schema(list(LEGACY) + [("sensor_type", pa.string()), ("value", pa.float32())])
+MODERN = pa.schema(list(LEGACY) + [("sensor_type", pa.string()), ("value", pa.float32()), ("freq", pa.int32())])
 LABELS = pa.schema([("ts", UTC), ("from_ts", UTC), ("to_ts", UTC), ("room", pa.string()), ("source", pa.string()), ("device", pa.string())])
 META = pa.schema([("ts", UTC), ("key", pa.string()), ("value", pa.string()), ("valid_from", UTC)])
 
@@ -99,7 +100,7 @@ def make_lake(root, days, with_meta=True):
         if legacy:
             write_table(root, "watch_raw", rows, LEGACY, "ts")
         else:
-            rows = [dict(r, sensor_type="rssi", value=float(r["rssi"])) for r in rows]
+            rows = [dict(r, sensor_type="rssi", value=float(r["rssi"]), freq=FREQ[int(r["sender"][-2:], 16) % 3] if r["sender"] != TRANSIENT else None) for r in rows]
             rows += [{"ts": t, "sender": None, "rssi": None, "batch_id": 0, "device": "pixel", "sensor_type": k, "value": v} for t, k, v in sensors]
             write_table(root, "watch_raw", rows, MODERN, "ts")
         write_table(root, "labels", [{"ts": t, "from_ts": f, "to_ts": e, "room": r, "source": src, "device": "pixel"} for t, f, e, r, src in labels], LABELS, "ts")

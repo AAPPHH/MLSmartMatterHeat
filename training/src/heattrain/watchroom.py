@@ -1,7 +1,7 @@
 import json
 import tempfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,7 +14,7 @@ from skl2onnx.common.data_types import FloatTensorType
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.neighbors import KNeighborsClassifier
-from heattrain.eval import NO_TEMPLATE, Matcher, evaluate, forward, report_md, score, vectorize
+from heattrain.eval import NO_TEMPLATE, Matcher, band_of, evaluate, features, forward, report_md, score
 
 
 @dataclass
@@ -24,6 +24,8 @@ class Scan:
     aps: dict
     room: str | None = None
     state: str | None = None
+    freqs: dict = field(default_factory=dict)
+    hist: list = field(default_factory=list)
 
 
 class Lake:
@@ -120,20 +122,43 @@ def load_scans(data_root, cfg):
     lake = Lake(data_root)
     cols = lake.columns("watch_raw")
     value = "coalesce(" + ", ".join(f"CAST({c} AS DOUBLE)" for c in ("rssi", "value") if c in cols) + ")"
-    rows = lake.query("watch_raw", [("epoch(ts)", None), ("device", None), ("batch_id", None), ("sender", None), (value, None)],
+    rows = lake.query("watch_raw", [("epoch(ts)", None), ("device", None), ("batch_id", None), ("sender", None), (value, None), ("freq", "freq")],
                       "sensor_type IS NULL OR sensor_type = 'rssi'" if "sensor_type" in cols else "TRUE", "ORDER BY ts")
     grouped = {}
-    for t, dev, batch, sender, rssi in rows:
+    for t, dev, batch, sender, rssi, freq in rows:
         if rssi is None:
             continue
         s = grouped.setdefault((str(dev), batch, round(t)), Scan(float(t), str(dev), {}))
         s.aps[sender] = max(rssi, s.aps.get(sender, rssi))
+        if freq is not None:
+            s.freqs[sender] = int(freq)
     scans = sorted(grouped.values(), key=lambda s: (s.ts, s.device))
+    attach_history(scans, cfg)
     assign_labels(lake, cfg, scans)
     sig, tz = load_signals(lake, cfg), ZoneInfo(cfg["timezone"])
     for s in scans:
         s.state = classify_state(cfg["state"], tz, s.ts, s.device, sig)
     return scans, load_links(lake)
+
+
+def attach_history(scans, cfg):
+    n, h, past = cfg.get("history_scans", 5), cfg.get("history_s", 300.0), {}
+    for s in scans:
+        prior = past.setdefault(s.device, [])
+        s.hist = [x.aps for x in prior[-(n - 1):] if s.ts - x.ts <= h] + [s.aps] if n > 1 else [s.aps]
+        prior.append(s)
+
+
+def feature_spec(cfg, senders, scans):
+    spec = {"senders": senders, "scale": cfg["scale"], "sentinel_dbm": cfg["scale"]["floor"]}
+    if cfg.get("feature_version", 2) >= 2:
+        freq = {}
+        for s in scans:
+            for b, f in s.freqs.items():
+                freq.setdefault(b, Counter())[f] += 1
+        bands = [band_of(freq[b].most_common(1)[0][0]) if b in freq else None for b in senders]
+        spec |= {"feature_version": 2, "sender_bands": bands, "history_s": cfg.get("history_s", 300.0), "history_scans": cfg.get("history_scans", 5)}
+    return spec
 
 
 def load_links(lake):
@@ -234,9 +259,9 @@ class Trainer:
             raise ValueError(f"need at least 2 rooms with {c['min_room_scans']} labelled scans, got {dict(counts)}")
         labelled = [s for s in labelled if s.room in rooms and s.state not in NO_TEMPLATE]
         senders = vocabulary(labelled, c)
-        sc = c["scale"]
+        spec = feature_spec(c, senders, labelled)
         keep = [s for s in labelled if any(b in s.aps for b in senders)]
-        X = np.stack([vectorize(s.aps, senders, sc["floor"], sc["span"]) for s in keep])
+        X = np.stack([features(spec, s.hist or [s.aps]) for s in keep])
         y = np.array([rooms.index(s.room) for s in keep])
         days = np.array([day_of(s) for s in keep])
         states = np.array([s.state or "all" for s in keep])
@@ -258,7 +283,7 @@ class Trainer:
             per = np.bincount(y[m], minlength=len(rooms))
             if m.sum() >= c["min_state_scans"] and per.min() >= c["min_state_room_scans"]:
                 models[st] = self.make(kind, y[m]).fit(X[m], y[m])
-        return {"rooms": rooms, "senders": senders, "kind": kind, "models": models, "tau": tau, "delta": delta,
+        return {"rooms": rooms, "senders": senders, "spec": spec, "kind": kind, "models": models, "tau": tau, "delta": delta,
                 "transition": trans, "n_labels": {r: int((y == i).sum()) for i, r in enumerate(rooms)},
                 "window": (min(keep, key=lambda s: s.ts).ts, max(keep, key=lambda s: s.ts).ts), "X": X,
                 "metrics": {"cv_macro_f1": {k: v[1] for k, v in cv.items()}, "chosen": kind, "validation": {k: val[k] for k in ("coverage", "accuracy", "macro_f1")}}}
@@ -276,8 +301,8 @@ def to_onnx(model, n):
 def export(bundle, cfg, out_dir, version, metrics):
     out = Path(out_dir) / version
     out.mkdir(parents=True, exist_ok=True)
-    n, files = len(bundle["senders"]), {}
     X = bundle["X"][: cfg["parity_rows"]]
+    n, files = X.shape[1], {}
     for key, model in bundle["models"].items():
         blob = to_onnx(model, n)
         got = ort.InferenceSession(blob, providers=["CPUExecutionProvider"]).run(["probabilities"], {"x": X})[0]
@@ -293,6 +318,7 @@ def export(bundle, cfg, out_dir, version, metrics):
             "tau_room": bundle["tau"], "delta_room": bundle["delta"], "t_hold_min": cfg["t_hold_min"],
             "smoothing": {"kind": "hmm", "stay_prob": cfg["hmm"]["stay_prob"], "step_s": 60, "transition": bundle["transition"]},
             "state_rule": cfg["state"], "classifier": bundle["kind"], "metrics": metrics, "train_window": {"from": lo, "to": hi}, "n_labels": bundle["n_labels"]}
+    meta |= {k: v for k, v in bundle["spec"].items() if k not in meta}
     (out / "model.json").write_text(json.dumps(meta, indent=2))
     return out
 
@@ -304,6 +330,12 @@ def split_days(scans, frac):
     return [s for s in scans if day_of(s) < cut], [s for s in scans if day_of(s) >= cut]
 
 
+def holdout(cfg, tr, ho, links):
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = Matcher(export(Trainer(cfg).fit(tr, links), cfg, tmp, "probe", {}))
+    return {"smoothed": evaluate(probe, ho), "raw": evaluate(probe, ho, smooth=False)}
+
+
 def train(cfg, data_root, models_dir, version=None):
     scans, links = load_scans(data_root, cfg)
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -311,10 +343,10 @@ def train(cfg, data_root, models_dir, version=None):
     metrics = {}
     tr, ho = split_days(scans, cfg["holdout_frac"])
     if any(s.room for s in tr) and any(s.room for s in ho):
-        with tempfile.TemporaryDirectory() as tmp:
-            probe = Matcher(export(trainer.fit(tr, links), cfg, tmp, "probe", {}))
-        metrics["holdout"] = {"smoothed": evaluate(probe, ho), "raw": evaluate(probe, ho, smooth=False),
-                              "days": sorted({datetime.fromtimestamp(s.ts, timezone.utc).date().isoformat() for s in ho})}
+        metrics["holdout"] = holdout(cfg, tr, ho, links)
+        metrics["holdout"]["days"] = sorted({datetime.fromtimestamp(s.ts, timezone.utc).date().isoformat() for s in ho})
+        if cfg.get("feature_version", 2) > 1:
+            metrics["holdout"]["v1"] = holdout({**cfg, "feature_version": 1}, tr, ho, links)
     bundle = trainer.fit(scans, links)
     metrics.update(bundle["metrics"])
     out = export(bundle, cfg, models_dir, version, metrics)
@@ -330,13 +362,20 @@ def write_report(cfg, version, m, extra):
 
 
 def eval_model(cfg, data_root, model_dir):
-    scans, _ = load_scans(data_root, cfg)
+    scans, links = load_scans(data_root, cfg)
     matcher = Matcher(model_dir)
     meta = matcher.meta
     end = meta["train_window"]["to"]
     new = [s for s in scans if datetime.fromtimestamp(s.ts, timezone.utc).date().isoformat() > end]
     use, note = (new, f"Tage nach {end}") if any(s.room for s in new) else (scans, "alle Daten (im Training enthalten, nur Plausibilitaet)")
     m = {"smoothed": evaluate(matcher, use), "raw": evaluate(matcher, use, smooth=False), "note": note}
+    if meta.get("feature_version", 1) > 1:
+        cut = {id(s) for s in new}
+        old = [s for s in scans if id(s) not in cut] if use is new else scans
+        try:
+            m["v1"] = holdout({**cfg, "feature_version": 1}, old, use, links)
+        except ValueError:
+            pass
     meta["metrics"]["eval"] = m
     (Path(model_dir) / "model.json").write_text(json.dumps(meta, indent=2))
     write_report(cfg, meta["model_version"], m, note)

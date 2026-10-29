@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import pytest
@@ -43,7 +45,7 @@ def test_onnx_contract_and_parity(trained, lake, config):
     for f in meta["states"].values():
         s = ort.InferenceSession(str(out / f))
         assert [i.name for i in s.get_inputs()] == ["x"] and [o.name for o in s.get_outputs()] == ["probabilities"]
-        p = s.run(None, {"x": np.random.default_rng(0).random((5, len(meta["senders"]))).astype(np.float32)})[0]
+        p = s.run(None, {"x": np.random.default_rng(0).random((5, s.get_inputs()[0].shape[1])).astype(np.float32)})[0]
         assert p.shape == (5, len(meta["rooms"])) and p.dtype == np.float32
         np.testing.assert_allclose(p.sum(axis=1), 1.0, atol=1e-5)
 
@@ -63,7 +65,7 @@ def test_eval_on_new_days(trained, config, tmp_path):
     assert m["note"].startswith("Tage nach") and m["smoothed"]["n"] > 100
     assert m["smoothed"]["coverage"] >= 0.8 and m["smoothed"]["macro_f1"] >= 0.85
     assert json.loads((out / "model.json").read_text())["metrics"]["eval"]["smoothed"]["n"] == m["smoothed"]["n"]
-    assert list(config["eval_dir"].glob("watchroom_v1.md"))
+    assert "v1" in m and "Features v1 vs v2" in next(config["eval_dir"].glob("watchroom_v1.md")).read_text()
 
 
 def test_matcher_abstains_without_data(trained):
@@ -155,3 +157,48 @@ def test_default_links_are_config_only():
     assert tr["keiner"]["flur"] > tr["keiner"]["bad"]
     plain = transitions(["flur", "keiner", "bad"], [], {**cfg, "default_links": []})["keiner"]
     assert plain["flur"] == pytest.approx(plain["bad"])
+
+
+FIXTURE = Path(__file__).resolve().parents[2] / "crates" / "heatd" / "testdata" / "watch_features_v2.json"
+
+
+def feature_fixture(cfg):
+    from heattrain.eval import features
+    from heattrain.watchroom import Scan, attach_history
+    spec = {"feature_version": 2, "senders": ["aa:00", "bb:00", "cc:00", "dd:00", "ee:00", "ff:00"], "sender_bands": ["2.4", "2.4", "5", "5", "6", None],
+            "scale": {"floor": -100, "span": 70}, "sentinel_dbm": -100, "history_s": 300.0, "history_scans": 5}
+    steps = [(0, {"aa:00": -50, "cc:00": -70}), (60, {"aa:00": -60, "bb:00": -80, "cc:00": -65, "dd:00": -90, "zz:00": -40}), (120, {"bb:00": -55, "ee:00": -75, "ff:00": -45}),
+             (180, {"aa:00": -45, "bb:00": -62, "cc:00": -72, "dd:00": -58, "ee:00": -85}), (240, {"cc:00": -30, "dd:00": -100}), (300, {"aa:00": -20, "ee:00": -60}),
+             (360, {"bb:00": -130, "cc:00": -66}), (400, {"zz:00": -50}), (1000, {"aa:00": -70, "dd:00": -70, "ee:00": -70}), (1100, {"aa:00": -72, "bb:00": -52})]
+    scans = [Scan(float(t), "w", dict(a)) for t, a in steps]
+    attach_history(scans, {"history_s": spec["history_s"], "history_scans": spec["history_scans"]})
+    return {"spec": spec, "scans": [{"ts": s.ts, "aps": s.aps} for s in scans], "expected": [[float(v) for v in features(spec, s.hist)] for s in scans]}
+
+
+def test_feature_v2_fixture_matches_rust_input(config):
+    fx = feature_fixture(config)
+    if os.environ.get("REGEN_FIXTURE"):
+        FIXTURE.write_text(json.dumps(fx, indent=1))
+    assert json.loads(FIXTURE.read_text()) == fx
+    n = len(fx["spec"]["senders"])
+    assert all(len(v) == 3 * n + 9 for v in fx["expected"])
+    last = fx["expected"][-1]
+    assert last[n + 0] == pytest.approx((np.mean([(-70 + 100) / 70, (-72 + 100) / 70])), abs=1e-6) and last[2 * n + 0] == 1.0 and last[2 * n + 1] == 0.5
+
+
+def test_history_uses_only_past_and_current(config):
+    from heattrain.watchroom import Scan, attach_history
+    scans = [Scan(float(t), "d", {"a": -50 - t}) for t in (0, 100, 200, 700, 710)]
+    attach_history(scans, {"history_s": 300.0, "history_scans": 3})
+    assert [[h["a"] for h in s.hist] for s in scans] == [[-50], [-50, -150], [-50, -150, -250], [-750], [-750, -760]]
+
+
+def test_v2_model_json_and_v1_compat(trained, lake, config, tmp_path):
+    out, meta = trained
+    n = len(meta["senders"])
+    assert meta["feature_version"] == 2 and len(meta["sender_bands"]) == n and meta["history_s"] == 300.0 and meta["history_scans"] == 5
+    assert set(meta["sender_bands"]) == {"2.4", "5", "6"}
+    assert ort.InferenceSession(str(out / meta["states"]["all"])).get_inputs()[0].shape[1] == 3 * n + 9
+    assert "v1" in meta["metrics"]["holdout"]
+    v1 = json.loads((train({**config, "feature_version": 1}, lake, tmp_path / "m1", version="v1x") / "model.json").read_text())
+    assert "feature_version" not in v1 and "sender_bands" not in v1

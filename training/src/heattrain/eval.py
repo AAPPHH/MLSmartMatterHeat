@@ -8,6 +8,35 @@ def vectorize(aps, senders, floor, span):
     return np.array([min(max((aps[s] - floor) / span, 0.0), 1.0) if s in aps else 0.0 for s in senders], dtype=np.float32)
 
 
+BANDS = ("2.4", "5", "6")
+
+
+def band_of(freq):
+    if freq is None:
+        return None
+    return "2.4" if 2400 <= freq < 2500 else "5" if 5000 <= freq < 5925 else "6" if 5925 <= freq < 7200 else None
+
+
+def features(spec, hist):
+    fl, sp, senders = spec["scale"]["floor"], spec["scale"]["span"], spec["senders"]
+    if spec.get("feature_version", 1) < 2:
+        return vectorize(hist[-1], senders, fl, sp)
+    norm = lambda r: min(max((r - fl) / sp, 0.0), 1.0)
+    sent, cur, bands = norm(spec["sentinel_dbm"]), hist[-1], spec["sender_bands"]
+    now, mean, pres = [], [], []
+    for s in senders:
+        vals = [norm(h[s]) for h in hist if s in h]
+        now.append(norm(cur[s]) if s in cur else sent)
+        mean.append(sum(vals) / len(vals) if vals else sent)
+        pres.append(len(vals) / len(hist))
+    out = now + mean + pres
+    for b in BANDS:
+        idx = [i for i in range(len(senders)) if bands[i] == b]
+        vis = sorted((now[i] for i in idx if senders[i] in cur), reverse=True)[:3]
+        out += [vis[0] if vis else sent, sum(vis) / len(vis) if vis else sent, sum(senders[i] in cur for i in idx) / len(idx) if idx else 0.0]
+    return np.array(out, dtype=np.float32)
+
+
 def decide(p, tau, delta):
     order = np.argsort(p)[::-1]
     top, second = float(p[order[0]]), float(p[order[1]]) if len(p) > 1 else 0.0
@@ -74,7 +103,7 @@ class Matcher:
         return self.sessions[key].run(["probabilities"], {"x": X})[0]
 
     def run(self, scans, smooth=True):
-        m, sc = self.meta, self.meta["scale"]
+        m = self.meta
         n, k = len(scans), len(self.rooms)
         P = np.full((n, k), np.nan)
         reason = [None] * n
@@ -92,7 +121,7 @@ class Matcher:
                 reason[i] = "unknown_state"
         for key in set(k_ for k_ in keys if k_):
             idx = [i for i in range(n) if keys[i] == key]
-            X = np.stack([vectorize(scans[i].aps, self.senders, sc["floor"], sc["span"]) for i in idx])
+            X = np.stack([features(m, scans[i].hist or [scans[i].aps]) for i in idx])
             P[idx] = self.probs(key, X)
         out = [None] * n
         held = [None] * n
@@ -143,6 +172,12 @@ def report_md(version, metrics, extra):
         lines += ["", "confusion (rows true, cols predicted, non-abstained):", "", "```"]
         lines += [f"{r:>14} " + " ".join(f"{c:5d}" for c in row) for r, row in zip(m["rooms"], m["confusion"])]
         lines += ["```", ""]
+    if "v1" in metrics:
+        lines += ["## Features v1 vs v2", "", "| variante | feature | n | coverage | accuracy | macro_f1 | abstain |", "|---|---|---|---|---|---|---|"]
+        for name in ("smoothed", "raw"):
+            for ver, m in (("v1", metrics["v1"][name]), ("v2", metrics[name])):
+                lines.append(f"| {name} | {ver} | {m['n']} | {m['coverage']:.3f} | {m['accuracy']:.3f} | {m['macro_f1']:.3f} | {m['abstain_reasons']} |")
+        lines.append("")
     b = metrics["smoothed"]["baselines"]
     lines += ["## Baseline", "", f"kein Matcher: coverage 0, macro_f1 0 (Anwesenheit nur aus Labels). Mehrheitsraum `{b['majority_room']['room']}`: accuracy {b['majority_room']['accuracy']:.3f}", ""]
     return "\n".join(lines)
