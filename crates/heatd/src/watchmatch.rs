@@ -395,6 +395,18 @@ pub struct WatchMatch {
     inner: Arc<Mutex<Inner>>,
 }
 
+fn match_value(row: &WatchInference, top: &[(String, f64)]) -> serde_json::Value {
+    let top_json: Vec<serde_json::Value> = top.iter().map(|(room, p)| serde_json::json!({"room": room, "p": p})).collect();
+    serde_json::json!({
+        "room": top.first().map(|t| t.0.clone()),
+        "p": top.first().map_or(0.0, |t| t.1),
+        "abstained": row.abstained,
+        "reason": row.reason,
+        "top": top_json,
+        "model": (row.model_version != NO_MODEL).then(|| row.model_version.clone()),
+    })
+}
+
 fn newest_dir(base: &Path) -> Option<(String, PathBuf)> {
     let mut found: Vec<(String, String, PathBuf)> = std::fs::read_dir(base)
         .ok()?
@@ -467,11 +479,16 @@ impl WatchMatch {
         signals.into_iter().for_each(|(ts, s)| dev.signals.push(ts, s));
     }
 
-    pub fn scan(&self, device: &str, ts_ms: i64, now_ms: i64, aps: &[(String, i32)]) -> Option<WatchInference> {
-        self.scan_at(device, ts_ms, now_ms, local_minute(ts_ms), aps)
+    #[cfg(test)]
+    pub fn scan_at(&self, device: &str, ts_ms: i64, now_ms: i64, minute: u32, aps: &[(String, i32)]) -> Option<WatchInference> {
+        self.scan_ranked(device, ts_ms, now_ms, minute, aps).map(|(row, _)| row)
     }
 
-    pub fn scan_at(&self, device: &str, ts_ms: i64, now_ms: i64, minute: u32, aps: &[(String, i32)]) -> Option<WatchInference> {
+    pub fn scan_match(&self, device: &str, ts_ms: i64, now_ms: i64, aps: &[(String, i32)]) -> Option<serde_json::Value> {
+        self.scan_ranked(device, ts_ms, now_ms, local_minute(ts_ms), aps).map(|(row, top)| match_value(&row, &top))
+    }
+
+    fn scan_ranked(&self, device: &str, ts_ms: i64, now_ms: i64, minute: u32, aps: &[(String, i32)]) -> Option<(WatchInference, Vec<(String, f64)>)> {
         if !self.cfg.enabled || aps.is_empty() || now_ms - ts_ms > self.cfg.scan_fresh_s * 1000 {
             return None;
         }
@@ -485,6 +502,7 @@ impl WatchMatch {
         dev.gap_logged = false;
         let rule = model.as_ref().and_then(|m| m.rule()).unwrap_or(self.rule);
         let state = dev.signals.classify(&rule, ts_ms, minute);
+        let mut ranked: Vec<(String, f64)> = Vec::new();
         let mut row = WatchInference {
             ts: ts_ms * 1000,
             matcher: MATCHER_ROOM.into(),
@@ -508,6 +526,9 @@ impl WatchMatch {
                         let prior = dev.belief.as_ref().map(|(b, t)| (b.as_slice(), (ts_ms - t) as f64 / 60_000.0));
                         let belief = forward(prior, &model.transition, &emission);
                         let (top, confidence, reason) = decide(&belief, model.spec.tau_room, model.spec.delta_room);
+                        ranked = model.spec.rooms.iter().cloned().zip(belief.iter().copied()).collect();
+                        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        ranked.truncate(3);
                         row.confidence = confidence as f32;
                         row.reason = reason.map(Into::into);
                         row.abstained = reason.is_some();
@@ -526,7 +547,7 @@ impl WatchMatch {
         }
         drop(inner);
         self.record(&row);
-        Some(row)
+        Some((row, ranked))
     }
 
     fn record(&self, row: &WatchInference) {

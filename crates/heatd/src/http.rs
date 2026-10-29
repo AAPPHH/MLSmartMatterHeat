@@ -148,6 +148,7 @@ struct Outcome {
     duplicate: bool,
     room: Option<(String, i64)>,
     explanation: Explanation,
+    matched: Option<Value>,
 }
 
 fn attribution(out: Option<&Outcome>) -> Value {
@@ -180,10 +181,8 @@ fn ingest(state: &AppState, body: &ScanBody, received: i64, raw: bool) -> Result
     }
     let prediction = room.as_ref().map(|(label, probability)| (label.as_str(), *probability));
     let done = state.storage.ingest(&body, received, prediction)?;
-    if !done.duplicate {
-        record_scan(state, &body, received, room.as_ref(), &explanation, raw);
-    }
-    Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)), explanation })
+    let matched = if done.duplicate { None } else { record_scan(state, &body, received, room.as_ref(), &explanation, raw) };
+    Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)), explanation, matched })
 }
 
 fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, received_ms: i64, batch_id: u64, aps: impl Iterator<Item = (String, i32, Option<u8>, Option<u16>)>) -> anyhow::Result<usize> {
@@ -208,7 +207,7 @@ fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, 
     Ok(n)
 }
 
-fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(String, f64)>, explanation: &Explanation, raw: bool) {
+fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(String, f64)>, explanation: &Explanation, raw: bool) -> Option<Value> {
     if raw {
         let batch = state.next_batch();
         if let Err(e) = raw_rows(state, &body.device, body.ts, None, received, batch, body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok()))) {
@@ -251,13 +250,14 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
         state.watchmatch.signals(&body.device, [(body.ts, Signal::OnBody(power != Power::Offbody))]);
     }
     let pairs: Vec<(String, i32)> = body.aps.iter().map(|a| (a.bssid.clone(), a.rssi)).collect();
-    state.watchmatch.scan(&body.device, body.ts, received, &pairs);
+    let matched = state.watchmatch.scan_match(&body.device, body.ts, received, &pairs);
     let transition = state.tracker.lock().unwrap().observe(&body.device, body.ts, body.away, body.motion, body.power);
     if let Some(t) = transition {
         if let Err(e) = state.sink.append(presence_event(&body.device, t)) {
             eprintln!("presence event: {e}");
         }
     }
+    matched
 }
 
 const SENSOR_TYPES: [&str; 7] = ["rssi", "temp", "hr", "offbody", "motion", "battery", "charging"];
@@ -368,7 +368,7 @@ fn long_rows(body: &LongBody, batch: u64, received: i64) -> Result<Vec<WatchRaw>
         .collect()
 }
 
-fn feed_matcher(state: &AppState, body: &LongBody, received: i64, scans_fed: bool) {
+fn feed_matcher(state: &AppState, body: &LongBody, received: i64, scans_fed: bool) -> Option<Value> {
     let ts = |s: &Sample| s.ts.min(received + MAX_FUTURE_MS);
     let charging: std::collections::BTreeMap<i64, bool> = body.samples.iter().filter(|s| s.sensor_type == "charging").map(|s| (ts(s), s.value >= 0.5)).collect();
     let mut signals = Vec::new();
@@ -388,11 +388,10 @@ fn feed_matcher(state: &AppState, body: &LongBody, received: i64, scans_fed: boo
     }
     counts.iter().for_each(|(t, n)| state.status.watch_samples(t, *n));
     state.watchmatch.signals(&body.device, signals);
-    if !scans_fed {
-        scans.into_iter().for_each(|(t, aps)| {
-            state.watchmatch.scan(&body.device, t, received, &aps);
-        });
+    if scans_fed {
+        return None;
     }
+    scans.into_iter().filter_map(|(t, aps)| state.watchmatch.scan_match(&body.device, t, received, &aps)).collect::<Vec<_>>().pop()
 }
 
 async fn flushed(state: &AppState, table: Table) -> Result<(), ApiError> {
@@ -414,8 +413,11 @@ async fn watch_long(state: AppState, body: LongBody) -> ApiResult {
     state.sink.append_many(rows)?;
     flushed(&state, Table::WatchRaw).await?;
     state.storage.claim_id(&body.device, &key)?;
-    feed_matcher(&state, &body, received, scan.is_some());
+    let fed = feed_matcher(&state, &body, received, scan.is_some());
     let mut response = json!({"stored": stored, "batch_id": batch});
+    if let Some(m) = scan.as_ref().and_then(|o| o.matched.clone()).or(fed) {
+        response["match"] = m;
+    }
     if let Some(out) = &scan {
         response["room"] = json!(out.room.as_ref().map(|r| r.0.clone()));
         merge(&mut response, attribution(Some(out)));
@@ -448,8 +450,11 @@ async fn watch_measurement(State(state): State<AppState>, Json(value): Json<Valu
         state.storage.claim_id(&body.device, id)?;
     }
     state.status.watch_samples("rssi", stored as u64);
-    state.watchmatch.scan(&body.device, ts, received, &pairs);
-    Ok(Json(json!({"stored": stored, "batch_id": batch})))
+    let mut response = json!({"stored": stored, "batch_id": batch});
+    if let Some(m) = state.watchmatch.scan_match(&body.device, ts, received, &pairs) {
+        response["match"] = m;
+    }
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -497,6 +502,9 @@ async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiR
     let out = ingest(&state, &body, now_ms(), true)?;
     let mut response = json!({"stored": out.stored, "room": out.room.as_ref().map(|r| r.0.clone())});
     merge(&mut response, attribution(Some(&out)));
+    if let Some(m) = out.matched {
+        response["match"] = m;
+    }
     if out.duplicate {
         response["duplicate"] = json!(true);
     }
@@ -507,8 +515,12 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     let received = now_ms();
     let (mut stored, mut duplicates) = (0, 0);
     let mut latest: Option<Outcome> = None;
+    let mut matched: Option<(i64, Value)> = None;
     for scan in &body.scans {
         let out = ingest(&state, scan, received, true)?;
+        if let Some(m) = out.matched.clone().filter(|_| matched.as_ref().is_none_or(|l| scan.ts >= l.0)) {
+            matched = Some((scan.ts, m));
+        }
         stored += out.stored;
         duplicates += usize::from(out.duplicate);
         if out.room.as_ref().is_some_and(|r| latest.as_ref().and_then(|l| l.room.as_ref()).is_none_or(|l| r.1 >= l.1)) {
@@ -517,6 +529,9 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     }
     let mut response = json!({"stored": stored, "accepted": body.scans.len(), "duplicates": duplicates, "room": latest.as_ref().and_then(|o| o.room.as_ref().map(|r| r.0.clone()))});
     merge(&mut response, attribution(latest.as_ref()));
+    if let Some((_, m)) = matched {
+        response["match"] = m;
+    }
     Ok(Json(response))
 }
 
@@ -1392,12 +1407,34 @@ nodes = [5]
     }
 
     #[tokio::test]
+    async fn scan_reply_carries_matcher_guess_with_top_rooms() {
+        let h = matcher_harness(&fixture_models());
+        let body = json!({"device": "pixel-watch", "ts": now_ms(), "aps": [{"bssid": "aa:bb:cc:00:00:01", "rssi": -40, "freq": 2437}, {"bssid": "aa:bb:cc:00:00:02", "rssi": -60, "freq": 2437}, {"bssid": "aa:bb:cc:00:00:03", "rssi": -90, "freq": 2437}]});
+        let (status, resp) = call(&h.state, "POST", "/api/scan", Some(body.to_string())).await;
+        let m = &resp["match"];
+        assert_eq!((status, m["room"].clone(), m["abstained"].clone(), m["reason"].clone(), m["model"].clone()), (StatusCode::OK, json!("wohnzimmer"), json!(false), Value::Null, json!("v1")));
+        assert!(m["p"].as_f64().unwrap() > 0.9 && m["top"].as_array().unwrap().len() == 3 && m["top"][0]["room"] == "wohnzimmer");
+    }
+
+    #[tokio::test]
+    async fn scan_reply_without_model_abstains_with_no_model() {
+        let dir = std::env::temp_dir().join(format!("heatd-empty-models-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = matcher_harness(dir.to_str().unwrap());
+        let body = json!({"device": "pixel-watch", "ts": now_ms(), "aps": [{"bssid": "aa:bb:cc:00:00:01", "rssi": -40, "freq": 2437}]});
+        let (_, resp) = call(&h.state, "POST", "/api/scan", Some(body.to_string())).await;
+        assert_eq!(resp["match"], json!({"room": null, "p": 0.0, "abstained": true, "reason": "no_model", "top": [], "model": null}));
+        let (_, batch) = call(&h.state, "POST", "/api/scans", Some(json!({"scans": [{"device": "pixel-watch", "ts": now_ms() + 1_000, "aps": body["aps"].clone()}]}).to_string())).await;
+        assert_eq!(batch["match"]["reason"], "no_model");
+    }
+
+    #[tokio::test]
     async fn long_format_is_stored_idempotently_and_feeds_the_matcher() {
         let h = matcher_harness(&fixture_models());
         let now = now_ms();
         let body = long_body(7, now, [-40, -60, -90]).to_string();
         let (status, resp) = call(&h.state, "POST", "/watch/measurement", Some(body.clone())).await;
-        assert_eq!((status, resp), (StatusCode::OK, json!({"stored": 6, "batch_id": 7})));
+        assert_eq!((status, resp["stored"].clone(), resp["batch_id"].clone(), resp["match"]["room"].clone(), resp["match"]["abstained"].clone()), (StatusCode::OK, json!(6), json!(7), json!("wohnzimmer"), json!(false)));
         let (_, again) = call(&h.state, "POST", "/watch/measurement", Some(body)).await;
         assert_eq!(again, json!({"stored": 0, "duplicate": true, "batch_id": 7}));
         let raw = lake_rows(&h, "watch_raw");
