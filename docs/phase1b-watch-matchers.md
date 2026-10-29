@@ -84,6 +84,21 @@ Watch 4 einer normalen App erlaubt (geprÃ¼ft per `dumpsys sensorservice`).
 - Re-Enrollment: neue Labels flieÃŸen ein; wÃ¶chentliches Neutraining;
   Drift-Alarm (Event), wenn die Abstain-Quote Ã¼ber 7 Tage um > 50 % steigt.
 
+## Feature v2 (WiFi-Fingerprint)
+- `model.json`: `feature_version: 2` (fehlt = 1 = bisherige Features), `sender_bands`
+  (parallel zu `senders`: "2.4" | "5" | "6" | null, Band je BSSID aus der häufigsten
+  `watch_raw.freq` beim Training), `history_s` (300), `history_scans` (5).
+- Vektor (3n + 9): je Sender aktuelle stärkste RSSI (normiert); je Sender Mittel der
+  normierten RSSI über die Scans des Geräts in den letzten `history_s` s (höchstens
+  `history_scans` inkl. aktuellem, nur Scans mit Sender; fehlt überall = Sentinel) und
+  Präsenzanteil; je Band max, Mittel der Top-3 und Anteil sichtbarer Vokabular-Sender
+  (leeres Band = Sentinel / 0). Nur Vergangenheit und aktueller Scan.
+- Parität Python/Rust: `crates/heatd/testdata/watch_features_v2.json` (Spec, Scans,
+  erwartete Vektoren; neu erzeugen mit `REGEN_FIXTURE=1 uv run pytest`), geprüft in
+  `training/tests/test_watchroom.py` und `watchmatch_tests.rs` (Toleranz 1e-6).
+- Training: Config `feature_version` (Default 2); der Eval-Report zeigt v1 und v2
+  nebeneinander (v1 wird auf denselben Trainingstagen mitgefittet).
+
 ## Laufzeit in heatd (`watchmatch`)
 - Modelle als ONNX plus Sidecar-JSON, Version aus Config; Inferenz auf dem
   Minix, Ergebnis nach `watch_inference`.

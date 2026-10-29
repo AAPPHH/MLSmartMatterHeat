@@ -414,3 +414,36 @@ fn python_trained_model_classifies_and_survives_model_removal() {
     after.sink().flush().unwrap();
     assert!(lake_reasons(&env).contains(&Some("no_model".to_string())));
 }
+
+#[test]
+fn feature_v2_matches_python_fixture() {
+    let fx: Value = serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/watch_features_v2.json")).unwrap()).unwrap();
+    let mut spec = json!({"model_version": "t", "matcher": "room", "rooms": ["a", "b"], "states": {"all": "all.onnx"}, "tau_room": 0.5, "delta_room": 0.1, "t_hold_min": 30, "smoothing": {"kind": "hmm", "stay_prob": 0.9}});
+    spec.as_object_mut().unwrap().extend(fx["spec"].as_object().unwrap().clone());
+    let spec: Spec = serde_json::from_value(spec).unwrap();
+    assert_eq!(spec.feature_version, 2);
+    let mut past: Vec<Past> = Vec::new();
+    for (scan, expected) in fx["scans"].as_array().unwrap().iter().zip(fx["expected"].as_array().unwrap()) {
+        let ts = (scan["ts"].as_f64().unwrap() * 1000.0) as i64;
+        let list: Vec<(String, i32)> = scan["aps"].as_object().unwrap().iter().map(|(k, v)| (k.to_uppercase(), v.as_i64().unwrap() as i32)).collect();
+        let got = spec.features(&past, ts, &list);
+        let want: Vec<f64> = expected.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert_eq!(got.len(), spec.feature_len());
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!((f64::from(*g) - w).abs() < 1e-6, "scan at {ts} feature {i}: {g} vs {w}");
+        }
+        past.push((ts, list));
+    }
+}
+
+#[test]
+fn feature_v1_models_keep_working_and_v2_needs_bands() {
+    let env = Env::new();
+    env.install("old", |_| {});
+    assert!(Model::load(&env.models().join("old")).unwrap().spec.feature_version == 1);
+    env.install("bad", |s| {
+        s["feature_version"] = json!(2);
+    });
+    assert!(Model::load(&env.models().join("bad")).is_err());
+}

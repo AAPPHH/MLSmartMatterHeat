@@ -16,6 +16,7 @@ pub const MATCHER_ROOM: &str = "room";
 pub const NO_MODEL: &str = "none";
 const SIGNAL_KEEP_MS: i64 = 1_800_000;
 const NO_SCAN_AFTER_MS: i64 = 120_000;
+const HISTORY_KEEP: usize = 32;
 const RELOAD_EVERY_TICKS: u64 = 60;
 const MAX_STEPS: f64 = 60.0;
 const BELIEF_FLOOR: f64 = 1e-4;
@@ -52,6 +53,77 @@ pub struct Spec {
     pub smoothing: Smoothing,
     #[serde(default)]
     pub state_rule: Option<RuleSpec>,
+    #[serde(default = "one")]
+    pub feature_version: u32,
+    #[serde(default)]
+    pub sender_bands: Vec<Option<String>>,
+    #[serde(default = "default_history_s")]
+    pub history_s: f64,
+    #[serde(default = "default_history_scans")]
+    pub history_scans: usize,
+}
+
+pub type Past = (i64, Vec<(String, i32)>);
+
+fn one() -> u32 {
+    1
+}
+
+fn default_history_s() -> f64 {
+    300.0
+}
+
+fn default_history_scans() -> usize {
+    5
+}
+
+fn strongest(aps: &[(String, i32)]) -> HashMap<String, i32> {
+    let mut out: HashMap<String, i32> = HashMap::new();
+    for (sender, rssi) in aps {
+        let e = out.entry(sender.to_lowercase()).or_insert(*rssi);
+        *e = (*e).max(*rssi);
+    }
+    out
+}
+
+impl Spec {
+    pub fn feature_len(&self) -> usize {
+        let n = self.senders.len();
+        if self.feature_version >= 2 {
+            3 * n + 9
+        } else {
+            n
+        }
+    }
+
+    pub fn features(&self, past: &[Past], ts_ms: i64, aps: &[(String, i32)]) -> Vec<f32> {
+        let cur = strongest(aps);
+        if self.feature_version < 2 {
+            return self.senders.iter().map(|s| ((cur.get(&s.to_lowercase()).map_or(self.sentinel_dbm, |r| *r as f32) - self.scale.floor) / self.scale.span).clamp(0.0, 1.0)).collect();
+        }
+        let norm = |r: f64| ((r - f64::from(self.scale.floor)) / f64::from(self.scale.span)).clamp(0.0, 1.0);
+        let sentinel = norm(f64::from(self.sentinel_dbm));
+        let recent = &past[past.len().saturating_sub(self.history_scans.saturating_sub(1))..];
+        let mut hist: Vec<HashMap<String, i32>> = recent.iter().filter(|(t, _)| (ts_ms - t) as f64 / 1000.0 <= self.history_s).map(|(_, a)| strongest(a)).collect();
+        hist.push(cur);
+        let keys: Vec<String> = self.senders.iter().map(|s| s.to_lowercase()).collect();
+        let now: Vec<f64> = keys.iter().map(|k| hist[hist.len() - 1].get(k).map_or(sentinel, |r| norm(f64::from(*r)))).collect();
+        let seen: Vec<Vec<f64>> = keys.iter().map(|k| hist.iter().filter_map(|h| h.get(k)).map(|r| norm(f64::from(*r))).collect()).collect();
+        let mut out: Vec<f64> = now.clone();
+        out.extend(seen.iter().map(|v| if v.is_empty() { sentinel } else { v.iter().sum::<f64>() / v.len() as f64 }));
+        out.extend(seen.iter().map(|v| v.len() as f64 / hist.len() as f64));
+        for band in ["2.4", "5", "6"] {
+            let idx: Vec<usize> = (0..keys.len()).filter(|i| self.sender_bands.get(*i).and_then(|b| b.as_deref()) == Some(band)).collect();
+            let mut vis: Vec<f64> = idx.iter().filter(|i| !seen[**i].is_empty() && hist[hist.len() - 1].contains_key(&keys[**i])).map(|i| now[*i]).collect();
+            let count = vis.len();
+            vis.sort_by(|a, b| b.total_cmp(a));
+            vis.truncate(3);
+            out.push(vis.first().copied().unwrap_or(sentinel));
+            out.push(if vis.is_empty() { sentinel } else { vis.iter().sum::<f64>() / vis.len() as f64 });
+            out.push(if idx.is_empty() { 0.0 } else { count as f64 / idx.len() as f64 });
+        }
+        out.into_iter().map(|v| v as f32).collect()
+    }
 }
 
 fn ten_minutes() -> f64 {
@@ -144,7 +216,7 @@ impl Model {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("model.json");
         let spec: Spec = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?).with_context(|| format!("parse {}", path.display()))?;
-        if spec.matcher != MATCHER_ROOM || spec.rooms.is_empty() || spec.senders.is_empty() || spec.states.is_empty() || spec.scale.span.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || spec.smoothing.kind != "hmm" {
+        if spec.matcher != MATCHER_ROOM || spec.rooms.is_empty() || spec.senders.is_empty() || spec.states.is_empty() || spec.scale.span.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || spec.smoothing.kind != "hmm" || !(1..=2).contains(&spec.feature_version) || (spec.feature_version == 2 && (spec.sender_bands.len() != spec.senders.len() || spec.history_scans == 0)) {
             bail!("{}: not a valid room model description", path.display());
         }
         let mut sessions = HashMap::new();
@@ -155,7 +227,7 @@ impl Model {
         let transition = matrix(&spec)?;
         let model = Self { spec, sessions, transition };
         for state in model.sessions.keys() {
-            model.probabilities(state, &vec![0.0; model.spec.senders.len()]).with_context(|| format!("probe template {state}"))?;
+            model.probabilities(state, &vec![0.0; model.spec.feature_len()]).with_context(|| format!("probe template {state}"))?;
         }
         Ok(model)
     }
@@ -168,13 +240,9 @@ impl Model {
         aps.iter().any(|(a, _)| self.spec.senders.iter().any(|s| s.eq_ignore_ascii_case(a)))
     }
 
+    #[cfg(test)]
     pub fn features(&self, aps: &[(String, i32)]) -> Vec<f32> {
-        let mut strongest: HashMap<String, i32> = HashMap::new();
-        for (sender, rssi) in aps {
-            let e = strongest.entry(sender.to_lowercase()).or_insert(*rssi);
-            *e = (*e).max(*rssi);
-        }
-        self.spec.senders.iter().map(|s| ((strongest.get(&s.to_lowercase()).map_or(self.spec.sentinel_dbm, |r| *r as f32) - self.spec.scale.floor) / self.spec.scale.span).clamp(0.0, 1.0)).collect()
+        self.spec.features(&[], 0, aps)
     }
 
     pub fn template_for(&self, state: &str) -> Option<&str> {
@@ -305,6 +373,7 @@ struct Device {
     signals: Signals,
     belief: Option<(Vec<f64>, i64)>,
     hold: Option<(String, i64)>,
+    history: VecDeque<Past>,
     last_scan_ms: Option<i64>,
     gap_logged: bool,
 }
@@ -432,7 +501,7 @@ impl WatchMatch {
             match model.template_for(state).filter(|_| model.knows(aps)) {
                 None if !model.knows(aps) => row.reason = Some("no_known_ap".into()),
                 None => row.reason = Some("unknown_state".into()),
-                Some(template) => match model.probabilities(template, &model.features(aps)) {
+                Some(template) => match model.probabilities(template, &model.spec.features(dev.history.make_contiguous(), ts_ms, aps)) {
                     Err(e) => eprintln!("watchmatch: inference failed: {e:#}"),
                     Ok(emission) => {
                         row.template_id = template.into();
@@ -450,6 +519,10 @@ impl WatchMatch {
                     }
                 },
             }
+        }
+        dev.history.push_back((ts_ms, aps.to_vec()));
+        while dev.history.len() > HISTORY_KEEP {
+            dev.history.pop_front();
         }
         drop(inner);
         self.record(&row);
