@@ -202,3 +202,28 @@ def test_v2_model_json_and_v1_compat(trained, lake, config, tmp_path):
     assert "v1" in meta["metrics"]["holdout"]
     v1 = json.loads((train({**config, "feature_version": 1}, lake, tmp_path / "m1", version="v1x") / "model.json").read_text())
     assert "feature_version" not in v1 and "sender_bands" not in v1
+
+
+def test_xgb_export_parity(lake, config, tmp_path):
+    from heattrain.watchroom import Trainer, export
+    cfg = dict(config, candidates=["xgb"])
+    scans, links = load_scans(lake, cfg)
+    bundle = Trainer(cfg).fit(scans, links)
+    out = export(bundle, cfg, tmp_path, "x1", {})
+    meta = json.loads((out / "model.json").read_text())
+    assert meta["classifier"] == "xgb"
+    s = ort.InferenceSession(str(out / meta["states"]["all"]))
+    assert [o.name for o in s.get_outputs()] == ["probabilities"]
+    p = s.run(None, {"x": bundle["X"][:20]})[0]
+    assert p.shape == (20, len(meta["rooms"])) and np.allclose(p.sum(axis=1), 1.0, atol=1e-5)
+
+
+def test_xgb_trains_on_single_day(config, tmp_path):
+    from heattrain.watchroom import Scan, Trainer, export
+    rng = np.random.default_rng(1)
+    scans = [Scan(1e9 + i * 60 + j * 3000, "d", {"aa": b + rng.normal(0, 2), "bb": -60.0 + rng.normal(0, 2)}, r, "rest")
+             for j, (r, b) in enumerate((("a", -40.0), ("b", -80.0), ("c", -65.0))) for i in range(8)]
+    cfg = {**config, "min_sender_scans": 1, "min_sender_days": 1, "min_room_scans": 5, "min_state_scans": 10 ** 6}
+    bundle = Trainer(cfg).fit(scans, [])
+    assert bundle["kind"] == "xgb" and bundle["metrics"]["cv_macro_f1"]["xgb"] > 0
+    export(bundle, cfg, tmp_path, "s1", {})

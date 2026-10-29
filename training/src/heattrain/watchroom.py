@@ -9,13 +9,19 @@ import duckdb
 import numpy as np
 import onnx
 import onnxruntime as ort
-from skl2onnx import convert_sklearn
+from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
+from skl2onnx import convert_sklearn, update_registered_converter
 from skl2onnx.common.data_types import FloatTensorType
+from skl2onnx.common.shape_calculator import calculate_linear_classifier_output_shapes
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
+from sklearn.utils.class_weight import compute_sample_weight
+from xgboost import XGBClassifier
 from heattrain.eval import NO_TEMPLATE, Matcher, band_of, evaluate, features, forward, report_md, score
+
+update_registered_converter(XGBClassifier, "XGBoostXGBClassifier", calculate_linear_classifier_output_shapes, convert_xgboost, options={"nocl": [True, False], "zipmap": [True, False, "columns"]})
 
 
 @dataclass
@@ -106,6 +112,8 @@ def assign_labels(lake, cfg, scans):
     dev = np.array([s.device for s in scans])
     room = np.full(len(scans), None, dtype=object)
     best = np.full(len(scans), np.inf)
+    start = datetime.fromisoformat(cfg["labels_from"]).timestamp() if cfg.get("labels_from") else None
+    rows = [r for r in rows if start is None or r[0] >= start]
     for ts, f, to, name, d in rows:
         if f is not None and to is not None:
             mask = (t >= f) & (t <= to) & ((dev == str(d)) if d else True)
@@ -200,6 +208,9 @@ def transitions(rooms, links, cfg):
 
 def day_folds(days, n):
     uniq = np.unique(days)
+    if len(uniq) < n:
+        idx = np.arange(len(days))
+        return [(np.setdiff1d(idx, b), b) for b in np.array_split(idx, n) if len(b)] if len(idx) >= n else []
     blocks = np.array_split(uniq, min(n, len(uniq)))
     return [(np.where(~np.isin(days, b))[0], np.where(np.isin(days, b))[0]) for b in blocks if len(b) and len(blocks) > 1]
 
@@ -210,23 +221,43 @@ def full_proba(model, X, k):
     return out
 
 
+class Dense:
+    def __init__(self, model, classes):
+        self.model, self.classes_ = model, classes
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
 
     def make(self, kind, y):
         c = self.cfg
+        if kind == "xgb":
+            return XGBClassifier(objective="multi:softprob", n_estimators=c["xgb_trees"], max_depth=c["xgb_depth"], learning_rate=c["xgb_lr"], min_child_weight=1,
+                                 subsample=0.8, colsample_bytree=0.8, random_state=c["seed"], n_jobs=1)
         base = {"knn": lambda: KNeighborsClassifier(c["knn_k"]), "svm": lambda: SVC(C=c["svm_c"], gamma=c["svm_gamma"], class_weight="balanced"),
                 "gb": lambda: GradientBoostingClassifier(n_estimators=c["gb_trees"], max_depth=c["gb_depth"], random_state=c["seed"])}[kind]()
         folds = min(3, int(np.bincount(y)[np.bincount(y) > 0].min()))
         return CalibratedClassifierCV(base, method="sigmoid", cv=folds) if folds >= 2 else base
+
+    def fit_model(self, kind, X, y, k):
+        model = self.make(kind, y)
+        if kind != "xgb":
+            return model.fit(X, y)
+        classes = np.unique(y)
+        model.set_params(num_class=len(classes))
+        model.fit(X, np.searchsorted(classes, y), sample_weight=compute_sample_weight("balanced", y))
+        return model if len(classes) == k else Dense(model, classes)
 
     def oof(self, kind, X, y, days, k):
         P = np.zeros((len(X), k))
         for tr, te in day_folds(days, self.cfg["cv_folds"]):
             if len(np.unique(y[tr])) < 2:
                 continue
-            P[te] = full_proba(self.make(kind, y[tr]).fit(X[tr], y[tr]), X[te], k)
+            P[te] = full_proba(self.fit_model(kind, X[tr], y[tr], k), X[te], k)
         return P
 
     def smoothed(self, P, keep, order, trans):
@@ -279,12 +310,12 @@ class Trainer:
         P = self.smoothed(cv[kind][0], keep, order, trans_m)
         ok = P.sum(axis=1) > 0
         tau, delta, val = self.thresholds(P[ok], y[ok], rooms)
-        models = {"all": self.make(kind, y).fit(X, y)}
+        models = {"all": self.fit_model(kind, X, y, len(rooms))}
         for st in sorted(set(states) - {"all"}):
             m = states == st
             per = np.bincount(y[m], minlength=len(rooms))
             if m.sum() >= c["min_state_scans"] and per.min() >= c["min_state_room_scans"]:
-                models[st] = self.make(kind, y[m]).fit(X[m], y[m])
+                models[st] = self.fit_model(kind, X[m], y[m], len(rooms))
         return {"rooms": rooms, "senders": senders, "spec": spec, "kind": kind, "models": models, "tau": tau, "delta": delta,
                 "transition": trans, "n_labels": {r: int((y == i).sum()) for i, r in enumerate(rooms)},
                 "window": (min(keep, key=lambda s: s.ts).ts, max(keep, key=lambda s: s.ts).ts), "X": X,
