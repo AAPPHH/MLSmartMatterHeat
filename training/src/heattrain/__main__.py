@@ -7,7 +7,7 @@ CONFIG = {
     "eval_dir": Path(__file__).resolve().parents[2] / "eval",
     "sources": ["watch", "manual"],
     "label_tolerance_s": 300.0,
-    "state": {"hr_rest_max": 70.0, "hr_active_min": 90.0, "motion_active_min": 0.5, "sleep_hours": [23, 7], "window_s": 600.0},
+    "state": {"hr_rest_max": 70.0, "hr_active_min": 90.0, "motion_active_min": 0.5, "sleep_hours": [23, 7], "window_s": 600.0, "stale_s": 600.0},
     "scale": {"floor": -100, "span": 70},
     "t_hold_min": 30,
     "min_sender_scans": 10, "min_sender_days": 2, "max_senders": 64,

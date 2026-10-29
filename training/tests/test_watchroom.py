@@ -58,7 +58,7 @@ def test_eval_on_new_days(trained, config, tmp_path):
     out, meta = trained
     lake = make_lake(tmp_path / "lake", 13)
     scans, _ = load_scans(lake, config)
-    assert any(s.state in ("sleep", "rest", "active") for s in scans) and any(s.state is None for s in scans)
+    assert any(s.state in ("sleep", "rest", "active") for s in scans) and all(s.state is not None for s in scans)
     m = eval_model(config, lake, out)
     assert m["note"].startswith("Tage nach") and m["smoothed"]["n"] > 100
     assert m["smoothed"]["coverage"] >= 0.8 and m["smoothed"]["macro_f1"] >= 0.85
@@ -70,21 +70,54 @@ def test_matcher_abstains_without_data(trained):
     from heattrain.watchroom import Scan
     m = Matcher(trained[0])
     out, held = m.run([Scan(1e9, "pixel", {"zz:zz": -50}, None, "all"), Scan(1e9 + 60, "pixel", {}, None, "all")])
-    assert out[0] == (None, "no_scan") and out[1] == (None, "no_scan") and held == [None, None]
+    assert out[0] == (None, "no_known_ap") and out[1] == (None, "no_known_ap") and held == [None, None]
+    off, _ = m.run([Scan(1e9, "pixel", {m.senders[0]: -50}, None, "offbody"), Scan(1e9, "pixel", {m.senders[0]: -50}, None, "charging")])
+    assert off == [(None, "unknown_state")] * 2
     m.sessions.pop("all")
     out, _ = m.run([Scan(1e9, "pixel", {m.senders[0]: -50}, None, "weird")])
     assert out[0] == (None, "unknown_state")
 
 
 def test_state_rule():
-    cfg = {"hr_rest_max": 70, "hr_active_min": 90, "motion_active_min": 0.5, "sleep_hours": [23, 7], "window_s": 600}
+    cfg = {"hr_rest_max": 70, "hr_active_min": 90, "motion_active_min": 0.5, "sleep_hours": [23, 7], "window_s": 600, "stale_s": 600}
     tz, t = ZoneInfo("Europe/Berlin"), 1790000000.0
     mk = lambda **kw: {("d", k): (np.array([t - 60]), np.array([v])) for k, v in kw.items()}
-    assert classify_state(cfg, tz, t, "d", {}) is None
+    assert classify_state(cfg, tz, t, "d", {}) == "rest"
+    quiet = {("d", "hr"): (np.array([t - 60]), np.array([55.0]))}
+    assert classify_state(cfg, tz, 1790000000.0 - 3 * 3600, "d", {}) == "rest"
+    assert classify_state(cfg, tz, t, "d", {**mk(offbody=0.0), **quiet}) == "offbody"
+    assert classify_state(cfg, tz, t + 900, "d", {**mk(offbody=0.0), **quiet}) == "rest"
+    assert classify_state(cfg, tz, t, "d", mk(offbody=1.0)) == "rest"
     assert classify_state(cfg, tz, t, "d", mk(hr=100.0, motion=0.1)) == "active"
     assert classify_state(cfg, tz, t, "d", mk(hr=60.0, motion=0.1)) in ("rest", "sleep")
     assert classify_state(cfg, tz, t, "d", mk(hr=60.0, charging=1.0)) == "charging"
     assert classify_state(cfg, tz, t, "d", mk(hr=60.0, offbody=0.0)) == "offbody"
+
+
+def test_smoothing_matches_heatd_forward_step():
+    from heattrain.eval import forward
+    trans = np.array([[0.9, 0.1], [0.1, 0.9]])
+    em = np.array([0.8, 0.2])
+    first = forward(None, 0.0, trans, em)
+    assert first == pytest.approx(em)
+    later = forward(first, 1.0, trans, np.array([0.5, 0.5]))
+    assert later == pytest.approx(first @ trans)
+    assert forward(first, 61.0, trans, em) == pytest.approx(em)
+    assert forward(first, 60.0, trans, em)[0] > 0.8
+    assert forward(np.array([1.0, 0.0]), 1.0, trans, np.array([0.0, 1.0])).min() >= 1e-4 / 2
+
+
+def test_offbody_and_charging_scans_never_train_templates(config):
+    from heattrain.watchroom import Scan, Trainer
+    rng = np.random.default_rng(0)
+    scans = []
+    for room, base in (("a", -40.0), ("b", -80.0)):
+        for i in range(60):
+            for state in ("rest", "offbody", "charging"):
+                scans.append(Scan(1e9 + i * 60 + (86400 * (i % 4)), "d", {"aa": base + rng.normal(0, 2), "bb": -60.0 + rng.normal(0, 2)}, room, state))
+    cfg = {**config, "min_sender_scans": 1, "min_sender_days": 1, "min_state_scans": 10, "min_state_room_scans": 3}
+    fit = Trainer(cfg).fit(scans, [])
+    assert set(fit["models"]) <= {"all", "rest"} and sum(fit["n_labels"].values()) == 120
 
 
 def test_transitions_fallback_uniform():

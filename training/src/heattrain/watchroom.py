@@ -14,7 +14,7 @@ from skl2onnx.common.data_types import FloatTensorType
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.neighbors import KNeighborsClassifier
-from heattrain.eval import Matcher, evaluate, report_md, score, vectorize
+from heattrain.eval import NO_TEMPLATE, Matcher, evaluate, forward, report_md, score, vectorize
 
 
 @dataclass
@@ -66,24 +66,24 @@ def window_mean(series, t, window):
     return float(vs[lo:hi].mean()) if hi > lo else None
 
 
-def last_value(series, t, window):
+def last_value(series, t, stale):
     if series is None:
         return None
     ts, vs = series
     hi = np.searchsorted(ts, t, side="right")
-    return float(vs[hi - 1]) if hi and t - ts[hi - 1] <= window else None
+    return float(vs[hi - 1]) if hi and t - ts[hi - 1] <= stale else None
 
 
 def classify_state(cfg, tz, t, dev, sig):
     w = cfg["window_s"]
-    charging, offbody = last_value(sig.get((dev, "charging")), t, w), last_value(sig.get((dev, "offbody")), t, w)
+    charging, offbody = last_value(sig.get((dev, "charging")), t, cfg["stale_s"]), last_value(sig.get((dev, "offbody")), t, cfg["stale_s"])
     hr, motion = window_mean(sig.get((dev, "hr")), t, w), window_mean(sig.get((dev, "motion")), t, w)
     if charging is not None and charging > 0.5:
         return "charging"
     if offbody is not None and offbody < 0.5:
         return "offbody"
     if hr is None and motion is None:
-        return None
+        return "rest"
     start, end = cfg["sleep_hours"]
     hour = datetime.fromtimestamp(t, tz).hour
     night = (hour >= start or hour < end) if start > end else start <= hour < end
@@ -202,6 +202,16 @@ class Trainer:
             P[te] = full_proba(self.make(kind, y[tr]).fit(X[tr], y[tr]), X[te], k)
         return P
 
+    def smoothed(self, P, keep, order, trans):
+        out, state = np.zeros_like(P), {}
+        for i in order:
+            if P[i].sum() <= 0:
+                continue
+            prior, last = state.get(keep[i].device, (None, None))
+            out[i] = forward(prior, (keep[i].ts - last) / 60.0 if last is not None else 0.0, trans, P[i])
+            state[keep[i].device] = (out[i], keep[i].ts)
+        return out
+
     def thresholds(self, P, y, rooms):
         best = None
         srt = np.sort(P, axis=1)
@@ -222,7 +232,7 @@ class Trainer:
         rooms = sorted(r for r, n in counts.items() if n >= c["min_room_scans"])
         if len(rooms) < 2:
             raise ValueError(f"need at least 2 rooms with {c['min_room_scans']} labelled scans, got {dict(counts)}")
-        labelled = [s for s in labelled if s.room in rooms]
+        labelled = [s for s in labelled if s.room in rooms and s.state not in NO_TEMPLATE]
         senders = vocabulary(labelled, c)
         sc = c["scale"]
         keep = [s for s in labelled if any(b in s.aps for b in senders)]
@@ -230,13 +240,16 @@ class Trainer:
         y = np.array([rooms.index(s.room) for s in keep])
         days = np.array([day_of(s) for s in keep])
         states = np.array([s.state or "all" for s in keep])
+        trans = transitions(rooms, links, c["hmm"])
+        trans_m = np.array([[trans[a][b] for b in rooms] for a in rooms])
+        order = sorted(range(len(keep)), key=lambda i: (keep[i].device, keep[i].ts))
         cv = {}
         for kind in c["candidates"]:
             P = self.oof(kind, X, y, days, len(rooms))
             ok = P.sum(axis=1) > 0
             cv[kind] = (P, score(list(y[ok]), [int(p.argmax()) for p in P[ok]], rooms)["macro_f1"])
         kind = max(cv, key=lambda k: cv[k][1])
-        P = cv[kind][0]
+        P = self.smoothed(cv[kind][0], keep, order, trans_m)
         ok = P.sum(axis=1) > 0
         tau, delta, val = self.thresholds(P[ok], y[ok], rooms)
         models = {"all": self.make(kind, y).fit(X, y)}
@@ -246,7 +259,7 @@ class Trainer:
             if m.sum() >= c["min_state_scans"] and per.min() >= c["min_state_room_scans"]:
                 models[st] = self.make(kind, y[m]).fit(X[m], y[m])
         return {"rooms": rooms, "senders": senders, "kind": kind, "models": models, "tau": tau, "delta": delta,
-                "transition": transitions(rooms, links, c["hmm"]), "n_labels": {r: int((y == i).sum()) for i, r in enumerate(rooms)},
+                "transition": trans, "n_labels": {r: int((y == i).sum()) for i, r in enumerate(rooms)},
                 "window": (min(keep, key=lambda s: s.ts).ts, max(keep, key=lambda s: s.ts).ts), "X": X,
                 "metrics": {"cv_macro_f1": {k: v[1] for k, v in cv.items()}, "chosen": kind, "validation": {k: val[k] for k in ("coverage", "accuracy", "macro_f1")}}}
 

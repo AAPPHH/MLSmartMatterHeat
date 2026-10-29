@@ -18,6 +18,24 @@ def decide(p, tau, delta):
     return int(order[0]), None
 
 
+NO_TEMPLATE = ("offbody", "charging")
+MAX_STEPS = 60
+BELIEF_FLOOR = 1e-4
+
+
+def forward(prior, dt_min, trans, emission):
+    n = len(emission)
+    if prior is not None and dt_min <= MAX_STEPS:
+        belief = prior @ np.linalg.matrix_power(trans, int(np.clip(np.floor(dt_min + 0.5), 1, MAX_STEPS)))
+    else:
+        belief = np.full(n, 1.0 / n)
+    belief = belief * emission
+    if not belief.sum() > 0:
+        belief = np.asarray(emission, dtype=float).copy()
+    belief = np.maximum(belief / belief.sum(), BELIEF_FLOOR)
+    return belief / belief.sum()
+
+
 def score(truth, pred, rooms):
     k, truth, pred = len(rooms), np.asarray(truth, dtype=int), np.array([-1 if p is None else p for p in pred], dtype=int)
     n, done = len(truth), pred >= 0
@@ -63,7 +81,9 @@ class Matcher:
         keys = [None] * n
         for i, s in enumerate(scans):
             if not any(b in s.aps for b in self.senders):
-                reason[i] = "no_scan"
+                reason[i] = "no_known_ap"
+            elif s.state in NO_TEMPLATE:
+                reason[i] = "unknown_state"
             elif s.state in self.sessions:
                 keys[i] = s.state
             elif "all" in self.sessions:
@@ -84,10 +104,8 @@ class Matcher:
             else:
                 alpha, last_ts = state.get(s.device, (None, None))
                 p = P[i]
-                if smooth and alpha is not None:
-                    steps = int(np.clip(round((s.ts - last_ts) / 60.0), 1, 60))
-                    post = (alpha @ np.linalg.matrix_power(self.trans, steps)) * p
-                    p = post / post.sum() if post.sum() > 0 else p
+                if smooth:
+                    p = forward(alpha, (s.ts - last_ts) / 60.0 if last_ts is not None else 0.0, self.trans, p)
                 state[s.device] = (p, s.ts)
                 room, why = decide(p, m["tau_room"], m["delta_room"])
                 out[i] = (room if why is None else None, why)
