@@ -5,6 +5,7 @@ mod capture;
 mod config;
 mod explore;
 mod context;
+mod dynamics;
 #[cfg(test)]
 mod context_tests;
 mod http;
@@ -17,6 +18,8 @@ mod migrate;
 mod report;
 #[cfg(test)]
 mod report_tests;
+#[cfg(test)]
+mod dynamics_tests;
 mod rules;
 mod status;
 mod storage;
@@ -32,7 +35,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | report [date] | thread form <serial-port> | thread dataset <serial-port>";
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | export --view step_responses|room_delta|room_delta_daily|radiator_summary|radiator_pairs [--room <room>] [--from <date>] [--to <date>] [--out <path>] | report [date] | thread form <serial-port> | thread dataset <serial-port>";
 const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -271,12 +274,20 @@ fn flag<'a>(args: &[&'a str], name: &str) -> Option<&'a str> {
 }
 
 fn export_command(config: &Config, args: &[&str]) -> Result<()> {
-    let date = |name: &str| -> Result<chrono::NaiveDate> {
-        let text = flag(args, name).ok_or_else(|| anyhow!(USAGE))?;
-        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| anyhow!("bad {name} {text}, expected YYYY-MM-DD"))
+    let parse = |name: &str| -> Result<Option<chrono::NaiveDate>> {
+        flag(args, name).map(|text| chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| anyhow!("bad {name} {text}, expected YYYY-MM-DD"))).transpose()
     };
-    let room = flag(args, "--room").ok_or_else(|| anyhow!(USAGE))?;
-    let (path, rows) = report::export(Path::new(&config.data_dir), room, date("--from")?, date("--to")?, flag(args, "--out").map(Into::into))?;
+    let (root, out, room) = (Path::new(&config.data_dir), flag(args, "--out").map(Into::into), flag(args, "--room"));
+    let (path, rows) = match flag(args, "--view") {
+        Some(view) if view != "room_minute" => {
+            let to = parse("--to")?.unwrap_or_else(|| chrono::Utc::now().date_naive() - chrono::Duration::days(1));
+            dynamics::export_view(root, view, room, parse("--from")?.unwrap_or(to - chrono::Duration::days(dynamics::SUMMARY_DAYS - 1)), to, out)?
+        }
+        _ => {
+            let required = |name: &str| parse(name)?.ok_or_else(|| anyhow!(USAGE));
+            report::export(root, room.ok_or_else(|| anyhow!(USAGE))?, required("--from")?, required("--to")?, out)?
+        }
+    };
     println!("{rows} rows written to {}", path.display());
     Ok(())
 }

@@ -21,7 +21,7 @@ const CATCH_UP_DELAY: Duration = Duration::from_secs(120);
 const RSSI_PATTERN: &str = r#"(?i)"(?:average_?rssi|last_?rssi)"\s*:\s*(-?\d+)"#;
 const LQI_PATTERN: &str = r#"(?i)"(?:lqi|link_?quality_?in|average_?lqi)"\s*:\s*(\d+)"#;
 
-fn quote(text: &str) -> String {
+pub(crate) fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
@@ -76,7 +76,7 @@ pub fn open_lake(root: &Path, first: NaiveDate, last: NaiveDate) -> Result<LakeD
     Ok(LakeDb { conn, scratch })
 }
 
-fn midnight_us(date: NaiveDate) -> i64 {
+pub(crate) fn midnight_us(date: NaiveDate) -> i64 {
     date.and_time(NaiveTime::MIN).and_utc().timestamp_micros()
 }
 
@@ -146,11 +146,11 @@ pub fn export(root: &Path, room: &str, from: NaiveDate, to: NaiveDate, out: Opti
     Ok((path, rows as usize))
 }
 
-fn hhmm(us: i64) -> String {
+pub(crate) fn hhmm(us: i64) -> String {
     chrono::DateTime::from_timestamp_micros(us).map_or("?".into(), |t| t.format("%H:%M:%S").to_string())
 }
 
-fn dur(seconds: f64) -> String {
+pub(crate) fn dur(seconds: f64) -> String {
     match seconds {
         s if s >= 3600.0 => format!("{:.1} h", s / 3600.0),
         s if s >= 120.0 => format!("{:.0} min", s / 60.0),
@@ -158,7 +158,7 @@ fn dur(seconds: f64) -> String {
     }
 }
 
-fn opt(v: Option<f64>, digits: usize) -> String {
+pub(crate) fn opt(v: Option<f64>, digits: usize) -> String {
     v.map_or("-".into(), |v| format!("{v:.digits$}"))
 }
 
@@ -171,7 +171,7 @@ fn trend(first: Option<f64>, second: Option<f64>, digits: usize) -> String {
 
 type Rows<T> = Result<Vec<T>>;
 
-fn rows<T>(conn: &Connection, sql: &str, map: impl Fn(&duckdb::Row) -> duckdb::Result<T>) -> Rows<T> {
+pub(crate) fn rows<T>(conn: &Connection, sql: &str, map: impl Fn(&duckdb::Row) -> duckdb::Result<T>) -> Rows<T> {
     let mut stmt = conn.prepare(sql).with_context(|| sql.to_string())?;
     let out = stmt.query_map([], |r| map(r))?.collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(out)
@@ -368,6 +368,13 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         sum.roll_ok &= status != "NOT ROLLED";
         let raw = lake::raw_files(root, table, Some(date)).map_or(0, |f| f.len());
         let _ = writeln!(md, "| {} | {raw} | {} | {} | {status} |", table.name(), marker.as_ref().map_or("-".into(), |m| m["rows"].to_string()), marker.as_ref().map_or("-".into(), |m| m["partitions"].to_string()));
+    }
+    md.push('\n');
+    match crate::dynamics::report_section(root, date) {
+        Ok(section) => md.push_str(&section),
+        Err(e) => {
+            let _ = writeln!(md, "## Soll/Ist und Nachregeln\n\nNicht verfuegbar: {e:#}");
+        }
     }
     Ok((md, sum))
 }
