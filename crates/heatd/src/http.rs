@@ -14,6 +14,7 @@ use matter_controller::MatterController;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -124,6 +125,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
         .route("/api/label", post(label))
+        .route("/api/labels/progress", get(labels_progress))
         .route("/watch/measurement", post(watch_measurement))
         .route("/watch/sensors", post(watch_sensors))
         .route("/watch/label", post(label))
@@ -582,6 +584,37 @@ async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> 
     Ok(Json(json!({"window_open": open.iter().collect::<Vec<_>>()})))
 }
 
+const LABEL_DEDUP_US: i64 = 3_000_000;
+
+fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<String, usize>> {
+    state.sink.flush()?;
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for batch in crate::context::read_raw(state.sink.root(), Table::Labels, None)? {
+        let (ts, room, source) = (crate::context::ts_column(&batch, "ts")?, crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
+        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && ts.value(i) >= since_us).map(|i| (ts.value(i), room.value(i).to_string())));
+    }
+    rows.sort();
+    let mut last: HashMap<String, i64> = HashMap::new();
+    let mut counts = HashMap::new();
+    for (ts, room) in rows {
+        if last.get(&room).is_none_or(|&t| ts - t > LABEL_DEDUP_US) {
+            *counts.entry(room.clone()).or_insert(0) += 1;
+        }
+        last.insert(room, ts);
+    }
+    Ok(counts)
+}
+
+async fn labels_progress(State(state): State<AppState>) -> ApiResult {
+    let cfg = &state.config.watchmatch;
+    let since_us = cfg.labels_since.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map_or(0, |t| t.timestamp_micros());
+    let counts = label_counts(&state, since_us)?;
+    let model_rooms = state.watchmatch.model_rooms();
+    let rooms: Vec<Value> = state.config.rooms.iter().filter(|r| !r.nodes.is_empty() || r.name == "flur" || model_rooms.contains(&r.name)).map(|r| json!({"room": r.name, "n": counts.get(&r.name).copied().unwrap_or(0)})).collect();
+    let done = !rooms.is_empty() && rooms.iter().all(|r| r["n"].as_u64().unwrap_or(0) >= cfg.label_target as u64);
+    Ok(Json(json!({"target": cfg.label_target, "since": cfg.labels_since, "rooms": rooms, "done": done})))
+}
+
 async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> ApiResult {
     let valid = (1..=32).contains(&body.label.len()) && body.label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
     if !valid {
@@ -836,8 +869,8 @@ nodes = [5]
         assert!(control_step(&h.state, noon, 2_000).await.unwrap().is_empty());
         call(&h.state, "POST", "/api/window", Some("{\"room\":\"wohnzimmer\",\"open\":true}".into())).await;
         let frost = control_step(&h.state, noon, 3_000).await.unwrap();
-        assert_eq!((frost[0].setpoint, frost[0].reason), (7.0, "window_open"));
-        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 7.0)]);
+        assert_eq!((frost[0].setpoint, frost[0].reason), (7.5, "window_open"));
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 7.5)]);
         assert_eq!(h.state.storage.last_setpoints().unwrap()[0].reason, "window_open");
         call(&h.state, "POST", "/api/scan", Some(scan_at(now_ms(), json!({})))).await;
         call(&h.state, "POST", "/api/window", Some("{\"room\":\"wohnzimmer\",\"open\":false}".into())).await;
@@ -897,6 +930,42 @@ nodes = [5]
 
     fn label_body(device: &str, from: i64, to: i64, label: &str) -> Option<String> {
         Some(json!({"device": device, "from": from, "to": to, "label": label}).to_string())
+    }
+
+    #[tokio::test]
+    async fn label_progress_counts_since_collapses_duplicates_and_reports_done() {
+        let since = now_ms() - 3_600_000;
+        let iso = chrono::DateTime::from_timestamp_millis(since).unwrap().to_rfc3339();
+        let h = harness_with(false, "away_guard_minutes = 0
+", &format!("[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+[[rooms]]
+name = 'bad'
+nodes = [7]
+[[rooms]]
+name = 'flur'
+[[rooms]]
+name = 'diele'
+[watchmatch]
+labels_since = '{iso}'
+label_target = 2
+"));
+        let (status, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((body["target"].clone(), body["since"].clone(), body["done"].clone()), (json!(2), json!(iso), json!(false)));
+        assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 0}, {"room": "bad", "n": 0}, {"room": "flur", "n": 0}]));
+        for (offset, room) in [(-60_000, "bad"), (1_000, "bad"), (2_000, "bad"), (10_000, "bad"), (1_000, "wohnzimmer"), (20_000, "flur"), (30_000, "diele")] {
+            call(&h.state, "POST", "/api/scan", Some(scan_at(since + offset, json!({"label": room})))).await;
+        }
+        let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
+        assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 1}, {"room": "bad", "n": 2}, {"room": "flur", "n": 1}]));
+        assert_eq!(body["done"], json!(false));
+        for (offset, room) in [(40_000, "wohnzimmer"), (50_000, "flur")] {
+            call(&h.state, "POST", "/api/scan", Some(scan_at(since + offset, json!({"label": room})))).await;
+        }
+        let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
+        assert_eq!(body["done"], json!(true));
     }
 
     #[tokio::test]

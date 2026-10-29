@@ -211,12 +211,14 @@ pub struct WatchMatchSection {
     pub model_dir: String,
     pub model_version: String,
     pub scan_fresh_s: i64,
+    pub labels_since: Option<String>,
+    pub label_target: usize,
     pub state: WatchState,
 }
 
 impl Default for WatchMatchSection {
     fn default() -> Self {
-        Self { enabled: false, model_dir: "/models/watchroom".into(), model_version: "latest".into(), scan_fresh_s: 180, state: WatchState::default() }
+        Self { enabled: false, model_dir: "/models/watchroom".into(), model_version: "latest".into(), scan_fresh_s: 180, labels_since: None, label_target: 10, state: WatchState::default() }
     }
 }
 
@@ -396,6 +398,9 @@ impl Config {
             }
         }
         config.watchmatch.state.sleep_minutes()?;
+        if let Some(since) = &config.watchmatch.labels_since {
+            chrono::DateTime::parse_from_rfc3339(since).map_err(|e| anyhow!("watchmatch.labels_since: {e}"))?;
+        }
         if let Some(unknown) = config.sleep_room.as_ref().filter(|r| !known(r)) {
             return Err(anyhow!("sleep_room: unknown room {unknown}"));
         }
@@ -467,17 +472,23 @@ mod tests {
             assert_eq!(nodes, vec![("wohnzimmer", vec![5]), ("schlafzimmer", vec![6]), ("bad", vec![7]), ("kueche", vec![8]), ("flur", vec![])]);
             assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
             assert_eq!((config.latitude, config.longitude, config.away_setpoint), (Some(52.52), Some(13.40), 18.0));
-            assert_eq!((config.occupied_setpoint, config.sleep_room.as_deref()), (21.0, Some("schlafzimmer")));
+            assert_eq!(config.sleep_room.as_deref(), Some("schlafzimmer"));
             assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 60, 60.0));
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "wall").count(), 5);
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "ceiling").count(), 4);
             assert!(config.neighbours.iter().any(|n| n.kind == "ceiling" && n.partial) && config.neighbours.iter().any(|n| n.kind == "open"));
             assert_eq!((config.heat_source.kind.as_str(), config.heat_source.efficiency_class.as_deref(), config.heat_source.flow_temp_controllable), ("oil", Some("E"), Some(false)));
             assert!(config.rooms.iter().all(|r| !r.exploration.enabled));
-            let kitchen = config.rooms.iter().find(|r| r.name == "kueche").unwrap();
-            assert_eq!(kitchen.schedules.len(), 2);
-            assert!(kitchen.schedules.iter().all(|s| s.setpoint == 21.0));
         }
+        let docker = Config::parse(&text).unwrap();
+        assert_eq!((docker.occupied_setpoint, docker.frost_setpoint, docker.watchmatch.label_target), (20.0, 8.0, 10));
+        assert_eq!(docker.watchmatch.labels_since.as_deref(), Some("2026-10-29T20:28:00+01:00"));
+        assert!(docker.rooms.iter().all(|r| r.schedules.is_empty()));
+        let example = Config::parse(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../heatd.example.toml")).unwrap()).unwrap();
+        assert_eq!(example.occupied_setpoint, 21.0);
+        let kitchen = example.rooms.iter().find(|r| r.name == "kueche").unwrap();
+        assert_eq!(kitchen.schedules.len(), 2);
+        assert!(kitchen.schedules.iter().all(|s| s.setpoint == 21.0));
     }
 
     #[test]

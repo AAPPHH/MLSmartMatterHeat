@@ -446,6 +446,10 @@ impl WatchMatch {
         self.inner.lock().unwrap().model.as_ref().map(|m| m.spec.model_version.clone())
     }
 
+    pub fn model_rooms(&self) -> Vec<String> {
+        self.inner.lock().unwrap().model.as_ref().map(|m| m.spec.rooms.clone()).unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub fn active(&self) -> bool {
         self.cfg.enabled && self.inner.lock().unwrap().model.is_some()

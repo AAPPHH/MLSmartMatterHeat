@@ -55,6 +55,8 @@ enabled = true
 model_dir = "/models/watchroom"
 model_version = "latest"
 scan_fresh_s = 180
+labels_since = "2026-10-29T20:28:00+01:00"
+label_target = 10
 
 [watchmatch.state]
 hr_rest_max = 70
