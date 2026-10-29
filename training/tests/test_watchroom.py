@@ -1,7 +1,9 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
+import pyarrow as pa
 import onnxruntime as ort
 import pytest
 from conftest import SYNTH, TRANSIENT, make_lake
@@ -278,3 +280,81 @@ def test_train_produces_model_dir(config, tmp_path, monkeypatch, rooms):
     monkeypatch.setattr("heattrain.watchroom.load_scans", lambda *a: (scans, []))
     meta = json.loads((train(small_cfg(config), tmp_path, tmp_path / "m", version="t") / "model.json").read_text())
     assert meta["classifier"] == "xgb" and meta["feature_version"] == 2 and meta["rooms"] == rooms
+
+
+def label_lake(root, rows):
+    from conftest import LABELS, write_table
+    ts = lambda t: datetime.fromtimestamp(t, timezone.utc) if t else None
+    write_table(root, "labels", [{"ts": ts(t), "from_ts": ts(f), "to_ts": ts(e), "room": r, "source": "watch", "device": "pixel"} for t, f, e, r in rows], LABELS, "ts")
+    return root
+
+
+def test_short_interval_label_is_a_point_at_its_midpoint_and_long_ones_are_ignored(tmp_path, config):
+    from heattrain.watchroom import Lake, Scan, assign_labels
+    base = 1_790_000_000.0
+    root = label_lake(tmp_path, [(base + 500, base - 1, base + 1, "bad"), (base + 9000, base + 4000, base + 4300, "kueche")])
+    scans = [Scan(base + dt, "pixel", {}) for dt in (-20, 0, 25, 100, 4100, 4290)]
+    assign_labels(Lake(root), {**config, "label_intervals": False, "label_tolerance_s": 30.0}, scans)
+    assert [s.room for s in scans] == ["bad", "bad", "bad", None, None, None]
+    assign_labels(Lake(root), {**config, "label_intervals": True, "label_tolerance_s": 30.0}, scans)
+    assert [s.room for s in scans] == [None, "bad", None, None, "kueche", "kueche"]
+
+
+def write_stream(path, batches, chop=0):
+    schema = pa.schema([("ts", pa.timestamp("us", tz="UTC")), ("room", pa.dictionary(pa.int32(), pa.string())), ("source", pa.string())])
+    with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_stream(sink, schema) as writer:
+        for b in batches:
+            writer.write_batch(pa.record_batch([pa.array([datetime.fromtimestamp(t, timezone.utc) for t in b], pa.timestamp("us", tz="UTC")), pa.array(["bad"] * len(b)).dictionary_encode(), pa.array(["watch"] * len(b))], schema=schema))
+    if chop:
+        data = Path(path).read_bytes()
+        Path(path).write_bytes(data[:-chop])
+
+
+def test_lake_reads_unrolled_raw_streams_ignores_truncated_tail_and_rolled_days(tmp_path):
+    from heattrain.watchroom import Lake
+    base = 1_790_000_000.0
+    raw = tmp_path / "raw" / "labels"
+    raw.mkdir(parents=True)
+    write_stream(raw / "2026-10-29.arrows", [[base, base + 1]])
+    write_stream(raw / "2026-10-29.1.arrows", [[base + 2], [base + 3, base + 4]], chop=40)
+    write_stream(raw / "2026-10-28.arrows", [[base - 100000]])
+    (tmp_path / "parquet" / "labels" / "date=2026-10-28").mkdir(parents=True)
+    (tmp_path / "parquet" / "labels" / "date=2026-10-28" / ".rolled").write_text("{}")
+    lake = Lake(tmp_path)
+    got = [r[0] for r in lake.query("labels", [("epoch(ts)", None)], order="ORDER BY ts")]
+    assert got == [base, base + 1, base + 2]
+    assert {"ts", "room", "source"} <= lake.columns("labels")
+    assert lake.query("labels", [("room", None)], "TRUE")[0] == ("bad",)
+
+
+def test_lake_merges_parquet_with_unrolled_raw(tmp_path):
+    from heattrain.watchroom import Lake
+    base = 1_790_000_000.0
+    label_lake(tmp_path, [(base - 200000, None, None, "kueche")])
+    raw = tmp_path / "raw" / "labels"
+    raw.mkdir(parents=True)
+    write_stream(raw / "2026-10-29.arrows", [[base]])
+    assert Lake(tmp_path).query("labels", [("room", None)], order="ORDER BY ts") == [("kueche",), ("bad",)]
+
+
+def test_anchor_devices_are_excluded_from_scans_and_drift_is_reported(tmp_path, config):
+    from conftest import MODERN, write_table
+    from heattrain.eval import anchor_drift
+    from heattrain.watchroom import anchor_rssi
+    base = datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
+    rows = []
+    for day, shift in ((0, 0), (1, 0), (5, 0), (6, -8)):
+        for k in range(5):
+            for s, level in (("aa:00", -50), ("bb:00", -60), ("cc:00", -70)):
+                if day == 6 and s == "cc:00":
+                    continue
+                v = level + (shift if s == "aa:00" else 0)
+                rows.append({"ts": base + timedelta(days=day, minutes=k), "sender": s, "rssi": v, "batch_id": day * 10 + k, "device": "minix-anchor", "sensor_type": "rssi", "value": float(v), "freq": 2437})
+    write_table(tmp_path, "watch_raw", rows, MODERN, "ts")
+    cfg = {**config, "anchor_devices": ["minix-anchor"]}
+    scans, _ = load_scans(tmp_path, cfg)
+    assert scans == []
+    drift = anchor_drift(anchor_rssi(tmp_path, cfg), ("2026-10-20", "2026-10-21"), 6.0)
+    assert drift["baseline"] == {"aa:00": -50.0, "bb:00": -60.0, "cc:00": -70.0} and sorted(drift["days"]) == ["2026-10-25", "2026-10-26"]
+    assert [(f["day"], f["sender"], f["kind"]) for f in drift["flags"]] == [("2026-10-26", "aa:00", "shift"), ("2026-10-26", "cc:00", "missing")]
+    assert drift["flags"][0]["delta"] == -8.0

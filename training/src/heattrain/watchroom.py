@@ -9,6 +9,8 @@ import duckdb
 import numpy as np
 import onnx
 import onnxruntime as ort
+import pyarrow as pa
+import pyarrow.ipc as ipc
 from onnxmltools.convert.xgboost.operator_converters.XGBoost import convert_xgboost
 from skl2onnx import convert_sklearn, update_registered_converter
 from skl2onnx.common.data_types import FloatTensorType
@@ -19,7 +21,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
-from heattrain.eval import NO_TEMPLATE, Matcher, band_of, evaluate, features, forward, report_md, score
+from heattrain.eval import NO_TEMPLATE, Matcher, anchor_drift, band_of, evaluate, features, forward, report_md, score
 
 update_registered_converter(XGBClassifier, "XGBoostXGBClassifier", calculate_linear_classifier_output_shapes, convert_xgboost, options={"nocl": [True, False], "zipmap": [True, False, "columns"]})
 
@@ -35,18 +37,57 @@ class Scan:
     hist: list = field(default_factory=list)
 
 
+def read_stream(path):
+    batches = []
+    try:
+        with open(path, "rb") as fh:
+            reader = ipc.open_stream(fh)
+            while True:
+                try:
+                    batch = reader.read_next_batch()
+                except StopIteration:
+                    break
+                batches.append(pa.record_batch([c.dictionary_decode() if pa.types.is_dictionary(c.type) else c for c in batch.columns], names=batch.schema.names))
+    except (pa.ArrowException, OSError, ValueError):
+        pass
+    return batches
+
+
 class Lake:
     def __init__(self, data_root):
-        self.root = Path(data_root) / "parquet"
+        self.base = Path(data_root)
+        self.root = self.base / "parquet"
         self.con = duckdb.connect()
+        self.sources = {}
 
-    def columns(self, table):
-        if not any((self.root / table).glob("date=*/part.parquet")):
-            return set()
-        return {r[0] for r in self.con.execute(f"DESCRIBE SELECT * FROM {self.src(table)}").fetchall()}
+    def unrolled(self, table):
+        days = {}
+        for f in sorted((self.base / "raw" / table).glob("*.arrows")):
+            day = f.name.split(".")[0]
+            if not (self.root / table / f"date={day}" / ".rolled").exists():
+                days.setdefault(day, []).append(f)
+        return days
+
+    def raw_table(self, table):
+        tables = [pa.Table.from_batches(b) for fs in self.unrolled(table).values() for f in fs if (b := read_stream(f))]
+        return pa.concat_tables(tables, promote_options="default") if tables else None
 
     def src(self, table):
-        return f"read_parquet('{(self.root / table).as_posix()}/*/part.parquet', hive_partitioning=true, union_by_name=true)"
+        if table not in self.sources:
+            parts, days = [], sorted(self.unrolled(table))
+            if any((self.root / table).glob("date=*/part.parquet")):
+                skip = f" WHERE CAST(date AS VARCHAR) NOT IN ({', '.join(repr(d) for d in days)})" if days else ""
+                parts.append(f"SELECT * FROM read_parquet('{(self.root / table).as_posix()}/*/part.parquet', hive_partitioning=true, union_by_name=true){skip}")
+            raw = self.raw_table(table)
+            if raw is not None:
+                self.con.register(f"raw_{table}", raw)
+                parts.append(f"SELECT * FROM raw_{table}")
+            self.sources[table] = f"({' UNION ALL BY NAME '.join(parts)})" if parts else None
+        return self.sources[table]
+
+    def columns(self, table):
+        src = self.src(table)
+        return {r[0] for r in self.con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()} if src else set()
 
     def query(self, table, select, where="TRUE", order="", need=()):
         cols = self.columns(table)
@@ -108,6 +149,8 @@ def assign_labels(lake, cfg, scans):
     if not scans:
         return
     rows = lake.query("labels", [("epoch(ts)", None), ("epoch(from_ts)", "from_ts"), ("epoch(to_ts)", "to_ts"), ("room", None), ("device", "device")], f"source IN ({','.join(repr(s) for s in cfg['sources'])})", "ORDER BY ts")
+    tol = cfg["label_tolerance_s"]
+    rows = [(ts, f, to, name, d) if f is None or to is None or cfg.get("label_intervals", True) or to - f > 2 * tol else ((f + to) / 2, None, None, name, d) for ts, f, to, name, d in rows]
     t = np.array([s.ts for s in scans])
     dev = np.array([s.device for s in scans])
     room = np.full(len(scans), None, dtype=object)
@@ -134,8 +177,9 @@ def load_scans(data_root, cfg):
     rows = lake.query("watch_raw", [("epoch(ts)", None), ("device", None), ("batch_id", None), ("sender", None), (value, None), ("freq", "freq")],
                       "sensor_type IS NULL OR sensor_type = 'rssi'" if "sensor_type" in cols else "TRUE", "ORDER BY ts")
     grouped = {}
+    anchors = set(cfg.get("anchor_devices", []))
     for t, dev, batch, sender, rssi, freq in rows:
-        if rssi is None:
+        if rssi is None or str(dev) in anchors:
             continue
         s = grouped.setdefault((str(dev), batch, round(t)), Scan(float(t), str(dev), {}))
         s.aps[sender] = max(rssi, s.aps.get(sender, rssi))
@@ -148,6 +192,18 @@ def load_scans(data_root, cfg):
     for s in scans:
         s.state = classify_state(cfg["state"], tz, s.ts, s.device, sig)
     return scans, load_links(lake)
+
+
+def anchor_rssi(data_root, cfg):
+    lake = Lake(data_root)
+    anchors = cfg.get("anchor_devices", [])
+    cols = lake.columns("watch_raw")
+    if not anchors or not {"sender", "device"} <= cols:
+        return []
+    value = "coalesce(" + ", ".join(f"CAST({c} AS DOUBLE)" for c in ("rssi", "value") if c in cols) + ")"
+    where = f"device IN ({','.join(repr(a) for a in anchors)}) AND sender IS NOT NULL" + (" AND (sensor_type IS NULL OR sensor_type = 'rssi')" if "sensor_type" in cols else "")
+    rows = lake.query("watch_raw", [("epoch(ts)", None), ("sender", None), (value, None)], where, "ORDER BY ts")
+    return [(datetime.fromtimestamp(t, timezone.utc).date().isoformat(), str(sender), float(v)) for t, sender, v in rows if v is not None]
 
 
 def attach_history(scans, cfg):
@@ -419,6 +475,9 @@ def eval_model(cfg, data_root, model_dir):
             m["v1"] = holdout({**cfg, "feature_version": 1}, old, use, links)
         except ValueError:
             pass
+    drift = anchor_drift(anchor_rssi(data_root, cfg), (meta["train_window"]["from"], end), cfg.get("anchor_drift_db", 6.0))
+    if drift["baseline"]:
+        m["anchor_drift"] = drift
     meta["metrics"]["eval"] = m
     (Path(model_dir) / "model.json").write_text(json.dumps(meta, indent=2))
     write_report(cfg, meta["model_version"], m, note)

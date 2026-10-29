@@ -162,6 +162,24 @@ def evaluate(matcher, scans, smooth=True):
     return res
 
 
+def anchor_drift(rows, window, threshold):
+    base, days = {}, {}
+    for day, sender, rssi in rows:
+        target = base if window[0] <= day <= window[1] else days.setdefault(day, {}) if day > window[1] else None
+        if target is not None:
+            target.setdefault(sender, []).append(rssi)
+    med = lambda d: {s: float(np.median(v)) for s, v in d.items()}
+    base, days = med(base), {d: med(v) for d, v in sorted(days.items())}
+    flags = []
+    for day, seen in days.items():
+        for sender, ref in sorted(base.items()):
+            if sender not in seen:
+                flags.append({"day": day, "sender": sender, "kind": "missing", "baseline": ref})
+            elif abs(seen[sender] - ref) > threshold:
+                flags.append({"day": day, "sender": sender, "kind": "shift", "baseline": ref, "median": seen[sender], "delta": seen[sender] - ref})
+    return {"baseline": base, "days": days, "flags": flags, "threshold_db": threshold}
+
+
 def report_md(version, metrics, extra):
     lines = [f"# watchroom {version}", "", f"Auswertung: {extra}", ""]
     for name in ("smoothed", "raw"):
@@ -177,6 +195,11 @@ def report_md(version, metrics, extra):
         for name in ("smoothed", "raw"):
             for ver, m in (("v1", metrics["v1"][name]), ("v2", metrics[name])):
                 lines.append(f"| {name} | {ver} | {m['n']} | {m['coverage']:.3f} | {m['accuracy']:.3f} | {m['macro_f1']:.3f} | {m['abstain_reasons']} |")
+        lines.append("")
+    if "anchor_drift" in metrics:
+        d = metrics["anchor_drift"]
+        lines += ["## Anchor-Drift", "", f"{len(d['baseline'])} Sender im Trainingsfenster, Schwelle {d['threshold_db']} dB, {len(d['days'])} Tage danach", ""]
+        lines += [f"- {f['day']} {f['sender']}: {f['kind']}" + (f" {f['delta']:+.1f} dB" if f["kind"] == "shift" else "") for f in d["flags"]] or ["keine Auffaelligkeiten"]
         lines.append("")
     b = metrics["smoothed"]["baselines"]
     lines += ["## Baseline", "", f"kein Matcher: coverage 0, macro_f1 0 (Anwesenheit nur aus Labels). Mehrheitsraum `{b['majority_room']['room']}`: accuracy {b['majority_room']['accuracy']:.3f}", ""]
