@@ -229,7 +229,7 @@ pub fn presence_event(device: &str, transition: Transition) -> lake::Event {
     event
 }
 
-fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<Presence>> {
+pub(crate) fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<Presence>> {
     let minutes = |ms: i64| (now_ms - ms) as f64 / 60_000.0;
     let prediction = state.storage.last_predictions()?.into_iter().max_by_key(|p| p.ts);
     let statuses = state.storage.device_statuses()?;
@@ -237,13 +237,18 @@ fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<Presence>> {
         Some(p) => statuses.into_iter().find(|s| s.device == p.device),
         None => statuses.into_iter().max_by_key(|s| s.state_ts),
     };
-    if prediction.is_none() && status.is_none() {
+    let matched = state.watchmatch.effective(now_ms);
+    if prediction.is_none() && status.is_none() && !matched.as_ref().is_some_and(Option::is_some) {
         return Ok(None);
     }
     let away = status.as_ref().is_some_and(|s| s.away && state.tracker.lock().unwrap().confirmed(&s.device));
+    let (room, prediction_age_minutes) = match matched {
+        Some(held) => (held.as_ref().map(|h| h.0.clone()), held.as_ref().map(|h| minutes(h.1))),
+        None => (prediction.as_ref().map(|p| p.room.clone()), prediction.as_ref().map(|p| minutes(p.ts))),
+    };
     Ok(Some(Presence {
-        prediction_age_minutes: prediction.as_ref().map(|p| minutes(p.ts)),
-        room: prediction.map(|p| p.room),
+        prediction_age_minutes,
+        room,
         motion: status.as_ref().and_then(|s| s.motion),
         power: status.as_ref().and_then(|s| s.power),
         away,

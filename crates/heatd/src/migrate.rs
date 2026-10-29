@@ -128,6 +128,7 @@ fn scans(conn: &Connection, cutoff: i64) -> Result<Dataset> {
                 device: device_or_unknown(device),
                 freq: freq.and_then(|f| u16::try_from(f).ok()),
                 received_ts: received,
+                ..Default::default()
             };
             (ts, Staged::Raw(row))
         })

@@ -23,9 +23,9 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 
 ## Schema metadata and versioning
 
-Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `1`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
+Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `2`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
 
-Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version`. The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
+Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
 
 ## Hot path (raw Arrow IPC streams)
 
@@ -137,6 +137,7 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 | roll_ok | a table/day was rolled to Parquet | heatd | no | date, table, rows, partitions |
 | roll_failed | a table/day failed to roll | heatd | no | date, table, error |
 | poll_failed | 60 s core-attribute poll got no response (backoff applies) | heatd | yes | error, consecutive, next_poll_s |
+| matcher_drift | 7-day abstain rate of a watch matcher rose by more than 50 % against the previous 7 days (checked daily with the report) | heatd | no | matcher, current, previous, rows_current, rows_previous |
 | watch_state | watch heartbeat state (migrated legacy device_state; new code may keep emitting it) | watch / legacy | no | device, motion, power, queued, n_aps, away, id |
 
 `experiment_id` links experiment_* events to `decisions.experiment_id`. `source` values: `subscription`, `poll`, `read`, `heatd`, `watch`, `legacy`.
@@ -204,9 +205,52 @@ batch_id: u64
 device: dict<utf8>
 freq: u16?
 received_ts: timestamp[us,UTC]?
+elapsed_ns: i64?
+clock_offset_ms: i32?
+sensor_type: dict<utf8>?
+sensor_name: dict<utf8>?
+value: f32?
+unit: dict<utf8>?
 ```
 
 - `ts`: measurement time as sent by the watch, `device_ts`: raw watch clock if reported separately, `received_ts`: heatd receive time. `sender` = BSSID (lowercase), `batch_id` = grouping id of one scan/upload batch, `device` = watch id, `freq` MHz, `channel` sent or derived from freq.
+
+- Phase 1b (schema v2, long format): one row per sample for every sensor. `sensor_type` is `rssi` (Wi-Fi access point, `value` = rssi), `temp` (skin temperature, degC), `hr` (bpm), `offbody` (1 = on body, 0 = off body), `motion` (movement measure of the accelerometer, m/s2 deviation from gravity), `battery` (percent), `charging` (1 = charging, 0 = not). `elapsed_ns` = `SystemClock.elapsedRealtimeNanos` of the sample on the watch, `clock_offset_ms` = wall clock minus device clock of the batch, `sensor_name` = Android sensor name, `unit` free text. Rows written before v2 and rows of `/api/scan` without the new fields have `sensor_type` null or `rssi`; treat null as `rssi`. For `sensor_type` other than `rssi` the required legacy columns carry placeholders: `sender` = empty string, `rssi` = 0, `channel`/`freq` null; filter by `sensor_type` before using `rssi`. All rssi rows of one scan carry the same `ts`.
+
+### watch_sensors
+
+Producer: `POST /watch/sensors`, the sensor inventory of the watch (`SensorManager.getSensorList`), written at app start and whenever it changes. Partitioned by date.
+
+```schema watch_sensors
+ts: timestamp[us,UTC]
+sensor_name: dict<utf8>
+android_type: i32
+vendor: dict<utf8>?
+resolution: f32?
+max_range: f32?
+app_version: dict<utf8>?
+```
+
+### watch_inference
+
+Producer: heatd `watchmatch` module. One row per fresh Wi-Fi scan (matcher `room`) and one row `reason=no_scan` per minute gap. Strictly separate from `labels`. Partitioned by date. `matcher` is `room` (written now) or `temp` (reserved for the later temperature matcher).
+
+```schema watch_inference
+ts: timestamp[us,UTC]
+matcher: dict<utf8>
+template_id: utf8
+result_room: dict<utf8>?
+result_temp: f32?
+confidence: f32
+abstained: bool
+reason: dict<utf8>?
+distance: f32?
+state: dict<utf8>
+features_hash: utf8
+model_version: dict<utf8>
+```
+
+- `ts`: scan time. `template_id`: state key of the model file used (`all`, `sleep`, ...), `none` without model. `result_room`: set only when not abstained. `confidence`: max probability after the HMM forward step (0 when no model). `reason` (abstained rows): `low_confidence`, `low_margin`, `no_model`, `no_scan`, `unknown_state`. `distance`: reserved (null). `state`: `rest`, `sleep`, `active`, `offbody`, `charging`. `features_hash`: 16 hex characters, FNV-1a 64 over the sorted `sender,rssi` pairs of the scan (empty for `no_scan`). `model_version`: `model_version` of `model.json`, `none` without model.
 
 ### weather
 
@@ -259,7 +303,11 @@ Deviations from `docs/phase1-spec.md` section 1 (Matter capture), all caused by 
 - `/health` returns `status` (`ok`, or `degraded` while a node is `lost`/`resubscribing`), `uptime_s`, per node `subscription`, `subscription_age_s`, `last_report_age_s`, `reports`, plus `ntp_offset_s`, `weather_age_s`, `last_roll`. `/metrics` is the same data as Prometheus text (`heatd_node_subscription`, `heatd_node_last_report_age_seconds`, `heatd_node_reports_total`, `heatd_ntp_offset_seconds`, `heatd_weather_last_fetch_age_seconds`, `heatd_weather_rows_total`, `heatd_last_roll_age_seconds`, `heatd_last_roll_ok`, `heatd_uptime_seconds`).
 - Status struct (`crates/heatd/src/status.rs`, `AppState.status: Status`, cheap `Clone`): `status.node_report(node, ts_us)` on every attribute report of a node, `status.subscription(node, SubState::{Unknown,Subscribed,Resubscribing (reserved, never set),Lost}, ts_us)` on every subscription state change (the age is measured from the last change), `status.register_nodes(iter)` at start (done in `serve`). Others are written by the context jobs (`ntp_offset`, `weather_fetched`, `rolled`).
 - Analysis view `analysis/views/room_minute.sql` (header documents all columns and the gap mask) is a DuckDB view `room_minute` on the gap-free UTC 1-minute grid per room. It reads the lake tables as views of the same names, so for ad-hoc work create those views over `read_parquet` and set `from_us` / `to_us` (see the file header). `heatd export --room <r> --from <date> --to <date> [--out path]` (`--to` inclusive) rolls pending past days, builds everything and writes `SELECT * FROM room_minute WHERE room = r` as Zstd Parquet (default `<data_dir>/exports/<room>_<from>_<to>.parquet`). The SQL file is compiled into the binary, so the Docker build copies `analysis/`. DuckDB is built with the `parquet` and `json` extensions (the bundled build has no network access to install them).
+- Watch matcher (`crates/heatd/src/watchmatch.rs`, config `[watchmatch]` and `[watchmatch.state]`, contract in `contract/README.md`): disabled unless `enabled = true`. Model directory `model_dir/<model_version>/` with `model.json` and one ONNX file per activity state (`states`, fallback key `all`; `offbody`/`charging` only with an explicit key, else `unknown_state`); `model_version = "latest"` takes the directory with the newest `created` and is re-checked hourly (hot reload; an invalid newer directory is ignored and the old model stays). Per fresh Wi-Fi scan (`/watch/measurement` long or phase-1 format, or `/api/scan`; `ts` not older than `scan_fresh_s`, strictly newer than the previous scan of the device) heatd computes the room probabilities, applies one HMM forward step (`steps = clamp(round(minutes since the last scan), 1, 60)` applications of the transition matrix built from `smoothing`; after more than 60 minutes the prior is uniform; the classifier output is used as emission), decides with `tau_room` / `delta_room` and writes one `watch_inference` row (`matcher=room`). A minute tick writes one `no_scan` row when a device has been silent for 2 minutes. The rules take the matcher room only if it is not abstained, else the last confident room for `t_hold_min` minutes, else no room (`Presence.room = None`, no boost, away logic untouched). Without a loadable model every scan is `no_model` and the presence logic runs on the legacy prediction, labels and Wi-Fi away state. Activity state per scan: same rules as the `watch_minute` view with the thresholds of `[watchmatch.state]`.
+- Watch drift alarm: the daily report job compares, per matcher, the abstain rate of the last 7 completed UTC days with the 7 days before (rows with reason `no_scan` excluded) and appends a `matcher_drift` event if it rose by more than 50 % (relative), by at least 5 percentage points, with at least 20 rows in each window.
+- `/health` additionally returns `watch`: `model_version`, `abstain` (per matcher and state: `total`, `abstained`, `rate` since start), `samples` (per `sensor_type` since start) and `battery_pct_per_h` (watch drain over the last 24 h while not charging, null with less than 30 minutes of data). `/metrics` adds `heatd_watch_model_loaded`, `heatd_watch_inference_total`, `heatd_watch_abstained_total`, `heatd_watch_abstain_ratio` (labels `matcher`, `state`), `heatd_watch_samples_total{sensor_type}` and `heatd_watch_battery_percent_per_hour`. The daily report has a `Watch` section (abstain rate per matcher and state, abstain reasons, sensor sample counts, battery drain; labels per room are in the labels section).
+- Analysis views `analysis/views/watch_minute.sql` and `analysis/views/watch_room_calib.sql` (headers document columns and variables): `watch_minute` is the gap-free UTC 1-minute grid of all watch signals with the derived features and the activity state (thresholds, sleep window and local offset are DuckDB variables, set by `report::open_watch_views`); `watch_room_calib` adds the Wi-Fi fingerprint of the minute (last scan) and the room label (labels with source `watch`/`manual`, window labels included).
 
 ## Public API
 
-`crates/heatd/src/lake.rs`: `Table`, row structs (`AttributeReport`, `Event`, `Decision` with `DecisionInputs`, `Label`, `WatchRaw`, `Weather`, `Meta`), trait `Row`, `LakeConfig`, `Sink` (`open`, `append`, `append_many`, `append_on`, `tick`, `flush`, `close`, `roll_day`, `roll_pending`), `kind::*`, `spawn_background`. `AppState.sink` carries the shared `Sink`.
+`crates/heatd/src/lake.rs`: `Table`, row structs (`AttributeReport`, `Event`, `Decision` with `DecisionInputs`, `Label`, `WatchRaw`, `WatchSensor`, `WatchInference`, `Weather`, `Meta`), trait `Row`, `LakeConfig`, `Sink` (`open`, `append`, `append_many`, `append_on`, `tick`, `flush`, `close`, `roll_day`, `roll_pending`), `kind::*`, `spawn_background`. `AppState.sink` carries the shared `Sink`.

@@ -20,6 +20,9 @@ mod report_tests;
 mod rules;
 mod status;
 mod storage;
+mod watchmatch;
+#[cfg(test)]
+mod watchmatch_tests;
 
 use anyhow::{anyhow, bail, Context, Result};
 use config::{Config, ControllerKind};
@@ -189,7 +192,10 @@ async fn serve(config: Config) -> Result<()> {
     status.register_nodes(config.all_nodes());
     let config = Arc::new(config);
     context::spawn_background(sink.clone(), status.clone(), config.clone(), context::Io::live(&config));
+    let watchmatch = watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone());
+    watchmatch.spawn_background();
     let state = http::AppState {
+        watchmatch,
         sink: sink.clone(),
         latest: Default::default(),
         status,

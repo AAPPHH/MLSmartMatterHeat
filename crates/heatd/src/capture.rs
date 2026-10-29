@@ -437,16 +437,19 @@ mod tests {
         let toml = format!("poll_silence_s = 0
 inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_str().unwrap().replace('\\', "/"));
         let config = Config::parse(&toml).unwrap();
+        let sink = lake::Sink::open(lake::LakeConfig::new(dir.join("lake"))).unwrap();
+        let status = crate::status::Status::new(lake::now_us());
         AppState {
+            watchmatch: crate::watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone()),
             storage: Arc::new(Storage::open(dir.join("state.duckdb").to_str().unwrap()).unwrap()),
-            sink: lake::Sink::open(lake::LakeConfig::new(dir.join("lake"))).unwrap(),
+            sink,
             latest: Latest::default(),
             config: Arc::new(config),
             model: None,
             controller: mock,
             windows: Default::default(),
             commanded: Default::default(),
-            status: crate::status::Status::new(lake::now_us()),
+            status,
             explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
             tracker: Default::default(),
             batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),

@@ -77,6 +77,25 @@ fn schema_meta() {
     check_schema(Table::Meta, Meta::to_batch(&[row]).unwrap());
 }
 
+#[test]
+fn schema_watch_sensors_and_inference() {
+    let sensor = WatchSensor { ts: 1, sensor_name: "skin".into(), android_type: 65555, ..Default::default() };
+    check_schema(Table::WatchSensors, WatchSensor::to_batch(&[sensor]).unwrap());
+    let inference = WatchInference { ts: 1, matcher: "room".into(), template_id: "all".into(), state: "rest".into(), features_hash: "00".into(), model_version: "v1".into(), ..Default::default() };
+    check_schema(Table::WatchInference, WatchInference::to_batch(&[inference]).unwrap());
+}
+
+#[test]
+fn watch_tables_roll_by_date_only() {
+    let env = Env::new("2026-10-29");
+    let sink = env.sink(10, 3600);
+    sink.append_on(d("2026-10-20"), WatchSensor { ts: 1, sensor_name: "hr".into(), android_type: 21, ..Default::default() }).unwrap();
+    sink.append_on(d("2026-10-20"), WatchInference { ts: 1, matcher: "room".into(), template_id: "all".into(), state: "rest".into(), features_hash: "00".into(), model_version: "v1".into(), ..Default::default() }).unwrap();
+    sink.roll_pending().unwrap();
+    assert_eq!(parquet_rows(&env.parquet(Table::WatchSensors, "2026-10-20").join("part.parquet")), 1);
+    assert_eq!(parquet_rows(&env.parquet(Table::WatchInference, "2026-10-20").join("part.parquet")), 1);
+}
+
 struct Env {
     dir: tempfile::TempDir,
     clock: Arc<AtomicI64>,
@@ -224,7 +243,7 @@ fn rolls_with_verification_marker_and_idempotence() {
     assert_eq!(parquet_rows(&env.parquet(Table::Labels, "2026-10-29").join("part.parquet")), 10);
     assert_eq!(parquet_rows(&env.parquet(Table::Events, "2026-10-29").join("node=none/part.parquet")), 1);
     let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(dir.join("node=5/part.parquet")).unwrap()).unwrap();
-    assert_eq!(reader.schema().metadata()["schema_version"], "1");
+    assert_eq!(reader.schema().metadata()["schema_version"], SCHEMA_VERSION.to_string());
     let batches: Vec<_> = reader.build().unwrap().map(|b| b.unwrap()).collect();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
     let raw_after: Vec<_> = env.raw(Table::AttributeReports).iter().map(|p| std::fs::read(p).unwrap()).collect();

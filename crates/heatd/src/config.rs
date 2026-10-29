@@ -183,6 +183,45 @@ impl Default for HeatSource {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct WatchState {
+    pub hr_rest_max: f64,
+    pub hr_active_min: f64,
+    pub motion_active_min: f64,
+    pub sleep_hours: String,
+}
+
+impl Default for WatchState {
+    fn default() -> Self {
+        Self { hr_rest_max: 75.0, hr_active_min: 100.0, motion_active_min: 0.5, sleep_hours: "23-7".into() }
+    }
+}
+
+impl WatchState {
+    pub fn sleep_minutes(&self) -> Result<(u32, u32)> {
+        let (from, to) = self.sleep_hours.split_once('-').ok_or_else(|| anyhow!("bad sleep_hours {}", self.sleep_hours))?;
+        let minutes = |t: &str| if t.contains(':') { parse_minutes(t) } else { parse_minutes(&format!("{}:00", t.trim())) };
+        Ok((minutes(from)?, minutes(to)?))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WatchMatchSection {
+    pub enabled: bool,
+    pub model_dir: String,
+    pub model_version: String,
+    pub scan_fresh_s: i64,
+    pub state: WatchState,
+}
+
+impl Default for WatchMatchSection {
+    fn default() -> Self {
+        Self { enabled: false, model_dir: "/models/watchroom".into(), model_version: "latest".into(), scan_fresh_s: 180, state: WatchState::default() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -212,6 +251,7 @@ pub struct Config {
     pub building: Building,
     pub manual_hold_minutes: f64,
     pub poll_silence_s: u64,
+    pub watchmatch: WatchMatchSection,
 }
 
 impl Default for Config {
@@ -245,6 +285,7 @@ impl Default for Config {
             building: Building::default(),
             manual_hold_minutes: 120.0,
             poll_silence_s: 300,
+            watchmatch: WatchMatchSection::default(),
         }
     }
 }
@@ -278,6 +319,7 @@ impl Config {
                 return Err(anyhow!("neighbours: unknown kind {} (expected {})", link.kind, NEIGHBOUR_KINDS.join(", ")));
             }
         }
+        config.watchmatch.state.sleep_minutes()?;
         if let Some(unknown) = config.building.roof_rooms.iter().find(|r| !known(r)) {
             return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
@@ -373,6 +415,15 @@ name = 'a'").is_err());
         let config = Config::parse("").unwrap();
         assert_eq!(config.db_path, "data/heatd.duckdb");
         assert_eq!(config.controller, ControllerKind::ChipTool);
+        assert_eq!((config.watchmatch.enabled, config.watchmatch.model_dir.as_str(), config.watchmatch.model_version.as_str(), config.watchmatch.state.sleep_minutes().unwrap()), (false, "/models/watchroom", "latest", (1380, 420)));
+        let tuned = Config::parse("[watchmatch]
+enabled = true
+[watchmatch.state]
+hr_rest_max = 70
+sleep_hours = '22-6'").unwrap();
+        assert_eq!((tuned.watchmatch.enabled, tuned.watchmatch.state.hr_rest_max, tuned.watchmatch.state.hr_active_min, tuned.watchmatch.state.sleep_minutes().unwrap()), (true, 70.0, 100.0, (1320, 360)));
+        assert!(Config::parse("[watchmatch.state]
+sleep_hours = 'never'").is_err());
         let chip = config.chip_tool.to_controller_config();
         assert_eq!((chip.storage_dir, chip.bypass_attestation, chip.commission_timeout_s), (None, false, 180));
         assert_eq!(chip.paa_trust_store.as_deref(), Some("/home/aapphh/snap/chip-tool/common/paa-root-certs"));

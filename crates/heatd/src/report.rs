@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const ROOM_MINUTE_SQL: &str = include_str!("../../../analysis/views/room_minute.sql");
+pub const WATCH_MINUTE_SQL: &str = include_str!("../../../analysis/views/watch_minute.sql");
+pub const WATCH_ROOM_CALIB_SQL: &str = include_str!("../../../analysis/views/watch_room_calib.sql");
 const REPORT_HOUR: u32 = 3;
 const REPORT_MINUTE: u32 = 10;
 const DAY_US: i64 = 86_400_000_000;
@@ -59,7 +61,8 @@ pub fn open_lake(root: &Path, first: NaiveDate, last: NaiveDate) -> Result<LakeD
     for table in Table::ALL {
         let mut files = parquet_files(root, table, first, last);
         if files.is_empty() {
-            let empty = std::env::temp_dir().join(format!("heatd_empty_{}_{}.parquet", std::process::id(), table.name()));
+            static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let empty = std::env::temp_dir().join(format!("heatd_empty_{}_{}_{}.parquet", std::process::id(), SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed), table.name()));
             lake::write_parquet(&empty, &table.schema(), &[])?;
             scratch.push(empty.clone());
             files.push(empty);
@@ -88,6 +91,19 @@ pub fn open_room_minute(root: &Path, from: NaiveDate, to: NaiveDate) -> Result<L
     let db = open_lake(root, from - chrono::Duration::days(2), to + chrono::Duration::days(1))?;
     set_window(&db.conn, from, to + chrono::Duration::days(1))?;
     db.conn.execute_batch(ROOM_MINUTE_SQL).context("room_minute view")?;
+    Ok(db)
+}
+
+pub fn open_watch_views(root: &Path, from: NaiveDate, to: NaiveDate, state: &crate::config::WatchState, local_offset_min: i32) -> Result<LakeDb> {
+    let db = open_lake(root, from - chrono::Duration::days(2), to + chrono::Duration::days(1))?;
+    set_window(&db.conn, from, to + chrono::Duration::days(1))?;
+    let (sleep_from, sleep_to) = state.sleep_minutes()?;
+    db.conn.execute_batch(&format!(
+        "SET VARIABLE hr_rest_max = {}; SET VARIABLE hr_active_min = {}; SET VARIABLE motion_active_min = {}; SET VARIABLE sleep_from_min = {sleep_from}; SET VARIABLE sleep_to_min = {sleep_to}; SET VARIABLE local_offset_min = {local_offset_min};",
+        state.hr_rest_max, state.hr_active_min, state.motion_active_min
+    ))?;
+    db.conn.execute_batch(WATCH_MINUTE_SQL).context("watch_minute view")?;
+    db.conn.execute_batch(WATCH_ROOM_CALIB_SQL).context("watch_room_calib view")?;
     Ok(db)
 }
 
@@ -169,6 +185,9 @@ pub struct DaySummary {
     pub weather_configured: bool,
     pub experiments: u64,
     pub roll_ok: bool,
+    pub watch_inferences: u64,
+    pub watch_abstained: u64,
+    pub watch_battery_per_h: Option<f64>,
 }
 
 pub fn roll_markers(root: &Path, date: NaiveDate) -> Vec<(Table, Option<Value>, bool)> {
@@ -254,7 +273,7 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
         md.push('\n');
     }
-    let watch = rows(c, &format!("SELECT count(*), avg(rssi) FILTER (WHERE epoch_us(ts) < {mid}), avg(rssi) FILTER (WHERE epoch_us(ts) >= {mid}) FROM watch_raw WHERE {day}"), |r| {
+    let watch = rows(c, &format!("SELECT count(*), avg(rssi) FILTER (WHERE epoch_us(ts) < {mid}), avg(rssi) FILTER (WHERE epoch_us(ts) >= {mid}) FROM watch_raw WHERE coalesce(sensor_type, 'rssi') = 'rssi' AND {day}"), |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, Option<f64>>(2)?))
     })?;
     if let Some((n, a, b)) = watch.into_iter().next() {
@@ -273,6 +292,40 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
         md.push('\n');
     }
+
+    md.push_str("## Watch\n\n");
+    let inference = rows(
+        c,
+        &format!("SELECT matcher, state, count(*), count(*) FILTER (WHERE abstained) FROM watch_inference WHERE reason IS DISTINCT FROM 'no_scan' AND {day} GROUP BY matcher, state ORDER BY matcher, state"),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)),
+    )?;
+    if inference.is_empty() {
+        md.push_str("Matcher: no inferences.\n\n");
+    } else {
+        md.push_str("| matcher | state | inferences | abstained | abstain rate |\n|---|---|---|---|---|\n");
+        for (matcher, state, n, abstained) in &inference {
+            sum.watch_inferences += *n as u64;
+            sum.watch_abstained += *abstained as u64;
+            let _ = writeln!(md, "| {matcher} | {state} | {n} | {abstained} | {:.1} % |", 100.0 * *abstained as f64 / (*n).max(1) as f64);
+        }
+        let reasons = rows(c, &format!("SELECT reason, count(*) FROM watch_inference WHERE abstained AND {day} GROUP BY reason ORDER BY reason"), |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)))?;
+        let _ = writeln!(md, "\nAbstain reasons: {}.\n", reasons.iter().map(|(k, n)| format!("{} {n}", k.as_deref().unwrap_or("-"))).collect::<Vec<_>>().join(", "));
+    }
+    let samples = rows(c, &format!("SELECT coalesce(sensor_type, 'rssi'), count(*) FROM watch_raw WHERE {day} GROUP BY 1 ORDER BY 1"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let _ = writeln!(md, "Sensor samples: {}.\n", if samples.is_empty() { "none".into() } else { samples.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ") });
+    let battery = rows(
+        c,
+        &format!(
+            "WITH b AS (SELECT epoch_us(ts) AS us, value FROM watch_raw WHERE sensor_type = 'battery' AND value IS NOT NULL AND {day}),
+                  g AS (SELECT epoch_us(ts) AS us, value >= 0.5 AS chg FROM watch_raw WHERE sensor_type = 'charging' AND value IS NOT NULL AND {day}),
+                  j AS (SELECT b.us, b.value, coalesce(g.chg, false) AS chg FROM b ASOF LEFT JOIN g ON b.us >= g.us),
+                  p AS (SELECT us - lag(us) OVER (ORDER BY us) AS dt, lag(value) OVER (ORDER BY us) - value AS drop, chg OR coalesce(lag(chg) OVER (ORDER BY us), false) AS charging FROM j)
+             SELECT sum(greatest(drop, 0)) FILTER (WHERE NOT charging AND dt <= 1800000000), sum(dt) FILTER (WHERE NOT charging AND dt <= 1800000000) / 3.6e9, count(*) FROM p"
+        ),
+        |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<f64>>(1)?)),
+    )?;
+    sum.watch_battery_per_h = battery.first().and_then(|(drop, hours)| drop.zip(*hours)).filter(|(_, h)| *h >= 0.5).map(|(d, h)| d / h);
+    let _ = writeln!(md, "Watch battery drain while not charging: {} %/h.\n", sum.watch_battery_per_h.map_or("-".into(), |v| format!("{v:.2}")));
 
     md.push_str("## Weather\n\n");
     let hours: Vec<u32> = rows(c, &format!("SELECT DISTINCT ((epoch_us(ts) - {lo}) // 3600000000)::INTEGER FROM weather WHERE kind = 'obs' AND {day} ORDER BY 1"), |r| r.get::<_, i32>(0))?.into_iter().map(|h| h as u32).collect();
@@ -370,6 +423,9 @@ fn daily_job(sink: &Sink, status: &Status, only_missing: bool) {
     match generate(root, date) {
         Ok((_, s)) => status.rolled(lake::now_us(), s.roll_ok),
         Err(e) => eprintln!("daily report {date} failed: {e:#}"),
+    }
+    if let Err(e) = crate::watchmatch::drift_alarm(sink) {
+        eprintln!("matcher drift check failed: {e:#}");
     }
 }
 
