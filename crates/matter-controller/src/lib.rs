@@ -1,3 +1,4 @@
+mod capture;
 mod chip_tool;
 mod inventory;
 mod mock;
@@ -6,6 +7,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::Receiver;
 
+pub use capture::{CaptureItem, CaptureParser, RawAttribute, RawEvent, TypedValue, SOURCE_POLL, SOURCE_SUBSCRIPTION};
 pub use chip_tool::{strip_ansi, ChipToolConfig, ChipToolController, ReportParser, StorageLock};
 pub use inventory::{
     attribute_name, attribute_writable, cluster_name, command_name, event_name, hex_id, is_vendor_id, parse_attributes, parse_events, parse_number, parse_scalar,
@@ -38,6 +40,14 @@ pub const BAT_PERCENT_REMAINING: AttributeSpec = AttributeSpec { id: 0x000C, pas
 pub const BAT_CHARGE_LEVEL: AttributeSpec = AttributeSpec { id: 0x000E, pascal: "BatChargeLevel", snake: "bat_charge_level", kebab: "bat-charge-level", scale: 1.0 };
 pub const ROUTING_ROLE: AttributeSpec = AttributeSpec { id: 0x0001, pascal: "RoutingRole", snake: "routing_role", kebab: "routing-role", scale: 1.0 };
 pub const NEIGHBOR_TABLE_SPEC: AttributeSpec = AttributeSpec { id: 0x0007, pascal: "NeighborTable", snake: "neighbor_table", kebab: "neighbor-table", scale: 1.0 };
+
+pub const POLL_ATTRIBUTES: [(u32, u32); 5] = [
+    (THERMOSTAT_CLUSTER, LOCAL_TEMPERATURE.id),
+    (THERMOSTAT_CLUSTER, OCCUPIED_HEATING_SETPOINT.id),
+    (THERMOSTAT_CLUSTER, PI_HEATING_DEMAND.id),
+    (THERMOSTAT_CLUSTER, SYSTEM_MODE.id),
+    (POWER_SOURCE_CLUSTER, BAT_PERCENT_REMAINING.id),
+];
 
 pub struct SubscriptionGroup {
     pub cluster: &'static str,
@@ -106,5 +116,7 @@ pub trait MatterController: Send + Sync {
     async fn read_thermostat(&self, node: NodeId) -> Result<ThermostatState>;
     async fn write_heating_setpoint(&self, node: NodeId, celsius: f64) -> Result<()>;
     async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>>;
+    async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>>;
+    async fn poll(&self, node: NodeId) -> Result<usize>;
     async fn inventory(&self, node: NodeId) -> Result<Inventory>;
 }
