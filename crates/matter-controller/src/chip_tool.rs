@@ -22,6 +22,8 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 const COMMISSION_MARGIN_S: u64 = 15;
 const LOCK_FILE: &str = "heatd.lock";
 const INVENTORY_TIMEOUT_FACTOR: u64 = 3;
+const INVENTORY_MARGIN_S: u64 = 30;
+const PAUSE_WAIT: Duration = Duration::from_secs(15);
 const WILDCARD: &str = "0xFFFFFFFF";
 const WILDCARD_ENDPOINT: &str = "0xFFFF";
 const CAPTURE_QUEUE: usize = 4096;
@@ -70,7 +72,7 @@ impl Default for ChipToolConfig {
             paa_trust_store: Some("/home/aapphh/snap/chip-tool/common/paa-root-certs".into()),
             bypass_attestation: false,
             endpoint: 1,
-            subscribe_min_s: 1,
+            subscribe_min_s: 30,
             subscribe_max_s: 300,
             timeout_s: 90,
             commission_timeout_s: 180,
@@ -150,15 +152,25 @@ impl ChipToolConfig {
 
     pub fn poll_line(&self, node: NodeId) -> String {
         let hex = |f: fn(&(u32, u32)) -> u32| POLL_ATTRIBUTES.iter().map(|p| format!("0x{:04X}", f(p))).collect::<Vec<_>>().join(",");
-        format!("any read-by-id {} {} {node} {WILDCARD_ENDPOINT}", hex(|p| p.0), hex(|p| p.1))
+        let endpoints = vec![WILDCARD_ENDPOINT; POLL_ATTRIBUTES.len()].join(",");
+        format!("any read-by-id {} {} {node} {endpoints}", hex(|p| p.0), hex(|p| p.1))
+    }
+
+    pub fn inventory_limit_s(&self) -> u64 {
+        self.timeout_s * INVENTORY_TIMEOUT_FACTOR
+    }
+
+    fn inventory_args(&self, command: &str, node: NodeId) -> Vec<String> {
+        let wait = self.inventory_limit_s().saturating_sub(INVENTORY_MARGIN_S).max(INVENTORY_MARGIN_S);
+        self.args(&strings(&["any", command, WILDCARD, WILDCARD, &node.to_string(), WILDCARD_ENDPOINT, "--timeout", &wait.to_string()]))
     }
 
     pub fn inventory_attribute_args(&self, node: NodeId) -> Vec<String> {
-        self.args(&strings(&["any", "read-by-id", WILDCARD, WILDCARD, &node.to_string(), WILDCARD_ENDPOINT]))
+        self.inventory_args("read-by-id", node)
     }
 
     pub fn inventory_event_args(&self, node: NodeId) -> Vec<String> {
-        self.args(&strings(&["any", "read-event-by-id", WILDCARD, WILDCARD, &node.to_string(), WILDCARD_ENDPOINT]))
+        self.inventory_args("read-event-by-id", node)
     }
 
     pub fn lock_path(&self) -> PathBuf {
@@ -210,8 +222,8 @@ fn snake_case(pascal: &str) -> String {
 
 fn parse_value(text: &str) -> Option<f64> {
     match text.trim() {
-        "true" => Some(1.0),
-        "false" => Some(0.0),
+        t if t.eq_ignore_ascii_case("true") => Some(1.0),
+        t if t.eq_ignore_ascii_case("false") => Some(0.0),
         t => t.strip_prefix("0x").map_or_else(|| t.parse::<f64>().ok(), |h| i64::from_str_radix(h, 16).ok().map(|v| v as f64)),
     }
 }
@@ -344,6 +356,7 @@ pub fn parse_reports(output: &str, node: NodeId, default_endpoint: u16) -> Vec<A
 pub enum StreamEvent {
     Report(AttributeReport),
     Write(std::result::Result<(), String>),
+    Failure(String),
 }
 
 pub struct StreamParser {
@@ -357,7 +370,7 @@ impl StreamParser {
         Self { reports: ReportParser::new(0, default_endpoint), peer: None, in_write: false }
     }
 
-    pub fn feed(&mut self, raw: &str, sole_node: Option<NodeId>) -> Vec<StreamEvent> {
+    pub fn feed(&mut self, raw: &str, sole_node: Option<NodeId>, writing: bool) -> Vec<StreamEvent> {
         let line = clean(raw);
         if let Some(peer) = rx_peer(&line) {
             self.peer = Some(peer);
@@ -374,7 +387,10 @@ impl StreamParser {
             }
         }
         if is_failure(&line) {
-            return vec![StreamEvent::Write(Err(line.trim().to_string()))];
+            let message = line.trim().to_string();
+            let ours = self.in_write || (writing && payload(&line).unwrap_or(&line).trim().starts_with("Run command failure"));
+            self.in_write = false;
+            return vec![if ours { StreamEvent::Write(Err(message)) } else { StreamEvent::Failure(message) }];
         }
         let node = self.peer.or(sole_node);
         self.reports.node = node.unwrap_or(0);
@@ -494,6 +510,8 @@ struct Session {
     write_gate: tokio::sync::Mutex<()>,
     poll_gate: tokio::sync::Mutex<()>,
     ready: watch::Sender<bool>,
+    pause: watch::Sender<bool>,
+    exclusive_gate: tokio::sync::Mutex<()>,
 }
 
 impl Session {
@@ -526,9 +544,18 @@ impl Session {
         let mut capture = CaptureParser::new();
         let mut reader = BufReader::new(stdout);
         let mut buf = Vec::new();
+        let mut pause = self.pause.subscribe();
         let result = loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
+            let read = tokio::select! {
+                read = reader.read_until(b'\n', &mut buf) => Some(read),
+                _ = async { let _ = pause.wait_for(|p| *p).await; } => None,
+            };
+            let Some(read) = read else {
+                let _ = child.kill().await;
+                break Ok(());
+            };
+            match read {
                 Ok(0) => break Ok(()),
                 Err(e) => break Err(Error::from(e)),
                 Ok(_) => {
@@ -536,8 +563,10 @@ impl Session {
                     for item in capture.feed(&text, self.hub.sole_node()) {
                         self.hub.emit(item).await;
                     }
-                    for event in parser.feed(&text, self.hub.sole_node()) {
+                    let writing = self.hub.pending.lock().unwrap().is_some();
+                    for event in parser.feed(&text, self.hub.sole_node(), writing) {
                         match event {
+                            StreamEvent::Failure(message) => self.hub.log_once(&message),
                             StreamEvent::Report(report) => self.hub.dispatch(report).await,
                             StreamEvent::Write(result) => {
                                 if let Some(message) = self.hub.finish_write(result) {
@@ -564,15 +593,32 @@ impl Session {
         loop {
             let started = Instant::now();
             if let Err(e) = self.run_once().await {
-                eprintln!("{e}");
+                if !*self.pause.borrow() {
+                    eprintln!("{e}");
+                }
             }
             if started.elapsed() > HEALTHY_AFTER {
                 backoff = BACKOFF_START;
             }
             self.hub.emit(CaptureItem::SubscriptionLost { node: None, reason: "chip-tool interactive session ended".into(), backoff_s: Some(backoff.as_secs()) }).await;
+            let mut pause = self.pause.subscribe();
+            let _ = pause.wait_for(|p| !*p).await;
             sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }
+    }
+
+    async fn exclusive(&self, args: Vec<String>, limit_s: u64) -> Result<RunOutput> {
+        let _turn = self.exclusive_gate.lock().await;
+        self.pause.send_replace(true);
+        let mut ready = self.ready.subscribe();
+        let stopped = timeout(PAUSE_WAIT, ready.wait_for(|r| !*r)).await.is_ok();
+        let result = match stopped {
+            true => run_lenient(&self.config.binary, &args, limit_s).await,
+            false => Err(Error::Command("chip-tool interactive session did not stop for the inventory".into())),
+        };
+        self.pause.send_replace(false);
+        result
     }
 
     async fn start_node(&self, stdin: &mut ChildStdin, node: NodeId) -> Result<()> {
@@ -667,6 +713,53 @@ impl Session {
     }
 }
 
+#[derive(Debug)]
+struct RunOutput {
+    stdout: String,
+    stderr: String,
+    status: Option<std::process::ExitStatus>,
+    limit_s: u64,
+}
+
+impl RunOutput {
+    fn failure(&self) -> Option<String> {
+        match &self.status {
+            Some(status) if status.success() => None,
+            Some(status) => Some(format!("chip-tool exited with {status}")),
+            None => Some(format!("chip-tool killed after {}s timeout", self.limit_s)),
+        }
+    }
+
+    fn combined(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            self.stdout.clone()
+        } else {
+            format!("{}\n{}", self.stdout, self.stderr)
+        }
+    }
+}
+
+async fn read_all<R: tokio::io::AsyncRead + Unpin>(mut stream: R) -> Vec<u8> {
+    let mut data = Vec::new();
+    let _ = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut data).await;
+    data
+}
+
+async fn run_lenient(binary: &str, args: &[String], limit_s: u64) -> Result<RunOutput> {
+    let mut child = Command::new(binary).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
+    let stdout = tokio::spawn(read_all(child.stdout.take().ok_or_else(|| Error::Command("no stdout".into()))?));
+    let stderr = tokio::spawn(read_all(child.stderr.take().ok_or_else(|| Error::Command("no stderr".into()))?));
+    let status = match timeout(Duration::from_secs(limit_s), child.wait()).await {
+        Ok(status) => Some(status?),
+        Err(_) => {
+            let _ = child.kill().await;
+            None
+        }
+    };
+    let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
+    Ok(RunOutput { stdout: text(stdout.await.unwrap_or_default()), stderr: text(stderr.await.unwrap_or_default()), status, limit_s })
+}
+
 pub struct ChipToolController {
     config: ChipToolConfig,
     session: Option<Arc<Session>>,
@@ -685,21 +778,19 @@ impl ChipToolController {
             write_gate: Default::default(),
             poll_gate: Default::default(),
             ready: watch::channel(false).0,
+            pause: watch::channel(false).0,
+            exclusive_gate: Default::default(),
         });
         tokio::spawn(session.clone().supervise());
         Self { config, session: Some(session) }
     }
 
     async fn output(&self, args: Vec<String>, limit_s: u64) -> Result<(String, String)> {
-        let child = Command::new(&self.config.binary).args(&args).stdin(Stdio::null()).kill_on_drop(true).output();
-        let output = timeout(Duration::from_secs(limit_s), child)
-            .await
-            .map_err(|_| Error::Command(format!("timeout after {limit_s}s: {}", args.join(" "))))??;
-        let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout).into_owned(), String::from_utf8_lossy(&output.stderr).into_owned());
-        if !output.status.success() {
-            return Err(Error::Command(format!("chip-tool exited with {}: {}", output.status, output_tail(&format!("{stdout}\n{stderr}"), 10))));
+        let out = run_lenient(&self.config.binary, &args, limit_s).await?;
+        match out.failure() {
+            Some(why) => Err(Error::Command(format!("{why}: {}", output_tail(&format!("{}\n{}", out.stdout, out.stderr), 10)))),
+            None => Ok((out.stdout, out.stderr)),
         }
-        Ok((stdout, stderr))
     }
 
     async fn run(&self, args: Vec<String>, limit_s: u64) -> Result<String> {
@@ -754,18 +845,18 @@ impl MatterController for ChipToolController {
     }
 
     async fn inventory(&self, node: NodeId) -> Result<Inventory> {
-        let limit = self.config.timeout_s * INVENTORY_TIMEOUT_FACTOR;
-        let (attributes, _) = self.output(self.config.inventory_attribute_args(node), limit).await?;
-        let (raw_events, failure) = match self.output(self.config.inventory_event_args(node), limit).await {
-            Ok((stdout, _)) => (stdout, None),
-            Err(e) => (String::new(), Some(format!("event read failed: {e}"))),
+        let limit = self.config.inventory_limit_s();
+        let run = |args: Vec<String>| async move {
+            match &self.session {
+                Some(session) => session.exclusive(args, limit).await,
+                None => run_lenient(&self.config.binary, &args, limit).await,
+            }
         };
-        let mut inventory = Inventory::from_raw(node, attributes, raw_events);
-        inventory.errors.extend(failure);
-        if inventory.attributes.is_empty() {
-            let reason = inventory.errors.first().map_or("no error line", String::as_str);
-            return Err(Error::Command(format!("no attributes parsed from chip-tool output: {reason}")));
-        }
+        let attributes = run(self.config.inventory_attribute_args(node)).await?;
+        let events = run(self.config.inventory_event_args(node)).await?;
+        let mut inventory = Inventory::from_raw(node, attributes.combined(), events.combined());
+        let failures = [("attribute read", &attributes), ("event read", &events)].into_iter().filter_map(|(what, out)| out.failure().map(|why| format!("{what}: {why}")));
+        inventory.errors.extend(failures);
         Ok(inventory)
     }
 }
@@ -785,7 +876,7 @@ mod tests {
 
     fn stream(text: &str, sole: Option<NodeId>) -> Vec<StreamEvent> {
         let mut parser = StreamParser::new(1);
-        text.lines().flat_map(|l| parser.feed(l, sole)).collect()
+        text.lines().flat_map(|l| parser.feed(l, sole, false)).collect()
     }
 
     #[test]
@@ -816,16 +907,16 @@ mod tests {
     #[test]
     fn builds_wildcard_subscribe_and_poll_lines() {
         let c = config();
-        assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 1 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
+        assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
         assert_eq!(
             c.subscribe_lines(5),
             vec![
-                "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 1 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-                "any subscribe-event-by-id 0xFFFFFFFF 0xFFFFFFFF 1 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "any subscribe-event-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
             ]
         );
-        assert_eq!(c.poll_line(5), "any read-by-id 0x0201,0x0201,0x0201,0x0201,0x002F 0x0000,0x0012,0x0008,0x001C,0x000C 5 0xFFFF");
-        assert_eq!(ChipToolConfig::default().subscribe_min_s, 1);
+        assert_eq!(c.poll_line(5), "any read-by-id 0x0201,0x0201,0x0201,0x0201,0x002F 0x0000,0x0012,0x0008,0x001C,0x000C 5 0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFFFF");
+        assert_eq!(ChipToolConfig::default().subscribe_min_s, 30);
     }
 
     #[test]
@@ -833,8 +924,8 @@ mod tests {
         let c = config();
         let tail = ["--storage-directory", "/var/lib/heatd/chip", "--paa-trust-store-path", "/opt/paa"];
         let expect = |head: &[&str]| head.iter().chain(tail.iter()).map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(c.inventory_attribute_args(5), expect(&["any", "read-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF"]));
-        assert_eq!(c.inventory_event_args(5), expect(&["any", "read-event-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF"]));
+        assert_eq!(c.inventory_attribute_args(5), expect(&["any", "read-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF", "--timeout", "240"]));
+        assert_eq!(c.inventory_event_args(5), expect(&["any", "read-event-by-id", "0xFFFFFFFF", "0xFFFFFFFF", "5", "0xFFFF", "--timeout", "240"]));
     }
 
     #[test]
@@ -962,7 +1053,22 @@ mod tests {
         assert_eq!(stream(include_str!("../tests/fixtures/write_ok.txt"), Some(5)), vec![StreamEvent::Write(Ok(()))]);
         let failed = stream(include_str!("../tests/fixtures/write_fail.txt"), Some(5));
         assert!(matches!(failed.first(), Some(StreamEvent::Write(Err(m))) if m.contains("0x87")));
-        assert!(failed.iter().all(|e| matches!(e, StreamEvent::Write(Err(_)))));
+        assert!(matches!(failed.get(1), Some(StreamEvent::Failure(_))));
+    }
+
+    #[test]
+    fn unrelated_failures_do_not_fail_a_pending_write() {
+        let mut parser = StreamParser::new(1);
+        let line = "[1.0] [1:2] [TOO] Run command failure: IM Error 0x00000581: General error: 0x81 (UNSUPPORTED_CLUSTER)";
+        assert!(matches!(parser.feed(line, Some(5), false).as_slice(), [StreamEvent::Failure(_)]));
+        assert!(matches!(parser.feed("[1.0] [1:2] [TOO] Response Failure: x", Some(5), true).as_slice(), [StreamEvent::Failure(_)]));
+        assert!(matches!(parser.feed(line, Some(5), true).as_slice(), [StreamEvent::Write(Err(_))]));
+    }
+
+    #[test]
+    fn uppercase_booleans_parse() {
+        assert_eq!(parse_value("TRUE"), Some(1.0));
+        assert_eq!(parse_value("FALSE"), Some(0.0));
     }
 
     #[tokio::test]

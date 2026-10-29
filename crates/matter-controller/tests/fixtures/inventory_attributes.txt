@@ -11,7 +11,7 @@
 [0;32m[1761580800.011] [4821:4825] [TOO]      }[0m
 [0;32m[1761580800.012] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_001D Attribute 0x0000_0001 DataVersion: 11[0m
 [0;32m[1761580800.013] [4821:4825] [TOO]   ServerList: 3 entries[0m
-[0;32m[1761580800.014] [4821:4825] [TOO]     [1]: 29[0m
+[0;32m[1761580800.014] [4821:4825] [TOO]     [1]: 29 (Descriptor)[0m
 [0;32m[1761580800.015] [4821:4825] [TOO]     [2]: 40[0m
 [0;32m[1761580800.016] [4821:4825] [TOO]     [3]: 53[0m
 [0;32m[1761580800.017] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0028 Attribute 0x0000_0001 DataVersion: 12[0m
@@ -40,7 +40,7 @@
 [0;32m[1761580800.040] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000E DataVersion: 21[0m
 [0;32m[1761580800.041] [4821:4825] [TOO]   BatChargeLevel: 0[0m
 [0;32m[1761580800.042] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_0011 DataVersion: 21[0m
-[0;32m[1761580800.043] [4821:4825] [TOO]   BatPresent: true[0m
+[0;32m[1761580800.043] [4821:4825] [TOO]   BatPresent: TRUE[0m
 [0;32m[1761580800.044] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_0013 DataVersion: 21[0m
 [0;32m[1761580800.045] [4821:4825] [TOO]   BatReplacementDescription: "2x AA"[0m
 [0;32m[1761580800.046] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0000 DataVersion: 5[0m
@@ -64,10 +64,10 @@
 [0;32m[1761580800.064] [4821:4825] [TOO]       LastRssi: -63[0m
 [0;32m[1761580800.065] [4821:4825] [TOO]       FrameErrorRate: 0[0m
 [0;32m[1761580800.066] [4821:4825] [TOO]       MessageErrorRate: 0[0m
-[0;32m[1761580800.067] [4821:4825] [TOO]       RxOnWhenIdle: true[0m
-[0;32m[1761580800.068] [4821:4825] [TOO]       FullThreadDevice: true[0m
-[0;32m[1761580800.069] [4821:4825] [TOO]       FullNetworkData: true[0m
-[0;32m[1761580800.070] [4821:4825] [TOO]       IsChild: false[0m
+[0;32m[1761580800.067] [4821:4825] [TOO]       RxOnWhenIdle: TRUE[0m
+[0;32m[1761580800.068] [4821:4825] [TOO]       FullThreadDevice: TRUE[0m
+[0;32m[1761580800.069] [4821:4825] [TOO]       FullNetworkData: TRUE[0m
+[0;32m[1761580800.070] [4821:4825] [TOO]       IsChild: FALSE[0m
 [0;32m[1761580800.071] [4821:4825] [TOO]      }[0m
 [0;32m[1761580800.072] [4821:4825] [TOO]     [2]: {[0m
 [0;32m[1761580800.073] [4821:4825] [TOO]       ExtAddress: 1311768467294899696[0m
@@ -80,10 +80,10 @@
 [0;32m[1761580800.080] [4821:4825] [TOO]       LastRssi: -80[0m
 [0;32m[1761580800.081] [4821:4825] [TOO]       FrameErrorRate: 3[0m
 [0;32m[1761580800.082] [4821:4825] [TOO]       MessageErrorRate: 1[0m
-[0;32m[1761580800.083] [4821:4825] [TOO]       RxOnWhenIdle: false[0m
-[0;32m[1761580800.084] [4821:4825] [TOO]       FullThreadDevice: false[0m
-[0;32m[1761580800.085] [4821:4825] [TOO]       FullNetworkData: false[0m
-[0;32m[1761580800.086] [4821:4825] [TOO]       IsChild: true[0m
+[0;32m[1761580800.083] [4821:4825] [TOO]       RxOnWhenIdle: FALSE[0m
+[0;32m[1761580800.084] [4821:4825] [TOO]       FullThreadDevice: FALSE[0m
+[0;32m[1761580800.085] [4821:4825] [TOO]       FullNetworkData: FALSE[0m
+[0;32m[1761580800.086] [4821:4825] [TOO]       IsChild: TRUE[0m
 [0;32m[1761580800.087] [4821:4825] [TOO]      }[0m
 [0;32m[1761580800.088] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0008 DataVersion: 5[0m
 [0;32m[1761580800.089] [4821:4825] [TOO]   RouteTable: 0 entries[0m

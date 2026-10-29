@@ -103,7 +103,7 @@ impl MockController {
         put(ep, 0x201, 0x08, &["  PIHeatingDemand: 30"]);
         put(ep, 0x201, 0x12, &[&format!("  OccupiedHeatingSetpoint: {}", centi_degrees(state.setpoint))]);
         put(ep, 0x201, 0x1C, &[&format!("  SystemMode: {}", state.mode as u8)]);
-        put(ep, 0x201, 0xFFF9, &["  AcceptedCommandList: 1 entries", "    [1]: 0"]);
+        put(ep, 0x201, 0xFFF9, &["  AcceptedCommandList: 1 entries", "    [1]: 0 (SetpointRaiseLower)"]);
         put(ep, 0x201, 0xFFFC, &["  FeatureMap: 17"]);
         put(ep, 0x2F, 0x0B, &["  BatVoltage: 2900"]);
         put(ep, 0x2F, 0x0C, &["  BatPercentRemaining: 180"]);
@@ -112,7 +112,7 @@ impl MockController {
             0,
             0x35,
             0x07,
-            &["  NeighborTable: 1 entries", "    [1]: {", "      Rloc16: 20480", "      Lqi: 3", "      AverageRssi: -60", "      LastRssi: -62", "      IsChild: false", "     }"],
+            &["  NeighborTable: 1 entries", "    [1]: {", "      Rloc16: 20480", "      Lqi: 3", "      AverageRssi: -60", "      LastRssi: -62", "      IsChild: FALSE", "     }"],
         );
         put(ep, 0xFFF1_FC01, 0xFFF1_0001, &["  Unknown: 7"]);
         out

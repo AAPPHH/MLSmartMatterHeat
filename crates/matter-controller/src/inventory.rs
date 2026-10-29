@@ -351,7 +351,11 @@ enum Kind {
     Event { meta: Meta },
 }
 
+const UNDECODED: &str = "Don't know how to log";
+pub const UNDECODED_VALUE: &str = "<not decoded by chip-tool, see raw log>";
+
 struct Section {
+    undecoded: bool,
     endpoint: u16,
     cluster: u32,
     id: u32,
@@ -364,14 +368,21 @@ pub fn parse_number(token: &str) -> Option<u64> {
     t.strip_prefix("0x").map_or_else(|| t.parse().ok(), |h| u64::from_str_radix(h, 16).ok())
 }
 
+fn id_with_name(text: &str) -> Option<u64> {
+    let (number, rest) = text.split_once(' ')?;
+    (rest.starts_with('(') && rest.ends_with(')') && number.bytes().all(|b| b.is_ascii_digit())).then(|| number.parse().ok()).flatten()
+}
+
 pub fn parse_scalar(text: &str) -> Value {
     let t = text.trim();
     match t {
         "null" => Value::Null,
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
+        _ if t.eq_ignore_ascii_case("true") => Value::Bool(true),
+        _ if t.eq_ignore_ascii_case("false") => Value::Bool(false),
         _ => {
-            if let Some(s) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            if let Some(n) = id_with_name(t) {
+                Value::from(n)
+            } else if let Some(s) = t.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
                 Value::String(s.to_string())
             } else if let Ok(i) = t.parse::<i64>() {
                 Value::from(i)
@@ -425,7 +436,7 @@ impl Section {
             },
             _ => return None,
         };
-        Some(Self { endpoint, cluster, id, kind, stack: vec![Frame::new(0, "", false)] })
+        Some(Self { undecoded: false, endpoint, cluster, id, kind, stack: vec![Frame::new(0, "", false)] })
     }
 
     fn collapse(&mut self) {
@@ -448,6 +459,10 @@ impl Section {
                     break;
                 }
             }
+            return true;
+        }
+        if text.starts_with(UNDECODED) {
+            self.undecoded = true;
             return true;
         }
         let Some((key, value)) = text.split_once(": ").or_else(|| text.strip_suffix(':').map(|k| (k, ""))) else {
@@ -491,7 +506,10 @@ impl Section {
         while self.stack.len() > 1 {
             self.collapse();
         }
-        let fields = self.stack.pop().map(|f| f.fields).unwrap_or_default();
+        let mut fields = self.stack.pop().map(|f| f.fields).unwrap_or_default();
+        if self.undecoded && fields.is_empty() {
+            fields.insert(String::new(), Value::String(UNDECODED_VALUE.into()));
+        }
         (self.endpoint, self.cluster, self.id, self.kind, fields)
     }
 }
@@ -669,6 +687,22 @@ mod tests {
         assert_eq!(command_name(0x201, 0), Some("SetpointRaiseLower"));
         assert_eq!(command_name(0x201, 0x99), None);
         assert!(is_vendor_id(0xFFF1_FC01) && is_vendor_id(0xFC10) && !is_vendor_id(0xFFFC) && !is_vendor_id(0x201));
+    }
+
+    #[test]
+    fn real_chip_tool_formats_booleans_id_lists_and_undecoded_values() {
+        assert_eq!((parse_scalar("TRUE"), parse_scalar("FALSE")), (json!(true), json!(false)));
+        assert_eq!(parse_scalar("0 (SetpointRaiseLower)"), json!(0));
+        assert_eq!(parse_scalar("1.10"), json!(1.1));
+        let text = "[TOO] Endpoint: 1 Cluster: 0x0000_0201 Attribute 0x0000_FFF9 DataVersion: 1
+[TOO]   AcceptedCommandList: 1 entries
+[TOO]     [1]: 0 (SetpointRaiseLower)
+[TOO] Endpoint: 1 Cluster: 0xFFF1_FC01 Attribute 0xFFF1_0001 DataVersion: 1
+[TOO]   Don't know how to log attribute value
+";
+        let (records, _) = parse_attributes(text);
+        assert_eq!(records[0].value, json!([0]));
+        assert_eq!(records[1].value, json!(UNDECODED_VALUE));
     }
 
     #[test]
