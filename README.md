@@ -202,6 +202,34 @@ Die APK liegt auch im GitHub-Release. In der App erlaubst du **genauen Standort*
 
 Feature-Auswahl: Nur stabile BSSIDs kommen ins Modell, also solche, die in genügend Scans eines Raums sichtbar sind und nicht ständig auftauchen und verschwinden. Fehlende BSSIDs werden maskiert. Schwellen stehen in `CONFIG` in `ml/src/heatml/__main__.py`.
 
+## Datenlake, Export & Konfiguration 🗄
+
+`heatd` schreibt alle Rohdaten als Arrow-Streams nach `<data_dir>/raw/` und rollt sie täglich um 03:00 in Parquet (`<data_dir>/parquet/`, Marker `.rolled`). Schema: `docs/data-foundation.md`.
+
+```bash
+heatd migrate                                                   # einmalig: alte DuckDB-Daten (scans, readings, setpoints) in die Lake übernehmen
+heatd inventory 5                                               # Geräteinventar (siehe oben), heatd vorher stoppen
+heatd export --room wohnzimmer --from 2026-10-01 --to 2026-10-20   # 1-min-Raster (analysis/views/room_minute.sql) als Parquet, --to inklusive
+heatd report [2026-10-20]                                       # Tagesreport nach <data_dir>/reports/<datum>.md (läuft automatisch um 03:10)
+```
+
+Docker: `docker compose run --rm heatd export --room wohnzimmer --from ... --to ...` schreibt nach `/data/exports/`.
+
+Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `deploy/docker/heatd.docker.toml`):
+
+| Schlüssel | Bedeutung |
+|---|---|
+| `latitude`, `longitude` | schaltet den stündlichen Open-Meteo-Abruf (Wetter, `weather_url` überschreibt den Endpunkt) und `coordinates` in `meta` ein; ohne beide aus |
+| `away_setpoint`, `away_guard_minutes` | Sollwert bei Abwesenheit (18 °C) und Zeit, die die getragene Uhr das WLAN fehlen muss (20 min) |
+| `exploration_seed` | Seed für die zufälligen Startzeiten der Experimente |
+| `[rooms.exploration]` | je Raum `enabled` (Standard `false`), `p_per_day`, `comfort_min`, `comfort_max`, `blackout = [{from, to}]` |
+| `neighbours` | Raumpaare `[["a","b"], ...]` für die Nachbartemperaturen im Raster |
+| `[heat_source]` | `kind`, `operating_hours`, `night_shutdown` als `meta` |
+| `ntp_server` | SNTP-Drift-Check (Event ab 1 s), leer schaltet ihn aus |
+| `inventory_dir` | Ablage der Inventardateien |
+
+`/health` zeigt je Node Subscription-Status und Alter des letzten Reports (`degraded` bei Verlust), `/metrics` dieselben Werte für Prometheus.
+
 ## Regeln 🧠
 
 | Priorität | Bedingung | Sollwert |

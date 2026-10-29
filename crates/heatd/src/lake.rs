@@ -699,6 +699,10 @@ impl Sink {
         &self.cfg.root
     }
 
+    pub fn now_us(&self) -> i64 {
+        (self.clock)()
+    }
+
     pub fn today(&self) -> NaiveDate {
         date_of_us((self.clock)())
     }

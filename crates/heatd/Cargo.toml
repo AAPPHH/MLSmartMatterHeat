@@ -2,6 +2,7 @@
 name = "heatd"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [dependencies]
 matter-controller = { path = "../matter-controller" }

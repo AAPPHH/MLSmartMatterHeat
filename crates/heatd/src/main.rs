@@ -1,3 +1,6 @@
+#[cfg(test)]
+#[path = "../tests/acceptance.rs"]
+mod acceptance;
 mod capture;
 mod config;
 mod explore;

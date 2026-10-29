@@ -11,10 +11,20 @@ default_setpoint = 18.0
 away_setpoint = 18.0
 away_guard_minutes = 20
 # exploration_seed = 1
+# latitude = 52.52
+# longitude = 13.41
+# weather_url = "https://api.open-meteo.com/v1/forecast"
+# ntp_server = "pool.ntp.org"
+# neighbours = [["wohnzimmer", "schlafzimmer"], ["wohnzimmer", "bad"]]
 presence_boost = 1.0
 presence_timeout_minutes = 30
 still_contact_timeout_minutes = 180
 frost_setpoint = 7.0
+
+# [heat_source]
+# kind = "unknown"
+# operating_hours = "05:00-22:00"
+# night_shutdown = "22:00-05:00"
 
 [chip_tool]
 binary = "/usr/local/bin/chip-tool"
@@ -22,7 +32,7 @@ storage_dir = "/chip-storage"
 paa_trust_store = "/opt/paa-root-certs"
 bypass_attestation = false
 endpoint = 1
-subscribe_min_s = 5
+subscribe_min_s = 1
 subscribe_max_s = 300
 timeout_s = 90
 commission_timeout_s = 180
@@ -52,6 +62,13 @@ setpoint = 21.5
 [[rooms]]
 name = "schlafzimmer"
 nodes = [6]
+
+# [rooms.exploration]
+# enabled = false
+# p_per_day = 1.0
+# comfort_min = 16.0
+# comfort_max = 21.0
+# blackout = [{ from = "22:00", to = "07:00" }]
 
 [[rooms.schedules]]
 days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]

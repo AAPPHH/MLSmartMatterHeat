@@ -217,6 +217,7 @@ fn lifecycle_event(state: &AppState, life: Lifecycle) {
         detail["reason"] = json!(why);
     }
     let mut event = lake::Event::now(name, "heatd").with_experiment(&e.id).with_detail(detail);
+    event.ts = state.sink.now_us();
     event.node = state.config.rooms.iter().find(|r| r.name == e.room).and_then(|r| r.nodes.first().copied());
     log("experiment event", state.sink.append(event));
 }
