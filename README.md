@@ -321,6 +321,17 @@ Wöchentliches Neutraining extern, z. B. systemd-Timer auf dem Minix (nicht depl
 0 4 * * 0  cd /opt/MLSmartMatterHeat/training && uv run python -m heattrain watchroom /data /models/watchroom
 ```
 
+## Thermisches Raummodell (virtuelles Raumthermometer) 🌡
+
+Je Thermostat ein Grey-Box-Modell (Radiator `T_r`, Raumluft `T_a`, Sensor `y = w*T_r + (1-w)*T_a`): Der Heizkörper wird vom Ventil `u` (PIHeatingDemand, Werte über 100 gelten als fehlend) mit effektiver Vorlauftemperatur `T_s` geheizt, die Luft koppelt an Radiator, Außentemperatur, Wind, Strahlung und Nachbarräume (`links` aus `meta`). Fit per Kalman-Filter-Likelihood (scipy, Parameter positiv und beschränkt, 1-Minuten-Raster); Parameter-Unsicherheit aus der Jacobi-Matrix, Fallback auf 1 Zustand, wenn 2 Zustände nicht identifizierbar oder auf dem Hold-out-Block nicht besser sind.
+
+```bash
+cd training
+uv run python -m heattrain thermal /data /models        # <data_root> (parquet/) oder Roh-Ordner mit *.arrows
+```
+
+Ausgabe: `<models_dir>/thermal/<datum>/<raum>.json` (Parameter, Grenzen, relative Standardabweichung, Zeitkonstanten, RMSE auf dem Hold-out-Block gegen Persistenz, Datenspanne, Warnungen). Python: `estimate_room_air` liefert die gefilterte Raumluft samt Unsicherheit, `predict` und `ThermalModel.lead_time` rechnen Vorlaufzeiten für geplante Ventilstellung oder Solltemperatur. Die Quelle `legacy` wird ausgeschlossen (Config `exclude_sources`). Mit weniger als etwa einem Tag Daten sind die Parameter schwach bestimmt; die Warnungen im JSON sagen, welche.
+
 ## Entwickeln 🧪
 
 ```bash
