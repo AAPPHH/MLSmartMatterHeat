@@ -272,7 +272,8 @@ class CoreTest {
     @Test
     fun roomsAreTheFiveFixedOnes() {
         assertEquals(listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur"), Defaults.ROOMS)
-        assertEquals(Defaults.ROOMS.toSet(), Defaults.CAPTIONS.keys)
+        assertEquals(Defaults.LABELS.toSet(), Defaults.CAPTIONS.keys)
+        assertEquals(Defaults.LABELS.toSet(), RoomIcons.RES.keys)
     }
 
     @Test
@@ -564,9 +565,14 @@ class CoreTest {
 
     @Test
     fun promptListsGuessFirstAndMarked() {
-        assertEquals(listOf("kueche", "wohnzimmer", "flur", "bad", "schlafzimmer"), Prompt.rooms(null))
-        assertEquals(listOf("bad", "kueche", "wohnzimmer", "flur", "schlafzimmer"), Prompt.rooms("bad"))
-        assertEquals(Prompt.ORDER, Prompt.rooms("unbekannt"))
+        assertEquals(listOf("kueche", "wohnzimmer", "flur", "bad", "schlafzimmer", "keiner"), Prompt.rooms(null))
+        assertEquals(listOf("bad", "kueche", "wohnzimmer", "flur", "schlafzimmer", "keiner"), Prompt.rooms("bad"))
+        assertEquals(Prompt.ORDER + "keiner", Prompt.rooms("unbekannt"))
+        assertEquals(Prompt.ORDER + "keiner", Prompt.rooms("keiner"))
+        assertEquals("Keiner", Prompt.caption("keiner", "bad"))
+        assertEquals("✓ Gespeichert: Kein Raum", Prompt.done("keiner"))
+        assertEquals("keiner", TileClick.room(TileClick.id("keiner", 3), 3))
+        assertEquals("keiner", StayTracker.parse(StayTracker().also { it.confirm("keiner", 1000L) }.json()).label)
         assertEquals("● Bad", Prompt.caption("bad", "bad"))
         assertEquals("Küche", Prompt.caption("kueche", "bad"))
         assertEquals("✓ Gespeichert: Wohnen", Prompt.done("wohnzimmer"))
@@ -957,6 +963,11 @@ class CoreTest {
         assertEquals("flur", Quarters.room(-60f, -59f, d))
         assertEquals("bad", Quarters.room(60f, 40f, 300f))
         assertEquals(listOf(0f, 90f, 180f, 270f), Quarters.WEDGES.map { Quarters.mid(it) })
+        assertEquals("keiner", Quarters.room(0f, 91f, d))
+        assertEquals("keiner", Quarters.room(25f, 95f, d))
+        assertEquals("kueche", Quarters.room(0f, 70f, d))
+        assertEquals("kueche", Quarters.room(60f, 85f, d))
+        assertEquals("kueche", Quarters.room(0f, 120f, d))
     }
 
     private val replyText = """{"stored":4,"room":"wohnzimmer","probability":0.8,"rooms":[

@@ -34,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -188,11 +189,22 @@ internal fun RoomsPage(hot: String?, ringed: String?, onTap: (String) -> Unit) {
             val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
             drawPath(centre, if (Quarters.CENTER == hot) SELECTED else IDLE)
             if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, Color.White, style = Stroke(ring)) }
+            val pillTopLeft = Offset(c.x - Quarters.NONE_HALF_W * d, c.y + Quarters.NONE_TOP * d)
+            val pillSize = Size(2f * Quarters.NONE_HALF_W * d, Quarters.NONE_H * d)
+            val corner = CornerRadius(pillSize.height / 2f)
+            drawRoundRect(Color.Black, pillTopLeft - Offset(gap, gap), Size(pillSize.width + 2f * gap, pillSize.height + 2f * gap), CornerRadius(corner.x + gap))
+            drawRoundRect(if (Defaults.NONE == hot) SELECTED else IDLE, pillTopLeft, pillSize, corner)
+            if (Defaults.NONE == ringed) drawRoundRect(Color.White, pillTopLeft, pillSize, corner, style = Stroke(2.dp.toPx()))
         }
+        Text(
+            Prompt.caption(Defaults.NONE, null),
+            Modifier.align(Alignment.Center).offset(y = ((Quarters.NONE_TOP + Quarters.NONE_H / 2f) * dDp.value).dp),
+            fontSize = 10.sp, lineHeight = 10.sp, maxLines = 1, color = if (Defaults.NONE == hot) INK else Color.White
+        )
         (Quarters.WEDGES + Quarters.CENTER).forEach { room ->
             val isCenter = room == Quarters.CENTER
             val a = Math.toRadians(Quarters.mid(room) - 90.0)
-            val r = if (isCenter) 0f else Quarters.LABEL_R * dDp.value
+            val r = if (isCenter) 0f else Quarters.labelR(room) * dDp.value
             val ink = if (room == hot) INK else Color.White
             Column(
                 Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp),
