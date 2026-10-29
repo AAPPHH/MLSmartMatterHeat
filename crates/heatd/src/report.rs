@@ -374,6 +374,26 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
     }
 
+    md.push_str("\n## Fenster-offen-Erkennung\n\n");
+    let windows = rows(
+        c,
+        &format!(
+            "WITH e AS (SELECT kind, json_extract_string(detail, '$.room') AS room, json_extract_string(detail, '$.reason') AS reason, json_extract(detail, '$.open_minutes')::DOUBLE AS minutes FROM events WHERE kind IN ('window_open', 'window_close', 'window_reopen', 'window_suppressed') AND {day})
+             SELECT room, count(*) FILTER (WHERE kind = 'window_open'), count(*) FILTER (WHERE kind = 'window_reopen'), count(*) FILTER (WHERE kind = 'window_suppressed'),
+                    count(*) FILTER (WHERE kind = 'window_close'), coalesce(sum(minutes) FILTER (WHERE kind = 'window_close'), 0),
+                    coalesce(string_agg(DISTINCT reason, ', ') FILTER (WHERE kind = 'window_close'), '-') FROM e GROUP BY room ORDER BY room"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, f64>(5)?, r.get::<_, String>(6)?)),
+    )?;
+    if windows.is_empty() {
+        md.push_str("Keine Fensterereignisse.\n");
+    } else {
+        md.push_str("| Raum | geoeffnet | wieder geoeffnet | unterdrueckt | geschlossen | offene Minuten | Gruende |\n|---|---|---|---|---|---|---|\n");
+        for (room, opened, reopened, suppressed, closed, minutes, reasons) in windows {
+            let _ = writeln!(md, "| {room} | {opened} | {reopened} | {suppressed} | {closed} | {minutes:.0} | {reasons} |");
+        }
+    }
+
     md.push_str("\n## Events by kind\n\n");
     let kinds = rows(c, &format!("SELECT kind, count(*) FROM events WHERE {day} GROUP BY kind ORDER BY kind"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let _ = writeln!(md, "{}\n", if kinds.is_empty() { "none".into() } else { kinds.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ") });

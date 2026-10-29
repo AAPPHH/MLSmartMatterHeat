@@ -255,6 +255,16 @@ Der belegte Raum ist der Raum des Matchers, solange er sicher ist (nicht abstain
 
 Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °C vom zuletzt gesetzten abweicht. Die Entscheidung wird vor dem Geräte-Schreiben auf Platte geschrieben (fsync). Berichte, die kurz nach einem eigenen Schreiben noch den alten oder einen vom Gerät gerundeten Wert zeigen (2 × `timeout_s`), und Poll-Antworten gelten nie als manueller Eingriff. Ein echter manueller Eingriff am Thermostat wird genau `manual_hold_minutes` (60) gehalten; danach schreibt `heatd` sofort den Systemwert (ohne Ratenlimit).
 
+## Fenster-offen-Erkennung 🪟
+
+heatd erkennt offene Fenster selbst aus dem Temperaturverlauf der Thermostate (Raumtemperatur = Mittel der `local_temperature` der Knoten eines Raums; die Thermostate werden seit 2026-10-29 alle 60 s abgefragt, `poll_silence_s = 60`, Batterie beobachten).
+
+- **Offen**, wenn die Temperatur innerhalb von 10 min um mindestens 1,0 K fällt oder mindestens 4 min lang schneller als -4 K/h (Steigung über 6 min). Bei Wind über 6 m/s liegen die Schwellen 20 % niedriger.
+- **Kein Alarm**, wenn der Sollwert gerade selbst gesenkt wurde (20 min), draußen weniger als 5 K kälter ist als drinnen, nur der Heizkörper nach Ventilschluss abkühlt (Abfall muss doppelt so schnell sein wie die typische Abkühlung, Rückfall 1,5 K/h) oder der Raum schon 4-mal pro Stunde geöffnet wurde (`window_suppressed`).
+- **Wirkung**: Raum sofort auf `frost_setpoint`, Experimente werden abgebrochen, Event `window_open`.
+- **Zu**, wenn die Temperatur nach mindestens 5 min um 0,3 K vom Minimum gestiegen ist, während nicht geheizt wird (`window_close`, Grund `recovery`). Nach 20 min ohne Erholung wird 10 min lang normal geheizt (Probe): fällt die Temperatur weiter um 0,5 K, gilt das Fenster wieder als offen (`window_reopen`, Timeout verdoppelt, höchstens 60 min), sonst als zu (`timeout_probe`).
+- `POST /api/window {"room": "...", "open": true|false}` überschreibt manuell. Zustand: `/api/state`, `/health`, `/metrics`, Tagesbericht. Schwellen unter `[window]` in der Konfiguration.
+
 ## API
 
 | Methode | Pfad | |

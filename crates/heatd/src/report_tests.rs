@@ -83,6 +83,9 @@ fn sample_lake(root: &Path) {
     for (minute, minutes) in [(500, 30), (700, 20)] {
         sink.append(Event { detail: Some(format!("{{\"room\":\"a\",\"minutes\":{minutes}.0}}")), ..event(minute, kind::OCCUPANCY_END, None) }).unwrap();
     }
+    for (minute, k, detail) in [(300, kind::WINDOW_OPEN, "{\"room\":\"a\",\"source\":\"auto\"}"), (320, kind::WINDOW_CLOSE, "{\"room\":\"a\",\"reason\":\"recovery\",\"open_minutes\":18.0}"), (330, kind::WINDOW_SUPPRESSED, "{\"room\":\"a\",\"reason\":\"outdoor\"}")] {
+        sink.append(Event { detail: Some(detail.into()), ..event(minute, k, None) }).unwrap();
+    }
     for (room, source, n) in [("a", "watch", 2), ("b", "watch", 1), ("a", "override", 1)] {
         for i in 0..n {
             sink.append(Label { ts: at(10 + i), room: room.into(), source: source.into(), ..Default::default() }).unwrap();
@@ -240,6 +243,8 @@ fn daily_report_covers_all_sections() {
     assert!(md.contains("23 of 24 observation hours present, missing 1: 05:00"), "weather\n{md}");
     assert!(md.contains("1 started, 1 ended, 1 aborted"), "experiments\n{md}");
     assert!(md.contains("| a | 1 | 1 | 2 | 50 |"), "filter\n{md}");
+    assert!(md.contains("| a | 1 | 0 | 1 | 1 | 18 | recovery |"), "window section
+{md}");
     assert!(md.contains("experiment_start node 1 x1"), "{md}");
     assert!(md.contains("| attribute_reports | 1 |") && !md.contains("NOT ROLLED"), "roll status\n{md}");
     assert_eq!((s.nodes, s.labels, s.experiments, s.missing_weather_hours.clone(), s.roll_ok), (3, 4, 1, vec![5], true));

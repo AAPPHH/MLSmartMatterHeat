@@ -362,6 +362,12 @@ fn lifecycle_event(state: &AppState, life: Lifecycle) {
     log("experiment event", state.sink.append(event));
 }
 
+pub fn window_event(state: &AppState, e: crate::window::WinEvent) {
+    let mut event = lake::Event::now(e.kind, "heatd").with_detail(e.detail);
+    event.node = state.config.rooms.iter().find(|r| r.name == e.room).and_then(|r| r.nodes.first().copied());
+    log("window event", state.sink.append(event));
+}
+
 fn mode_name(value: f64) -> String {
     match value as u8 {
         0 => "off",
@@ -434,7 +440,10 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         eprintln!("presence: {e}");
         None
     });
-    let windows = state.windows.lock().unwrap().clone();
+    let outdoor = state.status.outdoor(lake::now_us());
+    let found = state.windows.lock().unwrap().step(&state.config, now_ms, outdoor);
+    found.into_iter().for_each(|e| window_event(state, e));
+    let windows = state.windows.lock().unwrap().open_rooms();
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
@@ -513,6 +522,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                     commands.last_write.insert(want.node, (now_ms, want.reason));
                     commands.deferred.remove(&want.node);
                 }
+                if want.reason != "window_open" && old.is_some_and(|o| want.setpoint < o) {
+                    state.windows.lock().unwrap().note_decrease(&want.room, now_ms);
+                }
                 log("setpoint row", state.storage.insert_setpoint(now_ms, want.node, &want.room, want.setpoint, want.reason));
                 written.push(want);
             }
@@ -557,11 +569,18 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
 }
 
 pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
+    if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND].contains(&report.attribute.as_str()) {
+        state.windows.lock().unwrap().observe(&state.config, report.node, &report.attribute, report.value, now_ms);
+        return;
+    }
     if report.attribute != OCCUPIED_HEATING_SETPOINT.snake {
         return;
     }
     let Some(previous) = manual_change(state, report, poll, now_ms) else { return };
     let Some(room) = state.config.rooms.iter().find(|r| r.nodes.contains(&report.node)) else { return };
+    if report.value < previous {
+        state.windows.lock().unwrap().note_decrease(&room.name, now_ms);
+    }
     let (aborted, running) = {
         let mut explorer = state.explorer.lock().unwrap();
         let running = explorer.active_in(&room.name).map(|e| e.id.clone());

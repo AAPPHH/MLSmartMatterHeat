@@ -11,7 +11,7 @@ default_setpoint = 18.0
 away_setpoint = 18.0
 away_guard_minutes = 20
 manual_hold_minutes = 60
-poll_silence_s = 300
+poll_silence_s = 60
 # exploration_seed = 1
 latitude = 52.52
 longitude = 13.40
@@ -141,3 +141,26 @@ setpoint = 21.0
 [[rooms]]
 name = "flur"
 exterior = ["front_door"]
+
+[window]
+enabled = true
+window_slope_min = 6.0
+open_drop_k = 1.0
+open_window_min = 10.0
+open_slope_k_per_h = -4.0
+open_sustain_min = 4.0
+setpoint_guard_min = 20.0
+min_outdoor_delta_k = 5.0
+cooldown_grace_min = 30.0
+expected_cooldown_factor = 2.0
+fallback_cooldown_k_per_h = 1.5
+wind_ms = 6.0
+wind_relax = 0.2
+min_open_min = 5.0
+close_rise_k = 0.3
+close_window_min = 10.0
+max_open_min = 20.0
+max_timeout_min = 60.0
+probe_min = 10.0
+probe_drop_k = 0.5
+max_events_per_hour = 4

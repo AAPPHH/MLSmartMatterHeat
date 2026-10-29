@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use matter_controller::MatterController;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +26,7 @@ pub struct AppState {
     pub status: crate::status::Status,
     pub model: Option<Arc<RoomModel>>,
     pub controller: Arc<dyn MatterController>,
-    pub windows: Arc<Mutex<HashSet<String>>>,
+    pub windows: Arc<Mutex<crate::window::Windows>>,
     pub commanded: Arc<Mutex<crate::rules::Commands>>,
     pub explorer: Arc<Mutex<Explorer>>,
     pub tracker: Arc<Mutex<Tracker>>,
@@ -131,11 +131,14 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    Json(state.status.health(crate::lake::now_us()))
+    let mut body = state.status.health(crate::lake::now_us());
+    let windows = state.windows.lock().unwrap();
+    body["windows"] = state.config.rooms.iter().map(|r| json!({"room": r.name, "window": windows.view(&r.name, now_ms())})).collect();
+    Json(body)
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], state.status.metrics(crate::lake::now_us()))
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics()))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -520,7 +523,8 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
 async fn api_state(State(state): State<AppState>) -> ApiResult {
     let readings = state.latest.all();
     let setpoints = state.storage.last_setpoints()?;
-    let windows = state.windows.lock().unwrap().clone();
+    let windows = state.windows.lock().unwrap();
+    let open = windows.open_rooms();
     let commands = state.commanded.lock().unwrap();
     let rooms: Vec<Value> = state
         .config
@@ -545,7 +549,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                     })
                 })
                 .collect();
-            json!({"name": room.name, "window_open": windows.contains(&room.name), "nodes": nodes})
+            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "nodes": nodes})
         })
         .collect();
     Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?})))
@@ -557,13 +561,10 @@ async fn snapshot(State(state): State<AppState>) -> ApiResult {
 }
 
 async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> ApiResult {
-    let mut windows = state.windows.lock().unwrap();
-    if body.open {
-        windows.insert(body.room);
-    } else {
-        windows.remove(&body.room);
-    }
-    Ok(Json(json!({"window_open": windows.iter().collect::<Vec<_>>()})))
+    let event = state.windows.lock().unwrap().manual(&body.room, body.open, now_ms());
+    event.into_iter().for_each(|e| crate::rules::window_event(&state, e));
+    let open = state.windows.lock().unwrap().open_rooms();
+    Ok(Json(json!({"window_open": open.iter().collect::<Vec<_>>()})))
 }
 
 async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> ApiResult {

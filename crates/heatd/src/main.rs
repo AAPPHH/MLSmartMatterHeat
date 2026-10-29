@@ -26,6 +26,9 @@ mod storage;
 mod watchmatch;
 #[cfg(test)]
 mod watchmatch_tests;
+mod window;
+#[cfg(test)]
+mod window_tests;
 
 use anyhow::{anyhow, bail, Context, Result};
 use config::{Config, ControllerKind};
