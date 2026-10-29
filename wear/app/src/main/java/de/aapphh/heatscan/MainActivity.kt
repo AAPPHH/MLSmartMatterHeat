@@ -61,8 +61,21 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class MainActivity : ComponentActivity() {
-    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { ScanService.instance?.refreshSensors(); ScanStarter.start(this, "permissions") }
+    private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val background = ScanStarter.missingBackground(this)
+        if (background.isNotEmpty() && !askedBackground) {
+            askedBackground = true
+            backgroundPerms.launch(background.toTypedArray())
+        } else done()
+    }
+    private val backgroundPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { done() }
     private var asked = false
+    private var askedBackground = false
+
+    private fun done() {
+        ScanService.instance?.refreshSensors()
+        ScanStarter.start(this, "permissions")
+    }
     private val prompt get() = intent.getBooleanExtra("prompt", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,6 +97,9 @@ class MainActivity : ComponentActivity() {
         if (missing.isNotEmpty() && !asked) {
             asked = true
             perms.launch(missing.toTypedArray())
+        } else if (!askedBackground && ScanStarter.missingBackground(this).isNotEmpty()) {
+            askedBackground = true
+            backgroundPerms.launch(ScanStarter.missingBackground(this).toTypedArray())
         } else ScanStarter.start(this, "resume")
     }
 

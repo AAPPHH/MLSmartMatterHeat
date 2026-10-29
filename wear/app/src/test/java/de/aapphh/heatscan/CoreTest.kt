@@ -1,5 +1,6 @@
 package de.aapphh.heatscan
 
+import android.content.pm.ServiceInfo
 import org.json.JSONObject
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -1346,6 +1347,11 @@ class CoreTest {
         assertEquals(900_000_000_000L, s.getJSONObject(0).getLong("elapsed_ns"))
         assertEquals("still", a.getString("motion"))
         assertEquals("w-abc-000123", a.getString("id"))
+        assertEquals("normal", a.getString("power"))
+        assertEquals(false, a.getBoolean("away"))
+        assertFalse(a.has("label"))
+        val labelled = MeasureBatch.fromScan(Payload.build(1_000_000L, "w", "kueche", aps, "moving", "doze", true, "w-abc-000124").put("queued", true), "2.4", 2_000_000L, 5_000L)!!
+        assertEquals(listOf("kueche", "moving", "doze", true, true, "w-abc-000124"), listOf("label", "motion", "power", "away", "queued", "id").map { labelled.get(it) })
         assertEquals(null, MeasureBatch.fromScan(Payload.build(1L, "w", null, emptyList()), "2.4", 1L, 1L))
         assertFalse(Payload.build(1L, "w", null, emptyList()).has("elapsed_ns"))
     }
@@ -1359,19 +1365,36 @@ class CoreTest {
     }
 
     @Test
-    fun accelerometerVarianceIsEmittedPerInterval() {
-        val v = AccelVar(60_000_000_000L, 3)
-        val s = 1_000_000_000L
-        val out = ArrayList<Pair<Long, Double>>()
-        for (i in 0 until 60) v.add(i * s, if (i % 2 == 0) 9.0 else 11.0)?.let { out.add(it) }
-        assertTrue(out.isEmpty())
-        v.add(60 * s, 10.0)?.let { out.add(it) }
-        assertEquals(1, out.size)
-        assertEquals(60 * s, out[0].first)
-        assertEquals(1.0, out[0].second, 1e-9)
-        for (i in 61 until 62) v.add(i * s, 10.0)?.let { out.add(it) }
-        assertEquals(1, out.size)
-        assertEquals(null, v.add(120 * s, 10.0))
+    fun accelerometerBurstEmitsOneVarianceOrNothing() {
+        val b = AccelBurst(3)
+        for (i in 0 until 10) b.add(i * 1_000_000_000L, if (i % 2 == 0) 9.0 else 11.0)
+        val (end, variance) = b.finish()!!
+        assertEquals(9_000_000_000L, end)
+        assertEquals(1.0, variance, 1e-9)
+        assertEquals(null, b.finish())
+        b.add(1, 10.0)
+        b.add(2, 10.0)
+        assertEquals(null, b.finish())
+        b.add(3, 5.0)
+        assertEquals(null, b.finish())
+    }
+
+    @Test
+    fun burstGateAllowsOneWindowPerPeriod() {
+        val g = BurstGate(60_000)
+        assertTrue(g.take(1_000))
+        assertFalse(g.take(30_000))
+        assertTrue(g.take(61_000))
+        assertFalse(g.take(100_000))
+    }
+
+    @Test
+    fun offBodyValueFollowsAndroidConvention() {
+        assertTrue(OffBody.isOff(0f))
+        assertFalse(OffBody.isOff(1f))
+        assertEquals(0.0, OffBody.value(true), 0.0)
+        assertEquals(1.0, OffBody.value(false), 0.0)
+        for (raw in listOf(0f, 1f)) assertEquals(raw.toDouble(), OffBody.value(OffBody.isOff(raw)), 0.0)
     }
 
     @Test
@@ -1382,6 +1405,13 @@ class CoreTest {
         assertEquals(HealthPlan(false, false, "hr=Sensor fehlt skin=Sensor fehlt"), Health.plan(false, true, false, false))
         assertEquals(listOf(Health.HR, Health.SKIN), Health.requestable(36))
         assertEquals(emptyList<String>(), Health.requestable(35))
+        assertEquals(listOf(Health.BACKGROUND), Health.backgroundStep(36, true, false))
+        assertEquals(emptyList<String>(), Health.backgroundStep(36, false, false))
+        assertEquals(emptyList<String>(), Health.backgroundStep(36, true, true))
+        assertEquals(emptyList<String>(), Health.backgroundStep(35, true, false))
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION, Health.foregroundTypes(36, false))
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH, Health.foregroundTypes(36, true))
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION, Health.foregroundTypes(33, true))
     }
 
     @Test
@@ -1419,7 +1449,7 @@ class CoreTest {
         assertTrue(Inventory.isSensors(e))
         val body = JSONObject(Inventory.body(e))
         assertEquals(setOf("device", "app_version", "sensors"), body.keys().asSequence().toSet())
-        assertEquals(setOf("name", "android_type", "string_type", "vendor", "resolution", "max_range"), body.getJSONArray("sensors").getJSONObject(0).keys().asSequence().toSet())
+        assertEquals(setOf("name", "android_type", "string_type", "vendor", "resolution", "max_range", "wake_up", "min_delay_us", "max_delay_us", "fifo_max", "reporting_mode"), body.getJSONArray("sensors").getJSONObject(0).keys().asSequence().toSet())
         assertEquals(Inventory.hash("2.4", a), Inventory.hash("2.4", a.toList()))
         assertTrue(Inventory.hash("2.4", a) != Inventory.hash("2.5", a))
         assertTrue(Inventory.hash("2.4", a) != Inventory.hash("2.4", a + a))
@@ -1459,15 +1489,6 @@ class CoreTest {
         assertTrue(BatchId.sensor(5, 499) % 1000 >= 500)
         assertTrue(BatchId.scan(5, "w-x-000499") % 1000 < 500)
         assertEquals(5000L, BatchId.scan(5, null))
-    }
-
-    @Test
-    fun routeGateBlocksForAnHourAfterFailure() {
-        val g = RouteGate(1000)
-        assertTrue(g.allow(0))
-        g.fail(10)
-        assertFalse(g.allow(500))
-        assertTrue(g.allow(1010))
     }
 
     @Test

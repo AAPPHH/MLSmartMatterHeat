@@ -4,11 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Handler
 import android.os.SystemClock
 import org.json.JSONArray
@@ -20,12 +22,13 @@ object Measure {
     const val SKIN_STRING = "com.google.sensor.skin_temperature"
     const val PERIOD_S = 60
     const val LATENCY_US = 300_000_000
-    const val ACCEL_HZ = 1
+    const val ACCEL_PERIOD_US = 200_000
+    const val ACCEL_WINDOW_MS = 10_000L
+    const val HR_WINDOW_MS = 20_000L
     const val BATCH_MAX = 50
     const val BATCH_AGE_MS = 300_000L
     const val ACCEL_MIN_N = 5
     const val FLUSH_WAIT_MS = 1_500L
-    const val ROUTE_RETRY_MS = 3_600_000L
     const val DRAIN_MIN_MS = 3_600_000L
     const val DRAIN_MAX_MS = 12 * 3_600_000L
     const val KIND = "measure"
@@ -48,6 +51,12 @@ data class Sample(
         channel?.let { o.put("channel", it) }
         freq?.let { o.put("freq", it) }
     }
+}
+
+object OffBody {
+    fun isOff(raw: Float): Boolean = raw == 0f
+
+    fun value(off: Boolean): Double = if (off) 0.0 else 1.0
 }
 
 object BatchId {
@@ -97,34 +106,41 @@ object MeasureBatch {
         }
         return build(e.getString("device"), BatchId.scan(ts, e.optString("id").ifEmpty { null }), nowWall, offset, appVersion, samples).also { o ->
             if (e.has("id")) o.put("id", e.getString("id"))
-            listOf("motion", "power").forEach { k -> if (!e.isNull(k) && e.has(k)) o.put(k, e.getString(k)) }
+            listOf("motion", "power", "label").forEach { k -> if (!e.isNull(k) && e.has(k)) o.put(k, e.getString(k)) }
             if (e.has("away")) o.put("away", e.getBoolean("away"))
             if (e.optBoolean("queued")) o.put("queued", true)
         }
     }
 }
 
-class AccelVar(private val intervalNs: Long, private val minN: Int = Measure.ACCEL_MIN_N) {
-    private var bucket = Long.MIN_VALUE
+class AccelBurst(private val minN: Int = Measure.ACCEL_MIN_N) {
     private var n = 0
     private var mean = 0.0
     private var m2 = 0.0
+    private var lastNs = 0L
 
-    fun add(elapsedNs: Long, magnitude: Double): Pair<Long, Double>? {
-        val b = elapsedNs / intervalNs
-        var out: Pair<Long, Double>? = null
-        if (bucket != Long.MIN_VALUE && b != bucket) {
-            if (n >= minN) out = Pair((bucket + 1) * intervalNs, m2 / n)
-            n = 0
-            mean = 0.0
-            m2 = 0.0
-        }
-        bucket = b
+    fun add(elapsedNs: Long, magnitude: Double) {
+        lastNs = elapsedNs
         n++
         val d = magnitude - mean
         mean += d / n
         m2 += d * (magnitude - mean)
-        return out
+    }
+
+    fun finish(): Pair<Long, Double>? = (if (n >= minN) Pair(lastNs, m2 / n) else null).also {
+        n = 0
+        mean = 0.0
+        m2 = 0.0
+    }
+}
+
+class BurstGate(private val minGapMs: Long) {
+    private var last = Long.MIN_VALUE / 4
+
+    fun take(nowMs: Long): Boolean {
+        if (nowMs - last < minGapMs) return false
+        last = nowMs
+        return true
     }
 }
 
@@ -164,7 +180,14 @@ object Health {
     const val SKIN = "android.permission.health.READ_SKIN_TEMPERATURE"
     const val SDK = 36
 
+    const val BACKGROUND = "android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND"
+
     fun requestable(sdk: Int): List<String> = if (sdk >= SDK) listOf(HR, SKIN) else emptyList()
+
+    fun backgroundStep(sdk: Int, anyGranted: Boolean, bgGranted: Boolean): List<String> = if (sdk >= SDK && anyGranted && !bgGranted) listOf(BACKGROUND) else emptyList()
+
+    fun foregroundTypes(sdk: Int, healthGranted: Boolean): Int =
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or (if (sdk >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && healthGranted) ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH else 0)
 
     private fun state(present: Boolean, granted: Boolean) = when {
         !present -> "Sensor fehlt"
@@ -176,12 +199,16 @@ object Health {
         HealthPlan(hrSensor && hrGranted, skinSensor && skinGranted, "hr=${state(hrSensor, hrGranted)} skin=${state(skinSensor, skinGranted)}")
 }
 
-data class SensorInfo(val name: String, val type: Int, val stringType: String, val vendor: String, val resolution: Double, val maxRange: Double, val wakeUp: Boolean) {
+data class SensorInfo(
+    val name: String, val type: Int, val stringType: String, val vendor: String, val resolution: Double, val maxRange: Double, val wakeUp: Boolean,
+    val minDelayUs: Int = 0, val maxDelayUs: Int = 0, val fifoMax: Int = 0, val mode: Int = 0
+) {
     fun json(): JSONObject = JSONObject().put("name", name).put("android_type", type).put("string_type", stringType).put("vendor", vendor)
-        .put("resolution", resolution).put("max_range", maxRange)
+        .put("resolution", resolution).put("max_range", maxRange).put("wake_up", wakeUp)
+        .put("min_delay_us", minDelayUs).put("max_delay_us", maxDelayUs).put("fifo_max", fifoMax).put("reporting_mode", mode)
 
     companion object {
-        fun of(s: Sensor) = SensorInfo(s.name.orEmpty(), s.type, s.stringType.orEmpty(), s.vendor.orEmpty(), s.resolution.toDouble(), s.maximumRange.toDouble(), s.isWakeUpSensor)
+        fun of(s: Sensor) = SensorInfo(s.name.orEmpty(), s.type, s.stringType.orEmpty(), s.vendor.orEmpty(), s.resolution.toDouble(), s.maximumRange.toDouble(), s.isWakeUpSensor, s.minDelay, s.maxDelay, s.fifoMaxEventCount, s.reportingMode)
     }
 }
 
@@ -203,16 +230,6 @@ object Inventory {
         (appVersion + all.joinToString("|") { it.json().toString() }).hashCode().toString(36)
 }
 
-class RouteGate(private val retryMs: Long = Measure.ROUTE_RETRY_MS) {
-    private var failedAt = Long.MIN_VALUE / 4
-
-    fun allow(nowMs: Long) = nowMs - failedAt >= retryMs
-
-    fun fail(nowMs: Long) {
-        failedAt = nowMs
-    }
-}
-
 object Special {
     fun isSpecial(o: JSONObject) = LabelEvent.isLabel(o) || MeasureBatch.isMeasure(o) || Inventory.isSensors(o)
 }
@@ -223,12 +240,19 @@ class SensorSampler(
 ) {
     private val batcher = Batcher()
     private val drain = DrainMeter()
-    private var accelVar = AccelVar(intervalNs())
+    private var gate = BurstGate(Measure.PERIOD_S * 1000L)
+    private var accel = AccelBurst()
     private var skin: Sensor? = null
     private var hr: Sensor? = null
     private var acc: Sensor? = null
+    private var hrAllowed = false
+    private var hrActive = false
+    private var accActive = false
     private var registered = false
+    @Volatile var onBody: Boolean? = null
     private val closeLater = Runnable { closeBatch() }
+    private val endHr = Runnable { stopHr() }
+    private val endAccel = Runnable { stopAccel() }
 
     private val listener = object : SensorEventListener {
         override fun onSensorChanged(e: SensorEvent) {
@@ -237,8 +261,6 @@ class SensorSampler(
 
         override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
-
-    private fun intervalNs() = store.samplePeriodS * 1_000_000_000L
 
     fun infos(): List<SensorInfo> = sm.getSensorList(Sensor.TYPE_ALL).map { SensorInfo.of(it) }
 
@@ -261,27 +283,61 @@ class SensorSampler(
             hr != null, ctx.checkSelfPermission(Health.HR) == PackageManager.PERMISSION_GRANTED,
             skin != null, ctx.checkSelfPermission(Health.SKIN) == PackageManager.PERMISSION_GRANTED
         )
-        store.sensorNote = plan.note + " accel=" + (if (acc != null) "ok" else "Sensor fehlt")
+        val bg = ctx.checkSelfPermission(Health.BACKGROUND) == PackageManager.PERMISSION_GRANTED
+        hrAllowed = plan.hr
+        store.sensorNote = plan.note + " bg=" + (if (bg) "ok" else "fehlt") + " accel=" + (if (acc != null) "ok" else "Sensor fehlt")
         Trace.i("sensors", "plan" to store.sensorNote, "periodS" to store.samplePeriodS)
-        accelVar = AccelVar(intervalNs())
-        val period = store.samplePeriodS * 1_000_000
-        if (plan.skin) reg(skin, period)
-        if (plan.hr) reg(hr, period)
-        reg(acc, 1_000_000 / Measure.ACCEL_HZ)
+        listOfNotNull(skin, hr, acc).forEach {
+            Trace.i("sensor_caps", "name" to it.name, "wakeUp" to it.isWakeUpSensor, "fifoMax" to it.fifoMaxEventCount, "minDelayUs" to it.minDelay, "maxDelayUs" to it.maxDelay, "mode" to it.reportingMode)
+        }
+        gate = BurstGate(store.samplePeriodS * 1000L)
+        if (plan.skin) reg(skin, store.samplePeriodS * 1_000_000, Measure.LATENCY_US)
         registered = true
     }
 
-    private fun reg(s: Sensor?, periodUs: Int) {
+    private fun reg(s: Sensor?, periodUs: Int, latencyUs: Int) {
         if (s == null) return
         try {
-            if (!sm.registerListener(listener, s, periodUs, Measure.LATENCY_US)) Trace.i("sensor_register", "name" to s.name, "ok" to false)
+            if (!sm.registerListener(listener, s, periodUs, latencyUs)) Trace.i("sensor_register", "name" to s.name, "ok" to false)
         } catch (e: Exception) {
             Trace.w("sensor_register", e, "name" to s.name)
         }
     }
 
+    fun burst() {
+        if (!registered || onBody == false || !gate.take(SystemClock.elapsedRealtime())) return
+        if (hrAllowed && !hrActive && hr != null) {
+            hrActive = true
+            reg(hr, SensorManager.SENSOR_DELAY_NORMAL, 0)
+            handler.postDelayed(endHr, Measure.HR_WINDOW_MS)
+        }
+        if (acc != null && !accActive) {
+            accActive = true
+            accel = AccelBurst()
+            reg(acc, Measure.ACCEL_PERIOD_US, 0)
+            handler.postDelayed(endAccel, Measure.ACCEL_WINDOW_MS)
+        }
+    }
+
+    private fun stopHr() {
+        handler.removeCallbacks(endHr)
+        if (!hrActive) return
+        hrActive = false
+        hr?.let { sm.unregisterListener(listener, it) }
+    }
+
+    private fun stopAccel() {
+        handler.removeCallbacks(endAccel)
+        if (!accActive) return
+        accActive = false
+        acc?.let { sm.unregisterListener(listener, it) }
+        accel.finish()?.let { (end, variance) -> add(Sample(end, wall(end), "motion", acc?.name.orEmpty(), variance, "m2/s4")) }
+    }
+
     fun stop() {
         handler.removeCallbacks(closeLater)
+        stopHr()
+        stopAccel()
         if (registered) {
             try { sm.flush(listener) } catch (e: Exception) { Trace.w("sensor_flush", e) }
             sm.unregisterListener(listener)
@@ -308,7 +364,12 @@ class SensorSampler(
     }
 
     fun onOffBody(e: SensorEvent, off: Boolean) {
-        add(Sample(e.timestamp, wall(e.timestamp), "offbody", e.sensor.name.orEmpty(), if (off) 1.0 else 0.0, "bool"))
+        onBody = !off
+        if (off) {
+            stopHr()
+            stopAccel()
+        }
+        add(Sample(e.timestamp, wall(e.timestamp), "offbody", e.sensor.name.orEmpty(), OffBody.value(off), "bool"))
     }
 
     fun onPower() {
@@ -333,13 +394,13 @@ class SensorSampler(
         val v = e.values[0].toDouble()
         val name = e.sensor.name.orEmpty()
         when {
-            e.sensor === acc -> {
-                val m = sqrt(e.values[0].toDouble() * e.values[0] + e.values[1].toDouble() * e.values[1] + e.values[2].toDouble() * e.values[2])
-                accelVar.add(e.timestamp, m)?.let { (end, variance) -> add(Sample(end, wall(end), "motion", name, variance, "m2/s4")) }
-            }
+            e.sensor === acc -> if (accActive) accel.add(e.timestamp, sqrt(v * v + e.values[1].toDouble() * e.values[1] + e.values[2].toDouble() * e.values[2]))
             !v.isFinite() -> {}
             e.sensor === skin -> add(Sample(e.timestamp, wall(e.timestamp), "temp", name, v, "C"))
-            e.sensor === hr -> if (v > 0.0) add(Sample(e.timestamp, wall(e.timestamp), "hr", name, v, "bpm"))
+            e.sensor === hr -> if (v > 0.0 && hrActive) {
+                add(Sample(e.timestamp, wall(e.timestamp), "hr", name, v, "bpm"))
+                stopHr()
+            }
         }
         closeIfDue()
     }

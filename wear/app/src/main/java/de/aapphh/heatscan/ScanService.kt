@@ -70,7 +70,6 @@ class ScanService : Service() {
     private var lastScanRequestAt = Long.MIN_VALUE / 4
     private var loggedMode: Mode? = null
     private val flusher = Flusher()
-    private val gate = RouteGate()
     private var sampler: SensorSampler? = null
     private val appVersion by lazy { try { packageManager.getPackageInfo(packageName, 0).versionName.orEmpty() } catch (e: Exception) { "-" } }
     private val flushPending = AtomicBoolean(false)
@@ -89,7 +88,7 @@ class ScanService : Service() {
 
     private val offBodyListener = object : SensorEventListener {
         override fun onSensorChanged(e: SensorEvent) {
-            val off = e.values[0] == 0f
+            val off = OffBody.isOff(e.values[0])
             if (offBody != off) Trace.i("offbody", "off" to off)
             offBody = off
             sampler?.onOffBody(e, off)
@@ -126,6 +125,7 @@ class ScanService : Service() {
                 Intent.ACTION_SCREEN_ON -> {
                     Trace.i("screen_on", "queue" to queue.size)
                     sampler?.flushFifo()
+                    sampler?.burst()
                     flush("screen_on")
                     onWake("screen_on", power.isDeviceIdleMode)
                 }
@@ -174,7 +174,7 @@ class ScanService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!active) {
             try {
-                startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                startForeground(1, notification(), Health.foregroundTypes(Build.VERSION.SDK_INT, healthGranted()))
             } catch (e: Exception) {
                 Trace.w("start_refused", e, "source" to "service")
                 store.status = "Start nicht erlaubt"
@@ -281,12 +281,13 @@ class ScanService : Service() {
             io.execute {
                 val dropped = queue.add(entry, System.currentTimeMillis())
                 Trace.i("enqueue", "kind" to entry.optString("kind"), "queue" to queue.size, "dropped" to dropped)
-                flush(entry.optString("kind"))
             }
         } catch (e: RejectedExecutionException) {
             Log.w(TAG, "meta enqueue rejected", e)
         }
     }
+
+    private fun healthGranted() = checkSelfPermission(Health.HR) == PackageManager.PERMISSION_GRANTED || checkSelfPermission(Health.SKIN) == PackageManager.PERMISSION_GRANTED
 
     private fun powerState() = PowerState.of(power.isPowerSaveMode, power.isDeviceIdleMode, offBody)
 
@@ -387,6 +388,7 @@ class ScanService : Service() {
     }
 
     private fun scan(beat: Boolean = false) {
+        sampler?.burst()
         if (beat) {
             beatPending = true
             handler.removeCallbacks(beatTimeout)
@@ -548,32 +550,12 @@ class ScanService : Service() {
 
     private fun sendMeta(server: String, e: JSONObject, net: Network?): Int {
         val c = if (MeasureBatch.isMeasure(e)) plain(server, Measure.PATH, MeasureBatch.body(e), net) else plain(server, Measure.PATH_SENSORS, Inventory.body(e), net)
-        return if (c in Measure.FALLBACK_CODES) 404 else c
+        return if (c == 405) 404 else c
     }
 
-    private fun sendScan(server: String, e: JSONObject, net: Network?): Int {
-        val now = SystemClock.elapsedRealtime()
-        val m = if (gate.allow(now)) MeasureBatch.fromScan(e, appVersion, System.currentTimeMillis(), now) else null
-        if (m != null) {
-            val c = send(server, Measure.PATH, m.toString(), net)
-            if (c !in Measure.FALLBACK_CODES) return c
-            gate.fail(now)
-            Trace.i("measure_fallback", "code" to c)
-        }
-        return send(server, "/api/scan", e.toString(), net)
-    }
+    private fun sendScan(server: String, e: JSONObject, net: Network?): Int = send(server, "/api/scan", e.toString(), net)
 
-    private fun sendScans(server: String, a: JSONArray, net: Network?): Int {
-        val rest = JSONArray()
-        for (i in 0 until a.length()) {
-            val e = a.getJSONObject(i)
-            if ((e.optJSONArray("aps")?.length() ?: 0) > 0) {
-                val c = sendScan(server, e, net)
-                if (c !in 200..299) return c
-            } else rest.put(e)
-        }
-        return if (rest.length() == 0) 200 else send(server, "/api/scans", JSONObject().put("scans", rest).toString(), net)
-    }
+    private fun sendScans(server: String, a: JSONArray, net: Network?): Int = send(server, "/api/scans", JSONObject().put("scans", a).toString(), net)
 
     private fun runFlush(reason: String) {
         val server = store.server
@@ -782,6 +764,12 @@ object ScanStarter {
         Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.ACTIVITY_RECOGNITION,
         Diag.LOCAL_NETWORK.takeIf { Build.VERSION.SDK_INT >= Diag.LOCAL_NETWORK_SDK }
     ).plus(Health.requestable(Build.VERSION.SDK_INT)).filter { c.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+
+    fun missingBackground(c: Context): List<String> = Health.backgroundStep(
+        Build.VERSION.SDK_INT,
+        Health.requestable(Build.VERSION.SDK_INT).any { c.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED },
+        c.checkSelfPermission(Health.BACKGROUND) == PackageManager.PERMISSION_GRANTED
+    )
 
     fun bgLocation(c: Context): Boolean = c.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
 
