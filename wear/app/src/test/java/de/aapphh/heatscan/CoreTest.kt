@@ -1219,10 +1219,61 @@ class CoreTest {
     }
 
     @Test
-    fun manualMessagesFollowState() {
-        assertEquals("Messe …", Prompt.measured("bad", "wait"))
-        assertTrue(Prompt.measured("bad", "ok").endsWith("Messung ok"))
-        assertTrue(Prompt.measured("bad", "rejected").endsWith("gilt für die nächste"))
+    fun tapVerdictSeparatesFreshStaleAndEmpty() {
+        assertEquals(Verdict.FRESH, Tap.verdict(true, 5, 10_000_000L, 9_999L))
+        assertEquals(Verdict.FRESH, Tap.verdict(true, 5, 10_000_000L, 10_000L))
+        assertEquals(Verdict.STALE, Tap.verdict(true, 5, 10_000_000L, 10_001L))
+        assertEquals(Verdict.STALE, Tap.verdict(false, 5, 10_000_000L, 1L))
+        assertEquals(Verdict.EMPTY, Tap.verdict(true, 0, 0L, 1L))
+        assertEquals(Verdict.EMPTY, Tap.verdict(false, 0, 0L, 1L))
+    }
+
+    @Test
+    fun throttleCountdownFollowsOwnScanStarts() {
+        val w = ScanConfig.SCAN_WINDOW_MS
+        assertEquals(30, Tap.waitS(emptyList(), 500_000L, 30))
+        assertEquals(30, Tap.waitS(listOf(400_000L, 410_000L, 420_000L), 500_000L, 30))
+        assertEquals(2, Tap.waitS(listOf(400_000L), 500_000L, 2))
+        val full = listOf(400_000L, 410_000L, 420_000L, 430_000L)
+        assertEquals(20, Tap.waitS(full, 500_000L, 30))
+        assertEquals(1, Tap.waitS(full, 400_000L + w - 1, 30))
+        assertEquals(30, Tap.waitS(full, 400_000L + w, 30))
+        assertEquals(20, Tap.waitS(listOf(1L, 390_000L, 400_000L, 410_000L, 420_000L, 430_000L), 500_000L, 30))
+        assertEquals(0, Tap.remainingS(1_000L, 1_000L))
+        assertEquals(1, Tap.remainingS(1_001L, 1_000L))
+        assertEquals(3, Tap.remainingS(4_000L, 1_000L))
+        assertEquals(0, Tap.remainingS(1_000L, 5_000L))
+    }
+
+    @Test
+    fun serverAckDecidesOutcome() {
+        assertEquals(Tap.OK, Tap.ack(200, 0, 0))
+        assertNull(Tap.ack(204, 2, 0))
+        assertEquals(Tap.QUEUED, Tap.ack(-1, 1, 0))
+        assertEquals(Tap.QUEUED, Tap.ack(200, 0, 1))
+        assertEquals(Tap.failed("Server HTTP 500"), Tap.ack(500, 1, 0))
+    }
+
+    @Test
+    fun tapViewShowsOneOutcomePerState() {
+        assertEquals(TapView(TapKind.WAIT, "Messe…"), Tap.view(Tap.WAIT, "bad", 0, 0))
+        assertEquals("✓ Messung gespeichert – Bad", Tap.view(Tap.OK, "bad", 0, 0)?.title)
+        assertEquals(TapKind.QUEUED, Tap.view(Tap.QUEUED, "bad", 0, 0)?.kind)
+        assertEquals("✓ Gespeichert (wird gesendet)", Tap.view(Tap.QUEUED, "bad", 0, 0)?.title)
+        assertEquals("Zu schnell – in 5 s nochmal tippen", Tap.view(Tap.THROTTLED, "bad", 10_000, 5_000)?.title)
+        assertEquals("Zu schnell – in 1 s nochmal tippen", Tap.view(Tap.THROTTLED, "bad", 10_000, 10_000)?.title)
+        val f = Tap.view(Tap.failed("WLAN aus"), "bad", 0, 0)
+        assertEquals(TapView(TapKind.FAILED, "Fehlgeschlagen – erneut versuchen", "WLAN aus"), f)
+        assertNull(Tap.view("", "bad", 0, 0))
+    }
+
+    @Test
+    fun roomsLockedWhileMeasuringOrCountingDown() {
+        assertTrue(Tap.locked(Tap.WAIT, 0, 0))
+        assertTrue(Tap.locked(Tap.THROTTLED, 10_000, 5_000))
+        assertFalse(Tap.locked(Tap.THROTTLED, 10_000, 10_000))
+        assertFalse(Tap.locked(Tap.OK, 0, 0))
+        assertFalse(Tap.locked(Tap.failed("x"), 0, 0))
     }
 
     @Test
