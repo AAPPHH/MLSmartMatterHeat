@@ -48,14 +48,26 @@ object LabelEvent {
 
     fun window(from: Long, now: Long): Pair<Long, Long> = Pair(minOf(maxOf(from, Span.ms(now, MAX_SPAN_MS)), now), now)
 
-    fun entry(device: String, from: Long, to: Long, label: String): JSONObject =
-        JSONObject().put("ts", to).put("kind", KIND).put("device", device).put("from", from).put("to", to).put("label", label)
+    const val POINT_MS = 1_000L
+
+    fun entry(device: String, from: Long, to: Long, label: String, heat: Boolean = true): JSONObject =
+        JSONObject().put("ts", to).put("kind", KIND).put("device", device).put("from", from).put("to", to).put("label", label).put("heat", heat)
+
+    fun point(device: String, at: Long, label: String, heat: Boolean): JSONObject = entry(device, at - POINT_MS, at + POINT_MS, label, heat)
 
     fun isLabel(o: JSONObject) = o.optString("kind") == KIND
 
-    fun watchBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("to")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("room", o.getString("label")).put("source", "watch").toString()
+    fun watchBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("to")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("room", o.getString("label")).put("source", "watch").put("heat", o.optBoolean("heat", true)).toString()
 
     fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).toString()
+}
+
+object Heat {
+    const val CHOICE_MS = 8_000L
+    const val YES = "Heizen"
+    const val NO = "nur Label"
+
+    fun default(learning: Boolean) = !learning
 }
 
 object Prompt {
@@ -395,9 +407,12 @@ object Learn {
     const val MAX_MS = 3_600_000L
     const val TICK_MS = 2_000L
     const val GAP_MS = 5_000L
+    const val PENDING_MS = 20_000L
     const val PATH = "/api/labels/progress"
     const val TITLE = "Wo bist du gerade?"
     const val FINISHED = "Fertig ✓"
+
+    fun waiting(pending: Boolean, tapMs: Long, now: Long) = pending && Span.ms(now, tapMs) in 0 until PENDING_MS
 
     fun parse(text: String?): Progress? = try {
         val o = JSONObject(text ?: "")

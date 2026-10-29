@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -121,6 +122,7 @@ class MainActivity : ComponentActivity() {
         }
         val pager = rememberPagerState { 2 }
         var tapped by remember { mutableStateOf<String?>(null) }
+        var choosing by remember { mutableStateOf<String?>(null) }
         var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
         val state = version.let { store.manual }
         val until = version.let { store.manualUntil }
@@ -132,7 +134,18 @@ class MainActivity : ComponentActivity() {
         val progress = version.let { store.progress }
         val learnView = Learn.view(learning, progress)
         LaunchedEffect(version, tapped) {
-            if (learnPrompt && tapped == null && store.learnPromptAt == 0L) finish()
+            if (learnPrompt && tapped == null && choosing == null && store.learnPromptAt == 0L) finish()
+        }
+        val pick = { room: String, heat: Boolean ->
+            choosing = null
+            LabelRecorder.measure(this@MainActivity, room, heat) { if (prompt) Prompter.cancel(applicationContext) }
+            tapped = room
+        }
+        LaunchedEffect(choosing) {
+            choosing?.let { room ->
+                delay(Heat.CHOICE_MS)
+                pick(room, Heat.default(store.learnAt != 0L))
+            }
         }
         LaunchedEffect(locked, tapped) {
             while (locked || tapped != null) {
@@ -164,10 +177,7 @@ class MainActivity : ComponentActivity() {
                     if (page == 0) {
                         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
                         RoomsPage(hot, ringed, locked, learnView) {
-                            if (!Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
-                                LabelRecorder.measure(this@MainActivity, it) { if (prompt) Prompter.cancel(applicationContext) }
-                                tapped = it
-                            }
+                            if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) choosing = it
                         }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,
@@ -175,13 +185,28 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
-            if (!prompt && view == null && pager.currentPage == 0) {
+            if (!prompt && view == null && choosing == null && pager.currentPage == 0) {
                 Text(
                     Learn.chip(learning, progress),
                     Modifier.align(Alignment.TopCenter).padding(top = 2.dp).clip(RoundedCornerShape(50)).background(if (learning) SELECTED else IDLE)
                         .clickable { ScanService.instance?.setLearning(!learning) }.padding(horizontal = 10.dp, vertical = 2.dp),
                     fontSize = 9.sp, maxLines = 1, color = if (learning) INK else Color.White
                 )
+            }
+            choosing?.let { room ->
+                Column(Modifier.fillMaxSize().background(Color.Black).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+                    Text(Defaults.CAPTIONS.getValue(room), fontSize = 12.sp, color = Color.White, maxLines = 1)
+                    Text(
+                        Heat.YES,
+                        Modifier.padding(top = 6.dp).fillMaxWidth().clip(RoundedCornerShape(50)).background(SELECTED).clickable { pick(room, true) }.padding(vertical = 12.dp),
+                        fontSize = 18.sp, fontWeight = FontWeight.Bold, color = INK, textAlign = TextAlign.Center
+                    )
+                    Text(
+                        Heat.NO,
+                        Modifier.padding(top = 8.dp).clip(RoundedCornerShape(50)).background(IDLE).clickable { pick(room, false) }.padding(horizontal = 14.dp, vertical = 4.dp),
+                        fontSize = 10.sp, color = Color.White, maxLines = 1
+                    )
+                }
             }
             view?.let {
                 Column(Modifier.fillMaxSize().background(TapColors.of(it.kind)).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
