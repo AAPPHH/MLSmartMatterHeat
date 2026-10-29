@@ -623,9 +623,8 @@ fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<Strin
     for batch in crate::context::read_raw(state.sink.root(), Table::Labels, None)? {
         let (ts, from, to) = (crate::context::ts_column(&batch, "ts")?, crate::context::ts_column(&batch, "from_ts")?, crate::context::ts_column(&batch, "to_ts")?);
         let (room, source) = (crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
-        let at = |i: usize| if to.is_null(i) { ts.value(i) } else { to.value(i) };
         let retroactive = |i: usize| !from.is_null(i) && !to.is_null(i) && to.value(i) - from.value(i) > max_span_us;
-        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && at(i) >= since_us && !retroactive(i)).map(|i| (at(i), room.value(i).to_string())));
+        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && !to.is_null(i) && to.value(i) >= since_us && !retroactive(i)).map(|i| (to.value(i), room.value(i).to_string())));
     }
     rows.sort();
     let mut last: HashMap<String, i64> = HashMap::new();
@@ -633,8 +632,8 @@ fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<Strin
     for (ts, room) in rows {
         if last.get(&room).is_none_or(|&t| ts - t > LABEL_DEDUP_US) {
             *counts.entry(room.clone()).or_insert(0) += 1;
+            last.insert(room, ts);
         }
-        last.insert(room, ts);
     }
     Ok(counts)
 }
@@ -993,13 +992,13 @@ label_target = 2
         assert_eq!((body["target"].clone(), body["since"].clone(), body["done"].clone()), (json!(2), json!(iso), json!(false)));
         assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 0}, {"room": "bad", "n": 0}, {"room": "flur", "n": 0}]));
         for (offset, room) in [(-60_000, "bad"), (1_000, "bad"), (2_000, "bad"), (50_000, "bad"), (1_000, "wohnzimmer"), (20_000, "flur"), (30_000, "diele")] {
-            call(&h.state, "POST", "/api/scan", Some(scan_at(since + offset, json!({"label": room})))).await;
+            call(&h.state, "POST", "/watch/label", label_body("pixel-watch", since + offset - 1_000, since + offset + 1_000, room)).await;
         }
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
         assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 1}, {"room": "bad", "n": 2}, {"room": "flur", "n": 1}]));
         assert_eq!(body["done"], json!(false));
         for (offset, room) in [(40_000, "wohnzimmer"), (60_000, "flur")] {
-            call(&h.state, "POST", "/api/scan", Some(scan_at(since + offset, json!({"label": room})))).await;
+            call(&h.state, "POST", "/watch/label", label_body("pixel-watch", since + offset - 1_000, since + offset + 1_000, room)).await;
         }
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
         assert_eq!(body["done"], json!(true));
@@ -1763,7 +1762,7 @@ name = 'flur'
         post(json!({"ts": now - 60_000, "label": "wohnzimmer", "motion": "still", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]})).await;
         assert_eq!(wanted(&h, now), vec![("wohnzimmer".to_string(), 21.0, "occupied", "stay_label", false), ("schlafzimmer".to_string(), 18.0, "default", "stay_label", false)]);
         assert_eq!(wanted(&h, now + 31 * 60_000)[0].1, 18.0);
-        post(json!({"ts": now - 30_000, "motion": "moving"})).await;
+        post(json!({"ts": now - 20_000, "motion": "moving"})).await;
         assert_eq!(wanted(&h, now)[0].1, 18.0);
     }
 
@@ -1773,8 +1772,39 @@ name = 'flur'
         let now = now_ms();
         call(&h.state, "POST", "/api/label", label_body("pixel-watch", now - 120_000, now - 1_000, "wohnzimmer")).await;
         assert_eq!(wanted(&h, now)[0].2, "occupied");
-        call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "pixel-watch", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]}).to_string())).await;
+        let unlabeled = |ts: i64, extra: Value| {
+            let mut v = json!({"ts": ts, "device": "pixel-watch", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]});
+            extra.as_object().unwrap().iter().for_each(|(k, x)| v[k] = x.clone());
+            Some(v.to_string())
+        };
+        call(&h.state, "POST", "/api/scan", unlabeled(now, json!({}))).await;
+        call(&h.state, "POST", "/api/scan", unlabeled(now + 20_000, json!({}))).await;
+        assert_eq!(wanted(&h, now)[0].2, "occupied");
+        call(&h.state, "POST", "/api/scan", unlabeled(now + 60_000, json!({"heat": false}))).await;
+        assert_eq!(wanted(&h, now)[0].2, "occupied");
+        call(&h.state, "POST", "/api/scan", unlabeled(now + 60_000, json!({}))).await;
         assert_eq!(wanted(&h, now)[0].2, "default");
+    }
+
+    #[tokio::test]
+    async fn label_progress_dedupes_against_the_last_counted_tap_not_a_sliding_chain() {
+        let now = now_ms();
+        let iso = chrono::DateTime::from_timestamp_millis(now - 3_600_000).unwrap().to_rfc3339();
+        let base = now - 1_800_000;
+        let cfg = format!("[[rooms]]
+name = 'bad'
+nodes = [7]
+[watchmatch]
+labels_since = '{iso}'
+");
+        for (offsets, expected) in [(vec![0, 40_000, 80_000], 3), (vec![0, 20_000], 1)] {
+            let h = harness_with(false, "away_guard_minutes = 0
+", &cfg);
+            for at in offsets {
+                call(&h.state, "POST", "/watch/label", label_body("pixel-watch", base + at - 1_000, base + at + 1_000, "bad")).await;
+            }
+            assert_eq!(call(&h.state, "GET", "/api/labels/progress", None).await.1["rooms"], json!([{"room": "bad", "n": expected}]));
+        }
     }
 
     #[tokio::test]

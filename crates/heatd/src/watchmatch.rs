@@ -602,7 +602,7 @@ impl WatchMatch {
                 inner.stays.insert(device.into(), (l.into(), ts_ms));
             }
             Some(_) => {}
-            None if inner.stays.get(device).is_some_and(|s| ts_ms > s.1) => {
+            None if inner.stays.get(device).is_some_and(|s| ts_ms > s.1 + self.cfg.label_tolerance_s * 1000) => {
                 inner.stays.remove(device);
             }
             None => {}
