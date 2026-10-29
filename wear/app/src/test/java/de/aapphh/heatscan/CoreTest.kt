@@ -1667,4 +1667,34 @@ class CoreTest {
         assertEquals("Wo bist du gerade?", Prompt.title(true, true))
         assertEquals("Wo bist du?", Prompt.title(false))
     }
+
+    @Test
+    fun tapProducesOnePointLabelAtScanTime() {
+        val e = LabelEvent.point("w", 10_000, "bad", true)
+        assertEquals(9_000L, e.getLong("from"))
+        assertEquals(11_000L, e.getLong("to"))
+        assertTrue(LabelEvent.isLabel(e))
+        val b = JSONObject(LabelEvent.watchBody(e))
+        assertEquals("bad", b.getString("room"))
+        assertTrue(b.getBoolean("heat"))
+        val n = LabelEvent.point("w", 10_000, "bad", false)
+        assertFalse(JSONObject(LabelEvent.watchBody(n)).getBoolean("heat"))
+        assertTrue(JSONObject(LabelEvent.watchBody(LabelEvent.entry("w", 1, 2, "bad"))).getBoolean("heat"))
+        val old = JSONObject(LabelEvent.entry("w", 1, 2, "bad").toString()).also { it.remove("heat") }
+        assertTrue(JSONObject(LabelEvent.watchBody(old)).getBoolean("heat"))
+    }
+
+    @Test
+    fun heatDefaultsByMode() {
+        assertTrue(Heat.default(false))
+        assertFalse(Heat.default(true))
+        assertEquals(8_000L, Heat.CHOICE_MS)
+    }
+
+    @Test
+    fun learnPendingTimesOut() {
+        assertTrue(Learn.waiting(true, 1_000, 1_000 + Learn.PENDING_MS - 1))
+        assertFalse(Learn.waiting(true, 1_000, 1_000 + Learn.PENDING_MS))
+        assertFalse(Learn.waiting(false, 1_000, 1_001))
+    }
 }

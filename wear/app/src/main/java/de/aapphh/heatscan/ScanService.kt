@@ -421,12 +421,18 @@ class ScanService : Service() {
     }
 
     private var learnPending = false
+    @Volatile private var learnReady = false
     private var learnTapMs = 0L
     private var learnIdleAt = 0L
     private val learnTick = object : Runnable {
         override fun run() {
             val now = System.currentTimeMillis()
-            when (Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt)) {
+            if (learnPending && !Learn.waiting(true, learnTapMs, SystemClock.elapsedRealtime())) {
+                Trace.i("learn_pending_timeout")
+                learnPending = false
+            }
+            val step = if (!learnReady) LearnStep.WAIT else Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt)
+            when (step) {
                 LearnStep.STOP -> stopLearn("auto")
                 LearnStep.DISCARD -> {
                     Trace.i("learn_discard")
@@ -449,6 +455,8 @@ class ScanService : Service() {
             store.learnPromptAt = 0L
             learnIdleAt = 0L
             learnPending = false
+            learnReady = false
+            store.progressText = null
             Trace.i("learn_start")
             fetchProgress()
             handler.removeCallbacks(learnTick)
@@ -476,9 +484,12 @@ class ScanService : Service() {
                     if (r.code in 200..299 && Learn.parse(r.text) != null) store.progressText = r.text
                 } catch (e: Exception) {
                     Trace.w("progress", e)
+                } finally {
+                    learnReady = true
                 }
             }
         } catch (e: RejectedExecutionException) {
+            learnReady = true
             Log.w(TAG, "progress rejected", e)
         }
     }
@@ -495,7 +506,7 @@ class ScanService : Service() {
         learnTapMs = now
     }
 
-    fun learnLabel(room: String) {
+    fun learnLabel(room: String, heat: Boolean = false) {
         handler.post {
             val at = store.learnScanAt
             if (store.learnPromptAt == 0L || room !in Defaults.LABELS) return@post
@@ -512,11 +523,7 @@ class ScanService : Service() {
             store.manual = Tap.WAIT
             try {
                 io.execute {
-                    queue.add(LabelEvent.entry(store.device, at - 1000L, at + 1000L, room), wall)
-                    store.stay { it.confirm(room, wall) }
-                    store.refreshTile()
-                    Trace.i("label", "room" to room, "from" to at - 1000L, "to" to at + 1000L, "learn" to true)
-                    onLabel()
+                    LabelRecorder.point(applicationContext, room, at, heat)
                     flush("label")
                 }
             } catch (e: RejectedExecutionException) {
@@ -528,6 +535,7 @@ class ScanService : Service() {
     private var manualPending = false
     private var manualAwaiting = false
     private var manualRoom = ""
+    private var manualHeat = true
     private var manualTapMs = 0L
     private val manualTimeout = Runnable { throttleManual() }
     private val ackTimeout = Runnable { setManual(Tap.QUEUED) }
@@ -561,13 +569,14 @@ class ScanService : Service() {
         }
     }
 
-    fun manualScan(room: String, tapMs: Long) {
+    fun manualScan(room: String, tapMs: Long, heat: Boolean = true) {
         handler.post {
             if (manualPending || manualAwaiting) return@post
             if (!active) return@post failManual("Scan pausiert")
             val now = SystemClock.elapsedRealtime()
             manualPending = true
             manualRoom = room
+            manualHeat = heat
             manualTapMs = tapMs
             val claimed = policy.claimManual(now)
             val ok = claimed && try { wifi.startScan() } catch (e: Exception) { false }
@@ -586,11 +595,7 @@ class ScanService : Service() {
         try {
             val results = wifi.scanResults
             val pending = manualPending && broadcast
-            val learn = learnPending && broadcast && !pending
-            if (learn && Tap.verdict(updated, results.size, results.maxOfOrNull { it.timestamp } ?: 0L, learnTapMs) != Verdict.FRESH) {
-                learnPending = false
-                return
-            }
+            val learn = learnPending && broadcast && !pending && Tap.verdict(updated, results.size, results.maxOfOrNull { it.timestamp } ?: 0L, learnTapMs) == Verdict.FRESH
             if (pending) {
                 when (Tap.verdict(updated, results.size, results.maxOfOrNull { it.timestamp } ?: 0L, manualTapMs)) {
                     Verdict.EMPTY -> return failManual(Diag.emptyScan(getSystemService(LocationManager::class.java).isLocationEnabled, wifi.isWifiEnabled))
@@ -660,9 +665,9 @@ class ScanService : Service() {
         try {
             io.execute {
                 val wall = System.currentTimeMillis()
-                if (manual) LabelRecorder.record(applicationContext, manualRoom, false)
-                val d = if (learn) Decision() else if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
-                val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime())
+                if (manual) LabelRecorder.point(applicationContext, manualRoom, ts, manualHeat, false)
+                val d = if (learn || (manual && !manualHeat)) Decision() else if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
+                val body = Payload.build(ts, store.device, if (manual) null else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime())
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
@@ -898,6 +903,17 @@ object LabelRecorder {
         }
     }
 
+    fun point(c: Context, room: String, at: Long, heat: Boolean, flush: Boolean = true) {
+        val store = Store(c)
+        val now = System.currentTimeMillis()
+        ScanQueue.get(c).add(LabelEvent.point(store.device, at, room, heat), now)
+        if (heat) store.stay { it.confirm(room, now) }
+        store.refreshTile()
+        Trace.i("label", "room" to room, "from" to at - LabelEvent.POINT_MS, "to" to at + LabelEvent.POINT_MS, "heat" to heat)
+        ScanService.instance?.onLabel()
+        if (flush) ScanService.instance?.flush("label")
+    }
+
     fun record(c: Context, room: String, notify: Boolean = true) {
         if (room !in Defaults.LABELS) return
         val store = Store(c)
@@ -913,16 +929,16 @@ object LabelRecorder {
         ScanService.instance?.flush("label")
     }
 
-    fun measure(c: Context, room: String, done: () -> Unit = {}) {
+    fun measure(c: Context, room: String, heat: Boolean, done: () -> Unit = {}) {
         val tapMs = SystemClock.elapsedRealtime()
         val store = Store(c)
         if (store.learnPromptAt != 0L && ScanService.instance != null) {
-            ScanService.instance?.learnLabel(room)
+            ScanService.instance?.learnLabel(room, heat)
             return done()
         }
         store.manualUntil = 0L
         store.manual = Tap.WAIT
-        ScanService.instance?.manualScan(room, tapMs) ?: store.run { manual = Tap.failed("Dienst läuft nicht") }
+        ScanService.instance?.manualScan(room, tapMs, heat) ?: store.run { manual = Tap.failed("Dienst läuft nicht") }
         done()
     }
 }
