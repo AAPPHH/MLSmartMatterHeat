@@ -419,7 +419,28 @@ data class RoomP(val room: String, val p: Float, val parts: List<Part>)
 
 data class NamedAp(val bssid: String, val ssid: String, val rssi: Int, val freq: Int)
 
-class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true)
+data class MatchP(val room: String, val p: Float)
+
+data class Match(val room: String?, val p: Float, val abstained: Boolean, val reason: String?, val top: List<MatchP>)
+
+class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true, val match: Match? = null)
+
+object MatchView {
+    private val REASONS = mapOf(
+        "no_model" to "kein Modell", "low_margin" to "zu knapp", "low_confidence" to "zu unklar",
+        "no_known_ap" to "kein bekanntes WLAN", "unknown_state" to "Zustand unklar", "no_scan" to "kein Scan"
+    )
+
+    fun percent(p: Float): Int = Math.round(p.coerceIn(0f, 1f) * 100f)
+
+    fun reason(r: String?): String = if (r == null) "" else REASONS[r] ?: r
+
+    fun title(m: Match): String = m.room?.let { Rings.name(it) } ?: "-"
+
+    fun sub(m: Match): String = if (m.abstained) ("unsicher" + (m.reason?.let { " - " + reason(it) } ?: "")) else "${percent(m.p)} % sicher"
+
+    fun top(m: Match): String = m.top.joinToString(" | ") { "${Rings.name(it.room)} ${percent(it.p)}" }
+}
 
 object ReplyJson {
     private fun <T> list(text: String?, f: (JSONObject) -> T): List<T> = try {
@@ -453,11 +474,28 @@ object ReplyJson {
         aps.forEach { a.put(JSONObject().put("bssid", it.bssid).put("ssid", it.ssid).put("rssi", it.rssi).put("freq", it.freq)) }
     }.toString()
 
+    fun match(o: JSONObject?): Match? = try {
+        o?.let {
+            Match(
+                if (it.isNull("room")) null else it.getString("room"), it.optDouble("p", 0.0).toFloat(), it.optBoolean("abstained", false),
+                if (it.isNull("reason")) null else it.optString("reason"),
+                list(it.optJSONArray("top")?.toString()) { t -> MatchP(t.getString("room"), t.getDouble("p").toFloat()) }
+            )
+        }
+    } catch (e: Exception) { null }
+
+    fun matchJson(m: Match?): String? = m?.let {
+        JSONObject().put("room", it.room ?: JSONObject.NULL).put("p", it.p.toDouble()).put("abstained", it.abstained).put("reason", it.reason ?: JSONObject.NULL)
+            .put("top", JSONArray().also { a -> it.top.forEach { t -> a.put(JSONObject().put("room", t.room).put("p", t.p.toDouble())) } }).toString()
+    }
+
+    fun matchOf(text: String?): Match? = try { match(text?.let { JSONObject(it) }) } catch (e: Exception) { null }
+
     fun parse(text: String): Reply = try {
         val o = JSONObject(text)
         Reply(
             if (o.isNull("probability")) null else o.optDouble("probability").toFloat().takeIf { !it.isNaN() },
-            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms")
+            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms"), match(o.optJSONObject("match"))
         )
     } catch (e: Exception) { Reply(null, emptyList(), emptyList(), false) }
 
@@ -1031,6 +1069,7 @@ class Store(private val ctx: Context) {
         get() = if (sp.contains("probability")) sp.getFloat("probability", 0f) else null
         set(v) = sp.edit().also { if (v == null) it.remove("probability") else it.putFloat("probability", v) }.apply()
     val rooms: List<RoomP> get() = ReplyJson.rooms(sp.getString("rooms", null))
+    val match: Match? get() = ReplyJson.matchOf(sp.getString("match", null))
     val replyAps: List<Ap> get() = ReplyJson.aps(sp.getString("replyAps", null))
     val lastAps: List<NamedAp> get() = ReplyJson.named(sp.getString("lastAps", null))
     var postHm: String
@@ -1049,6 +1088,7 @@ class Store(private val ctx: Context) {
         sp.edit().also {
             if (r.probability == null) it.remove("probability") else it.putFloat("probability", r.probability)
             it.putString("rooms", ReplyJson.roomsJson(r.rooms)).putString("replyAps", ReplyJson.apsJson(r.aps))
+            ReplyJson.matchJson(r.match).let { m -> if (m == null) it.remove("match") else it.putString("match", m) }
             it.putString("colors", ColorBook.json(ColorBook.assign(colors, Rings.palette(Rings.order(r.rooms)), now)))
         }.apply()
     }

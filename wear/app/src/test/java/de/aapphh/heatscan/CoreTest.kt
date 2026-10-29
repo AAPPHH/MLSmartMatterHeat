@@ -992,6 +992,33 @@ class CoreTest {
     }
 
     @Test
+    fun matchParsingAndText() {
+        val m = ReplyJson.parse("""{"stored":4,"room":"flur","match":{"room":"wohnzimmer","p":0.62,"abstained":false,"reason":null,"top":[{"room":"wohnzimmer","p":0.62},{"room":"bad","p":0.2},{"room":"kueche","p":0.09}],"model":"v1"}}""").match!!
+        assertEquals("wohnzimmer", m.room)
+        assertEquals(3, m.top.size)
+        assertEquals(Rings.name("wohnzimmer"), MatchView.title(m))
+        assertEquals("62 % sicher", MatchView.sub(m))
+        assertEquals("${Rings.name("wohnzimmer")} 62 | ${Rings.name("bad")} 20 | ${Rings.name("kueche")} 9", MatchView.top(m))
+        assertEquals(m, ReplyJson.matchOf(ReplyJson.matchJson(m)))
+    }
+
+    @Test
+    fun matchAbstainedAndMissing() {
+        val none = ReplyJson.parse("""{"match":{"room":null,"p":0.0,"abstained":true,"reason":"no_model","top":[],"model":null}}""").match!!
+        assertEquals(null, none.room)
+        assertEquals("-", MatchView.title(none))
+        assertEquals("unsicher - kein Modell", MatchView.sub(none))
+        assertEquals("", MatchView.top(none))
+        assertEquals(none, ReplyJson.matchOf(ReplyJson.matchJson(none)))
+        val thin = ReplyJson.parse("""{"match":{"room":"bad","p":0.41,"abstained":true,"reason":"low_margin","top":[{"room":"bad","p":0.41}]}}""").match!!
+        assertEquals("unsicher - zu knapp", MatchView.sub(thin))
+        assertEquals(null, ReplyJson.parse("""{"stored":4,"room":"flur","rooms":[],"aps":[]}""").match)
+        assertEquals(null, ReplyJson.parse("garbage").match)
+        assertEquals(null, ReplyJson.matchOf(null))
+        assertEquals(null, ReplyJson.matchOf("not json"))
+    }
+
+    @Test
     fun jsonRoundTrip() {
         val r = ReplyJson.parse(replyText)
         assertEquals(r.rooms, ReplyJson.rooms(ReplyJson.roomsJson(r.rooms)))
