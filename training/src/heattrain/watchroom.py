@@ -115,7 +115,7 @@ def assign_labels(lake, cfg, scans):
     start = datetime.fromisoformat(cfg["labels_from"]).timestamp() if cfg.get("labels_from") else None
     rows = [r for r in rows if start is None or r[0] >= start]
     for ts, f, to, name, d in rows:
-        if f is not None and to is not None:
+        if f is not None and to is not None and cfg.get("label_intervals", True):
             mask = (t >= f) & (t <= to) & ((dev == str(d)) if d else True)
             room[mask], best[mask] = name, -1.0
     for ts, f, to, name, d in rows:

@@ -117,4 +117,4 @@ def lake(tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def config(tmp_path_factory):
-    return dict(CONFIG, eval_dir=tmp_path_factory.mktemp("eval"), labels_from=None, min_sender_days=2, min_room_scans=20)
+    return dict(CONFIG, eval_dir=tmp_path_factory.mktemp("eval"), labels_from=None, label_tolerance_s=300.0, label_intervals=True, min_sender_days=2, min_room_scans=20)
