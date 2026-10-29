@@ -262,11 +262,31 @@ Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °
 
 Die API hat keine Authentifizierung und gehört nur ins LAN.
 
+## Raum-Abgleich trainieren (Phase 1b) 🧭
+
+Das Training liest nur Parquet aus dem Datenlake (`<data_root>/parquet`, nie `raw/`) und schreibt ein versioniertes Modell nach `<models_dir>/<version>/` (`model.json` plus ein ONNX je Zustand, `all` ist der Fallback). heatd lädt es über `[watchmatch] model_dir`.
+
+```bash
+cd training
+uv run python -m heattrain watchroom /data /models/watchroom    # trainieren + exportieren (Hold-out-Auswertung in model.json und eval/*.md)
+uv run python -m heattrain eval /data /models/watchroom/<version>   # Modell auf Tagen nach dem Trainingsfenster prüfen
+uv run pytest
+```
+
+Ablauf: gelabelte WLAN-Scans (Fenster-Labels mit `from_ts`/`to_ts` und Punkt-Labels) werden je Scan gruppiert, per Regel einem Zustand zugeordnet (rest, sleep, active, offbody, charging; ohne Puls und Bewegung `all`), kNN gegen Gradient Boosting per Tages-Block-CV gewählt und kalibriert. τ und δ maximieren Macro-F1 bei Coverage ≥ 0,8; die HMM-Übergänge kommen aus den `links` in `meta` (Wand/offen bevorzugt, ohne Meta gleichverteilt). Beim Export wird ONNX gegen sklearn geprüft (≤ 1e-5). Abweichung: HistGradientBoosting lässt sich mit skl2onnx 1.20 und onnx 1.23 nicht konvertieren, daher klassisches GradientBoosting.
+
+Wöchentliches Neutraining extern, z. B. systemd-Timer auf dem Minix (nicht deployt):
+
+```
+0 4 * * 0  cd /opt/MLSmartMatterHeat/training && uv run python -m heattrain watchroom /data /models/watchroom
+```
+
 ## Entwickeln 🧪
 
 ```bash
 cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings   # ohne Hardware, Mock-Controller
 cd ml && uv run pytest
+cd training && uv run pytest
 sh wear/build.sh
 ```
 
