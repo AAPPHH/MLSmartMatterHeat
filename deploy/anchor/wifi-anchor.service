@@ -1,0 +1,7 @@
+[Unit]
+Description=heatd WiFi anchor scan (fixed reference fingerprint)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/heatd-anchor/wifi-anchor.py
