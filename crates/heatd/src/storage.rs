@@ -178,6 +178,10 @@ impl Storage {
         Ok(Ingested { stored: scan.aps.len(), duplicate: false })
     }
 
+    pub fn claim_id(&self, device: &str, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute("INSERT INTO ingest_ids VALUES (?, ?) ON CONFLICT DO NOTHING", params![device, id])? > 0)
+    }
+
     pub fn relabel(&self, device: &str, from_ms: i64, to_ms: i64, label: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let ids: i64 = conn.query_row(

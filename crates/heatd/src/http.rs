@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 pub struct AppState {
     pub config: Arc<Config>,
     pub storage: Arc<Storage>,
+    pub sink: crate::lake::Sink,
     pub model: Option<Arc<RoomModel>>,
     pub controller: Arc<dyn MatterController>,
     pub windows: Arc<Mutex<HashSet<String>>>,
@@ -234,6 +235,7 @@ mod tests {
         let model = with_model.then(|| Arc::new(RoomModel::load(&Path::new(FIXTURES).join("room_model.onnx")).unwrap()));
         let state = AppState {
             storage: Arc::new(Storage::open(&config.db_path).unwrap()),
+            sink: crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap(),
             config: Arc::new(config),
             model,
             controller: mock.clone(),

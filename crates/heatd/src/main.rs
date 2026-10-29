@@ -2,6 +2,10 @@ mod config;
 mod http;
 mod infer;
 mod inventory;
+mod lake;
+#[cfg(test)]
+mod lake_tests;
+mod migrate;
 mod rules;
 mod storage;
 
@@ -13,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | thread form <serial-port> | thread dataset <serial-port>";
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | thread form <serial-port> | thread dataset <serial-port>";
 const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -166,7 +170,11 @@ async fn serve(config: Config) -> Result<()> {
     } else {
         None
     };
+    let sink = lake::Sink::open(lake::LakeConfig::new(&config.data_dir))?;
+    sink.append(lake::Event::now(lake::kind::STARTUP, "heatd").with_detail(serde_json::json!({"commit": lake::COMMIT, "schema_version": lake::SCHEMA_VERSION})))?;
+    lake::spawn_background(sink.clone());
     let state = http::AppState {
+        sink: sink.clone(),
         storage: Arc::new(storage::Storage::open(&config.db_path)?),
         model,
         controller,
@@ -178,6 +186,8 @@ async fn serve(config: Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);
     axum::serve(listener, http::router(state)).with_graceful_shutdown(shutdown_signal()).await?;
+    sink.append(lake::Event::now(lake::kind::SHUTDOWN, "heatd"))?;
+    sink.close()?;
     Ok(())
 }
 
@@ -242,6 +252,7 @@ fn run(args: Vec<String>) -> Result<()> {
             let dataset = open_cli(port, &config)?.active_dataset()?;
             save_dataset(&config, &dataset)
         }
+        ["migrate"] => migrate::run(&config),
         ["commission" | "read" | "set" | "inventory", ..] => runtime()?.block_on(controller_command(config, &args)),
         _ => bail!(USAGE),
     }

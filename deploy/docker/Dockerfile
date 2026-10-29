@@ -3,6 +3,8 @@ ARG MATTER_TAG=v1.5.1.0
 ARG NINJA_JOBS=4
 
 FROM rust:1.99-slim-bookworm AS heatd-build
+ARG HEATD_COMMIT=unknown
+ENV HEATD_COMMIT=${HEATD_COMMIT}
 RUN apt-get update && apt-get install -y --no-install-recommends g++ pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

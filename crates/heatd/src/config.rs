@@ -79,6 +79,7 @@ pub struct Room {
 pub struct Config {
     pub listen: String,
     pub db_path: String,
+    pub data_dir: String,
     pub snapshot_path: String,
     pub dataset_path: String,
     pub model_path: String,
@@ -99,6 +100,7 @@ impl Default for Config {
         Self {
             listen: "0.0.0.0:8080".into(),
             db_path: "data/heatd.duckdb".into(),
+            data_dir: "data".into(),
             snapshot_path: "data/snapshot.duckdb".into(),
             dataset_path: "secrets/thread_dataset.hex".into(),
             model_path: "models/room_model.onnx".into(),
