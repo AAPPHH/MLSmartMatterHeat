@@ -353,7 +353,7 @@ impl Default for Config {
             heat_source: HeatSource::default(),
             building: Building::default(),
             manual_hold_minutes: 60.0,
-            poll_silence_s: 300,
+            poll_silence_s: 60,
             watchmatch: WatchMatchSection::default(),
             window: WindowSection::default(),
         }
@@ -462,7 +462,7 @@ mod tests {
             assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
             assert_eq!((config.latitude, config.longitude, config.away_setpoint), (Some(52.52), Some(13.40), 18.0));
             assert_eq!((config.occupied_setpoint, config.sleep_room.as_deref()), (21.0, Some("schlafzimmer")));
-            assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 300, 60.0));
+            assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 60, 60.0));
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "wall").count(), 5);
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "ceiling").count(), 4);
             assert!(config.neighbours.iter().any(|n| n.kind == "ceiling" && n.partial) && config.neighbours.iter().any(|n| n.kind == "open"));
