@@ -1,0 +1,61 @@
+{
+ "model_version": "v1",
+ "created": "2026-10-29T12:00:00+00:00",
+ "matcher": "room",
+ "rooms": [
+  "wohnzimmer",
+  "schlafzimmer",
+  "bad"
+ ],
+ "senders": [
+  "aa:bb:cc:00:00:01",
+  "aa:bb:cc:00:00:02",
+  "aa:bb:cc:00:00:03",
+  "aa:bb:cc:00:00:04"
+ ],
+ "sentinel_dbm": -100,
+ "scale": {
+  "floor": -100,
+  "span": 70
+ },
+ "states": {
+  "all": "all.onnx",
+  "sleep": "sleep.onnx"
+ },
+ "tau_room": 0.7,
+ "delta_room": 0.3,
+ "t_hold_min": 10,
+ "smoothing": {
+  "kind": "hmm",
+  "stay_prob": 0.9,
+  "transition": {
+   "wohnzimmer": {
+    "wohnzimmer": 0.9,
+    "schlafzimmer": 0.025,
+    "bad": 0.075
+   },
+   "schlafzimmer": {
+    "schlafzimmer": 0.9,
+    "wohnzimmer": 0.025,
+    "bad": 0.075
+   },
+   "bad": {
+    "bad": 0.9,
+    "wohnzimmer": 0.05,
+    "schlafzimmer": 0.05
+   }
+  }
+ },
+ "metrics": {
+  "fixture": true
+ },
+ "train_window": {
+  "from": "2026-10-01",
+  "to": "2026-10-28"
+ },
+ "n_labels": {
+  "wohnzimmer": 12,
+  "schlafzimmer": 12,
+  "bad": 12
+ }
+}

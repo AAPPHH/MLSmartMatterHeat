@@ -45,6 +45,18 @@ night_setback_controllable = false
 floor = 3
 roof_rooms = ["schlafzimmer"]
 
+[watchmatch]
+enabled = true
+model_dir = "/models/watchroom"
+model_version = "latest"
+scan_fresh_s = 180
+
+[watchmatch.state]
+hr_rest_max = 75
+hr_active_min = 100
+motion_active_min = 0.5
+sleep_hours = "23-7"
+
 [chip_tool]
 binary = "chip-tool"
 # storage_dir = "/home/aapphh/snap/chip-tool/common"

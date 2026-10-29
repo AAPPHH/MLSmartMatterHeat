@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const COMMIT: &str = env!("HEATD_COMMIT");
 pub const ROW_GROUP_ROWS: usize = 65_536;
 pub const EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
@@ -46,9 +46,10 @@ pub mod kind {
     pub const ROLL_FAILED: &str = "roll_failed";
     pub const WATCH_STATE: &str = "watch_state";
     pub const POLL_FAILED: &str = "poll_failed";
-    pub const ALL: [&str; 16] = [
+    pub const MATCHER_DRIFT: &str = "matcher_drift";
+    pub const ALL: [&str; 17] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
-        ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED,
+        ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT,
     ];
 }
 
@@ -74,10 +75,12 @@ pub enum Table {
     WatchRaw,
     Weather,
     Meta,
+    WatchSensors,
+    WatchInference,
 }
 
 impl Table {
-    pub const ALL: [Table; 7] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta];
+    pub const ALL: [Table; 9] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -88,6 +91,8 @@ impl Table {
             Table::WatchRaw => "watch_raw",
             Table::Weather => "weather",
             Table::Meta => "meta",
+            Table::WatchSensors => "watch_sensors",
+            Table::WatchInference => "watch_inference",
         }
     }
 
@@ -122,12 +127,23 @@ impl Table {
             Table::WatchRaw => vec![
                 tsf("ts", false), tsf("device_ts", true), fld("sender", dict(), false), fld("rssi", DataType::Int8, false), fld("channel", DataType::UInt8, true), fld("batch_id", DataType::UInt64, false),
                 fld("device", dict(), false), fld("freq", DataType::UInt16, true), tsf("received_ts", true),
+                fld("elapsed_ns", DataType::Int64, true), fld("clock_offset_ms", DataType::Int32, true), fld("sensor_type", dict(), true), fld("sensor_name", dict(), true),
+                fld("value", DataType::Float32, true), fld("unit", dict(), true),
             ],
             Table::Weather => vec![
                 tsf("ts", false), fld("kind", dict(), false), tsf("issued_ts", true), tsf("fetched_ts", false), fld("temp_c", DataType::Float32, true), fld("wind_ms", DataType::Float32, true),
                 fld("radiation_wm2", DataType::Float32, true), fld("cloud_pct", DataType::Float32, true), fld("precip_mm", DataType::Float32, true),
             ],
             Table::Meta => vec![tsf("ts", false), fld("key", dict(), false), fld("value", DataType::Utf8, false), tsf("valid_from", false)],
+            Table::WatchSensors => vec![
+                tsf("ts", false), fld("sensor_name", dict(), false), fld("android_type", DataType::Int32, false), fld("vendor", dict(), true), fld("resolution", DataType::Float32, true),
+                fld("max_range", DataType::Float32, true), fld("app_version", dict(), true),
+            ],
+            Table::WatchInference => vec![
+                tsf("ts", false), fld("matcher", dict(), false), fld("template_id", DataType::Utf8, false), fld("result_room", dict(), true), fld("result_temp", DataType::Float32, true),
+                fld("confidence", DataType::Float32, false), fld("abstained", DataType::Boolean, false), fld("reason", dict(), true), fld("distance", DataType::Float32, true),
+                fld("state", dict(), false), fld("features_hash", DataType::Utf8, false), fld("model_version", dict(), false),
+            ],
         };
         let metadata = HashMap::from([("schema_version".to_string(), SCHEMA_VERSION.to_string()), ("heatd_commit".to_string(), COMMIT.to_string()), ("table".to_string(), self.name().to_string())]);
         Arc::new(Schema::new_with_metadata(fields, metadata))
@@ -165,6 +181,7 @@ pub fn type_name(dt: &DataType) -> String {
         DataType::Binary => "binary".into(),
         DataType::Boolean => "bool".into(),
         DataType::Int8 => "i8".into(),
+        DataType::Int32 => "i32".into(),
         DataType::Int64 => "i64".into(),
         DataType::UInt8 => "u8".into(),
         DataType::UInt16 => "u16".into(),
@@ -399,6 +416,12 @@ pub struct WatchRaw {
     pub device: String,
     pub freq: Option<u16>,
     pub received_ts: Option<i64>,
+    pub elapsed_ns: Option<i64>,
+    pub clock_offset_ms: Option<i32>,
+    pub sensor_type: Option<String>,
+    pub sensor_name: Option<String>,
+    pub value: Option<f32>,
+    pub unit: Option<String>,
 }
 
 impl Row for WatchRaw {
@@ -407,6 +430,8 @@ impl Row for WatchRaw {
         let cols = vec![
             ts_col(rows, |r| Some(r.ts)), ts_col(rows, |r| r.device_ts), dict_col(rows, |r| Some(&r.sender)), prim::<Int8Type, _>(rows, |r| Some(r.rssi)), prim::<UInt8Type, _>(rows, |r| r.channel),
             prim::<UInt64Type, _>(rows, |r| Some(r.batch_id)), dict_col(rows, |r| Some(&r.device)), prim::<UInt16Type, _>(rows, |r| r.freq), ts_col(rows, |r| r.received_ts),
+            prim::<Int64Type, _>(rows, |r| r.elapsed_ns), prim::<Int32Type, _>(rows, |r| r.clock_offset_ms), dict_col(rows, |r| r.sensor_type.as_deref()), dict_col(rows, |r| r.sensor_name.as_deref()),
+            prim::<Float32Type, _>(rows, |r| r.value), dict_col(rows, |r| r.unit.as_deref()),
         ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }
@@ -448,6 +473,56 @@ impl Row for Meta {
     const TABLE: Table = Table::Meta;
     fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
         let cols = vec![ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.key)), str_col(rows, |r| Some(&r.value)), ts_col(rows, |r| Some(r.valid_from))];
+        Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WatchSensor {
+    pub ts: i64,
+    pub sensor_name: String,
+    pub android_type: i32,
+    pub vendor: Option<String>,
+    pub resolution: Option<f32>,
+    pub max_range: Option<f32>,
+    pub app_version: Option<String>,
+}
+
+impl Row for WatchSensor {
+    const TABLE: Table = Table::WatchSensors;
+    fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
+        let cols = vec![
+            ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.sensor_name)), prim::<Int32Type, _>(rows, |r| Some(r.android_type)), dict_col(rows, |r| r.vendor.as_deref()),
+            prim::<Float32Type, _>(rows, |r| r.resolution), prim::<Float32Type, _>(rows, |r| r.max_range), dict_col(rows, |r| r.app_version.as_deref()),
+        ];
+        Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WatchInference {
+    pub ts: i64,
+    pub matcher: String,
+    pub template_id: String,
+    pub result_room: Option<String>,
+    pub result_temp: Option<f32>,
+    pub confidence: f32,
+    pub abstained: bool,
+    pub reason: Option<String>,
+    pub distance: Option<f32>,
+    pub state: String,
+    pub features_hash: String,
+    pub model_version: String,
+}
+
+impl Row for WatchInference {
+    const TABLE: Table = Table::WatchInference;
+    fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
+        let cols = vec![
+            ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.matcher)), str_col(rows, |r| Some(&r.template_id)), dict_col(rows, |r| r.result_room.as_deref()),
+            prim::<Float32Type, _>(rows, |r| r.result_temp), prim::<Float32Type, _>(rows, |r| Some(r.confidence)), bool_col(rows, |r| Some(r.abstained)), dict_col(rows, |r| r.reason.as_deref()),
+            prim::<Float32Type, _>(rows, |r| r.distance), dict_col(rows, |r| Some(&r.state)), str_col(rows, |r| Some(&r.features_hash)), dict_col(rows, |r| Some(&r.model_version)),
+        ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }
 }

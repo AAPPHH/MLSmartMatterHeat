@@ -1,0 +1,501 @@
+use crate::config::{WatchMatchSection, WatchState};
+use crate::lake::{self, kind, Event, Sink, WatchInference};
+use crate::report::open_lake;
+use crate::status::Status;
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{NaiveDate, Timelike};
+use ort::session::Session;
+use ort::value::Tensor;
+use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+pub const MATCHER_ROOM: &str = "room";
+pub const NO_MODEL: &str = "none";
+const SIGNAL_WINDOW_MS: i64 = 600_000;
+const SIGNAL_KEEP_MS: i64 = 1_800_000;
+const NO_SCAN_AFTER_MS: i64 = 120_000;
+const RELOAD_EVERY_TICKS: u64 = 60;
+const MAX_STEPS: f64 = 60.0;
+const BELIEF_FLOOR: f64 = 1e-4;
+const DRIFT_RISE: f64 = 1.5;
+const DRIFT_MIN_ABS: f64 = 0.05;
+const DRIFT_MIN_ROWS: i64 = 20;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Scale {
+    pub floor: f32,
+    pub span: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Smoothing {
+    pub kind: String,
+    pub stay_prob: f64,
+    #[serde(default)]
+    pub transition: BTreeMap<String, BTreeMap<String, f64>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Spec {
+    pub model_version: String,
+    pub matcher: String,
+    pub rooms: Vec<String>,
+    pub senders: Vec<String>,
+    pub sentinel_dbm: f32,
+    pub scale: Scale,
+    pub states: BTreeMap<String, String>,
+    pub tau_room: f64,
+    pub delta_room: f64,
+    pub t_hold_min: i64,
+    pub smoothing: Smoothing,
+}
+
+pub struct Model {
+    pub spec: Spec,
+    sessions: HashMap<String, Mutex<Session>>,
+    transition: Vec<Vec<f64>>,
+}
+
+fn matrix(spec: &Spec) -> Result<Vec<Vec<f64>>> {
+    let n = spec.rooms.len();
+    let stay = spec.smoothing.stay_prob;
+    if !(stay > 0.0 && stay <= 1.0) {
+        bail!("stay_prob {stay} outside (0, 1]");
+    }
+    let mut out = Vec::with_capacity(n);
+    for (i, from) in spec.rooms.iter().enumerate() {
+        let weights: Vec<f64> = spec.rooms.iter().enumerate().map(|(j, to)| if i == j { 0.0 } else { spec.smoothing.transition.get(from).and_then(|r| r.get(to)).copied().unwrap_or(0.0) }).collect();
+        if weights.iter().any(|w| *w < 0.0 || !w.is_finite()) {
+            bail!("negative transition weight from {from}");
+        }
+        let total: f64 = weights.iter().sum();
+        out.push(
+            (0..n)
+                .map(|j| match (i == j, total > 0.0, n > 1) {
+                    (true, ..) if n == 1 => 1.0,
+                    (true, ..) => stay,
+                    (false, true, _) => (1.0 - stay) * weights[j] / total,
+                    (false, false, _) => (1.0 - stay) / (n - 1) as f64,
+                })
+                .collect(),
+        );
+    }
+    Ok(out)
+}
+
+pub fn hash64(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
+}
+
+pub fn features_hash(aps: &[(String, i32)]) -> String {
+    let mut pairs: Vec<(String, i32)> = aps.iter().map(|(s, r)| (s.to_lowercase(), *r)).collect();
+    pairs.sort();
+    format!("{:016x}", hash64(&pairs.iter().map(|(s, r)| format!("{s},{r};")).collect::<String>()))
+}
+
+impl Model {
+    pub fn load(dir: &Path) -> Result<Self> {
+        let path = dir.join("model.json");
+        let spec: Spec = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?).with_context(|| format!("parse {}", path.display()))?;
+        if spec.matcher != MATCHER_ROOM || spec.rooms.is_empty() || spec.senders.is_empty() || spec.states.is_empty() || !(spec.scale.span > 0.0) || spec.smoothing.kind != "hmm" {
+            bail!("{}: not a valid room model description", path.display());
+        }
+        let mut sessions = HashMap::new();
+        for (state, file) in &spec.states {
+            let session = Session::builder()?.commit_from_file(dir.join(file)).with_context(|| format!("load {file}"))?;
+            sessions.insert(state.clone(), Mutex::new(session));
+        }
+        let transition = matrix(&spec)?;
+        let model = Self { spec, sessions, transition };
+        for state in model.sessions.keys() {
+            model.probabilities(state, &vec![0.0; model.spec.senders.len()]).with_context(|| format!("probe template {state}"))?;
+        }
+        Ok(model)
+    }
+
+    pub fn features(&self, aps: &[(String, i32)]) -> Vec<f32> {
+        let mut strongest: HashMap<String, i32> = HashMap::new();
+        for (sender, rssi) in aps {
+            let e = strongest.entry(sender.to_lowercase()).or_insert(*rssi);
+            *e = (*e).max(*rssi);
+        }
+        self.spec.senders.iter().map(|s| ((strongest.get(&s.to_lowercase()).map_or(self.spec.sentinel_dbm, |r| *r as f32) - self.spec.scale.floor) / self.spec.scale.span).clamp(0.0, 1.0)).collect()
+    }
+
+    pub fn template_for(&self, state: &str) -> Option<&str> {
+        let explicit = self.spec.states.get_key_value(state).map(|(k, _)| k.as_str());
+        explicit.or_else(|| (!matches!(state, "offbody" | "charging")).then(|| self.spec.states.get_key_value("all").map(|(k, _)| k.as_str())).flatten())
+    }
+
+    pub fn probabilities(&self, template: &str, x: &[f32]) -> Result<Vec<f64>> {
+        let mut session = self.sessions.get(template).ok_or_else(|| anyhow!("no template {template}"))?.lock().unwrap();
+        let outputs = session.run(ort::inputs!["x" => Tensor::from_array(([1usize, x.len()], x.to_vec()))?])?;
+        let (_, p) = outputs["probabilities"].try_extract_tensor::<f32>()?;
+        let sum: f64 = p.iter().map(|v| f64::from(*v)).sum();
+        if p.len() != self.spec.rooms.len() || !(sum > 0.0) || p.iter().any(|v| !v.is_finite()) {
+            bail!("template {template} returned {} values (sum {sum}), expected {} probabilities", p.len(), self.spec.rooms.len());
+        }
+        Ok(p.iter().map(|v| f64::from(*v) / sum).collect())
+    }
+}
+
+pub fn forward(prior: Option<(&[f64], f64)>, transition: &[Vec<f64>], emission: &[f64]) -> Vec<f64> {
+    let n = emission.len();
+    let mut belief = match prior {
+        Some((b, dt_min)) if dt_min <= MAX_STEPS => {
+            let mut b = b.to_vec();
+            for _ in 0..dt_min.round().clamp(1.0, MAX_STEPS) as usize {
+                b = (0..n).map(|j| (0..n).map(|i| b[i] * transition[i][j]).sum()).collect();
+            }
+            b
+        }
+        _ => vec![1.0 / n as f64; n],
+    };
+    belief.iter_mut().zip(emission).for_each(|(b, e)| *b *= e);
+    let total: f64 = belief.iter().sum();
+    if !(total > 0.0) {
+        belief = emission.to_vec();
+    }
+    let total: f64 = belief.iter().sum();
+    belief.iter_mut().for_each(|b| *b = (*b / total).max(BELIEF_FLOOR));
+    let total: f64 = belief.iter().sum();
+    belief.iter().map(|b| b / total).collect()
+}
+
+pub fn decide(p: &[f64], tau: f64, delta: f64) -> (usize, f64, Option<&'static str>) {
+    let top = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+    let second = p.iter().enumerate().filter(|(i, _)| *i != top).map(|(_, v)| *v).fold(0.0, f64::max);
+    let reason = if p[top] < tau {
+        Some("low_confidence")
+    } else if p[top] - second < delta {
+        Some("low_margin")
+    } else {
+        None
+    };
+    (top, p[top], reason)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Signal {
+    Hr(f64),
+    Motion(f64),
+    OnBody(bool),
+    Charging(bool),
+}
+
+#[derive(Debug, Default)]
+pub struct Signals {
+    hr: VecDeque<(i64, f64)>,
+    motion: VecDeque<(i64, f64)>,
+    on_body: Option<(i64, bool)>,
+    charging: Option<(i64, bool)>,
+}
+
+impl Signals {
+    pub fn push(&mut self, ts_ms: i64, signal: Signal) {
+        let newest = |q: &VecDeque<(i64, f64)>| q.iter().map(|s| s.0).max().unwrap_or(ts_ms);
+        match signal {
+            Signal::Hr(v) => self.hr.push_back((ts_ms, v)),
+            Signal::Motion(v) => self.motion.push_back((ts_ms, v)),
+            Signal::OnBody(v) if self.on_body.is_none_or(|(t, _)| ts_ms >= t) => self.on_body = Some((ts_ms, v)),
+            Signal::Charging(v) if self.charging.is_none_or(|(t, _)| ts_ms >= t) => self.charging = Some((ts_ms, v)),
+            _ => {}
+        }
+        for q in [&mut self.hr, &mut self.motion] {
+            let cut = newest(q) - SIGNAL_KEEP_MS;
+            q.retain(|s| s.0 >= cut);
+        }
+    }
+
+    fn mean(q: &VecDeque<(i64, f64)>, at_ms: i64) -> Option<f64> {
+        let v: Vec<f64> = q.iter().filter(|s| s.0 > at_ms - SIGNAL_WINDOW_MS && s.0 <= at_ms).map(|s| s.1).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    }
+
+    pub fn classify(&self, cfg: &WatchState, sleep: (u32, u32), at_ms: i64, minute_of_day: u32) -> &'static str {
+        let (hr, motion) = (Self::mean(&self.hr, at_ms), Self::mean(&self.motion, at_ms));
+        if self.charging.is_some_and(|c| c.1) {
+            return "charging";
+        }
+        if self.on_body.is_some_and(|o| !o.1) {
+            return "offbody";
+        }
+        let (from, to) = sleep;
+        let in_sleep = if from == to { false } else if from < to { (from..to).contains(&minute_of_day) } else { minute_of_day >= from || minute_of_day < to };
+        if in_sleep && hr.is_none_or(|h| h <= cfg.hr_rest_max) && motion.is_none_or(|m| m < cfg.motion_active_min) {
+            "sleep"
+        } else if hr.is_some_and(|h| h >= cfg.hr_active_min) || motion.is_some_and(|m| m >= cfg.motion_active_min) {
+            "active"
+        } else {
+            "rest"
+        }
+    }
+}
+
+pub fn local_minute(ts_ms: i64) -> u32 {
+    chrono::DateTime::from_timestamp_millis(ts_ms).map_or(0, |t| {
+        let local = t.with_timezone(&chrono::Local);
+        local.hour() * 60 + local.minute()
+    })
+}
+
+#[derive(Default)]
+struct Device {
+    signals: Signals,
+    belief: Option<(Vec<f64>, i64)>,
+    hold: Option<(String, i64)>,
+    last_scan_ms: Option<i64>,
+    gap_logged: bool,
+}
+
+#[derive(Default)]
+struct Inner {
+    model: Option<Arc<Model>>,
+    dir_name: Option<String>,
+    devices: HashMap<String, Device>,
+}
+
+#[derive(Clone)]
+pub struct WatchMatch {
+    cfg: Arc<WatchMatchSection>,
+    sleep: (u32, u32),
+    sink: Sink,
+    status: Status,
+    inner: Arc<Mutex<Inner>>,
+}
+
+fn newest_dir(base: &Path) -> Option<(String, PathBuf)> {
+    let mut found: Vec<(String, String, PathBuf)> = std::fs::read_dir(base)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let text = std::fs::read_to_string(e.path().join("model.json")).ok()?;
+            let created = serde_json::from_str::<serde_json::Value>(&text).ok()?["created"].as_str().unwrap_or_default().to_string();
+            Some((created, e.file_name().to_string_lossy().into_owned(), e.path()))
+        })
+        .collect();
+    found.sort();
+    found.pop().map(|(_, name, path)| (name, path))
+}
+
+impl WatchMatch {
+    pub fn new(cfg: &WatchMatchSection, sink: Sink, status: Status) -> Self {
+        let wm = Self { cfg: Arc::new(cfg.clone()), sleep: cfg.state.sleep_minutes().unwrap_or((1380, 420)), sink, status, inner: Default::default() };
+        if cfg.enabled {
+            if let Err(e) = wm.reload() {
+                eprintln!("watchmatch: no model loaded, matcher abstains: {e:#}");
+            }
+        }
+        wm
+    }
+
+    #[cfg(test)]
+    pub fn sink(&self) -> &Sink {
+        &self.sink
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.cfg.enabled
+    }
+
+    pub fn model_version(&self) -> Option<String> {
+        self.inner.lock().unwrap().model.as_ref().map(|m| m.spec.model_version.clone())
+    }
+
+    pub fn active(&self) -> bool {
+        self.cfg.enabled && self.inner.lock().unwrap().model.is_some()
+    }
+
+    pub fn reload(&self) -> Result<bool> {
+        let base = Path::new(&self.cfg.model_dir);
+        let (name, path) = if self.cfg.model_version == "latest" { newest_dir(base) } else { Some((self.cfg.model_version.clone(), base.join(&self.cfg.model_version))) }.ok_or_else(|| anyhow!("no model in {}", base.display()))?;
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.model.is_some() && inner.dir_name.as_deref() == Some(name.as_str()) {
+                return Ok(false);
+            }
+        }
+        let model = Arc::new(Model::load(&path)?);
+        eprintln!("watchmatch: loaded model {} from {}", model.spec.model_version, path.display());
+        self.status.watch_model(Some(model.spec.model_version.clone()));
+        let mut inner = self.inner.lock().unwrap();
+        inner.model = Some(model);
+        inner.dir_name = Some(name);
+        inner.devices.values_mut().for_each(|d| d.belief = None);
+        Ok(true)
+    }
+
+    pub fn signals(&self, device: &str, signals: impl IntoIterator<Item = (i64, Signal)>) {
+        if !self.cfg.enabled {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let dev = inner.devices.entry(device.into()).or_default();
+        signals.into_iter().for_each(|(ts, s)| dev.signals.push(ts, s));
+    }
+
+    pub fn scan(&self, device: &str, ts_ms: i64, now_ms: i64, aps: &[(String, i32)]) -> Option<WatchInference> {
+        self.scan_at(device, ts_ms, now_ms, local_minute(ts_ms), aps)
+    }
+
+    pub fn scan_at(&self, device: &str, ts_ms: i64, now_ms: i64, minute: u32, aps: &[(String, i32)]) -> Option<WatchInference> {
+        if !self.cfg.enabled || aps.is_empty() || now_ms - ts_ms > self.cfg.scan_fresh_s * 1000 {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let model = inner.model.clone();
+        let dev = inner.devices.entry(device.into()).or_default();
+        if dev.last_scan_ms.is_some_and(|t| ts_ms <= t) {
+            return None;
+        }
+        dev.last_scan_ms = Some(ts_ms);
+        dev.gap_logged = false;
+        let state = dev.signals.classify(&self.cfg.state, self.sleep, ts_ms, minute);
+        let mut row = WatchInference {
+            ts: ts_ms * 1000,
+            matcher: MATCHER_ROOM.into(),
+            template_id: NO_MODEL.into(),
+            abstained: true,
+            reason: Some("no_model".into()),
+            state: state.into(),
+            features_hash: features_hash(aps),
+            model_version: NO_MODEL.into(),
+            ..Default::default()
+        };
+        if let Some(model) = model {
+            row.model_version = model.spec.model_version.clone();
+            match model.template_for(state) {
+                None => row.reason = Some("unknown_state".into()),
+                Some(template) => match model.probabilities(template, &model.features(aps)) {
+                    Err(e) => eprintln!("watchmatch: inference failed: {e:#}"),
+                    Ok(emission) => {
+                        row.template_id = template.into();
+                        let prior = dev.belief.as_ref().map(|(b, t)| (b.as_slice(), (ts_ms - t) as f64 / 60_000.0));
+                        let belief = forward(prior, &model.transition, &emission);
+                        let (top, confidence, reason) = decide(&belief, model.spec.tau_room, model.spec.delta_room);
+                        row.confidence = confidence as f32;
+                        row.reason = reason.map(Into::into);
+                        row.abstained = reason.is_some();
+                        if !row.abstained {
+                            row.result_room = Some(model.spec.rooms[top].clone());
+                            dev.hold = Some((model.spec.rooms[top].clone(), ts_ms));
+                        }
+                        dev.belief = Some((belief, ts_ms));
+                    }
+                },
+            }
+        }
+        drop(inner);
+        self.record(&row);
+        Some(row)
+    }
+
+    fn record(&self, row: &WatchInference) {
+        self.status.watch_inference(&row.matcher, &row.state, row.abstained);
+        if let Err(e) = self.sink.append(row.clone()) {
+            eprintln!("watch_inference: {e}");
+        }
+    }
+
+    pub fn minute_tick(&self, now_ms: i64) {
+        if !self.cfg.enabled {
+            return;
+        }
+        let version = self.model_version().unwrap_or_else(|| NO_MODEL.into());
+        let mut rows = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for dev in inner.devices.values_mut().filter(|d| !d.gap_logged && d.last_scan_ms.is_some_and(|t| now_ms - t >= NO_SCAN_AFTER_MS)) {
+                dev.gap_logged = true;
+                let state = dev.signals.classify(&self.cfg.state, self.sleep, now_ms, local_minute(now_ms));
+                rows.push(WatchInference {
+                    ts: now_ms * 1000,
+                    matcher: MATCHER_ROOM.into(),
+                    template_id: NO_MODEL.into(),
+                    abstained: true,
+                    reason: Some("no_scan".into()),
+                    state: state.into(),
+                    model_version: version.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+        rows.iter().for_each(|r| self.record(r));
+    }
+
+    pub fn effective(&self, now_ms: i64) -> Option<Option<(String, i64)>> {
+        if !self.cfg.enabled {
+            return None;
+        }
+        let inner = self.inner.lock().unwrap();
+        let hold_ms = inner.model.as_ref()?.spec.t_hold_min * 60_000;
+        Some(inner.devices.values().filter_map(|d| d.hold.clone()).filter(|(_, t)| now_ms - t <= hold_ms).max_by_key(|(_, t)| *t))
+    }
+
+    pub fn spawn_background(&self) {
+        if !self.cfg.enabled {
+            return;
+        }
+        let wm = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            let mut n = 0u64;
+            loop {
+                tick.tick().await;
+                n += 1;
+                let w = wm.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    w.minute_tick(lake::now_us() / 1000);
+                    if n % RELOAD_EVERY_TICKS == 0 && w.cfg.model_version == "latest" {
+                        if let Err(e) = w.reload() {
+                            eprintln!("watchmatch: reload failed, keeping current model: {e:#}");
+                        }
+                    }
+                })
+                .await;
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drift {
+    pub matcher: String,
+    pub current: f64,
+    pub previous: f64,
+    pub rows_current: i64,
+    pub rows_previous: i64,
+}
+
+pub fn drift_of(matcher: &str, current: (i64, i64), previous: (i64, i64)) -> Option<Drift> {
+    if current.0 < DRIFT_MIN_ROWS || previous.0 < DRIFT_MIN_ROWS {
+        return None;
+    }
+    let (c, p) = (current.1 as f64 / current.0 as f64, previous.1 as f64 / previous.0 as f64);
+    (c > p * DRIFT_RISE && c - p >= DRIFT_MIN_ABS).then(|| Drift { matcher: matcher.into(), current: c, previous: p, rows_current: current.0, rows_previous: previous.0 })
+}
+
+pub fn drift_check(root: &Path, today: NaiveDate) -> Result<Vec<Drift>> {
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let week = chrono::Duration::days(7);
+    let (c0, c1, p0) = (midnight(today - week), midnight(today), midnight(today - week - week));
+    let db = open_lake(root, today - week - week - chrono::Duration::days(1), today)?;
+    let mut stmt = db.conn.prepare(&format!(
+        "SELECT matcher, count(*) FILTER (WHERE epoch_us(ts) >= {c0} AND epoch_us(ts) < {c1}), count(*) FILTER (WHERE epoch_us(ts) >= {c0} AND epoch_us(ts) < {c1} AND abstained),
+                count(*) FILTER (WHERE epoch_us(ts) >= {p0} AND epoch_us(ts) < {c0}), count(*) FILTER (WHERE epoch_us(ts) >= {p0} AND epoch_us(ts) < {c0} AND abstained)
+         FROM watch_inference WHERE reason IS DISTINCT FROM 'no_scan' GROUP BY matcher ORDER BY matcher"
+    ))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().filter_map(|(m, cn, ca, pn, pa)| drift_of(&m, (cn, ca), (pn, pa))).collect())
+}
+
+pub fn drift_alarm(sink: &Sink) -> Result<usize> {
+    let drifts = drift_check(sink.root(), sink.today())?;
+    for d in &drifts {
+        sink.append(Event::now(kind::MATCHER_DRIFT, "heatd").with_detail(serde_json::json!({"matcher": d.matcher, "current": d.current, "previous": d.previous, "rows_current": d.rows_current, "rows_previous": d.rows_previous})))?;
+    }
+    Ok(drifts.len())
+}

@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::infer::{Explanation, RoomModel};
 use crate::explore::Explorer;
-use crate::lake::{self, kind, Event, Label, Table, WatchRaw};
+use crate::lake::{self, kind, Event, Label, Table, WatchRaw, WatchSensor};
 use crate::rules::{presence_event, Tracker};
-use crate::storage::{now_ms, BatchBody, ScanBody, Storage};
+use crate::storage::{now_ms, BatchBody, Power, ScanBody, Storage};
+use crate::watchmatch::{Signal, WatchMatch};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -30,6 +31,7 @@ pub struct AppState {
     pub explorer: Arc<Mutex<Explorer>>,
     pub tracker: Arc<Mutex<Tracker>>,
     pub batch_seq: Arc<AtomicU64>,
+    pub watchmatch: WatchMatch,
 }
 
 impl AppState {
@@ -123,6 +125,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/window", post(window))
         .route("/api/label", post(label))
         .route("/watch/measurement", post(watch_measurement))
+        .route("/watch/sensors", post(watch_sensors))
         .route("/watch/label", post(label))
         .with_state(state)
 }
@@ -192,6 +195,9 @@ fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, 
             device: device.into(),
             freq,
             received_ts: Some(received_ms * 1000),
+            sensor_type: Some("rssi".into()),
+            value: Some(rssi as f32),
+            ..Default::default()
         })
         .collect();
     let n = rows.len();
@@ -233,6 +239,11 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
             eprintln!("labels: {e}");
         }
     }
+    if let Some(power) = body.power {
+        state.watchmatch.signals(&body.device, [(body.ts, Signal::OnBody(power != Power::Offbody))]);
+    }
+    let pairs: Vec<(String, i32)> = body.aps.iter().map(|a| (a.bssid.clone(), a.rssi)).collect();
+    state.watchmatch.scan(&body.device, body.ts, received, &pairs);
     let transition = state.tracker.lock().unwrap().observe(&body.device, body.ts, body.away, body.motion, body.power);
     if let Some(t) = transition {
         if let Err(e) = state.sink.append(presence_event(&body.device, t)) {
@@ -241,7 +252,133 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     }
 }
 
-async fn watch_measurement(State(state): State<AppState>, Json(body): Json<MeasurementBody>) -> ApiResult {
+const SENSOR_TYPES: [&str; 7] = ["rssi", "temp", "hr", "offbody", "motion", "battery", "charging"];
+
+#[derive(Deserialize)]
+struct LongBody {
+    device: String,
+    batch_id: Value,
+    #[serde(default)]
+    clock_offset_ms: Option<i64>,
+    samples: Vec<Sample>,
+}
+
+#[derive(Deserialize)]
+struct Sample {
+    #[serde(default)]
+    elapsed_ns: Option<i64>,
+    ts: i64,
+    sensor_type: String,
+    #[serde(default)]
+    sensor_name: Option<String>,
+    value: f64,
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    sender: Option<String>,
+    #[serde(default)]
+    channel: Option<u8>,
+    #[serde(default)]
+    freq: Option<u16>,
+}
+
+fn batch_number(id: &Value) -> Result<(u64, String), ApiError> {
+    match id {
+        Value::Number(n) => n.as_u64().map(|v| (v, v.to_string())).ok_or_else(|| ApiError::bad("batch_id must be a non-negative integer or a string")),
+        Value::String(t) if !t.is_empty() => Ok((t.parse().unwrap_or_else(|_| crate::watchmatch::hash64(t)), t.clone())),
+        _ => Err(ApiError::bad("batch_id must be a non-negative integer or a string")),
+    }
+}
+
+fn long_rows(body: &LongBody, batch: u64, received: i64) -> Result<Vec<WatchRaw>, ApiError> {
+    body.samples
+        .iter()
+        .map(|s| {
+            if !SENSOR_TYPES.contains(&s.sensor_type.as_str()) {
+                return Err(ApiError::bad(&format!("unknown sensor_type {} (expected {})", s.sensor_type, SENSOR_TYPES.join(", "))));
+            }
+            let rssi = s.sensor_type == "rssi";
+            let sender = s.sender.as_deref().map(str::to_lowercase).filter(|x| !x.is_empty());
+            if rssi && sender.is_none() {
+                return Err(ApiError::bad("rssi samples need a sender"));
+            }
+            if !s.value.is_finite() {
+                return Err(ApiError::bad("value must be finite"));
+            }
+            Ok(WatchRaw {
+                ts: s.ts.min(received + MAX_FUTURE_MS) * 1000,
+                sender: sender.unwrap_or_default(),
+                rssi: if rssi { s.value.round().clamp(i8::MIN as f64, i8::MAX as f64) as i8 } else { 0 },
+                channel: s.channel.or_else(|| s.freq.and_then(channel_of)),
+                batch_id: batch,
+                device: body.device.clone(),
+                freq: s.freq,
+                received_ts: Some(received * 1000),
+                elapsed_ns: s.elapsed_ns,
+                clock_offset_ms: body.clock_offset_ms.map(|v| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+                sensor_type: Some(s.sensor_type.clone()),
+                sensor_name: s.sensor_name.clone(),
+                value: Some(s.value as f32),
+                unit: s.unit.clone(),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+fn feed_matcher(state: &AppState, body: &LongBody, received: i64) {
+    let ts = |s: &Sample| s.ts.min(received + MAX_FUTURE_MS);
+    let charging: std::collections::BTreeMap<i64, bool> = body.samples.iter().filter(|s| s.sensor_type == "charging").map(|s| (ts(s), s.value >= 0.5)).collect();
+    let mut signals = Vec::new();
+    let mut scans: std::collections::BTreeMap<i64, Vec<(String, i32)>> = Default::default();
+    let mut counts: std::collections::BTreeMap<&str, u64> = Default::default();
+    for s in &body.samples {
+        *counts.entry(s.sensor_type.as_str()).or_default() += 1;
+        match s.sensor_type.as_str() {
+            "rssi" => scans.entry(ts(s)).or_default().push((s.sender.clone().unwrap_or_default(), s.value.round() as i32)),
+            "hr" => signals.push((ts(s), Signal::Hr(s.value))),
+            "motion" => signals.push((ts(s), Signal::Motion(s.value))),
+            "offbody" => signals.push((ts(s), Signal::OnBody(s.value >= 0.5))),
+            "charging" => signals.push((ts(s), Signal::Charging(s.value >= 0.5))),
+            "battery" => state.status.watch_battery(ts(s) * 1000, s.value, charging.range(..=ts(s)).next_back().is_some_and(|c| *c.1)),
+            _ => {}
+        }
+    }
+    counts.iter().for_each(|(t, n)| state.status.watch_samples(t, *n));
+    state.watchmatch.signals(&body.device, signals);
+    scans.into_iter().for_each(|(t, aps)| {
+        state.watchmatch.scan(&body.device, t, received, &aps);
+    });
+}
+
+async fn flushed(state: &AppState, table: Table) -> Result<(), ApiError> {
+    let sink = state.sink.clone();
+    tokio::task::spawn_blocking(move || sink.flush_table(table)).await.map_err(anyhow::Error::from)??;
+    Ok(())
+}
+
+async fn watch_long(state: AppState, body: LongBody) -> ApiResult {
+    let received = now_ms();
+    let (batch, key) = batch_number(&body.batch_id)?;
+    let key = format!("batch:{key}");
+    if state.storage.seen_id(&body.device, &key)? {
+        return Ok(Json(json!({"stored": 0, "duplicate": true, "batch_id": batch})));
+    }
+    let rows = long_rows(&body, batch, received)?;
+    let stored = rows.len();
+    state.sink.append_many(rows)?;
+    flushed(&state, Table::WatchRaw).await?;
+    state.storage.claim_id(&body.device, &key)?;
+    feed_matcher(&state, &body, received);
+    Ok(Json(json!({"stored": stored, "batch_id": batch})))
+}
+
+async fn watch_measurement(State(state): State<AppState>, Json(value): Json<Value>) -> ApiResult {
+    if value.get("samples").is_some() {
+        let body: LongBody = serde_json::from_value(value).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.into()))?;
+        return watch_long(state, body).await;
+    }
+    let body: MeasurementBody = serde_json::from_value(value).map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.into()))?;
     let received = now_ms();
     if let Some(id) = &body.id {
         if state.storage.seen_id(&body.device, id)? {
@@ -250,14 +387,57 @@ async fn watch_measurement(State(state): State<AppState>, Json(body): Json<Measu
     }
     let batch = body.batch_id.unwrap_or_else(|| state.next_batch());
     let ts = body.ts.min(received + MAX_FUTURE_MS);
+    let pairs: Vec<(String, i32)> = body.measurements.iter().map(|m| (m.sender.clone(), m.rssi)).collect();
     let aps = body.measurements.into_iter().map(|m| (m.sender, m.rssi, m.channel, m.freq));
     let stored = raw_rows(&state, &body.device, ts, body.device_ts, received, batch, aps)?;
-    let sink = state.sink.clone();
-    tokio::task::spawn_blocking(move || sink.flush_table(Table::WatchRaw)).await.map_err(anyhow::Error::from)??;
+    flushed(&state, Table::WatchRaw).await?;
     if let Some(id) = &body.id {
         state.storage.claim_id(&body.device, id)?;
     }
+    state.status.watch_samples("rssi", stored as u64);
+    state.watchmatch.scan(&body.device, ts, received, &pairs);
     Ok(Json(json!({"stored": stored, "batch_id": batch})))
+}
+
+#[derive(Deserialize)]
+struct SensorsBody {
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    app_version: Option<String>,
+    sensors: Vec<SensorBody>,
+}
+
+#[derive(Deserialize)]
+struct SensorBody {
+    #[serde(alias = "name")]
+    sensor_name: String,
+    #[serde(alias = "type")]
+    android_type: i32,
+    #[serde(default)]
+    vendor: Option<String>,
+    #[serde(default)]
+    resolution: Option<f32>,
+    #[serde(default, alias = "maxRange")]
+    max_range: Option<f32>,
+    #[serde(default)]
+    app_version: Option<String>,
+}
+
+async fn watch_sensors(State(state): State<AppState>, Json(body): Json<SensorsBody>) -> ApiResult {
+    if body.sensors.is_empty() {
+        return Err(ApiError::bad("sensors must not be empty"));
+    }
+    let ts = body.ts.unwrap_or_else(now_ms).min(now_ms() + MAX_FUTURE_MS) * 1000;
+    let rows: Vec<WatchSensor> = body
+        .sensors
+        .into_iter()
+        .map(|s| WatchSensor { ts, sensor_name: s.sensor_name, android_type: s.android_type, vendor: s.vendor, resolution: s.resolution, max_range: s.max_range, app_version: s.app_version.or_else(|| body.app_version.clone()) })
+        .collect();
+    let stored = rows.len();
+    state.sink.append_many(rows)?;
+    flushed(&state, Table::WatchSensors).await?;
+    Ok(Json(json!({"stored": stored})))
 }
 
 async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiResult {
@@ -387,11 +567,14 @@ mod tests {
         let mock = Arc::new(MockController::new(1));
         mock.add_node(5, 19.0, 19.0);
         let model = with_model.then(|| Arc::new(RoomModel::load(&Path::new(FIXTURES).join("room_model.onnx")).unwrap()));
+        let sink = crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap();
+        let status = crate::status::Status::new(crate::lake::now_us());
         let state = AppState {
+            watchmatch: WatchMatch::new(&config.watchmatch, sink.clone(), status.clone()),
             storage: Arc::new(Storage::open(&config.db_path).unwrap()),
-            sink: crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap(),
+            sink: sink.clone(),
             latest: Default::default(),
-            status: crate::status::Status::new(crate::lake::now_us()),
+            status: status.clone(),
             config: Arc::new(config),
             model,
             controller: mock.clone(),

@@ -23,9 +23,9 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 
 ## Schema metadata and versioning
 
-Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `1`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
+Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `2`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
 
-Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version`. The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
+Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
 
 ## Hot path (raw Arrow IPC streams)
 
@@ -137,6 +137,7 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 | roll_ok | a table/day was rolled to Parquet | heatd | no | date, table, rows, partitions |
 | roll_failed | a table/day failed to roll | heatd | no | date, table, error |
 | poll_failed | 60 s core-attribute poll got no response (backoff applies) | heatd | yes | error, consecutive, next_poll_s |
+| matcher_drift | 7-day abstain rate of a watch matcher rose by more than 50 % against the previous 7 days (checked daily with the report) | heatd | no | matcher, current, previous, rows_current, rows_previous |
 | watch_state | watch heartbeat state (migrated legacy device_state; new code may keep emitting it) | watch / legacy | no | device, motion, power, queued, n_aps, away, id |
 
 `experiment_id` links experiment_* events to `decisions.experiment_id`. `source` values: `subscription`, `poll`, `read`, `heatd`, `watch`, `legacy`.
@@ -204,9 +205,52 @@ batch_id: u64
 device: dict<utf8>
 freq: u16?
 received_ts: timestamp[us,UTC]?
+elapsed_ns: i64?
+clock_offset_ms: i32?
+sensor_type: dict<utf8>?
+sensor_name: dict<utf8>?
+value: f32?
+unit: dict<utf8>?
 ```
 
 - `ts`: measurement time as sent by the watch, `device_ts`: raw watch clock if reported separately, `received_ts`: heatd receive time. `sender` = BSSID (lowercase), `batch_id` = grouping id of one scan/upload batch, `device` = watch id, `freq` MHz, `channel` sent or derived from freq.
+
+- Phase 1b (schema v2, long format): one row per sample for every sensor. `sensor_type` is `rssi` (Wi-Fi access point, `value` = rssi), `temp` (skin temperature, degC), `hr` (bpm), `offbody` (1 = on body, 0 = off body), `motion` (movement measure of the accelerometer, m/s2 deviation from gravity), `battery` (percent), `charging` (1 = charging, 0 = not). `elapsed_ns` = `SystemClock.elapsedRealtimeNanos` of the sample on the watch, `clock_offset_ms` = wall clock minus device clock of the batch, `sensor_name` = Android sensor name, `unit` free text. Rows written before v2 and rows of `/api/scan` without the new fields have `sensor_type` null or `rssi`; treat null as `rssi`. For `sensor_type` other than `rssi` the required legacy columns carry placeholders: `sender` = empty string, `rssi` = 0, `channel`/`freq` null; filter by `sensor_type` before using `rssi`. All rssi rows of one scan carry the same `ts`.
+
+### watch_sensors
+
+Producer: `POST /watch/sensors`, the sensor inventory of the watch (`SensorManager.getSensorList`), written at app start and whenever it changes. Partitioned by date.
+
+```schema watch_sensors
+ts: timestamp[us,UTC]
+sensor_name: dict<utf8>
+android_type: i32
+vendor: dict<utf8>?
+resolution: f32?
+max_range: f32?
+app_version: dict<utf8>?
+```
+
+### watch_inference
+
+Producer: heatd `watchmatch` module. One row per fresh Wi-Fi scan (matcher `room`) and one row `reason=no_scan` per minute gap. Strictly separate from `labels`. Partitioned by date. `matcher` is `room` (written now) or `temp` (reserved for the later temperature matcher).
+
+```schema watch_inference
+ts: timestamp[us,UTC]
+matcher: dict<utf8>
+template_id: utf8
+result_room: dict<utf8>?
+result_temp: f32?
+confidence: f32
+abstained: bool
+reason: dict<utf8>?
+distance: f32?
+state: dict<utf8>
+features_hash: utf8
+model_version: dict<utf8>
+```
+
+- `ts`: scan time. `template_id`: state key of the model file used (`all`, `sleep`, ...), `none` without model. `result_room`: set only when not abstained. `confidence`: max probability after the HMM forward step (0 when no model). `reason` (abstained rows): `low_confidence`, `low_margin`, `no_model`, `no_scan`, `unknown_state`. `distance`: reserved (null). `state`: `rest`, `sleep`, `active`, `offbody`, `charging`. `features_hash`: 16 hex characters, FNV-1a 64 over the sorted `sender,rssi` pairs of the scan (empty for `no_scan`). `model_version`: `model_version` of `model.json`, `none` without model.
 
 ### weather
 

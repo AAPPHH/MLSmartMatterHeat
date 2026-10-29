@@ -35,8 +35,36 @@ pub struct NodeStatus {
     pub reports: u64,
 }
 
+const BATTERY_KEEP_US: i64 = 86_400_000_000;
+const BATTERY_MAX_STEP_US: i64 = 1_800_000_000;
+const BATTERY_MIN_HOURS: f64 = 0.5;
+
+#[derive(Debug, Default)]
+struct WatchStats {
+    inference: BTreeMap<(String, String), (u64, u64)>,
+    samples: BTreeMap<String, u64>,
+    battery: Vec<(i64, f64, bool)>,
+    model_version: Option<String>,
+}
+
+impl WatchStats {
+    fn battery_per_hour(&self) -> Option<f64> {
+        let (mut drop, mut span) = (0.0, 0i64);
+        for w in self.battery.windows(2) {
+            let (dt, d) = (w[1].0 - w[0].0, w[0].1 - w[1].1);
+            if !w[0].2 && !w[1].2 && dt > 0 && dt <= BATTERY_MAX_STEP_US {
+                drop += d.max(0.0);
+                span += dt;
+            }
+        }
+        let hours = span as f64 / 3.6e9;
+        (hours >= BATTERY_MIN_HOURS).then(|| drop / hours)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
+    watch: WatchStats,
     nodes: BTreeMap<u64, NodeStatus>,
     started_us: i64,
     ntp_offset_s: Option<f64>,
@@ -89,6 +117,31 @@ impl Status {
         inner.weather_rows += rows as u64;
     }
 
+    pub fn watch_inference(&self, matcher: &str, state: &str, abstained: bool) {
+        let mut inner = self.0.lock().unwrap();
+        let e = inner.watch.inference.entry((matcher.into(), state.into())).or_default();
+        e.0 += 1;
+        e.1 += u64::from(abstained);
+    }
+
+    pub fn watch_samples(&self, sensor_type: &str, n: u64) {
+        *self.0.lock().unwrap().watch.samples.entry(sensor_type.into()).or_default() += n;
+    }
+
+    pub fn watch_battery(&self, ts_us: i64, pct: f64, charging: bool) {
+        let mut inner = self.0.lock().unwrap();
+        let battery = &mut inner.watch.battery;
+        let at = battery.partition_point(|b| b.0 <= ts_us);
+        battery.insert(at, (ts_us, pct, charging));
+        let newest = battery.last().map_or(ts_us, |b| b.0);
+        let stale = battery.partition_point(|b| b.0 < newest - BATTERY_KEEP_US);
+        battery.drain(..stale);
+    }
+
+    pub fn watch_model(&self, version: Option<String>) {
+        self.0.lock().unwrap().watch.model_version = version;
+    }
+
     pub fn rolled(&self, ts_us: i64, ok: bool) {
         self.0.lock().unwrap().last_roll = Some((ts_us, ok));
     }
@@ -118,6 +171,12 @@ impl Status {
             "ntp_offset_s": inner.ntp_offset_s,
             "weather_age_s": age(inner.weather_ok_us),
             "last_roll": inner.last_roll.map(|(t, ok)| json!({"age_s": age(Some(t)), "ok": ok})),
+            "watch": {
+                "model_version": inner.watch.model_version,
+                "abstain": inner.watch.inference.iter().map(|((m, s), (n, a))| json!({"matcher": m, "state": s, "total": n, "abstained": a, "rate": *a as f64 / (*n).max(1) as f64})).collect::<Vec<_>>(),
+                "samples": inner.watch.samples,
+                "battery_pct_per_h": inner.watch.battery_per_hour(),
+            },
         })
     }
 
@@ -159,6 +218,31 @@ impl Status {
             let _ = writeln!(out, "heatd_last_roll_age_seconds {}", age(t));
             family(&mut out, "heatd_last_roll_ok", "1 if every table of the last roll job succeeded", "gauge");
             let _ = writeln!(out, "heatd_last_roll_ok {}", u8::from(ok));
+        }
+        family(&mut out, "heatd_watch_model_loaded", "1 if a watch matcher model is loaded", "gauge");
+        let _ = writeln!(out, "heatd_watch_model_loaded{{version=\"{}\"}} {}", inner.watch.model_version.as_deref().unwrap_or("none"), u8::from(inner.watch.model_version.is_some()));
+        for (name, help, kind, pick) in [
+            ("heatd_watch_inference_total", "watch matcher inferences since start", "counter", 0),
+            ("heatd_watch_abstained_total", "abstained watch matcher inferences since start", "counter", 1),
+            ("heatd_watch_abstain_ratio", "abstained share of watch matcher inferences since start", "gauge", 2),
+        ] {
+            family(&mut out, name, help, kind);
+            inner.watch.inference.iter().for_each(|((m, st), (n, a))| {
+                let v = match pick {
+                    0 => *n as f64,
+                    1 => *a as f64,
+                    _ => *a as f64 / (*n).max(1) as f64,
+                };
+                let _ = writeln!(out, "{name}{{matcher=\"{m}\",state=\"{st}\"}} {v}");
+            });
+        }
+        family(&mut out, "heatd_watch_samples_total", "watch samples received since start by sensor type", "counter");
+        inner.watch.samples.iter().for_each(|(t, n)| {
+            let _ = writeln!(out, "heatd_watch_samples_total{{sensor_type=\"{t}\"}} {n}");
+        });
+        if let Some(rate) = inner.watch.battery_per_hour() {
+            family(&mut out, "heatd_watch_battery_percent_per_hour", "watch battery drain over the last 24 h while not charging", "gauge");
+            let _ = writeln!(out, "heatd_watch_battery_percent_per_hour {rate}");
         }
         out
     }

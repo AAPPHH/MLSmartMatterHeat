@@ -55,12 +55,14 @@ async fn phase1_acceptance_simulated_day() {
     let mock = Arc::new(MockController::new(1));
     [5, 6, 7].into_iter().for_each(|n| mock.add_node(n, 19.0, 19.0));
     let config = Arc::new(config);
+    let status = crate::status::Status::new(midnight());
     let state = AppState {
+        watchmatch: crate::watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone()),
         config: config.clone(),
         storage: Arc::new(crate::storage::Storage::open(&config.db_path).unwrap()),
         sink: sink.clone(),
         latest: Default::default(),
-        status: crate::status::Status::new(midnight()),
+        status,
         model: None,
         controller: mock.clone(),
         windows: Default::default(),
