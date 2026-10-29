@@ -207,10 +207,11 @@ Feature-Auswahl: Nur stabile BSSIDs kommen ins Modell, also solche, die in genü
 | Priorität | Bedingung | Sollwert |
 |---|---|---|
 | 1 | Fenster offen (`POST /api/window`) | `frost_setpoint` |
-| 2 | Zeitplan greift (auch über Mitternacht) | Zeitplan-Wert |
+| 2 | Uhr abwesend (Schutz: `away_guard_minutes`, Uhr muss getragen worden sein) | `away_setpoint` (18 °C) in allen Räumen, ohne Zeitplan |
+| 3 | Laufendes Explorationsexperiment (`rooms.exploration`) | Experiment-Sollwert |
+| 4 | Zeitplan greift (auch über Mitternacht) | Zeitplan-Wert |
 | – | sonst | `default_setpoint` |
 | + | Uhr im Raum, jünger als `presence_timeout_minutes` | `+ presence_boost` |
-| ↓ | Anwesenheit veraltet | max. `eco_setpoint` |
 
 Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °C vom zuletzt gesetzten abweicht.
 
@@ -220,6 +221,8 @@ Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °
 |---|---|---|
 | `POST` | `/api/scan` | Scan der Uhr → `{stored, room}` |
 | `GET` | `/api/state` | Räume, Temperaturen, Sollwerte, letzter Raum je Gerät |
+| `POST` | `/watch/measurement` | `{device, ts, measurements:[{sender, rssi, freq oder channel}]}` nach `watch_raw` |
+| `POST` | `/watch/label` | wie `/api/label`, nach `labels` |
 | `POST` | `/api/snapshot` | DuckDB-Snapshot für das Training |
 | `POST` | `/api/window` | `{room, open}` |
 | `GET` | `/health` | |

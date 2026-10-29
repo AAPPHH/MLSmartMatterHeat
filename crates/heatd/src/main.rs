@@ -1,5 +1,6 @@
 mod capture;
 mod config;
+mod explore;
 mod http;
 mod infer;
 mod inventory;
@@ -182,6 +183,9 @@ async fn serve(config: Config) -> Result<()> {
         controller,
         windows: Default::default(),
         commanded: Default::default(),
+        explorer: Arc::new(std::sync::Mutex::new(explore::Explorer::new(config.exploration_seed.unwrap_or_else(|| lake::now_us() as u64)))),
+        tracker: Default::default(),
+        batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(lake::now_us() as u64)),
         config: Arc::new(config),
     };
     rules::spawn_background(state.clone());

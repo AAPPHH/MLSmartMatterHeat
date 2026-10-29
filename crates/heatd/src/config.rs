@@ -67,11 +67,45 @@ pub struct Schedule {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Exploration {
+    pub enabled: bool,
+    pub p_per_day: f64,
+    pub comfort_min: f64,
+    pub comfort_max: f64,
+    pub blackout: Vec<Blackout>,
+}
+
+impl Default for Exploration {
+    fn default() -> Self {
+        Self { enabled: false, p_per_day: 1.0, comfort_min: 16.0, comfort_max: 23.0, blackout: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Blackout {
+    pub from: String,
+    pub to: String,
+}
+
+impl Blackout {
+    pub fn minutes(&self) -> Result<(u32, u32)> {
+        Ok((parse_minutes(&self.from)?, parse_minutes(&self.to)?))
+    }
+
+    pub fn contains(&self, minute: u32) -> bool {
+        self.minutes().is_ok_and(|(from, to)| if from == to { false } else if from < to { (from..to).contains(&minute) } else { minute >= from || minute < to })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Room {
     pub name: String,
     pub nodes: Vec<u64>,
     #[serde(default)]
     pub schedules: Vec<Schedule>,
+    #[serde(default)]
+    pub exploration: Exploration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,7 +122,9 @@ pub struct Config {
     pub chip_tool: ChipToolSection,
     pub thread_cli_prefix: String,
     pub default_setpoint: f64,
-    pub eco_setpoint: f64,
+    pub away_setpoint: f64,
+    pub away_guard_minutes: f64,
+    pub exploration_seed: Option<u64>,
     pub presence_boost: f64,
     pub presence_timeout_minutes: f64,
     pub still_contact_timeout_minutes: f64,
@@ -110,7 +146,9 @@ impl Default for Config {
             chip_tool: ChipToolSection::default(),
             thread_cli_prefix: "ot ".to_string(),
             default_setpoint: 18.0,
-            eco_setpoint: 16.0,
+            away_setpoint: 18.0,
+            away_guard_minutes: 20.0,
+            exploration_seed: None,
             presence_boost: 1.0,
             presence_timeout_minutes: 30.0,
             still_contact_timeout_minutes: 180.0,
@@ -135,6 +173,9 @@ impl Config {
             for schedule in &room.schedules {
                 schedule.minutes()?;
                 schedule.weekdays()?;
+            }
+            for blackout in &room.exploration.blackout {
+                blackout.minutes()?;
             }
         }
         Ok(config)
