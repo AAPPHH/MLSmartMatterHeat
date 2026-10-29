@@ -353,6 +353,27 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         let _ = writeln!(md, "- {} {kind} node {} {} {}", hhmm(*us), node.map_or("-".into(), |n| n.to_string()), id.as_deref().unwrap_or("-"), detail.as_deref().unwrap_or(""));
     }
 
+    md.push_str("\n## Heizfilter je Raum\n\n");
+    let filter = rows(
+        c,
+        &format!(
+            "WITH d AS (SELECT room, proposed, applied, json_extract_string(inputs.extra, '$.reason') AS why FROM decisions WHERE proposed AND {day}),
+                  o AS (SELECT json_extract_string(detail, '$.room') AS room, json_extract(detail, '$.minutes')::DOUBLE AS minutes FROM events WHERE kind = 'occupancy_end' AND {day}),
+                  r AS (SELECT room FROM d UNION SELECT room FROM o)
+             SELECT r.room, (SELECT count(*) FROM d WHERE d.room = r.room AND applied), (SELECT count(*) FROM d WHERE d.room = r.room AND why = 'rate_limited'),
+                    (SELECT count(*) FROM d WHERE d.room = r.room AND why = 'debounce'), (SELECT coalesce(sum(minutes), 0) FROM o WHERE o.room = r.room) FROM r ORDER BY r.room"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, f64>(4)?)),
+    )?;
+    if filter.is_empty() {
+        md.push_str("Keine Sollwert-Schreibvorgaenge, aufgeschobenen Vorschlaege oder belegten Intervalle.\n");
+    } else {
+        md.push_str("| Raum | Schreibvorgaenge | rate_limited | debounce | belegte Minuten |\n|---|---|---|---|---|\n");
+        for (room, writes, limited, debounced, occupied) in filter {
+            let _ = writeln!(md, "| {room} | {writes} | {limited} | {debounced} | {occupied:.0} |");
+        }
+    }
+
     md.push_str("\n## Events by kind\n\n");
     let kinds = rows(c, &format!("SELECT kind, count(*) FROM events WHERE {day} GROUP BY kind ORDER BY kind"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let _ = writeln!(md, "{}\n", if kinds.is_empty() { "none".into() } else { kinds.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ") });

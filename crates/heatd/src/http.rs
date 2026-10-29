@@ -722,7 +722,12 @@ mod tests {
 
     #[tokio::test]
     async fn still_heartbeat_keeps_presence_and_away_goes_eco() {
-        let h = harness(true);
+        let h = harness_with(true, "away_guard_minutes = 0
+occupancy_enter_min = 0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         let now = now_ms();
         let old = now - 3 * 3_600_000;
@@ -803,7 +808,12 @@ mod tests {
 
     #[tokio::test]
     async fn control_loop_commands_mock_and_respects_hysteresis() {
-        let h = harness(true);
+        let h = harness_with(true, "away_guard_minutes = 0
+occupancy_enter_min = 0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         let first = control_step(&h.state, noon, 1_000).await.unwrap();
         assert_eq!((first.len(), first[0].setpoint, first[0].reason), (1, 18.0, "default"));
@@ -1208,6 +1218,75 @@ nodes = [6]
         assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "presence_arrive"));
     }
 
+    fn extras(h: &Harness, why: &str) -> usize {
+        some(&column(&lake_rows(h, "decisions"), "inputs.extra")).iter().filter(|e| e.contains(&format!("\"reason\":\"{why}\""))).count()
+    }
+
+    #[tokio::test]
+    async fn occupied_needs_ten_minutes_and_holds_45_after_leaving() {
+        let h = harness_with(true, "away_guard_minutes = 0
+min_write_interval_min = 5
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let t0 = now_ms();
+        call(&h.state, "POST", "/api/scan", Some(scan_at(t0, json!({})))).await;
+        let at = |m: i64| t0 + m * 60_000;
+        for m in 0..10 {
+            control_step(&h.state, noon, at(m)).await.unwrap();
+        }
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0)]);
+        control_step(&h.state, noon, at(10)).await.unwrap();
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0)]);
+        for m in 11..75 {
+            control_step(&h.state, noon, at(m)).await.unwrap();
+        }
+        assert_eq!(device_setpoint(&h).await, 21.0);
+        control_step(&h.state, noon, at(75)).await.unwrap();
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0), (5, 18.0)]);
+        assert_eq!(extras(&h, "debounce"), 1);
+        assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "occupancy_end"));
+    }
+
+    #[tokio::test]
+    async fn explicit_tap_occupies_immediately() {
+        let h = harness(false);
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let now = now_ms();
+        call(&h.state, "POST", "/api/label", label_body("pixel-watch", now - 1_000, now, "wohnzimmer")).await;
+        control_step(&h.state, noon, now).await.unwrap();
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 21.0)]);
+    }
+
+    #[tokio::test]
+    async fn second_change_within_the_interval_is_rate_limited_and_logged_once() {
+        let h = harness_with(false, "", "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms.schedules]]\ndays = ['weekdays']\nfrom = '12:05'\nto = '23:00'\nsetpoint = 21.0\n");
+        let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+        let t0 = 1_700_000_000_000;
+        for m in 0..15 {
+            control_step(&h.state, at(m), t0 + m as i64 * 60_000).await.unwrap();
+        }
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0)]);
+        assert_eq!(extras(&h, "rate_limited"), 1);
+        control_step(&h.state, at(15), t0 + 15 * 60_000).await.unwrap();
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0)]);
+    }
+
+    #[tokio::test]
+    async fn changes_below_the_deadband_are_not_written() {
+        let h = harness_with(false, "", "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms.schedules]]\ndays = ['weekdays']\nfrom = '12:05'\nto = '23:00'\nsetpoint = 18.5\n");
+        let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+        let t0 = 1_700_000_000_000;
+        control_step(&h.state, at(0), t0).await.unwrap();
+        crate::rules::on_report(&h.state, &setpoint_report(18.3), true, t0 + 60_000);
+        for m in [5, 20, 40] {
+            control_step(&h.state, at(m), t0 + m as i64 * 60_000).await.unwrap();
+        }
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0)]);
+    }
+
     #[tokio::test]
     async fn watch_still_at_home_is_never_away() {
         let h = harness(false);
@@ -1418,7 +1497,7 @@ name = 'flur'
     fn wanted(h: &Harness, now: i64) -> Vec<(String, f64, &'static str, &'static str, bool)> {
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         let presence = crate::rules::current_presence(&h.state, now).unwrap();
-        crate::rules::desired(noon, &h.state.config, presence.as_ref(), &Default::default(), &Default::default()).into_iter().map(|d| (d.room, d.setpoint, d.reason, d.source, d.sleep)).collect()
+        crate::rules::desired(noon, &h.state.config, presence.as_ref(), &presence.as_ref().and_then(|p| p.detected(&h.state.config)).into_iter().collect(), &Default::default(), &Default::default()).into_iter().map(|d| (d.room, d.setpoint, d.reason, d.source, d.sleep)).collect()
     }
 
     #[tokio::test]

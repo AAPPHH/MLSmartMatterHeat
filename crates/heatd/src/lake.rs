@@ -47,9 +47,10 @@ pub mod kind {
     pub const WATCH_STATE: &str = "watch_state";
     pub const POLL_FAILED: &str = "poll_failed";
     pub const MATCHER_DRIFT: &str = "matcher_drift";
-    pub const ALL: [&str; 17] = [
+    pub const OCCUPANCY_END: &str = "occupancy_end";
+    pub const ALL: [&str; 18] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
-        ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT,
+        ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
     ];
 }
 

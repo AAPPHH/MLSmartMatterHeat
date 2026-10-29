@@ -77,6 +77,12 @@ fn sample_lake(root: &Path) {
     sink.append(decision(150, true, Some(19.5), None)).unwrap();
     sink.append(decision(300, false, None, Some(true))).unwrap();
     sink.append(decision(330, false, None, Some(false))).unwrap();
+    for (minute, applied, why) in [(400, true, "occupied"), (410, false, "rate_limited"), (420, false, "debounce"), (430, false, "debounce")] {
+        sink.append(Decision { proposed: true, inputs: DecisionInputs { extra: Some(format!("{{\"reason\":\"{why}\"}}")), ..Default::default() }, ..decision(minute, applied, Some(21.0), None) }).unwrap();
+    }
+    for (minute, minutes) in [(500, 30), (700, 20)] {
+        sink.append(Event { detail: Some(format!("{{\"room\":\"a\",\"minutes\":{minutes}.0}}")), ..event(minute, kind::OCCUPANCY_END, None) }).unwrap();
+    }
     for (room, source, n) in [("a", "watch", 2), ("b", "watch", 1), ("a", "override", 1)] {
         for i in 0..n {
             sink.append(Label { ts: at(10 + i), room: room.into(), source: source.into(), ..Default::default() }).unwrap();
@@ -233,6 +239,7 @@ fn daily_report_covers_all_sections() {
     assert!(md.contains("| a | watch | 2 |") && md.contains("| a | override | 1 |") && md.contains("| b | watch | 1 |"), "labels\n{md}");
     assert!(md.contains("23 of 24 observation hours present, missing 1: 05:00"), "weather\n{md}");
     assert!(md.contains("1 started, 1 ended, 1 aborted"), "experiments\n{md}");
+    assert!(md.contains("| a | 1 | 1 | 2 | 50 |"), "filter\n{md}");
     assert!(md.contains("experiment_start node 1 x1"), "{md}");
     assert!(md.contains("| attribute_reports | 1 |") && !md.contains("NOT ROLLED"), "roll status\n{md}");
     assert_eq!((s.nodes, s.labels, s.experiments, s.missing_weather_hours.clone(), s.roll_ok), (3, 4, 1, vec![5], true));

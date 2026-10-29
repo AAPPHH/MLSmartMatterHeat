@@ -31,11 +31,71 @@ pub struct Hold {
 }
 
 #[derive(Debug, Default)]
+pub struct Occ {
+    candidate: Option<(String, i64)>,
+    seen: HashMap<String, (i64, i64)>,
+    logged: Option<(String, i64)>,
+}
+
+#[derive(Debug, Default)]
+pub struct OccStep {
+    pub held: HashSet<String>,
+    pub ended: Vec<(String, i64, i64)>,
+    pub pending: Option<(String, i64)>,
+}
+
+impl Occ {
+    pub fn step(&mut self, detected: Option<&str>, tap: bool, away: bool, now: i64, enter_ms: i64, exit_ms: i64) -> OccStep {
+        let mut ended: Vec<(String, i64, i64)> = Vec::new();
+        if away {
+            ended.extend(self.seen.drain().map(|(r, (s, _))| (r, s, now)));
+        }
+        match detected.filter(|_| !away) {
+            Some(room) => {
+                if self.candidate.as_ref().is_none_or(|c| c.0 != room) {
+                    self.candidate = Some((room.into(), now));
+                }
+                let since = self.candidate.as_ref().map_or(now, |c| c.1);
+                match self.seen.get_mut(room) {
+                    Some(e) => e.1 = now,
+                    None if tap || now - since >= enter_ms => {
+                        self.seen.insert(room.into(), (now, now));
+                    }
+                    None => {}
+                }
+            }
+            None => self.candidate = None,
+        }
+        let expired: Vec<String> = self.seen.iter().filter(|(_, (_, last))| now - last >= exit_ms).map(|(r, _)| r.clone()).collect();
+        for room in expired {
+            if let Some((start, last)) = self.seen.remove(&room) {
+                ended.push((room, start, last + exit_ms));
+            }
+        }
+        let pending = self.candidate.clone().filter(|(r, _)| !self.seen.contains_key(r));
+        OccStep { held: self.seen.keys().cloned().collect(), ended, pending }
+    }
+
+    fn fresh_pending(&mut self, pending: &Option<(String, i64)>) -> bool {
+        match pending {
+            Some(p) if self.logged.as_ref() != Some(p) => {
+                self.logged = Some(p.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct Commands {
     sent: HashMap<u64, Sent>,
     device: HashMap<u64, f64>,
     desired: HashMap<u64, f64>,
     holds: HashMap<u64, Hold>,
+    last_write: HashMap<u64, (i64, &'static str)>,
+    deferred: HashMap<u64, f64>,
+    occ: Occ,
 }
 
 impl Commands {
@@ -51,16 +111,16 @@ impl Commands {
         self.holds.get(&node)
     }
 
-    fn release_due(&mut self, want: &Desired, now_ms: i64, hold_ms: i64) -> bool {
+    fn release_due(&mut self, want: &Desired, now_ms: i64, hold_ms: i64) -> Option<bool> {
         self.desired.insert(want.node, want.setpoint);
-        let Some(hold) = self.holds.get(&want.node) else { return true };
+        let Some(hold) = self.holds.get(&want.node) else { return Some(false) };
         if now_ms - hold.since_ms < hold_ms && (want.setpoint - hold.desired).abs() < DESIRED_EPS_C {
-            return false;
+            return None;
         }
         if let Some(hold) = self.holds.remove(&want.node) {
             self.sent.insert(want.node, Sent { target: hold.value, previous: None, written_ms: 0, acked: None });
         }
-        true
+        Some(true)
     }
 }
 
@@ -84,6 +144,13 @@ pub enum Occupancy<'a> {
 }
 
 impl Presence {
+    pub fn detected(&self, config: &Config) -> Option<String> {
+        match self.occupancy(config) {
+            Occupancy::Room(r) => Some(r.to_string()),
+            _ => None,
+        }
+    }
+
     pub fn occupancy(&self, config: &Config) -> Occupancy<'_> {
         if self.contact_age_minutes.is_some_and(|a| a > config.still_contact_timeout_minutes) || matches!(self.power, Some(Power::Saver | Power::Offbody)) {
             return Occupancy::Unknown;
@@ -137,7 +204,7 @@ pub fn base_setpoint(room: &Room, config: &Config, now: NaiveDateTime) -> f64 {
     scheduled(room, now).unwrap_or(config.default_setpoint)
 }
 
-pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
+pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
     let occupancy = presence.map_or(Occupancy::Unknown, |p| p.occupancy(config));
     let (source, sleeping) = presence.map_or(("", false), |p| (p.source, p.sleep));
     config
@@ -154,10 +221,10 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
             } else if let Some(e) = experiment {
                 (e.setpoint.max(config.frost_setpoint), "exploration", "exploration")
             } else {
-                match occupancy {
-                    Occupancy::Room(r) if r == room.name && sleeping && config.sleep_room.as_deref() == Some(r) => (base, "sleep", "presence"),
-                    Occupancy::Room(r) if r == room.name => (config.occupied_setpoint, "occupied", "presence"),
-                    _ => (base, base_reason, "schedule"),
+                match held.contains(&room.name) {
+                    true if sleeping && config.sleep_room.as_deref() == Some(room.name.as_str()) => (base, "sleep", "presence"),
+                    true => (config.occupied_setpoint, "occupied", "presence"),
+                    false => (base, base_reason, "schedule"),
                 }
             };
             let label = match occupancy {
@@ -345,6 +412,12 @@ fn proposal(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, rea
     }
 }
 
+fn deferred_row(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, readings: &[Reading], presence: Option<&Presence>, why: &str) -> Decision {
+    let mut row = proposal(state, want, now_ms, old, readings, presence);
+    row.inputs.extra = Some(json!({"phase": "proposal", "reason": why, "wanted": want.reason, "source": want.source, "sleep": want.sleep}).to_string());
+    row
+}
+
 fn result_row(proposal: &Decision, reason: &str, error: Option<String>) -> Decision {
     let mut row = proposal.clone();
     row.applied = error.is_none();
@@ -380,18 +453,52 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let readings = state.latest.all();
     let mut written = Vec::new();
     let hold_ms = (state.config.manual_hold_minutes * 60_000.0) as i64;
-    for want in desired(now, &state.config, presence.as_ref(), &windows, &exploring) {
+    let (detected, tap) = presence.as_ref().map_or((None, false), |p| (p.detected(&state.config), p.source == "stay_label"));
+    let minutes = |m: f64| (m * 60_000.0) as i64;
+    let step = state.commanded.lock().unwrap().occ.step(detected.as_deref(), tap, away, now_ms, minutes(state.config.occupancy_enter_min), minutes(state.config.occupancy_exit_min));
+    for (room, from, to) in &step.ended {
+        let event = lake::Event::now(kind::OCCUPANCY_END, "heatd").with_detail(json!({"room": room, "from_ms": from, "minutes": (to - from) as f64 / 60_000.0}));
+        log("occupancy event", state.sink.append(lake::Event { ts: to * 1000, ..event }));
+    }
+    let wants = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring);
+    let current = |commands: &Commands, node: u64| {
+        commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
+    };
+    let fresh = state.commanded.lock().unwrap().occ.fresh_pending(&step.pending);
+    if let Some((room, _)) = step.pending.as_ref().filter(|_| fresh) {
+        for want in wants.iter().filter(|w| &w.room == room && w.reason != "window_open") {
+            let old = current(&state.commanded.lock().unwrap(), want.node);
+            if old.is_some_and(|o| (o - state.config.occupied_setpoint).abs() < state.config.setpoint_deadband) {
+                continue;
+            }
+            let wanted = Desired { setpoint: state.config.occupied_setpoint, reason: "occupied", rule: "presence", ..want.clone() };
+            log("decision", state.sink.append(deferred_row(state, &wanted, now_ms, old, &readings, presence.as_ref(), "debounce")));
+        }
+    }
+    let interval_ms = minutes(state.config.min_write_interval_min);
+    for want in wants {
         let (old, prior) = {
             let mut commands = state.commanded.lock().unwrap();
-            if !commands.release_due(&want, now_ms, hold_ms) {
+            let Some(hold_ended) = commands.release_due(&want, now_ms, hold_ms) else {
                 continue;
-            }
+            };
             let last = commands.target(want.node);
-            if last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C) {
+            let old = current(&commands, want.node);
+            if last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C) || old.is_some_and(|o| (o - want.setpoint).abs() < state.config.setpoint_deadband) {
+                commands.deferred.remove(&want.node);
                 continue;
             }
-            let device = commands.device.get(&want.node).copied();
-            let old = device.or(last).or_else(|| readings.iter().find(|r| r.node == want.node && r.attribute == "occupied_heating_setpoint").map(|r| r.value));
+            let last_write = commands.last_write.get(&want.node).copied();
+            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration");
+            let bypass = hold_ended || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
+            if !bypass && last_write.is_some_and(|(t, _)| now_ms - t < interval_ms) {
+                if commands.deferred.get(&want.node).is_none_or(|d| (d - want.setpoint).abs() >= DESIRED_EPS_C) {
+                    commands.deferred.insert(want.node, want.setpoint);
+                    drop(commands);
+                    log("decision", state.sink.append(deferred_row(state, &want, now_ms, old, &readings, presence.as_ref(), "rate_limited")));
+                }
+                continue;
+            }
             (old, commands.sent.get(&want.node).cloned())
         };
         let decision = proposal(state, &want, now_ms, old, &readings, presence.as_ref());
@@ -404,6 +511,11 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         log("decision result", state.sink.append(result_row(&decision, want.reason, error)));
         match outcome {
             Ok(()) => {
+                {
+                    let mut commands = state.commanded.lock().unwrap();
+                    commands.last_write.insert(want.node, (now_ms, want.reason));
+                    commands.deferred.remove(&want.node);
+                }
                 log("setpoint row", state.storage.insert_setpoint(now_ms, want.node, &want.room, want.setpoint, want.reason));
                 written.push(want);
             }
@@ -539,10 +651,15 @@ setpoint = 19.0
         Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion, power, away, contact_age_minutes: Some(contact), source: "matcher", sleep: false })
     }
 
+    fn raw(now: NaiveDateTime, config: &Config, p: Option<&Presence>, windows: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
+        let held = p.and_then(|p| p.detected(config)).into_iter().collect();
+        desired(now, config, p, &held, windows, exploring)
+    }
+
     fn lookup(now: NaiveDateTime, p: Option<Presence>, windows: &[&str], node: u64) -> (f64, &'static str) {
         let config = Config::parse(CONFIG).unwrap();
         let windows = windows.iter().map(|s| s.to_string()).collect();
-        let d = desired(now, &config, p.as_ref(), &windows, &HashMap::new()).into_iter().find(|d| d.node == node).unwrap();
+        let d = raw(now, &config, p.as_ref(), &windows, &HashMap::new()).into_iter().find(|d| d.node == node).unwrap();
         (d.setpoint, d.reason)
     }
 
@@ -590,7 +707,7 @@ setpoint = 19.0
     fn occupied_room_gets_21_and_bedroom_keeps_night_value_while_asleep() {
         let config = Config::parse(CONFIG).unwrap();
         let go = |p: Option<Presence>, node: u64| {
-            let d = desired(at(27, 23, 0), &config, p.as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == node).unwrap();
+            let d = raw(at(27, 23, 0), &config, p.as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == node).unwrap();
             (d.setpoint, d.reason, d.rule, d.source, d.sleep)
         };
         let asleep = |room: &str| presence(room, 1.0).map(|p| Presence { sleep: true, ..p });
@@ -607,6 +724,31 @@ setpoint = 19.0
     }
 
     #[test]
+    fn walking_through_rooms_never_occupies_but_a_ten_minute_stay_does_and_leaving_holds() {
+        let (min, enter, exit) = (60_000, 10 * 60_000, 45 * 60_000);
+        let mut occ = Occ::default();
+        let mut now = 0;
+        let mut tick = |occ: &mut Occ, room: Option<&str>, tap: bool, away: bool, minutes: i64| {
+            let mut held = HashSet::new();
+            for _ in 0..minutes {
+                held = occ.step(room, tap, away, now, enter, exit).held;
+                now += min;
+            }
+            held
+        };
+        for room in ["kueche", "bad", "flur", "kueche", "bad"] {
+            assert!(tick(&mut occ, Some(room), false, false, 5).is_empty());
+        }
+        assert!(tick(&mut occ, Some("wohnzimmer"), false, false, 10).is_empty());
+        assert_eq!(tick(&mut occ, Some("wohnzimmer"), false, false, 1), HashSet::from(["wohnzimmer".to_string()]));
+        assert_eq!(tick(&mut occ, Some("kueche"), false, false, 5), HashSet::from(["wohnzimmer".to_string()]));
+        assert_eq!(tick(&mut occ, None, false, false, 39), HashSet::from(["wohnzimmer".to_string()]));
+        assert!(tick(&mut occ, None, false, false, 1).is_empty());
+        assert_eq!(tick(&mut occ, Some("bad"), true, false, 1), HashSet::from(["bad".to_string()]));
+        assert!(tick(&mut occ, Some("bad"), true, true, 1).is_empty());
+    }
+
+    #[test]
     fn away_overrides_schedule_and_can_be_configured() {
         let config = Config::parse("away_setpoint = 17.5
 [[rooms]]
@@ -618,7 +760,7 @@ from='06:00'
 to='08:30'
 setpoint=21.0").unwrap();
         let p = device("a", 500.0, None, None, true, 5.0);
-        let d = desired(at(27, 7, 0), &config, p.as_ref(), &HashSet::new(), &HashMap::new());
+        let d = raw(at(27, 7, 0), &config, p.as_ref(), &HashSet::new(), &HashMap::new());
         assert_eq!((d[0].setpoint, d[0].reason, d[0].rule, d[0].occupancy), (17.5, "away", "presence", "away"));
         assert_eq!(Config::parse("").unwrap().away_setpoint, 18.0);
     }
@@ -630,7 +772,7 @@ setpoint=21.0").unwrap();
         let exploring = HashMap::from([("wohnzimmer".to_string(), experiment)]);
         let go = |p: Option<Presence>, windows: &[&str]| {
             let windows = windows.iter().map(|s| s.to_string()).collect();
-            let d = desired(at(27, 7, 0), &config, p.as_ref(), &windows, &exploring).into_iter().find(|d| d.node == 5).unwrap();
+            let d = raw(at(27, 7, 0), &config, p.as_ref(), &windows, &exploring).into_iter().find(|d| d.node == 5).unwrap();
             (d.setpoint, d.reason, d.rule, d.experiment_id)
         };
         assert_eq!(go(None, &[]), (7.0, "exploration", "exploration", Some("e1".to_string())));
