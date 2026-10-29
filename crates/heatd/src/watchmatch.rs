@@ -314,6 +314,7 @@ struct Inner {
     model: Option<Arc<Model>>,
     dir_name: Option<String>,
     devices: HashMap<String, Device>,
+    stays: HashMap<String, (String, i64)>,
 }
 
 #[derive(Clone)]
@@ -487,6 +488,31 @@ impl WatchMatch {
             }
         }
         rows.iter().for_each(|r| self.record(r));
+    }
+
+    pub fn note_stay(&self, device: &str, ts_ms: i64, label: Option<&str>) {
+        let mut inner = self.inner.lock().unwrap();
+        match label.filter(|l| !l.is_empty()) {
+            Some(l) if inner.stays.get(device).is_none_or(|s| ts_ms >= s.1) => {
+                inner.stays.insert(device.into(), (l.into(), ts_ms));
+            }
+            Some(_) => {}
+            None if inner.stays.get(device).is_some_and(|s| ts_ms > s.1) => {
+                inner.stays.remove(device);
+            }
+            None => {}
+        }
+    }
+
+    pub fn stay(&self) -> Option<(String, String, i64)> {
+        let inner = self.inner.lock().unwrap();
+        inner.stays.iter().map(|(d, (r, t))| (d.clone(), r.clone(), *t)).max_by_key(|s| s.2)
+    }
+
+    pub fn sleeping(&self, now_ms: i64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let rule = inner.model.as_ref().and_then(|m| m.rule()).unwrap_or(self.rule);
+        inner.devices.values().any(|d| d.signals.classify(&rule, now_ms, local_minute(now_ms)) == "sleep")
     }
 
     pub fn effective(&self, now_ms: i64) -> Option<Option<(String, i64)>> {

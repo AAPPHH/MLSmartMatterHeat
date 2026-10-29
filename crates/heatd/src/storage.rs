@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS predictions (ts TIMESTAMP, device VARCHAR, room VARCH
 CREATE TABLE IF NOT EXISTS device_state (ts TIMESTAMP, received_at TIMESTAMP, device VARCHAR, motion VARCHAR, power VARCHAR, queued BOOLEAN, n_aps INTEGER, away BOOLEAN, id VARCHAR);
 CREATE TABLE IF NOT EXISTS ingest_ids (device VARCHAR, id VARCHAR, PRIMARY KEY (device, id));
 ALTER TABLE device_state ADD COLUMN IF NOT EXISTS id VARCHAR;
+ALTER TABLE device_state ADD COLUMN IF NOT EXISTS bedtime BOOLEAN;
 ";
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -83,6 +84,8 @@ pub struct ScanBody {
     pub power: Option<Power>,
     #[serde(default)]
     pub away: bool,
+    #[serde(default)]
+    pub bedtime: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +105,7 @@ pub struct DeviceStatus {
     pub motion: Option<Motion>,
     pub power: Option<Power>,
     pub away: bool,
+    pub bedtime: Option<bool>,
     pub state_ts: i64,
     pub contact_ms: i64,
 }
@@ -169,8 +173,8 @@ impl Storage {
             stmt.execute(params![scan_id, scan.ts, received_ms, scan.device, scan.label, ap.bssid.to_lowercase(), ap.rssi, ap.freq])?;
         }
         conn.execute(
-            "INSERT INTO device_state VALUES (epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?, ?, ?)",
-            params![scan.ts, received_ms, scan.device, scan.motion.map(Motion::as_str), scan.power.map(Power::as_str), scan.queued, scan.aps.len() as i32, scan.away, scan.id],
+            "INSERT INTO device_state VALUES (epoch_ms(?), epoch_ms(?), ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![scan.ts, received_ms, scan.device, scan.motion.map(Motion::as_str), scan.power.map(Power::as_str), scan.queued, scan.aps.len() as i32, scan.away, scan.id, scan.bedtime],
         )?;
         if let Some((room, probability)) = prediction {
             conn.execute("INSERT INTO predictions VALUES (epoch_ms(?), ?, ?, ?)", params![scan.ts, scan.device, room, probability])?;
@@ -209,7 +213,7 @@ impl Storage {
     pub fn device_statuses(&self) -> Result<Vec<DeviceStatus>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT device, motion, power, coalesce(away, false), epoch_ms(ts), (SELECT epoch_ms(max(received_at)) FROM device_state d2 WHERE d2.device = d.device) \
+            "SELECT device, motion, power, coalesce(away, false), epoch_ms(ts), bedtime, (SELECT epoch_ms(max(received_at)) FROM device_state d2 WHERE d2.device = d.device) \
              FROM device_state d QUALIFY row_number() OVER (PARTITION BY device ORDER BY ts DESC, received_at DESC) = 1 ORDER BY device",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -221,7 +225,8 @@ impl Storage {
                 power: power.as_deref().and_then(Power::parse),
                 away: r.get(3)?,
                 state_ts: r.get(4)?,
-                contact_ms: r.get(5)?,
+                bedtime: r.get(5)?,
+                contact_ms: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -307,6 +312,7 @@ mod tests {
             queued: false,
             power: None,
             away: false,
+            bedtime: None,
             aps: vec![
                 AccessPoint { bssid: "AA:BB:CC:00:00:01".into(), rssi: -45, freq: 2412 },
                 AccessPoint { bssid: "aa:bb:cc:00:00:02".into(), rssi: -67, freq: 5180 },
@@ -345,7 +351,7 @@ mod tests {
         storage.ingest(&hb, 12_000, None).unwrap();
         assert_eq!(
             storage.device_statuses().unwrap()[0],
-            DeviceStatus { device: "pixel-watch".into(), motion: Some(Motion::Still), power: Some(Power::Doze), away: true, state_ts: 2_000, contact_ms: 12_000 }
+            DeviceStatus { device: "pixel-watch".into(), motion: Some(Motion::Still), power: Some(Power::Doze), away: true, bedtime: None, state_ts: 2_000, contact_ms: 12_000 }
         );
         let snap = dir.path().join("snap").join("snapshot.duckdb");
         storage.snapshot(snap.to_str().unwrap()).unwrap();

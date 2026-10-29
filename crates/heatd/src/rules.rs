@@ -72,6 +72,8 @@ pub struct Presence {
     pub power: Option<Power>,
     pub away: bool,
     pub contact_age_minutes: Option<f64>,
+    pub source: &'static str,
+    pub sleep: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +109,8 @@ pub struct Desired {
     pub rule: &'static str,
     pub base: f64,
     pub occupancy: &'static str,
+    pub source: &'static str,
+    pub sleep: bool,
     pub window_open: bool,
     pub experiment_id: Option<String>,
 }
@@ -135,6 +139,7 @@ pub fn base_setpoint(room: &Room, config: &Config, now: NaiveDateTime) -> f64 {
 
 pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
     let occupancy = presence.map_or(Occupancy::Unknown, |p| p.occupancy(config));
+    let (source, sleeping) = presence.map_or(("", false), |p| (p.source, p.sleep));
     config
         .rooms
         .iter()
@@ -150,7 +155,8 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
                 (e.setpoint.max(config.frost_setpoint), "exploration", "exploration")
             } else {
                 match occupancy {
-                    Occupancy::Room(r) if r == room.name => (base + config.presence_boost, "presence_boost", "presence"),
+                    Occupancy::Room(r) if r == room.name && sleeping && config.sleep_room.as_deref() == Some(r) => (base, "sleep", "presence"),
+                    Occupancy::Room(r) if r == room.name => (config.occupied_setpoint, "occupied", "presence"),
                     _ => (base, base_reason, "schedule"),
                 }
             };
@@ -160,7 +166,7 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
                 Occupancy::Unknown => "unknown",
             };
             let id = experiment.filter(|_| reason == "exploration").map(|e| e.id.clone());
-            room.nodes.iter().map(move |&node| Desired { node, room: room.name.clone(), setpoint, reason, rule, base, occupancy: label, window_open: window, experiment_id: id.clone() })
+            room.nodes.iter().map(move |&node| Desired { node, room: room.name.clone(), setpoint, reason, rule, base, occupancy: label, source, sleep: sleeping, window_open: window, experiment_id: id.clone() })
         })
         .collect()
 }
@@ -234,21 +240,35 @@ pub(crate) fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<P
     let prediction = state.storage.last_predictions()?.into_iter().max_by_key(|p| p.ts);
     let statuses = state.storage.device_statuses()?;
     let status = match &prediction {
-        Some(p) => statuses.into_iter().find(|s| s.device == p.device),
-        None => statuses.into_iter().max_by_key(|s| s.state_ts),
-    };
+        Some(p) => statuses.iter().find(|s| s.device == p.device),
+        None => statuses.iter().max_by_key(|s| s.state_ts),
+    }
+    .cloned();
     let matched = state.watchmatch.effective(now_ms);
-    if prediction.is_none() && status.is_none() && !matched.as_ref().is_some_and(Option::is_some) {
+    let stay = state
+        .watchmatch
+        .stay()
+        .filter(|(_, _, ts)| minutes(*ts) <= state.config.presence_timeout_minutes)
+        .filter(|(device, _, ts)| !statuses.iter().any(|s| &s.device == device && s.motion == Some(Motion::Moving) && s.state_ts > *ts));
+    if prediction.is_none() && status.is_none() && stay.is_none() && !matched.as_ref().is_some_and(Option::is_some) {
         return Ok(None);
     }
     let away = status.as_ref().is_some_and(|s| s.away && state.tracker.lock().unwrap().confirmed(&s.device));
-    let (room, prediction_age_minutes) = match matched {
+    let (model_room, model_age) = match matched {
         Some(held) => (held.as_ref().map(|h| h.0.clone()), held.as_ref().map(|h| minutes(h.1))),
         None => (prediction.as_ref().map(|p| p.room.clone()), prediction.as_ref().map(|p| minutes(p.ts))),
     };
+    let model_fresh = model_age.is_some_and(|a| a <= state.config.presence_timeout_minutes);
+    let (room, prediction_age_minutes, source) = match stay {
+        Some((_, label, ts)) if !model_fresh => (Some(label), Some(minutes(ts)), "stay_label"),
+        _ => (model_room, model_age, "matcher"),
+    };
+    let sleep = state.watchmatch.sleeping(now_ms) || status.as_ref().is_some_and(|s| s.bedtime == Some(true));
     Ok(Some(Presence {
         prediction_age_minutes,
         room,
+        source,
+        sleep,
         motion: status.as_ref().and_then(|s| s.motion),
         power: status.as_ref().and_then(|s| s.power),
         away,
@@ -311,7 +331,7 @@ fn proposal(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, rea
             window_open: Some(want.window_open),
             away: Some(want.occupancy == "away"),
             system_mode: reading("system_mode").map(mode_name),
-            extra: Some(json!({"phase": "proposal", "reason": want.reason}).to_string()),
+            extra: Some(json!({"phase": "proposal", "reason": want.reason, "source": want.source, "sleep": want.sleep}).to_string()),
             ..Default::default()
         },
         setpoint_old: old,
@@ -480,7 +500,8 @@ mod tests {
     const CONFIG: &str = "
 default_setpoint = 18.0
 away_setpoint = 18.0
-presence_boost = 1.0
+occupied_setpoint = 21.0
+sleep_room = 'schlafzimmer'
 presence_timeout_minutes = 30
 frost_setpoint = 7.0
 [[rooms]]
@@ -511,11 +532,11 @@ setpoint = 19.0
     }
 
     fn presence(room: &str, age: f64) -> Option<Presence> {
-        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion: None, power: None, away: false, contact_age_minutes: None })
+        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion: None, power: None, away: false, contact_age_minutes: None, source: "matcher", sleep: false })
     }
 
     fn device(room: &str, age: f64, motion: Option<Motion>, power: Option<Power>, away: bool, contact: f64) -> Option<Presence> {
-        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion, power, away, contact_age_minutes: Some(contact) })
+        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion, power, away, contact_age_minutes: Some(contact), source: "matcher", sleep: false })
     }
 
     fn lookup(now: NaiveDateTime, p: Option<Presence>, windows: &[&str], node: u64) -> (f64, &'static str) {
@@ -540,29 +561,49 @@ setpoint = 19.0
             ("tuesday evening not scheduled", at(28, 23, 0), None, vec![], 6, (18.0, "default")),
             ("friday night into saturday", at(25, 1, 0), None, vec![], 6, (19.0, "schedule")),
             ("saturday night not scheduled", at(26, 1, 0), None, vec![], 6, (18.0, "default")),
-            ("fresh presence boosts occupied room", at(27, 7, 0), presence("wohnzimmer", 29.9), vec![], 5, (22.0, "presence_boost")),
+            ("fresh presence sets the occupied room to 21", at(27, 7, 0), presence("wohnzimmer", 29.9), vec![], 5, (21.0, "occupied")),
             ("fresh presence other room unchanged", at(27, 7, 0), presence("bad", 5.0), vec![], 5, (21.0, "schedule")),
-            ("boost applies to every node of the room", at(27, 23, 0), presence("schlafzimmer", 1.0), vec![], 7, (20.0, "presence_boost")),
+            ("occupied applies to every node of the room", at(27, 23, 0), presence("schlafzimmer", 1.0), vec![], 7, (21.0, "occupied")),
             ("stale presence is unknown not eco", at(27, 7, 0), presence("wohnzimmer", 30.1), vec![], 5, (21.0, "schedule")),
             ("stale presence other room schedule", at(27, 12, 0), presence("bad", 99.0), vec![], 6, (18.0, "default")),
-            ("still keeps old room", at(27, 7, 0), device("wohnzimmer", 120.0, Some(Motion::Still), None, false, 100.0), vec![], 5, (22.0, "presence_boost")),
-            ("still at contact timeout boundary", at(27, 7, 0), device("wohnzimmer", 500.0, Some(Motion::Still), Some(Power::Doze), false, 180.0), vec![], 5, (22.0, "presence_boost")),
+            ("still keeps old room", at(27, 7, 0), device("wohnzimmer", 120.0, Some(Motion::Still), None, false, 100.0), vec![], 5, (21.0, "occupied")),
+            ("still at contact timeout boundary", at(27, 7, 0), device("wohnzimmer", 500.0, Some(Motion::Still), Some(Power::Doze), false, 180.0), vec![], 5, (21.0, "occupied")),
             ("still but contact stale", at(27, 7, 0), device("wohnzimmer", 500.0, Some(Motion::Still), None, false, 180.1), vec![], 5, (21.0, "schedule")),
             ("moving with stale prediction unknown", at(27, 7, 0), device("wohnzimmer", 31.0, Some(Motion::Moving), None, false, 1.0), vec![], 5, (21.0, "schedule")),
-            ("moving with fresh prediction boosts", at(27, 7, 0), device("wohnzimmer", 2.0, Some(Motion::Moving), None, false, 1.0), vec![], 5, (22.0, "presence_boost")),
+            ("moving with fresh prediction occupies", at(27, 7, 0), device("wohnzimmer", 2.0, Some(Motion::Moving), None, false, 1.0), vec![], 5, (21.0, "occupied")),
             ("saver is unknown", at(27, 7, 0), device("wohnzimmer", 1.0, Some(Motion::Still), Some(Power::Saver), false, 1.0), vec![], 5, (21.0, "schedule")),
             ("offbody is unknown", at(27, 7, 0), device("wohnzimmer", 1.0, Some(Motion::Still), Some(Power::Offbody), false, 1.0), vec![], 5, (21.0, "schedule")),
             ("away goes eco", at(27, 12, 0), device("wohnzimmer", 1.0, Some(Motion::Moving), None, true, 1.0), vec![], 5, (18.0, "away")),
             ("away with saver is unknown", at(27, 12, 0), device("wohnzimmer", 1.0, None, Some(Power::Saver), true, 1.0), vec![], 5, (18.0, "default")),
             ("away but contact stale is unknown", at(27, 12, 0), device("wohnzimmer", 1.0, None, None, true, 181.0), vec![], 5, (18.0, "default")),
-            ("away without prediction", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: None, power: None, away: true, contact_age_minutes: Some(1.0) }), vec![], 5, (18.0, "away")),
-            ("heartbeat without prediction is unknown", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: Some(Motion::Still), power: None, away: false, contact_age_minutes: Some(1.0) }), vec![], 5, (18.0, "default")),
+            ("away without prediction", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: None, power: None, away: true, contact_age_minutes: Some(1.0), source: "matcher", sleep: false }), vec![], 5, (18.0, "away")),
+            ("heartbeat without prediction is unknown", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: Some(Motion::Still), power: None, away: false, contact_age_minutes: Some(1.0), source: "matcher", sleep: false }), vec![], 5, (18.0, "default")),
             ("window open frost", at(27, 7, 0), presence("wohnzimmer", 1.0), vec!["wohnzimmer"], 5, (7.0, "window_open")),
             ("window open other room unaffected", at(27, 7, 0), None, vec!["wohnzimmer"], 6, (18.0, "default")),
         ];
         for (name, now, p, windows, node, expected) in cases {
             assert_eq!(lookup(now, p, &windows, node), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn occupied_room_gets_21_and_bedroom_keeps_night_value_while_asleep() {
+        let config = Config::parse(CONFIG).unwrap();
+        let go = |p: Option<Presence>, node: u64| {
+            let d = desired(at(27, 23, 0), &config, p.as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == node).unwrap();
+            (d.setpoint, d.reason, d.rule, d.source, d.sleep)
+        };
+        let asleep = |room: &str| presence(room, 1.0).map(|p| Presence { sleep: true, ..p });
+        assert_eq!(go(presence("wohnzimmer", 1.0), 5), (21.0, "occupied", "presence", "matcher", false));
+        assert_eq!(go(presence("wohnzimmer", 1.0), 6), (19.0, "schedule", "schedule", "matcher", false));
+        assert_eq!(go(asleep("schlafzimmer"), 6), (19.0, "sleep", "presence", "matcher", true));
+        assert_eq!(go(asleep("schlafzimmer"), 5), (18.0, "default", "schedule", "matcher", true));
+        assert_eq!(go(asleep("wohnzimmer"), 5), (21.0, "occupied", "presence", "matcher", true));
+        assert_eq!(go(presence("schlafzimmer", 1.0), 6), (21.0, "occupied", "presence", "matcher", false));
+        let label = presence("wohnzimmer", 2.0).map(|p| Presence { source: "stay_label", ..p });
+        assert_eq!(go(label, 5), (21.0, "occupied", "presence", "stay_label", false));
+        let away = device("schlafzimmer", 1.0, None, None, true, 1.0).map(|p| Presence { sleep: true, ..p });
+        assert_eq!(go(away, 6).1, "away");
     }
 
     #[test]

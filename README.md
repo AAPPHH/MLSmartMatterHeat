@@ -225,6 +225,7 @@ Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `depl
 |---|---|
 | `latitude`, `longitude` | schaltet den stündlichen Open-Meteo-Abruf (Wetter, `weather_url` überschreibt den Endpunkt) und `coordinates` in `meta` ein; ohne beide aus |
 | `away_setpoint`, `away_guard_minutes` | Sollwert bei Abwesenheit (18 °C) und Zeit, die die getragene Uhr das WLAN fehlen muss (20 min) |
+| `occupied_setpoint` / `sleep_room` | Sollwert des belegten Raums (21) und Schlafzimmer, das bei Schlafen den Zeitplanwert behält (z. B. `schlafzimmer`; leer = keine Ausnahme) |
 | `manual_hold_minutes` | ändert jemand den Sollwert am Thermostat, hält `heatd` diesen Wert bis sich der gewünschte Sollwert (Zeitplan, Anwesenheit, Abwesenheit) ändert, höchstens so lange (120), und läuft dann weiter; Entscheidung `rule=manual` und Label `override` einmal, ein laufendes Experiment bricht ab |
 | `poll_silence_s` | Heartbeat-Poll pro Node nur, wenn so lange (300 s) kein Report kam |
 | `exploration_seed` | Seed für die zufälligen Startzeiten der Experimente |
@@ -244,9 +245,13 @@ Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `depl
 | 1 | Fenster offen (`POST /api/window`) | `frost_setpoint` |
 | 2 | Uhr abwesend (Schutz: `away_guard_minutes`, Uhr muss getragen worden sein) | `away_setpoint` (18 °C) in allen Räumen, ohne Zeitplan |
 | 3 | Laufendes Explorationsexperiment (`rooms.exploration`) | Experiment-Sollwert |
-| 4 | Zeitplan greift (auch über Mitternacht) | Zeitplan-Wert |
+| 4 | Raum, in dem du bist, außer `sleep_room`, solange die Uhr auf Schlafen steht | `occupied_setpoint` (21 °C), immer genau dieser Wert |
+| 5 | Zeitplan greift (auch über Mitternacht), auch im `sleep_room` bei Schlafen | Zeitplan-Wert |
 | – | sonst | `default_setpoint` |
-| + | Uhr im Raum, jünger als `presence_timeout_minutes` | `+ presence_boost` |
+
+Ein manueller Eingriff am Thermostat (`manual_hold_minutes`) hält den Wert des Geräts und geht allem davor vor, bis sich der gewünschte Sollwert ändert. Frost (`frost_setpoint`) ist der Wert bei offenem Fenster.
+
+Der belegte Raum ist der Raum des Matchers, solange er sicher ist (nicht abstained, innerhalb von `t_hold_min`, Alter höchstens `presence_timeout_minutes`). Fehlt er, gilt das bestätigte Stay-Label der Uhr (Scan-Label oder `/api/label`), wenn es jünger als `presence_timeout_minutes` ist und die Uhr seither keine Bewegung gemeldet hat. Räume ohne Node (z. B. `flur`) bekommen keine Aktion. Schlafen heißt: Zustand `sleep` aus dem Watch-Zustand oder das Feld `bedtime: true`, das die Uhr aus dem Bettzeit-Modus sendet. `presence_boost` wird nicht mehr verwendet (Schlüssel bleibt erlaubt, ohne Wirkung). Entscheidungen tragen `rule=presence`, `reason` = `occupied` oder `sleep`, sowie `source` (`matcher` oder `stay_label`) und `sleep` in `inputs.extra`.
 
 Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °C vom zuletzt gesetzten abweicht. Die Entscheidung wird vor dem Geräte-Schreiben auf Platte geschrieben (fsync). Berichte, die kurz nach einem eigenen Schreiben noch den alten oder einen vom Gerät gerundeten Wert zeigen (2 × `timeout_s`), und Poll-Antworten gelten nie als manueller Eingriff. Ein echter manueller Eingriff am Thermostat wird bis zur nächsten Änderung des gewünschten Sollwerts gehalten, höchstens `manual_hold_minutes`.
 

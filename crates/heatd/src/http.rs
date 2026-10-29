@@ -218,7 +218,10 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
             eprintln!("labels: {e}");
         }
     }
-    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "away": body.away, "id": body.id});
+    if !body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty()) {
+        state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref());
+    }
+    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "away": body.away, "bedtime": body.bedtime, "id": body.id});
     let mut state_event = Event::now(kind::WATCH_STATE, "watch").with_detail(detail);
     state_event.ts = body.ts * 1000;
     if let Err(e) = state.sink.append(state_event) {
@@ -274,12 +277,14 @@ struct LongBody {
     #[serde(default)]
     away: Option<bool>,
     #[serde(default)]
+    bedtime: Option<bool>,
+    #[serde(default)]
     queued: Option<bool>,
 }
 
 impl LongBody {
     fn scan_body(&self, received: i64) -> Option<ScanBody> {
-        let carries = self.id.is_some() || self.label.is_some() || self.motion.is_some() || self.power.is_some() || self.away.is_some() || self.queued.is_some();
+        let carries = self.id.is_some() || self.label.is_some() || self.motion.is_some() || self.power.is_some() || self.away.is_some() || self.bedtime.is_some() || self.queued.is_some();
         let rssi: Vec<&Sample> = self.samples.iter().filter(|s| s.sensor_type == "rssi").collect();
         let ts = rssi.iter().map(|s| s.ts.min(received + MAX_FUTURE_MS)).max()?;
         carries.then(|| ScanBody {
@@ -292,6 +297,7 @@ impl LongBody {
             queued: self.queued.unwrap_or(false),
             power: self.power,
             away: self.away.unwrap_or(false),
+            bedtime: self.bedtime,
         })
     }
 }
@@ -569,6 +575,7 @@ async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> Ap
         return Err(ApiError::bad("range must satisfy from <= to and to - from <= 3600000"));
     }
     let labelled = state.storage.relabel(&body.device, body.from, body.to, &body.label)?;
+    state.watchmatch.note_stay(&body.device, body.to.min(now_ms()), Some(&body.label));
     let row = Label { ts: lake::now_us(), from_ts: Some(body.from * 1000), to_ts: Some(body.to * 1000), room: body.label.clone(), source: "watch".into(), device: Some(body.device.clone()), ..Default::default() };
     if let Err(e) = state.sink.append(row) {
         eprintln!("labels: {e}");
@@ -722,7 +729,7 @@ mod tests {
         call(&h.state, "POST", "/api/scan", Some(scan_at(old, json!({"motion": "still"})))).await;
         call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "pixel-watch", "motion": "still", "power": "doze"}).to_string())).await;
         let boosted = control_step(&h.state, noon, now).await.unwrap();
-        assert_eq!((boosted[0].setpoint, boosted[0].reason), (19.0, "presence_boost"));
+        assert_eq!((boosted[0].setpoint, boosted[0].reason), (21.0, "occupied"));
         call(&h.state, "POST", "/api/scan", Some(json!({"ts": now + 1, "device": "pixel-watch", "motion": "moving", "away": true}).to_string())).await;
         let eco = control_step(&h.state, noon, now + 1).await.unwrap();
         assert_eq!((eco[0].setpoint, eco[0].reason), (18.0, "away"));
@@ -809,7 +816,7 @@ mod tests {
         call(&h.state, "POST", "/api/scan", Some(scan_at(now_ms(), json!({})))).await;
         call(&h.state, "POST", "/api/window", Some("{\"room\":\"wohnzimmer\",\"open\":false}".into())).await;
         let boosted = control_step(&h.state, noon, now_ms()).await.unwrap();
-        assert_eq!((boosted[0].setpoint, boosted[0].reason), (19.0, "presence_boost"));
+        assert_eq!((boosted[0].setpoint, boosted[0].reason), (21.0, "occupied"));
     }
 
     #[tokio::test]
@@ -1389,9 +1396,68 @@ nodes = [6]
         assert!(crate::rules::current_presence(&h.state, now_ms()).unwrap().is_none());
         call(&h.state, "POST", "/api/scan", Some(scan_at(now + 1000, json!({})))).await;
         let legacy = crate::rules::current_presence(&h.state, now_ms()).unwrap().unwrap();
-        assert!(legacy.room.is_none());
+        assert_eq!((legacy.room.as_deref(), legacy.source), (Some("wohnzimmer"), "stay_label"));
         let (_, health) = call(&h.state, "GET", "/health", None).await;
         assert_eq!(health["watch"]["abstain"][0]["abstained"], json!(2));
+    }
+
+    fn stay_harness() -> Harness {
+        harness_with(false, "away_guard_minutes = 0
+sleep_room = 'schlafzimmer'
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+[[rooms]]
+name = 'schlafzimmer'
+nodes = [6]
+[[rooms]]
+name = 'flur'
+")
+    }
+
+    fn wanted(h: &Harness, now: i64) -> Vec<(String, f64, &'static str, &'static str, bool)> {
+        let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let presence = crate::rules::current_presence(&h.state, now).unwrap();
+        crate::rules::desired(noon, &h.state.config, presence.as_ref(), &Default::default(), &Default::default()).into_iter().map(|d| (d.room, d.setpoint, d.reason, d.source, d.sleep)).collect()
+    }
+
+    #[tokio::test]
+    async fn stay_label_without_model_occupies_the_room_until_it_expires_or_the_wearer_moves() {
+        let h = stay_harness();
+        let now = now_ms();
+        let post = |extra: Value| {
+            let mut v = json!({"device": "pixel-watch"});
+            extra.as_object().unwrap().iter().for_each(|(k, x)| v[k] = x.clone());
+            call(&h.state, "POST", "/api/scan", Some(v.to_string()))
+        };
+        post(json!({"ts": now - 60_000, "label": "wohnzimmer", "motion": "still", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]})).await;
+        assert_eq!(wanted(&h, now), vec![("wohnzimmer".to_string(), 21.0, "occupied", "stay_label", false), ("schlafzimmer".to_string(), 18.0, "default", "stay_label", false)]);
+        assert_eq!(wanted(&h, now + 31 * 60_000)[0].1, 18.0);
+        post(json!({"ts": now - 30_000, "motion": "moving"})).await;
+        assert_eq!(wanted(&h, now)[0].1, 18.0);
+    }
+
+    #[tokio::test]
+    async fn label_endpoint_sets_the_stay_and_an_unlabeled_scan_ends_it() {
+        let h = stay_harness();
+        let now = now_ms();
+        call(&h.state, "POST", "/api/label", label_body("pixel-watch", now - 120_000, now - 1_000, "wohnzimmer")).await;
+        assert_eq!(wanted(&h, now)[0].2, "occupied");
+        call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "pixel-watch", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]}).to_string())).await;
+        assert_eq!(wanted(&h, now)[0].2, "default");
+    }
+
+    #[tokio::test]
+    async fn bedtime_flag_keeps_the_bedroom_at_its_night_value_and_is_stored() {
+        let h = stay_harness();
+        let now = now_ms();
+        call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "pixel-watch", "label": "schlafzimmer", "bedtime": true, "motion": "still", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]}).to_string())).await;
+        assert_eq!(h.state.storage.device_statuses().unwrap()[0].bedtime, Some(true));
+        assert_eq!(wanted(&h, now)[1], ("schlafzimmer".to_string(), 18.0, "sleep", "stay_label", true));
+        let mut long = long_body(900, now + 1000, [-40, -60, -90]);
+        long["bedtime"] = json!(false);
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(long.to_string())).await.0, StatusCode::OK);
+        assert_eq!(h.state.storage.device_statuses().unwrap()[0].bedtime, Some(false));
     }
 
     #[tokio::test]

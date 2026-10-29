@@ -237,7 +237,8 @@ pub struct Config {
     pub away_setpoint: f64,
     pub away_guard_minutes: f64,
     pub exploration_seed: Option<u64>,
-    pub presence_boost: f64,
+    pub occupied_setpoint: f64,
+    pub sleep_room: Option<String>,
     pub presence_timeout_minutes: f64,
     pub still_contact_timeout_minutes: f64,
     pub frost_setpoint: f64,
@@ -271,7 +272,8 @@ impl Default for Config {
             away_setpoint: 18.0,
             away_guard_minutes: 20.0,
             exploration_seed: None,
-            presence_boost: 1.0,
+            occupied_setpoint: 21.0,
+            sleep_room: None,
             presence_timeout_minutes: 30.0,
             still_contact_timeout_minutes: 180.0,
             frost_setpoint: 7.0,
@@ -320,6 +322,9 @@ impl Config {
             }
         }
         config.watchmatch.state.sleep_minutes()?;
+        if let Some(unknown) = config.sleep_room.as_ref().filter(|r| !known(r)) {
+            return Err(anyhow!("sleep_room: unknown room {unknown}"));
+        }
         if let Some(unknown) = config.building.roof_rooms.iter().find(|r| !known(r)) {
             return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
@@ -388,6 +393,7 @@ mod tests {
             assert_eq!(nodes, vec![("wohnzimmer", vec![5]), ("schlafzimmer", vec![6]), ("bad", vec![7]), ("kueche", vec![8]), ("flur", vec![])]);
             assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
             assert_eq!((config.latitude, config.longitude, config.away_setpoint), (Some(52.52), Some(13.40), 18.0));
+            assert_eq!((config.occupied_setpoint, config.sleep_room.as_deref()), (21.0, Some("schlafzimmer")));
             assert_eq!((config.chip_tool.subscribe_min_s, config.poll_silence_s, config.manual_hold_minutes), (30, 300, 120.0));
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "wall").count(), 5);
             assert_eq!(config.neighbours.iter().filter(|n| n.kind == "ceiling").count(), 4);
@@ -414,6 +420,10 @@ name = 'a'").is_err());
     fn defaults_and_validation() {
         let config = Config::parse("").unwrap();
         assert_eq!(config.db_path, "data/heatd.duckdb");
+        assert_eq!((config.occupied_setpoint, config.sleep_room.clone()), (21.0, None));
+        assert!(Config::parse("presence_boost = 1.0
+sleep_room = 'x'").is_err());
+        assert_eq!(Config::parse("presence_boost = 1.0").unwrap().occupied_setpoint, 21.0);
         assert_eq!(config.controller, ControllerKind::ChipTool);
         assert_eq!((config.watchmatch.enabled, config.watchmatch.model_dir.as_str(), config.watchmatch.model_version.as_str(), config.watchmatch.state.sleep_minutes().unwrap()), (false, "/models/watchroom", "latest", (1380, 420)));
         let tuned = Config::parse("[watchmatch]
