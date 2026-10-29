@@ -25,7 +25,7 @@ setpoint_deadband = 0.3
 sleep_room = "schlafzimmer"
 presence_timeout_minutes = 30
 still_contact_timeout_minutes = 180
-frost_setpoint = 7.0
+frost_setpoint = 8.0
 neighbours = [
     { a = "wohnzimmer", b = "flur", kind = "wall" },
     { a = "wohnzimmer", b = "bad", kind = "wall" },
