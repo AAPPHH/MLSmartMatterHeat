@@ -328,6 +328,15 @@ fn migrates_legacy_duckdb() {
         storage.ingest(&scan, 1_761_580_801_000, Some(("bad", 0.8))).unwrap();
         storage.insert_reading(1_761_580_802_000, 5, 1, "local_temperature", 21.5).unwrap();
         storage.insert_setpoint(1_761_580_803_000, 5, "bad", 20.0, "schedule").unwrap();
+        storage.insert_reading(1_761_580_900_000, 5, 1, "local_temperature", 22.5).unwrap();
+        storage.insert_setpoint(1_761_580_901_000, 5, "bad", 21.0, "schedule").unwrap();
+    }
+    {
+        let sink = Sink::open(LakeConfig::new(env.dir.path())).unwrap();
+        let mut start = Event::now(kind::STARTUP, "heatd");
+        start.ts = 1_761_580_850_000_000;
+        sink.append_on(date_of_us(start.ts), start).unwrap();
+        sink.close().unwrap();
     }
     let mut config = crate::config::Config::default();
     config.db_path = db.to_str().unwrap().into();
@@ -341,5 +350,5 @@ fn migrates_legacy_duckdb() {
     assert_eq!(parquet_rows(&env.parquet(Table::Labels, date).join("part.parquet")), 2);
     assert_eq!(parquet_rows(&env.parquet(Table::AttributeReports, date).join("node=5/part.parquet")), 1);
     assert_eq!(parquet_rows(&env.parquet(Table::Decisions, date).join("node=5/part.parquet")), 1);
-    assert_eq!(parquet_rows(&env.parquet(Table::Events, date).join("node=none/part.parquet")), 1);
+    assert_eq!(parquet_rows(&env.parquet(Table::Events, date).join("node=none/part.parquet")), 2);
 }

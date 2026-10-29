@@ -122,13 +122,13 @@ pub fn read_raw(root: &Path, table: Table, dates: Option<&[NaiveDate]>) -> Resul
     Ok(out)
 }
 
-fn text_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
+pub fn text_column(batch: &RecordBatch, name: &str) -> Result<StringArray> {
     let column: &ArrayRef = batch.column_by_name(name).ok_or_else(|| anyhow!("no column {name}"))?;
     let cast = cast(column, &DataType::Utf8)?;
     cast.as_any().downcast_ref::<StringArray>().cloned().ok_or_else(|| anyhow!("column {name} is not text"))
 }
 
-fn ts_column(batch: &RecordBatch, name: &str) -> Result<TimestampMicrosecondArray> {
+pub fn ts_column(batch: &RecordBatch, name: &str) -> Result<TimestampMicrosecondArray> {
     let column = batch.column_by_name(name).ok_or_else(|| anyhow!("no column {name}"))?;
     let cast = cast(column, &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))?;
     cast.as_any().downcast_ref::<TimestampMicrosecondArray>().cloned().ok_or_else(|| anyhow!("column {name} is not a timestamp"))
