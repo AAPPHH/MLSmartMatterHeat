@@ -159,6 +159,13 @@ impl MatterController for MockController {
         Ok(())
     }
 
+    async fn write_system_mode(&self, node: NodeId, mode: u8) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.nodes.get_mut(&node).ok_or(Error::UnknownNode(node))?.mode = f64::from(mode);
+        self.publish(&mut inner, node, SYSTEM_MODE.snake, f64::from(mode));
+        Ok(())
+    }
+
     async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>> {
         let mut inner = self.inner.lock().unwrap();
         let state = inner.nodes.get(&node).ok_or(Error::UnknownNode(node))?;
@@ -269,5 +276,8 @@ mod tests {
         assert_eq!(mock.read_thermostat(7).await.unwrap().local_temperature_c, Some(17.9));
         assert!(matches!(mock.read_thermostat(9).await, Err(Error::UnknownNode(9))));
         assert_eq!(mock.setpoint_writes(), vec![(7, 17.0)]);
+        mock.write_system_mode(7, 0).await.unwrap();
+        assert_eq!(mock.read_thermostat(7).await.unwrap().system_mode, Some(0));
+        assert!(matches!(mock.write_system_mode(9, 4).await, Err(Error::UnknownNode(9))));
     }
 }

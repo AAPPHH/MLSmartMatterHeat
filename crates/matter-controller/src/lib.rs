@@ -115,6 +115,7 @@ pub trait MatterController: Send + Sync {
     async fn commission(&self, node: NodeId, pairing_code: &str, thread_dataset_hex: &str) -> Result<()>;
     async fn read_thermostat(&self, node: NodeId) -> Result<ThermostatState>;
     async fn write_heating_setpoint(&self, node: NodeId, celsius: f64) -> Result<()>;
+    async fn write_system_mode(&self, node: NodeId, mode: u8) -> Result<()>;
     async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>>;
     async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>>;
     async fn poll(&self, node: NodeId) -> Result<usize>;

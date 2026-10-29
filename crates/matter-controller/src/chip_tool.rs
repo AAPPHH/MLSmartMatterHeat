@@ -1,7 +1,7 @@
 use crate::capture::{CaptureItem, CaptureParser, SOURCE_POLL};
 use crate::{
     centi_degrees, parse_number, AttributeReport, AttributeSpec, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
-    NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
+    NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, SYSTEM_MODE, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -29,6 +29,8 @@ const WILDCARD_ENDPOINT: &str = "0xFFFF";
 const CAPTURE_QUEUE: usize = 4096;
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_GRACE: Duration = Duration::from_secs(2);
+const WRITE_ATTEMPTS: u32 = 3;
+const WRITE_BACKOFF: Duration = Duration::from_secs(5);
 
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
@@ -112,19 +114,24 @@ impl ChipToolConfig {
         self.args(&strings(&["thermostat", "read", spec.kebab, &node.to_string(), &self.endpoint.to_string()]))
     }
 
+    fn write_parts(&self, spec: &AttributeSpec, value: i64, node: NodeId) -> Vec<String> {
+        strings(&["thermostat", "write", spec.kebab, &value.to_string(), &node.to_string(), &self.endpoint.to_string()])
+    }
+
     fn write_setpoint_parts(&self, node: NodeId, celsius: f64) -> Vec<String> {
-        strings(&[
-            "thermostat",
-            "write",
-            OCCUPIED_HEATING_SETPOINT.kebab,
-            &centi_degrees(celsius).to_string(),
-            &node.to_string(),
-            &self.endpoint.to_string(),
-        ])
+        self.write_parts(&OCCUPIED_HEATING_SETPOINT, centi_degrees(celsius).into(), node)
+    }
+
+    fn write_system_mode_parts(&self, node: NodeId, mode: u8) -> Vec<String> {
+        self.write_parts(&SYSTEM_MODE, mode.into(), node)
     }
 
     pub fn write_setpoint_args(&self, node: NodeId, celsius: f64) -> Vec<String> {
         self.args(&self.write_setpoint_parts(node, celsius))
+    }
+
+    pub fn write_system_mode_args(&self, node: NodeId, mode: u8) -> Vec<String> {
+        self.args(&self.write_system_mode_parts(node, mode))
     }
 
     pub fn interactive_args(&self) -> Vec<String> {
@@ -685,17 +692,21 @@ impl Session {
         Ok(got)
     }
 
-    async fn write(&self, node: NodeId, celsius: f64) -> Result<()> {
-        let limit = Duration::from_secs(self.config.timeout_s);
-        let line = self.config.write_setpoint_parts(node, celsius).join(" ");
-        let failed = |what: &str| Error::Command(format!("{what}: {line}"));
+    async fn write(&self, parts: Vec<String>) -> Result<()> {
+        let line = parts.join(" ");
         let _gate = self.write_gate.lock().await;
+        retrying(WRITE_ATTEMPTS, WRITE_BACKOFF, || self.write_once(&line)).await
+    }
+
+    async fn write_once(&self, line: &str) -> Result<()> {
+        let limit = Duration::from_secs(self.config.timeout_s);
+        let failed = |what: &str| Error::Command(format!("{what}: {line}"));
         let mut ready = self.ready.subscribe();
         timeout(limit, ready.wait_for(|r| *r)).await.map_err(|_| failed("chip-tool interactive session not ready"))?.map_err(|_| failed("session closed"))?;
         let (tx, rx) = oneshot::channel();
         *self.hub.pending.lock().unwrap() = Some(tx);
         let sent = match self.stdin.lock().await.as_mut() {
-            Some(stdin) => Self::send(stdin, &line).await,
+            Some(stdin) => Self::send(stdin, line).await,
             None => Err(failed("chip-tool interactive session not running")),
         };
         if let Err(e) = sent {
@@ -709,6 +720,29 @@ impl Session {
                 self.hub.pending.lock().unwrap().take();
                 Err(failed(&format!("no write status after {}s", self.config.timeout_s)))
             }
+        }
+    }
+}
+
+fn retryable(error: &Error) -> bool {
+    !matches!(error, Error::Command(message) if message.contains("status = 0x"))
+}
+
+async fn retrying<F, Fut>(attempts: u32, backoff: Duration, mut once: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut wait = backoff;
+    let mut attempt = 1;
+    loop {
+        match once().await {
+            Err(e) if attempt < attempts && retryable(&e) => {
+                sleep(wait).await;
+                wait *= 2;
+                attempt += 1;
+            }
+            other => return other,
         }
     }
 }
@@ -818,8 +852,15 @@ impl MatterController for ChipToolController {
 
     async fn write_heating_setpoint(&self, node: NodeId, celsius: f64) -> Result<()> {
         match &self.session {
-            Some(session) => session.write(node, celsius).await,
+            Some(session) => session.write(self.config.write_setpoint_parts(node, celsius)).await,
             None => check_output(&self.run(self.config.write_setpoint_args(node, celsius), self.config.timeout_s).await?),
+        }
+    }
+
+    async fn write_system_mode(&self, node: NodeId, mode: u8) -> Result<()> {
+        match &self.session {
+            Some(session) => session.write(self.config.write_system_mode_parts(node, mode)).await,
+            None => check_output(&self.run(self.config.write_system_mode_args(node, mode), self.config.timeout_s).await?),
         }
     }
 
@@ -895,6 +936,8 @@ mod tests {
         );
         assert_eq!(c.read_args(&LOCAL_TEMPERATURE, 5), expect(&["thermostat", "read", "local-temperature", "5", "1"]));
         assert_eq!(c.write_setpoint_args(5, 21.5), expect(&["thermostat", "write", "occupied-heating-setpoint", "2150", "5", "1"]));
+        assert_eq!(c.write_system_mode_args(5, 4), expect(&["thermostat", "write", "system-mode", "4", "5", "1"]));
+        assert_eq!(c.write_system_mode_parts(5, 0).join(" "), "thermostat write system-mode 0 5 1");
         assert_eq!(c.interactive_args(), expect(&["interactive", "start"]));
         let plain = ChipToolConfig { paa_trust_store: None, endpoint: 2, ..Default::default() };
         assert_eq!(plain.read_args(&SYSTEM_MODE, 9), ["thermostat", "read", "system-mode", "9", "2"]);
@@ -1054,6 +1097,35 @@ mod tests {
         let failed = stream(include_str!("../tests/fixtures/write_fail.txt"), Some(5));
         assert!(matches!(failed.first(), Some(StreamEvent::Write(Err(m))) if m.contains("0x87")));
         assert!(matches!(failed.get(1), Some(StreamEvent::Failure(_))));
+    }
+
+    #[test]
+    fn address_resolve_timeout_fails_a_pending_write_and_is_retryable() {
+        let mut parser = StreamParser::new(1);
+        let events: Vec<StreamEvent> = include_str!("../tests/fixtures/write_resolve_timeout.txt").lines().flat_map(|l| parser.feed(l, Some(5), true)).collect();
+        let [StreamEvent::Write(Err(message))] = events.as_slice() else { panic!("{events:?}") };
+        assert!(message.contains("Timeout") && retryable(&Error::Command(message.clone())));
+        let rejected = stream(include_str!("../tests/fixtures/write_fail.txt"), Some(5));
+        assert!(matches!(rejected.first(), Some(StreamEvent::Write(Err(m))) if !retryable(&Error::Command(m.clone()))));
+    }
+
+    #[tokio::test]
+    async fn writes_retry_with_backoff_until_success_but_not_on_device_rejection() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let flaky = |fail_for: u32, error: &'static str| {
+            let calls = &calls;
+            move || async move {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fail_for { Err(Error::Command(error.into())) } else { Ok(()) }
+            }
+        };
+        let started = Instant::now();
+        assert!(retrying(3, Duration::from_millis(20), flaky(2, "Timeout")).await.is_ok());
+        assert_eq!(calls.swap(0, std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(retrying(3, Duration::from_millis(1), flaky(9, "Timeout")).await.is_err());
+        assert_eq!(calls.swap(0, std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(retrying(3, Duration::from_millis(1), flaky(9, "status = 0x87 (CONSTRAINT_ERROR)")).await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

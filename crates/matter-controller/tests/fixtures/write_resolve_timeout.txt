@@ -1,0 +1,3 @@
+[0;34m[1761580800.075] [4821:4825] [DIS] Resolving node 5 fabric 1[0m
+[0;31m[1761580800.075] [4821:4825] [DIS] AddressResolve: lookup timed out for node 5[0m
+[0;31m[1761580830.088] [4821:4825] [TOO] Run command failure: ../../third_party/connectedhomeip/src/lib/address_resolve/AddressResolve_DefaultImpl.cpp:129: CHIP Error 0x00000032: Timeout[0m
