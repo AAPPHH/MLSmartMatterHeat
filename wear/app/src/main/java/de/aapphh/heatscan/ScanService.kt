@@ -32,6 +32,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -291,6 +292,13 @@ class ScanService : Service() {
 
     private fun powerState() = PowerState.of(power.isPowerSaveMode, power.isDeviceIdleMode, offBody)
 
+    private fun bedtime(): Boolean? {
+        fun probe(read: (String) -> Int) = { key: String -> try { read(key).takeIf { it == 0 || it == 1 } } catch (e: Exception) { null } }
+        val global = probe { Settings.Global.getInt(contentResolver, it, -1) }
+        val secure = probe { Settings.Secure.getInt(contentResolver, it, -1) }
+        return Bedtime.of(Bedtime.GLOBAL_KEYS.map(global) + Bedtime.SECURE_KEYS.map(secure))
+    }
+
     private fun motion(at: Long) {
         if (offBody == true) return
         motionSeen = true
@@ -486,7 +494,7 @@ class ScanService : Service() {
             io.execute {
                 val wall = System.currentTimeMillis()
                 val d = if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
-                val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId(), elapsedNs)
+                val body = Payload.build(ts, store.device, d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime())
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size

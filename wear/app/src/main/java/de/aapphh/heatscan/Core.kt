@@ -625,7 +625,7 @@ object Summary {
 object Payload {
     fun build(
         ts: Long, device: String, label: String?, aps: List<Ap>,
-        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null
+        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
@@ -635,6 +635,7 @@ object Payload {
         .put("motion", motion ?: JSONObject.NULL)
         .put("power", power ?: JSONObject.NULL)
         .put("away", away)
+        .also { if (bedtime != null) it.put("bedtime", bedtime) }
         .put("aps", JSONArray().also { arr ->
             aps.forEach { arr.put(JSONObject().put("bssid", it.bssid.lowercase()).put("rssi", it.rssi).put("freq", it.freq)) }
         })
@@ -642,6 +643,13 @@ object Payload {
 
 object EntryId {
     fun format(device: String, n: Long) = "$device-%06d".format(n)
+}
+
+object Bedtime {
+    val GLOBAL_KEYS = listOf("bedtime_mode", "bedtime_mode_enabled", "wear_bedtime_mode", "setting_bedtime_mode_running_state")
+    val SECURE_KEYS = listOf("bedtime_mode", "bedtime_mode_enabled")
+
+    fun of(values: List<Int?>): Boolean? = values.filterNotNull().let { v -> if (v.isEmpty()) null else v.any { it == 1 } }
 }
 
 object PowerState {

@@ -5,6 +5,7 @@ import org.json.JSONObject
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -635,6 +636,17 @@ class CoreTest {
             Summary.line(true, false, "Ruhe", null, "http://s", "", true, "12:00:00 200", 3, 1, "-")
         )
         assertTrue(Summary.line(false, true, "", "bad", "s", "h", null, "-", 0, 0, "-").contains("atHome=- "))
+    }
+
+    @Test
+    fun bedtimeIsSentOnlyWhenReadable() {
+        assertNull(Bedtime.of(listOf(null, null)))
+        assertEquals(true, Bedtime.of(listOf(null, 0, 1)))
+        assertEquals(false, Bedtime.of(listOf(0, null)))
+        assertTrue(Payload.build(5, "d", null, emptyList(), bedtime = true).getBoolean("bedtime"))
+        assertFalse(Payload.build(5, "d", null, emptyList()).has("bedtime"))
+        val scan = Payload.build(5, "d", null, aps, bedtime = false)
+        assertFalse(MeasureBatch.fromScan(scan, "2.6", 10, 1)!!.getBoolean("bedtime"))
     }
 
     @Test
