@@ -30,5 +30,8 @@ profile heatd-docker flags=(attach_disconnected,mediate_deleted) {
   dbus (send) bus=system path=/org/freedesktop/DBus interface=org.freedesktop.DBus,
   dbus (send, receive) bus=system peer=(name=org.bluez),
   dbus (send, receive) bus=system peer=(name=org.freedesktop.Avahi),
+  dbus (send) bus=system path=/ interface=org.freedesktop.DBus.ObjectManager peer=(label=unconfined),
+  dbus (send) bus=system path=/org/bluez{,/**} peer=(label=unconfined),
+  dbus (send) bus=system interface=org.freedesktop.Avahi.* peer=(label=unconfined),
   dbus (receive) bus=system,
 }

@@ -9,7 +9,7 @@ services:
     network_mode: host
     user: "${HEATD_UID:-1000}:${HEATD_GID:-1000}"
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: ["no-new-privileges:true", "apparmor=heatd-docker"]
     restart: unless-stopped
     stop_signal: SIGTERM
     stop_grace_period: 20s
