@@ -26,25 +26,45 @@ Batch für gepufferte Scans: `{"scans": [...]}`, Elemente wie bei `/api/scan` (`
 
 ## `POST /watch/measurement` (Sensor- und WLAN-Messungen der Uhr)
 
-Body wie `measurement_example.json`: `{"device","batch_id","sent_ts","clock_offset_ms","app_version","samples":[...]}`. `batch_id` ist eine Zahl (i64), stabil über Wiederholungen; `(device, batch_id)` ist der Idempotenzschlüssel (eine wiederholte `batch_id` wird mit `200` angenommen, aber nicht erneut gespeichert). `sent_ts` ist die Uhrzeit (Epoch ms) beim Bilden des Batches, `clock_offset_ms = Wanduhr_ms - elapsedRealtime_ms` zum selben Zeitpunkt; damit gilt für jedes Sample `ts ≈ elapsed_ns / 1e6 + clock_offset_ms`. Optional: `battery_pct_per_h` (Akkuverbrauch der Uhr in Prozentpunkten pro Stunde, gleitend über mindestens 1 h ohne Laden, fehlt sonst) und, nur bei WLAN-Batches, `id`, `motion`, `power`, `away`, `queued` mit der Bedeutung wie bei `/api/scan` (heatd schreibt dafür `device_state`).
+Nimmt zwei Bodyformen an (Unterscheidung: Feld `samples` vorhanden oder nicht).
 
-Jedes Sample: `elapsed_ns` (`SensorEvent.timestamp` bzw. bei WLAN-Scans `ScanResult.timestamp`; fehlt bei alten Einträgen), `ts` (Epoch ms), `sensor_type`, `sensor_name`, `value`, `unit`; optional `sender` (BSSID klein), `channel`, `freq` (MHz).
+1. Phase-1-Form (unverändert): `{"device", "ts" (ms), "device_ts"?, "id"?, "batch_id"?, "measurements"|"aps": [{"sender"|"bssid", "rssi", "channel"?, "freq"?}]}`. Idempotenz über `id`. Antwort `{"stored": n, "batch_id": b}`, bei Wiederholung `{"stored": 0, "duplicate": true}`.
+2. Langformat (Phase 1b), Body wie `measurement_example.json`: `{"device","batch_id","sent_ts","clock_offset_ms","app_version","samples":[...]}`.
+
+```json
+{"device": "pixel-watch", "batch_id": 1761580800001, "sent_ts": 1761580805000, "clock_offset_ms": -120, "app_version": "2.5",
+ "samples": [
+  {"elapsed_ns": 123456789000, "ts": 1761580800000, "sensor_type": "rssi", "sensor_name": "wifi", "value": -61, "unit": "dBm", "sender": "aa:bb:cc:00:00:01", "channel": 6, "freq": 2437},
+  {"elapsed_ns": 123456790000, "ts": 1761580800000, "sensor_type": "hr", "sensor_name": "com.google.sensor.heart_rate", "value": 64, "unit": "bpm"}]}
+```
+
+`batch_id` ist eine Zahl (i64) oder ein String, stabil über Wiederholungen; `(device, batch_id)` ist der Idempotenzschlüssel. `sent_ts` ist die Uhrzeit (Epoch ms) beim Bilden des Batches, `clock_offset_ms = Wanduhr_ms - elapsedRealtime_ms` zum selben Zeitpunkt; damit gilt für jedes Sample `ts ≈ elapsed_ns / 1e6 + clock_offset_ms`. Optional: `battery_pct_per_h` (Akkuverbrauch der Uhr in Prozentpunkten pro Stunde, gleitend über mindestens 1 h ohne Laden, fehlt sonst).
+
+Jedes Sample: `elapsed_ns` (`SensorEvent.timestamp` bzw. bei WLAN-Scans `ScanResult.timestamp`; fehlt bei alten Einträgen), `ts` (Epoch ms; mehr als 5 min in der Zukunft wird auf die Eingangszeit gesetzt), `sensor_type`, `sensor_name`, `value`, `unit`; optional `sender` (BSSID klein), `channel`, `freq` (MHz). Unbekannter `sensor_type`, `rssi` ohne `sender` oder nicht endlicher `value`: `400` mit `{"error": ...}`.
 
 | sensor_type | Quelle | unit | Takt |
 |---|---|---|---|
-| `temp` | Hauttemperatur (`com.google.sensor.skin_temperature`, Typ 65555) | `C` | 60 s, Hardware-Batching |
-| `hr` | Herzfrequenz | `bpm` | 60 s, Hardware-Batching |
-| `motion` | Varianz des Betrags der Beschleunigung je 60-s-Intervall (Accelerometer 1 Hz, Hardware-Batching) | `m2/s4` | 60 s |
-| `offbody` | Low-Latency-Off-Body (`1` = Uhr nicht am Arm) | `bool` | bei Änderung |
+| `temp` | Hauttemperatur (`com.google.sensor.skin_temperature`, Typ 65555) | `C` | 60 s, Hardware-Batching (nicht weckend) |
+| `hr` | Herzfrequenz, ein Wert je Weckfenster (Sensor höchstens 20 s registriert, erster gültiger Wert) | `bpm` | höchstens 1/60 s, nur bei ohnehin stattfindenden Wachphasen (Scan-Takt, Bildschirm an) |
+| `motion` | Varianz des Betrags der Beschleunigung über ein 10-s-Fenster (Accelerometer nur im Weckfenster) | `m2/s4` | höchstens 1/60 s, wie `hr` |
+| `offbody` | Low-Latency-Off-Body, Rohwert von Android: `1` = Uhr am Handgelenk, `0` = abgelegt | `bool` | bei Änderung |
 | `battery` | Akkustand | `%` | je Batch und bei Lade-Wechsel |
-| `charging` | Ladeflag | `bool` | je Batch und bei Lade-Wechsel |
-| `rssi` | WLAN-Scan, eine Zeile je Access Point (`sender`, `freq`, `value` = RSSI) | `dBm` | ereignisgesteuert wie bisher |
+| `charging` | Ladeflag (`1` = lädt) | `bool` | je Batch und bei Lade-Wechsel |
+| `rssi` | WLAN-Scan, eine Zeile je Access Point (`sender`, `freq`, `value` = RSSI; alle APs eines Scans tragen dasselbe `ts`) | `dBm` | ereignisgesteuert wie bisher |
 
-Batches schließt die Uhr nach 5 Minuten oder 50 Samples, beim Raum-Tipp sofort. Sie liegen in der dauerhaften Warteschlange (kein Verlust bei Netzfehler oder Neustart; nur der noch offene Batch, höchstens 5 Minuten, geht bei einem harten Absturz verloren). Antwort `200` mit `{"stored": <anzahl>, "batch_id": <id>}`, bei Wiederholung `{"stored": 0, "duplicate": true}`. Scans mit Access Points schickt die Uhr nur noch hierhin (Antwort darf wie bei `/api/scan` `room`, `rooms`, `probability` enthalten); Heartbeats ohne APs und Away-Einträge gehen weiter an `/api/scan(s)`. Antwortet der Server mit `400/404/405/422`, fällt die Uhr eine Stunde lang auf `/api/scan` zurück. Einträge für `/watch/measurement` und `/watch/sensors` bleiben bei `400/404/405/422` in der Warteschlange (zurückgestellt) und gehen nach einem Server-Update ein.
+Die Zeilen landen im Langformat in `watch_raw` (siehe `docs/data-foundation.md`).
+
+### Scan-Form (WLAN-Batch mit Scan-Feldern)
+
+Trägt ein Langformat-Body `rssi`-Samples und mindestens eines der Felder `id`, `label`, `motion`, `power`, `away`, `queued` (Bedeutung wie bei `/api/scan`), behandelt heatd ihn als Scan und durchläuft den vollständigen Phase-1-Pfad (derselbe Code wie `/api/scan`, nur ohne zweite `watch_raw`-Schreibung): `scans`/`device_state`/`predictions` (Idempotenz zusätzlich über `id`), Präsenz und Away-Übergänge, Label (`label` schreibt das Stay-Label), Vorhersage des alten Modells als Rückfallebene, Raum-Matcher. Die Antwort enthält zusätzlich `room`, `probability`, `rooms`, `aps` (Attribution wie bei `/api/scan`) und bei einer bereits gesehenen `id` `duplicate: true`. `ts` des Scans ist das größte `ts` der `rssi`-Samples. Die Uhr sendet Scans selbst über `/api/scan(s)` (ein Request je Rückstau); die Scan-Form ist für Clients gedacht, die nur einen Endpunkt sprechen (`MeasureBatch.fromScan`).
+
+### Haltbarkeit, Warteschlange, Antwort
+
+Die Zeilen sind auf der Platte (Flush mit fsync), bevor der Schlüssel vorgemerkt und `200` gesendet wird; bei Speicherfehler antwortet heatd `500`, ohne den Schlüssel vorzumerken, die Uhr sendet denselben Batch erneut. Antwort `200` mit `{"stored": <anzahl>, "batch_id": <id>}`, bei Wiederholung `{"stored": 0, "duplicate": true, "batch_id": <id>}`. Die Uhr schließt Batches nach 5 Minuten oder 50 Samples, beim Raum-Tipp sofort; sie liegen in der dauerhaften Warteschlange (kein Verlust bei Netzfehler oder Neustart; nur der noch offene Batch, höchstens 5 Minuten, geht bei einem harten Absturz verloren) und werden mit dem nächsten Scan-Post gesendet, ohne eigenen Flush. Einträge für `/watch/measurement` und `/watch/sensors` bleiben bei `404/405` in der Warteschlange (zurückgestellt) und gehen nach einem Server-Update ein; `400/422` verwirft den Eintrag.
 
 ## `POST /watch/sensors`
 
-Sensorinventar beim Start und bei Änderung (Sensorliste oder `app_version`): `{"device","ts","app_version","sensors":[{"name","android_type","string_type","vendor","resolution","max_range"}]}` (Tabelle `watch_sensors`).
+Sensorinventar beim Start und bei Änderung (Sensorliste oder `app_version`): `{"device","ts"?: ms,"app_version","sensors":[{"name"|"sensor_name","android_type"|"type","string_type","vendor","resolution","max_range"|"maxRange"}]}` (Tabelle `watch_sensors`). Die Uhr sendet zusätzlich `wake_up`, `min_delay_us`, `max_delay_us`, `fifo_max`, `reporting_mode`; heatd ignoriert sie bisher. Antwort `{"stored": n}` nach Flush auf Platte, `400` bei leerer Liste, `500` bei Speicherfehler.
 
 ## `POST /watch/label`
 
@@ -68,37 +88,15 @@ Feste BSSID-Reihenfolge `bssids` aus dem Training. Für BSSID `i`: `x_i = clamp(
 
 `room_model.onnx` + Sidecar `room_model.json`: `{"version": 1, "input_name": "input", "bssids": [...], "labels": [...], "rssi_floor": -100.0, "rssi_span": 70.0}`. Ausgaben: `label` (`int64 [N]`, Index in `labels`) und `probabilities` (`float32 [N, C]`), ohne ZipMap. Testmodell: `crates/heatd/tests/fixtures/room_model.{onnx,json}`, sagt für `scan_example.json` `wohnzimmer` voraus.
 
-## Phase 1b: `POST /watch/measurement`, `POST /watch/sensors`, Raum-Matcher
-
-### `POST /watch/measurement`
-
-Nimmt zwei Bodyformen an (Unterscheidung: Feld `samples` vorhanden oder nicht).
-
-1. Phase-1-Form (unverändert): `{"device", "ts" (ms), "device_ts"?, "id"?, "batch_id"?, "measurements"|"aps": [{"sender"|"bssid", "rssi", "channel"?, "freq"?}]}`. Idempotenz über `id`. Antwort `{"stored": n, "batch_id": b}`, bei Wiederholung `{"stored": 0, "duplicate": true}`.
-2. Langformat (Phase 1b):
-
-```json
-{"device": "pixel-watch", "batch_id": 1761580800001, "sent_ts": 1761580805000, "clock_offset_ms": -120, "app_version": "1.4.0",
- "samples": [
-  {"elapsed_ns": 123456789000, "ts": 1761580800000, "sensor_type": "rssi", "sensor_name": "wifi", "value": -61, "unit": "dBm", "sender": "aa:bb:cc:00:00:01", "channel": 6, "freq": 2437},
-  {"elapsed_ns": 123456790000, "ts": 1761580800000, "sensor_type": "hr", "sensor_name": "com.google.sensor.heart_rate", "value": 64, "unit": "bpm"}]}
-```
-
-`ts` in Millisekunden seit Epoch (Wanduhr der Uhr), `elapsed_ns` = `elapsedRealtimeNanos` des Samples, `clock_offset_ms` = Wanduhr minus Uhrenzeit des Batches. `sensor_type`: `rssi` (Pflicht: `sender`; `value` = RSSI in dBm; alle APs eines Scans tragen dasselbe `ts`), `temp` (Hauttemperatur, °C), `hr` (bpm), `offbody` (1 = am Handgelenk, 0 = abgelegt), `motion` (Bewegungsmaß, m/s² Abweichung von der Schwerkraft), `battery` (%), `charging` (1/0). Andere Werte: `400` mit `{"error": ...}`. `ts` mehr als 5 min in der Zukunft wird auf die Eingangszeit gesetzt.
-
-Idempotenz: `(device, batch_id)` ist der Schlüssel (`batch_id` Zahl oder String). Ein bereits gespeicherter Batch wird mit `200` und `{"stored": 0, "duplicate": true, "batch_id": b}` angenommen und nicht erneut gespeichert. Haltbarkeit wie in Phase 1: die Zeilen sind auf der Platte (Flush mit fsync), bevor der Schlüssel vorgemerkt und `200` gesendet wird; bei Speicherfehler antwortet heatd `500`, ohne den Schlüssel vorzumerken, die Uhr sendet denselben Batch erneut. Antwort sonst `{"stored": n, "batch_id": b}`. Die Zeilen landen im Langformat in `watch_raw` (siehe `docs/data-foundation.md`).
-
-### `POST /watch/sensors`
-
-Sensorinventar der Uhr, beim Start und bei Änderung: `{"app_version": "1.4.0", "ts"?: ms, "sensors": [{"name"|"sensor_name", "type"|"android_type": 65555, "vendor", "resolution", "maxRange"|"max_range"}]}`. Antwort `{"stored": n}` nach Flush auf Platte, `400` bei leerer Liste, `500` bei Speicherfehler. Ziel: Tabelle `watch_sensors`.
+## Phase 1b: Raum-Matcher
 
 ### Raum-Matcher (`[watchmatch]` in `heatd.toml`)
 
-Ein frischer Scan (Alter höchstens `scan_fresh_s`, Standard 180 s; über `/watch/measurement` oder `/api/scan`) wird mit dem ONNX-Modell aus `model_dir/<model_version>/` klassifiziert (`model_version = "latest"`: neuestes Verzeichnis nach `created` in `model.json`; stündliche Prüfung, Hot-Reload ohne Neustart). Pro Scan eine Zeile in `watch_inference` (`matcher=room`). Ausgabe nur bei `max_p >= tau_room` und Abstand zum Zweiten `>= delta_room`; sonst `abstained` mit Grund `low_confidence`, `low_margin`, `no_model`, `no_scan` (Minute ohne Scan) oder `unknown_state`. Die Anwesenheitsregeln nutzen den Matcher-Raum nur, wenn er nicht abstained; sonst gilt die letzte sichere Zuordnung bis `t_hold_min`, danach „unbekannt“ (kein Anwesenheits-Boost, Abwesenheitslogik unverändert). Ohne Modell oder bei ungültigem Modell: alles `no_model`, Anwesenheit wie vor Phase 1b (Vorhersage des alten Modells, Labels, Heim-WLAN), kein Absturz.
+Ein frischer Scan (Alter höchstens `scan_fresh_s`, Standard 180 s; über `/watch/measurement` oder `/api/scan`) wird mit dem ONNX-Modell aus `model_dir/<model_version>/` klassifiziert (`model_version = "latest"`: neuestes Verzeichnis nach `created` in `model.json`; stündliche Prüfung, Hot-Reload ohne Neustart). Pro Scan eine Zeile in `watch_inference` (`matcher=room`). Ausgabe nur bei `max_p >= tau_room` und Abstand zum Zweiten `>= delta_room`; sonst `abstained` mit Grund `low_confidence`, `low_margin`, `no_model`, `no_scan` (Minute ohne Scan), `no_known_ap` oder `unknown_state`. Die Anwesenheitsregeln nutzen den Matcher-Raum nur, wenn er nicht abstained; sonst gilt die letzte sichere Zuordnung bis `t_hold_min`, danach „unbekannt“ (kein Anwesenheits-Boost, Abwesenheitslogik unverändert). Ohne Modell oder bei ungültigem Modell: alles `no_model`, Anwesenheit wie vor Phase 1b (Vorhersage des alten Modells, Labels, Heim-WLAN; läuft über denselben Scan-Pfad), kein Absturz.
 
-Zustand je Scan (Schwellen `[watchmatch.state]`: `hr_rest_max`, `hr_active_min`, `motion_active_min`, `sleep_hours`): `charging`, `offbody`, `sleep` (im Schlaffenster, HR-Mittel der letzten 10 min <= `hr_rest_max`, Bewegung < `motion_active_min`), `active` (HR >= `hr_active_min` oder Bewegung >= `motion_active_min`), sonst `rest`. Modell-Datei je Zustand aus `states`, Fallback `all`; `offbody`/`charging` ohne eigenen Eintrag: `unknown_state`.
+Zustand je Scan, eine Regel für heatd und Training: Schwellen und Fenster stehen als `state_rule` in `model.json` (`hr_rest_max`, `hr_active_min`, `motion_active_min`, `sleep_hours` [von, bis] in vollen Stunden, `window_s` = 600, `stale_s` = 600); fehlt `state_rule`, gelten die Werte aus `[watchmatch.state]` (Standard 70/90/0,5, 23-7). Reihenfolge: `charging` (letzter Ladeflag-Wert jünger als `stale_s` und 1), `offbody` (letzter Off-Body-Wert jünger als `stale_s` und 0; Scans tragen `power = offbody` als frisches Signal), `rest` (weder HR- noch Bewegungswert in den letzten `window_s`), `sleep` (im Schlaffenster, HR-Mittel <= `hr_rest_max`, Bewegung < `motion_active_min`), `active` (HR-Mittel >= `hr_active_min` oder Bewegung >= `motion_active_min`), sonst `rest`. Ältere Ladeflag- und Off-Body-Werte zählen als unbekannt (am Handgelenk, nicht ladend). Modell-Datei je Zustand aus `states`, Fallback `all`. `offbody` und `charging` bekommen nie ein Template (das Training schließt sie aus): `unknown_state`. Enthält ein Scan keinen Sender aus `senders`, ist die Ausgabe `no_known_ap` (Training und heatd identisch), ohne die Glättung zu verändern.
 
-Modellvertrag `models/watchroom/<model_version>/`: `model.json` (`model_version`, `created`, `matcher: "room"`, `rooms`, `senders` in Merkmalsreihenfolge, `sentinel_dbm: -100`, `scale {floor: -100, span: 70}`, `states {<zustand|all>: <onnx>}`, `tau_room`, `delta_room`, `t_hold_min`, `smoothing {kind: "hmm", stay_prob, transition {von: {nach: p}}}`, `metrics`, `train_window`, `n_labels`) und je Zustand eine ONNX-Datei: Eingabe `x` `float32 [N, len(senders)]` mit `x = clip((rssi - floor) / span, 0, 1)` (fehlender Sender = `sentinel_dbm`), Ausgabe `probabilities` `float32 [N, len(rooms)]` (Softmax-normiert, Reihenfolge `rooms`, ohne ZipMap). heatd glättet mit einem Vorwärtsschritt des HMM (pro Minute seit dem letzten Scan ein Übergangsschritt, Selbstübergang `stay_prob`). Testmodell: `crates/heatd/tests/fixtures/watchroom/v1/` (Generator `make_fixture.py` daneben).
+Modellvertrag `models/watchroom/<model_version>/`: `model.json` (`model_version`, `created`, `matcher: "room"`, `rooms`, `senders` in Merkmalsreihenfolge, `sentinel_dbm: -100`, `scale {floor: -100, span: 70}`, `states {<zustand|all>: <onnx>}`, `tau_room`, `delta_room`, `t_hold_min`, `smoothing {kind: "hmm", stay_prob, transition {von: {nach: p}}}`, `metrics`, `train_window`, `n_labels`) und je Zustand eine ONNX-Datei: Eingabe `x` `float32 [N, len(senders)]` mit `x = clip((rssi - floor) / span, 0, 1)` (fehlender Sender = `sentinel_dbm`), Ausgabe `probabilities` `float32 [N, len(rooms)]` (Softmax-normiert, Reihenfolge `rooms`, ohne ZipMap). heatd glättet mit einem Vorwärtsschritt des HMM (pro Minute seit dem letzten Scan ein Übergangsschritt, höchstens 60, danach Neustart mit gleichverteiltem Prior, Selbstübergang `stay_prob`, Belief mindestens 1e-4); die Auswertung im Training rechnet denselben Schritt, und `tau_room`/`delta_room` werden auf dem geglätteten Belief abgestimmt. Testmodell: `crates/heatd/tests/fixtures/watchroom/v1/` (Generator `make_fixture.py` daneben).
 
 ## DuckDB (`heatd`)
 

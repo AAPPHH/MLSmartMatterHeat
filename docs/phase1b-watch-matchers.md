@@ -22,11 +22,18 @@ Watch 4 einer normalen App erlaubt (geprüft per `dumpsys sensorservice`).
 - "BLE-Scan" im Addendum = bestehende WLAN-Scan-Logik (Bluetooth-Ortung hat
   der Nutzer verworfen). WLAN-Scans bleiben ereignisgesteuert (Doze blockiert
   `startScan`), nicht 1/60 s.
-- 1 Sample/60 s für Haut-Temperatur, HR, Off-Body, Bewegung über Hardware-
-  Batching (`samplingPeriodUs` 60 s, `maxReportLatencyUs` 5 min, Non-Wakeup-
-  Sensoren), keine zusätzlichen Alarme. Akku-Budget < 3 %/Tag Mehrverbrauch,
-  Fallback 1/120 s. Batches an POST /watch/measurement alle 5 min oder
-  50 Samples, beim Raum-Tipp sofort.
+- Haut-Temperatur und Off-Body: 1 Sample/60 s über Hardware-Batching
+  (`samplingPeriodUs` 60 s, `maxReportLatencyUs` 5 min, Non-Wakeup-Sensoren).
+  Herzfrequenz und Bewegung (Accelerometer-Varianz über 10 s) nur
+  opportunistisch in ohnehin stattfindenden Wachphasen (Scan-Takt,
+  Bildschirm an): Sensor höchstens 20 s (HR) bzw. 10 s (Accel) registriert,
+  höchstens 1x/60 s, danach sofort abgemeldet; kein dauerhaft laufender
+  Herzfrequenz-Sensor. Keine zusätzlichen Alarme. Akku-Budget < 3 %/Tag
+  Mehrverbrauch, Fallback 1/120 s. Batches an POST /watch/measurement alle
+  5 min oder 50 Samples, mit dem nächsten Scan-Post gesendet (kein eigener
+  Flush), beim Raum-Tipp sofort.
+- Off-Body-Wert: Android-Rohwert (`TYPE_LOW_LATENCY_OFFBODY_DETECT`),
+  1 = am Handgelenk, 0 = abgelegt, überall gleich (Uhr, heatd, SQL, Training).
 
 ## Datenerfassung (Watch-App)
 - `SensorManager.getSensorList(TYPE_ALL)` beim Start und bei Änderung an
@@ -59,9 +66,11 @@ Watch 4 einer normalen App erlaubt (geprüft per `dumpsys sensorservice`).
 
 ## Zustandsklassifikation
 - Regelbasiert aus HR, Bewegung, Off-Body, Ladeflag, Tageszeit:
-  rest | sleep | active | offbody | charging; Schwellen in Config; Ergebnis je
-  Minute in watch_minute. Templates sind pro Zustand getrennt (Fallback
-  "all", wenn ein Zustand zu wenig Daten hat).
+  rest | sleep | active | offbody | charging; eine Regel für heatd und
+  Training (`state_rule` in model.json, Config als Rückfall, Details in
+  contract/README.md); Ergebnis je Minute in watch_minute. Templates sind
+  pro Zustand getrennt (Fallback "all", wenn ein Zustand zu wenig Daten hat);
+  offbody und charging bekommen nie ein Template.
 
 ## Matcher 1: Raum (RSSI-Fingerprinting)
 - Enrollment: pro Raum Template aus gelabelten RSSI-Vektoren (fehlende
