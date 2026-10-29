@@ -52,8 +52,8 @@ model_version = "latest"
 scan_fresh_s = 180
 
 [watchmatch.state]
-hr_rest_max = 75
-hr_active_min = 100
+hr_rest_max = 70
+hr_active_min = 90
 motion_active_min = 0.5
 sleep_hours = "23-7"
 

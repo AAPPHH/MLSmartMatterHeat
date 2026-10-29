@@ -241,7 +241,7 @@ pub fn write_meta(sink: &Sink, config: &Config, now_us: i64) -> Result<usize> {
 fn ntp_us(bytes: &[u8]) -> i64 {
     let secs = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as i64;
     let frac = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as i64;
-    (secs - NTP_UNIX_OFFSET_S) * 1_000_000 + (frac * 1_000_000 >> 32)
+    (secs - NTP_UNIX_OFFSET_S) * 1_000_000 + ((frac * 1_000_000) >> 32)
 }
 
 pub fn sntp_request(t1_us: i64) -> [u8; 48] {

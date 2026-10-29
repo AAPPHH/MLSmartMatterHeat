@@ -357,9 +357,7 @@ fn migrates_legacy_duckdb() {
         sink.append_on(date_of_us(start.ts), start).unwrap();
         sink.close().unwrap();
     }
-    let mut config = crate::config::Config::default();
-    config.db_path = db.to_str().unwrap().into();
-    config.data_dir = env.dir.path().to_str().unwrap().into();
+    let config = crate::config::Config { db_path: db.to_str().unwrap().into(), data_dir: env.dir.path().to_str().unwrap().into(), ..Default::default() };
     crate::migrate::run(&config).unwrap();
     assert!(crate::migrate::run(&config).is_err());
     let sink = env.sink(10, 3600);

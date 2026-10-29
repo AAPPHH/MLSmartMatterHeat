@@ -8,6 +8,7 @@ pub enum SubState {
     #[default]
     Unknown,
     Subscribed,
+    #[allow(dead_code)]
     Resubscribing,
     Lost,
 }
@@ -148,11 +149,6 @@ impl Status {
 
     pub fn last_report_us(&self, node: u64) -> Option<i64> {
         self.0.lock().unwrap().nodes.get(&node).and_then(|n| n.last_report_us)
-    }
-
-    #[cfg(test)]
-    pub fn node(&self, node: u64) -> Option<NodeStatus> {
-        self.0.lock().unwrap().nodes.get(&node).cloned()
     }
 
     pub fn health(&self, now_us: i64) -> Value {

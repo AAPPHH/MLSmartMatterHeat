@@ -42,7 +42,7 @@ RUN mkdir -p /shim && printf '#!/bin/sh\nexec %s -j %s "$@"\n' "$(which ninja)" 
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 libglib2.0-0t64 libdbus-1-3 libstdc++6 libreadline8t64 \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata curl libssl3t64 libglib2.0-0t64 libdbus-1-3 libstdc++6 libreadline8t64 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=heatd-build /heatd /usr/local/bin/heatd
 COPY --from=chip-tool-build /chip-tool /usr/local/bin/chip-tool

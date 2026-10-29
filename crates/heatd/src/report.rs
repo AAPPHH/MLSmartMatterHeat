@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const ROOM_MINUTE_SQL: &str = include_str!("../../../analysis/views/room_minute.sql");
+#[cfg(test)]
 pub const WATCH_MINUTE_SQL: &str = include_str!("../../../analysis/views/watch_minute.sql");
+#[cfg(test)]
 pub const WATCH_ROOM_CALIB_SQL: &str = include_str!("../../../analysis/views/watch_room_calib.sql");
 const REPORT_HOUR: u32 = 3;
 const REPORT_MINUTE: u32 = 10;
@@ -94,6 +96,7 @@ pub fn open_room_minute(root: &Path, from: NaiveDate, to: NaiveDate) -> Result<L
     Ok(db)
 }
 
+#[cfg(test)]
 pub fn open_watch_views(root: &Path, from: NaiveDate, to: NaiveDate, state: &crate::config::WatchState, local_offset_min: i32) -> Result<LakeDb> {
     let db = open_lake(root, from - chrono::Duration::days(2), to + chrono::Duration::days(1))?;
     set_window(&db.conn, from, to + chrono::Duration::days(1))?;

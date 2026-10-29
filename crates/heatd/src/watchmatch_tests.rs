@@ -76,6 +76,7 @@ fn matches_rooms_and_picks_template_per_state() {
     assert!(day.confidence > 0.9 && day.reason.is_none());
     let bed = scan(&wm, "w", T + MIN, NOON, &bedroom());
     assert_eq!(bed.result_room.as_deref(), Some("schlafzimmer"));
+    wm.signals("other", [(T, Signal::Hr(58.0)), (T, Signal::Motion(0.1))]);
     let night = scan(&wm, "other", T, NIGHT, &living());
     assert_eq!((night.state.as_str(), night.template_id.as_str(), night.result_room.as_deref()), ("sleep", "sleep", Some("schlafzimmer")));
     assert_eq!(day.features_hash, scan(&wm, "third", T, NOON, &living().into_iter().rev().collect::<Vec<_>>()).features_hash);
@@ -220,34 +221,62 @@ fn state_rules() {
     let cfg = WatchState::default();
     let sleep = cfg.sleep_minutes().unwrap();
     assert_eq!(sleep, (1380, 420));
+    let rule = Rule::of(&cfg, sleep);
     let mut s = Signals::default();
-    assert_eq!(s.classify(&cfg, sleep, T, NOON), "rest");
-    assert_eq!(s.classify(&cfg, sleep, T, NIGHT), "sleep");
-    assert_eq!(s.classify(&cfg, sleep, T, 300), "sleep");
+    assert_eq!(s.classify(&rule, T, NOON), "rest");
+    assert_eq!(s.classify(&rule, T, NIGHT), "rest");
     s.push(T - MIN, Signal::Hr(110.0));
-    assert_eq!(s.classify(&cfg, sleep, T, NOON), "active");
-    assert_eq!(s.classify(&cfg, sleep, T, NIGHT), "active");
-    assert_eq!(s.classify(&cfg, sleep, T + 11 * MIN, NOON), "rest");
+    assert_eq!(s.classify(&rule, T, NOON), "active");
+    assert_eq!(s.classify(&rule, T, NIGHT), "active");
+    assert_eq!(s.classify(&rule, T + 11 * MIN, NOON), "rest");
     s.push(T, Signal::Hr(60.0));
     s.push(T, Signal::Motion(0.1));
-    assert_eq!(s.classify(&cfg, sleep, T, NIGHT), "rest");
+    assert_eq!(s.classify(&rule, T, NIGHT), "rest");
     let mut quiet = Signals::default();
     quiet.push(T, Signal::Hr(58.0));
     quiet.push(T, Signal::Motion(0.1));
-    assert_eq!(quiet.classify(&cfg, sleep, T, NIGHT), "sleep");
-    assert_eq!(quiet.classify(&cfg, sleep, T, NOON), "rest");
+    assert_eq!(quiet.classify(&rule, T, NIGHT), "sleep");
+    assert_eq!(quiet.classify(&rule, T, 300), "sleep");
+    assert_eq!(quiet.classify(&rule, T, NOON), "rest");
     quiet.push(T, Signal::Motion(1.5));
-    assert_eq!(quiet.classify(&cfg, sleep, T, NOON), "active");
+    assert_eq!(quiet.classify(&rule, T, NOON), "active");
     quiet.push(T, Signal::OnBody(false));
-    assert_eq!(quiet.classify(&cfg, sleep, T, NOON), "offbody");
+    assert_eq!(quiet.classify(&rule, T, NOON), "offbody");
+    assert_eq!(quiet.classify(&rule, T + 11 * MIN, NOON), "rest");
     quiet.push(T - MIN, Signal::OnBody(true));
-    assert_eq!(quiet.classify(&cfg, sleep, T, NOON), "offbody");
+    assert_eq!(quiet.classify(&rule, T, NOON), "offbody");
     quiet.push(T + MIN, Signal::Charging(true));
-    assert_eq!(quiet.classify(&cfg, sleep, T + MIN, NOON), "charging");
+    assert_eq!(quiet.classify(&rule, T + MIN, NOON), "charging");
+    assert_eq!(quiet.classify(&rule, T + 12 * MIN, NOON), "rest");
     quiet.push(T + 2 * MIN, Signal::Charging(false));
-    assert_eq!(quiet.classify(&cfg, sleep, T + 2 * MIN, NOON), "offbody");
+    assert_eq!(quiet.classify(&rule, T + 2 * MIN, NOON), "offbody");
+    quiet.push(T + 3 * MIN, Signal::OnBody(true));
+    assert_eq!(quiet.classify(&rule, T + 3 * MIN, NOON), "active");
     assert!(WatchState { sleep_hours: "22:30-6:15".into(), ..Default::default() }.sleep_minutes().unwrap() == (1350, 375));
     assert!(WatchState { sleep_hours: "late".into(), ..Default::default() }.sleep_minutes().is_err());
+}
+
+#[test]
+fn model_state_rule_overrides_config() {
+    let env = Env::new();
+    env.install("v1", |s| s["state_rule"] = json!({"hr_rest_max": 50.0, "hr_active_min": 60.0, "motion_active_min": 0.5, "sleep_hours": [23, 7], "window_s": 600.0}));
+    let wm = env.matcher("latest");
+    wm.signals("w", [(T - MIN, Signal::Hr(65.0))]);
+    let row = scan(&wm, "w", T, NOON, &living());
+    assert_eq!(row.state, "active");
+}
+
+#[test]
+fn offbody_and_charging_never_get_templates_and_unknown_aps_abstain() {
+    let env = Env::new();
+    env.install("v1", |_| {});
+    let wm = env.matcher("latest");
+    wm.signals("w", [(T - MIN, Signal::OnBody(false))]);
+    let row = scan(&wm, "w", T, NOON, &living());
+    assert_eq!((row.state.as_str(), row.reason.as_deref(), row.abstained), ("offbody", Some("unknown_state"), true));
+    wm.signals("w", [(T + 21 * MIN, Signal::OnBody(true))]);
+    let row = scan(&wm, "w", T + 22 * MIN, NOON, &[("ff:ff:ff:ff:ff:ff".to_string(), -50)]);
+    assert_eq!((row.reason.as_deref(), row.abstained, row.result_room), (Some("no_known_ap"), true, None));
 }
 
 #[test]
@@ -283,10 +312,12 @@ fn hot_reloads_newest_model_only_for_latest() {
     assert!(waiting.reload().unwrap() && waiting.active());
 }
 
+type Mutation = fn(&mut Value);
+
 #[test]
 fn invalid_models_are_rejected() {
     let env = Env::new();
-    let cases: [(&str, fn(&mut Value)); 5] = [
+    let cases: [(&str, Mutation); 5] = [
         ("stay", |s| s["smoothing"]["stay_prob"] = json!(1.5)),
         ("matcher", |s| s["matcher"] = json!("temp")),
         ("states", |s| s["states"] = json!({})),

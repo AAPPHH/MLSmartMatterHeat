@@ -14,7 +14,6 @@ use std::time::Duration;
 
 pub const MATCHER_ROOM: &str = "room";
 pub const NO_MODEL: &str = "none";
-const SIGNAL_WINDOW_MS: i64 = 600_000;
 const SIGNAL_KEEP_MS: i64 = 1_800_000;
 const NO_SCAN_AFTER_MS: i64 = 120_000;
 const RELOAD_EVERY_TICKS: u64 = 60;
@@ -51,6 +50,51 @@ pub struct Spec {
     pub delta_room: f64,
     pub t_hold_min: i64,
     pub smoothing: Smoothing,
+    #[serde(default)]
+    pub state_rule: Option<RuleSpec>,
+}
+
+fn ten_minutes() -> f64 {
+    600.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuleSpec {
+    pub hr_rest_max: f64,
+    pub hr_active_min: f64,
+    pub motion_active_min: f64,
+    pub sleep_hours: [u32; 2],
+    #[serde(default = "ten_minutes")]
+    pub window_s: f64,
+    #[serde(default = "ten_minutes")]
+    pub stale_s: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Rule {
+    pub hr_rest_max: f64,
+    pub hr_active_min: f64,
+    pub motion_active_min: f64,
+    pub sleep: (u32, u32),
+    pub window_ms: i64,
+    pub stale_ms: i64,
+}
+
+impl Rule {
+    pub fn of(cfg: &WatchState, sleep: (u32, u32)) -> Self {
+        Self { hr_rest_max: cfg.hr_rest_max, hr_active_min: cfg.hr_active_min, motion_active_min: cfg.motion_active_min, sleep, window_ms: 600_000, stale_ms: 600_000 }
+    }
+
+    pub fn from_spec(s: &RuleSpec) -> Self {
+        Self {
+            hr_rest_max: s.hr_rest_max,
+            hr_active_min: s.hr_active_min,
+            motion_active_min: s.motion_active_min,
+            sleep: (s.sleep_hours[0] * 60, s.sleep_hours[1] * 60),
+            window_ms: (s.window_s * 1000.0) as i64,
+            stale_ms: (s.stale_s * 1000.0) as i64,
+        }
+    }
 }
 
 pub struct Model {
@@ -100,7 +144,7 @@ impl Model {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("model.json");
         let spec: Spec = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?).with_context(|| format!("parse {}", path.display()))?;
-        if spec.matcher != MATCHER_ROOM || spec.rooms.is_empty() || spec.senders.is_empty() || spec.states.is_empty() || !(spec.scale.span > 0.0) || spec.smoothing.kind != "hmm" {
+        if spec.matcher != MATCHER_ROOM || spec.rooms.is_empty() || spec.senders.is_empty() || spec.states.is_empty() || spec.scale.span.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || spec.smoothing.kind != "hmm" {
             bail!("{}: not a valid room model description", path.display());
         }
         let mut sessions = HashMap::new();
@@ -116,6 +160,14 @@ impl Model {
         Ok(model)
     }
 
+    pub fn rule(&self) -> Option<Rule> {
+        self.spec.state_rule.as_ref().map(Rule::from_spec)
+    }
+
+    pub fn knows(&self, aps: &[(String, i32)]) -> bool {
+        aps.iter().any(|(a, _)| self.spec.senders.iter().any(|s| s.eq_ignore_ascii_case(a)))
+    }
+
     pub fn features(&self, aps: &[(String, i32)]) -> Vec<f32> {
         let mut strongest: HashMap<String, i32> = HashMap::new();
         for (sender, rssi) in aps {
@@ -126,8 +178,10 @@ impl Model {
     }
 
     pub fn template_for(&self, state: &str) -> Option<&str> {
-        let explicit = self.spec.states.get_key_value(state).map(|(k, _)| k.as_str());
-        explicit.or_else(|| (!matches!(state, "offbody" | "charging")).then(|| self.spec.states.get_key_value("all").map(|(k, _)| k.as_str())).flatten())
+        if matches!(state, "offbody" | "charging") {
+            return None;
+        }
+        self.spec.states.get_key_value(state).or_else(|| self.spec.states.get_key_value("all")).map(|(k, _)| k.as_str())
     }
 
     pub fn probabilities(&self, template: &str, x: &[f32]) -> Result<Vec<f64>> {
@@ -135,7 +189,7 @@ impl Model {
         let outputs = session.run(ort::inputs!["x" => Tensor::from_array(([1usize, x.len()], x.to_vec()))?])?;
         let (_, p) = outputs["probabilities"].try_extract_tensor::<f32>()?;
         let sum: f64 = p.iter().map(|v| f64::from(*v)).sum();
-        if p.len() != self.spec.rooms.len() || !(sum > 0.0) || p.iter().any(|v| !v.is_finite()) {
+        if p.len() != self.spec.rooms.len() || sum.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || p.iter().any(|v| !v.is_finite()) {
             bail!("template {template} returned {} values (sum {sum}), expected {} probabilities", p.len(), self.spec.rooms.len());
         }
         Ok(p.iter().map(|v| f64::from(*v) / sum).collect())
@@ -156,7 +210,7 @@ pub fn forward(prior: Option<(&[f64], f64)>, transition: &[Vec<f64>], emission: 
     };
     belief.iter_mut().zip(emission).for_each(|(b, e)| *b *= e);
     let total: f64 = belief.iter().sum();
-    if !(total > 0.0) {
+    if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         belief = emission.to_vec();
     }
     let total: f64 = belief.iter().sum();
@@ -210,24 +264,28 @@ impl Signals {
         }
     }
 
-    fn mean(q: &VecDeque<(i64, f64)>, at_ms: i64) -> Option<f64> {
-        let v: Vec<f64> = q.iter().filter(|s| s.0 > at_ms - SIGNAL_WINDOW_MS && s.0 <= at_ms).map(|s| s.1).collect();
+    fn mean(q: &VecDeque<(i64, f64)>, at_ms: i64, window_ms: i64) -> Option<f64> {
+        let v: Vec<f64> = q.iter().filter(|s| s.0 > at_ms - window_ms && s.0 <= at_ms).map(|s| s.1).collect();
         (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
     }
 
-    pub fn classify(&self, cfg: &WatchState, sleep: (u32, u32), at_ms: i64, minute_of_day: u32) -> &'static str {
-        let (hr, motion) = (Self::mean(&self.hr, at_ms), Self::mean(&self.motion, at_ms));
-        if self.charging.is_some_and(|c| c.1) {
+    pub fn classify(&self, rule: &Rule, at_ms: i64, minute_of_day: u32) -> &'static str {
+        let (hr, motion) = (Self::mean(&self.hr, at_ms, rule.window_ms), Self::mean(&self.motion, at_ms, rule.window_ms));
+        let fresh = |v: Option<(i64, bool)>| v.filter(|(t, _)| at_ms - t <= rule.stale_ms).map(|(_, b)| b);
+        if fresh(self.charging) == Some(true) {
             return "charging";
         }
-        if self.on_body.is_some_and(|o| !o.1) {
+        if fresh(self.on_body) == Some(false) {
             return "offbody";
         }
-        let (from, to) = sleep;
+        if hr.is_none() && motion.is_none() {
+            return "rest";
+        }
+        let (from, to) = rule.sleep;
         let in_sleep = if from == to { false } else if from < to { (from..to).contains(&minute_of_day) } else { minute_of_day >= from || minute_of_day < to };
-        if in_sleep && hr.is_none_or(|h| h <= cfg.hr_rest_max) && motion.is_none_or(|m| m < cfg.motion_active_min) {
+        if in_sleep && hr.is_none_or(|h| h <= rule.hr_rest_max) && motion.is_none_or(|m| m < rule.motion_active_min) {
             "sleep"
-        } else if hr.is_some_and(|h| h >= cfg.hr_active_min) || motion.is_some_and(|m| m >= cfg.motion_active_min) {
+        } else if hr.is_some_and(|h| h >= rule.hr_active_min) || motion.is_some_and(|m| m >= rule.motion_active_min) {
             "active"
         } else {
             "rest"
@@ -261,7 +319,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct WatchMatch {
     cfg: Arc<WatchMatchSection>,
-    sleep: (u32, u32),
+    rule: Rule,
     sink: Sink,
     status: Status,
     inner: Arc<Mutex<Inner>>,
@@ -283,7 +341,7 @@ fn newest_dir(base: &Path) -> Option<(String, PathBuf)> {
 
 impl WatchMatch {
     pub fn new(cfg: &WatchMatchSection, sink: Sink, status: Status) -> Self {
-        let wm = Self { cfg: Arc::new(cfg.clone()), sleep: cfg.state.sleep_minutes().unwrap_or((1380, 420)), sink, status, inner: Default::default() };
+        let wm = Self { cfg: Arc::new(cfg.clone()), rule: Rule::of(&cfg.state, cfg.state.sleep_minutes().unwrap_or((1380, 420))), sink, status, inner: Default::default() };
         if cfg.enabled {
             if let Err(e) = wm.reload() {
                 eprintln!("watchmatch: no model loaded, matcher abstains: {e:#}");
@@ -297,6 +355,7 @@ impl WatchMatch {
         &self.sink
     }
 
+    #[cfg(test)]
     pub fn enabled(&self) -> bool {
         self.cfg.enabled
     }
@@ -305,6 +364,7 @@ impl WatchMatch {
         self.inner.lock().unwrap().model.as_ref().map(|m| m.spec.model_version.clone())
     }
 
+    #[cfg(test)]
     pub fn active(&self) -> bool {
         self.cfg.enabled && self.inner.lock().unwrap().model.is_some()
     }
@@ -353,7 +413,8 @@ impl WatchMatch {
         }
         dev.last_scan_ms = Some(ts_ms);
         dev.gap_logged = false;
-        let state = dev.signals.classify(&self.cfg.state, self.sleep, ts_ms, minute);
+        let rule = model.as_ref().and_then(|m| m.rule()).unwrap_or(self.rule);
+        let state = dev.signals.classify(&rule, ts_ms, minute);
         let mut row = WatchInference {
             ts: ts_ms * 1000,
             matcher: MATCHER_ROOM.into(),
@@ -367,7 +428,8 @@ impl WatchMatch {
         };
         if let Some(model) = model {
             row.model_version = model.spec.model_version.clone();
-            match model.template_for(state) {
+            match model.template_for(state).filter(|_| model.knows(aps)) {
+                None if !model.knows(aps) => row.reason = Some("no_known_ap".into()),
                 None => row.reason = Some("unknown_state".into()),
                 Some(template) => match model.probabilities(template, &model.features(aps)) {
                     Err(e) => eprintln!("watchmatch: inference failed: {e:#}"),
@@ -408,9 +470,10 @@ impl WatchMatch {
         let mut rows = Vec::new();
         {
             let mut inner = self.inner.lock().unwrap();
+            let rule = inner.model.as_ref().and_then(|m| m.rule()).unwrap_or(self.rule);
             for dev in inner.devices.values_mut().filter(|d| !d.gap_logged && d.last_scan_ms.is_some_and(|t| now_ms - t >= NO_SCAN_AFTER_MS)) {
                 dev.gap_logged = true;
-                let state = dev.signals.classify(&self.cfg.state, self.sleep, now_ms, local_minute(now_ms));
+                let state = dev.signals.classify(&rule, now_ms, local_minute(now_ms));
                 rows.push(WatchInference {
                     ts: now_ms * 1000,
                     matcher: MATCHER_ROOM.into(),
@@ -449,7 +512,7 @@ impl WatchMatch {
                 let w = wm.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     w.minute_tick(lake::now_us() / 1000);
-                    if n % RELOAD_EVERY_TICKS == 0 && w.cfg.model_version == "latest" {
+                    if n.is_multiple_of(RELOAD_EVERY_TICKS) && w.cfg.model_version == "latest" {
                         if let Err(e) = w.reload() {
                             eprintln!("watchmatch: reload failed, keeping current model: {e:#}");
                         }

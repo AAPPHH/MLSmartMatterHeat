@@ -192,7 +192,7 @@ pub struct WatchState {
 
 impl Default for WatchState {
     fn default() -> Self {
-        Self { hr_rest_max: 75.0, hr_active_min: 100.0, motion_active_min: 0.5, sleep_hours: "23-7".into() }
+        Self { hr_rest_max: 70.0, hr_active_min: 90.0, motion_active_min: 0.5, sleep_hours: "23-7".into() }
     }
 }
 
@@ -421,7 +421,7 @@ enabled = true
 [watchmatch.state]
 hr_rest_max = 70
 sleep_hours = '22-6'").unwrap();
-        assert_eq!((tuned.watchmatch.enabled, tuned.watchmatch.state.hr_rest_max, tuned.watchmatch.state.hr_active_min, tuned.watchmatch.state.sleep_minutes().unwrap()), (true, 70.0, 100.0, (1320, 360)));
+        assert_eq!((tuned.watchmatch.enabled, tuned.watchmatch.state.hr_rest_max, tuned.watchmatch.state.hr_active_min, tuned.watchmatch.state.sleep_minutes().unwrap()), (true, 70.0, 90.0, (1320, 360)));
         assert!(Config::parse("[watchmatch.state]
 sleep_hours = 'never'").is_err());
         let chip = config.chip_tool.to_controller_config();

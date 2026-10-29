@@ -40,7 +40,9 @@ impl Default for Timing {
 }
 
 #[derive(Clone, Default)]
-pub struct Latest(Arc<Mutex<HashMap<(u64, String), (f64, i64)>>>);
+pub struct Latest(Arc<Mutex<LatestMap>>);
+
+type LatestMap = HashMap<(u64, String), (f64, i64)>;
 
 impl Latest {
     pub fn update(&self, node: u64, attribute: &str, value: f64, ts_ms: i64) {
@@ -134,11 +136,8 @@ impl NodeCapture {
     }
 
     fn up(&mut self, out: &mut Vec<Out>, now: i64, via: &str) {
-        match std::mem::replace(&mut self.link, Link::Up) {
-            Link::Lost { since_us, attempts } => {
-                out.push(Out::Event(self.lifecycle(kind::RESUBSCRIBED, now, json!({"attempt": attempts, "downtime_s": (now - since_us) / 1_000_000, "via": via}))));
-            }
-            _ => {}
+        if let Link::Lost { since_us, attempts } = std::mem::replace(&mut self.link, Link::Up) {
+            out.push(Out::Event(self.lifecycle(kind::RESUBSCRIBED, now, json!({"attempt": attempts, "downtime_s": (now - since_us) / 1_000_000, "via": via}))));
         }
     }
 

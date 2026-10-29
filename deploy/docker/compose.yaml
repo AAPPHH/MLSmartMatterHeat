@@ -19,6 +19,7 @@ services:
     environment:
       HEATD_CONFIG: /etc/heatd/heatd.toml
       HEATD_PORT: ${HEATD_PORT:-8080}
+      TZ: ${TZ:-Europe/Berlin}
     volumes:
       - ../../heatd.toml:/etc/heatd/heatd.toml:ro
       - ../../data:/data

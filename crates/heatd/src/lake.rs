@@ -563,8 +563,7 @@ struct Framing {
 fn frame(bytes: &[u8]) -> Framing {
     let mut out = Framing { schema_end: None, batch_ends: Vec::new(), eos: false };
     let mut pos = 0;
-    loop {
-        let Some(head) = bytes.get(pos..pos + 8) else { break };
+    while let Some(head) = bytes.get(pos..pos + 8) {
         if head[..4] != [0xff; 4] {
             break;
         }
@@ -806,8 +805,8 @@ impl Sink {
     fn flush_key(&self, st: &mut State, key: (Table, NaiveDate)) -> Result<()> {
         let Some(buf) = st.buffers.get(&key) else { return Ok(()) };
         let batch = (buf.to_batch)(buf.rows.as_ref())?;
-        if !st.segments.contains_key(&key) {
-            st.segments.insert(key, Seg::create(&self.cfg.root, key.0, key.1)?);
+        if let std::collections::hash_map::Entry::Vacant(slot) = st.segments.entry(key) {
+            slot.insert(Seg::create(&self.cfg.root, key.0, key.1)?);
         }
         let written = st.segments.get_mut(&key).unwrap().write(&batch);
         if let Err(e) = written {

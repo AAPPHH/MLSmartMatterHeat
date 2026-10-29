@@ -328,7 +328,9 @@ fn watch_lake(root: &Path) {
     sink.close().unwrap();
 }
 
-fn minute_query(db: &LakeDb, minute: i64, columns: &str) -> duckdb::Result<(String, Option<i64>, Option<f64>, Option<f64>)> {
+type MinuteRow = (String, Option<i64>, Option<f64>, Option<f64>);
+
+fn minute_query(db: &LakeDb, minute: i64, columns: &str) -> duckdb::Result<MinuteRow> {
     db.conn.query_row(&format!("SELECT {columns} FROM watch_minute WHERE epoch_us(t) = {}", start() + minute * MIN), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
 }
 

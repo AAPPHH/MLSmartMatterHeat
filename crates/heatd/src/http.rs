@@ -3,7 +3,7 @@ use crate::infer::{Explanation, RoomModel};
 use crate::explore::Explorer;
 use crate::lake::{self, kind, Event, Label, Table, WatchRaw, WatchSensor};
 use crate::rules::{presence_event, Tracker};
-use crate::storage::{now_ms, BatchBody, Power, ScanBody, Storage};
+use crate::storage::{now_ms, AccessPoint, BatchBody, Motion, Power, ScanBody, Storage};
 use crate::watchmatch::{Signal, WatchMatch};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -160,7 +160,7 @@ fn merge(response: &mut Value, extra: Value) {
     }
 }
 
-fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, ApiError> {
+fn ingest(state: &AppState, body: &ScanBody, received: i64, raw: bool) -> Result<Outcome, ApiError> {
     let mut body = body.clone();
     if body.ts > received + MAX_FUTURE_MS {
         eprintln!("scan ts from {} is {} ms in the future, clamped to received_at", body.device, body.ts - received);
@@ -178,7 +178,7 @@ fn ingest(state: &AppState, body: &ScanBody, received: i64) -> Result<Outcome, A
     let prediction = room.as_ref().map(|(label, probability)| (label.as_str(), *probability));
     let done = state.storage.ingest(&body, received, prediction)?;
     if !done.duplicate {
-        record_scan(state, &body, received, room.as_ref(), &explanation);
+        record_scan(state, &body, received, room.as_ref(), &explanation, raw);
     }
     Ok(Outcome { stored: done.stored, duplicate: done.duplicate, room: room.map(|r| (r.0, body.ts)), explanation })
 }
@@ -205,10 +205,12 @@ fn raw_rows(state: &AppState, device: &str, ts_ms: i64, device_ts: Option<i64>, 
     Ok(n)
 }
 
-fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(String, f64)>, explanation: &Explanation) {
-    let batch = state.next_batch();
-    if let Err(e) = raw_rows(state, &body.device, body.ts, None, received, batch, body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok()))) {
-        eprintln!("watch_raw: {e}");
+fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(String, f64)>, explanation: &Explanation, raw: bool) {
+    if raw {
+        let batch = state.next_batch();
+        if let Err(e) = raw_rows(state, &body.device, body.ts, None, received, batch, body.aps.iter().map(|a| (a.bssid.clone(), a.rssi, None, u16::try_from(a.freq).ok()))) {
+            eprintln!("watch_raw: {e}");
+        }
     }
     if let Some(label) = body.label.as_deref().filter(|l| !l.is_empty()) {
         let row = Label { ts: body.ts * 1000, room: label.into(), source: "watch".into(), device: Some(body.device.clone()), ..Default::default() };
@@ -261,6 +263,37 @@ struct LongBody {
     #[serde(default)]
     clock_offset_ms: Option<i64>,
     samples: Vec<Sample>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    motion: Option<Motion>,
+    #[serde(default)]
+    power: Option<Power>,
+    #[serde(default)]
+    away: Option<bool>,
+    #[serde(default)]
+    queued: Option<bool>,
+}
+
+impl LongBody {
+    fn scan_body(&self, received: i64) -> Option<ScanBody> {
+        let carries = self.id.is_some() || self.label.is_some() || self.motion.is_some() || self.power.is_some() || self.away.is_some() || self.queued.is_some();
+        let rssi: Vec<&Sample> = self.samples.iter().filter(|s| s.sensor_type == "rssi").collect();
+        let ts = rssi.iter().map(|s| s.ts.min(received + MAX_FUTURE_MS)).max()?;
+        carries.then(|| ScanBody {
+            ts,
+            device: self.device.clone(),
+            id: self.id.clone(),
+            label: self.label.clone(),
+            aps: rssi.iter().map(|s| AccessPoint { bssid: s.sender.clone().unwrap_or_default().to_lowercase(), rssi: s.value.round() as i32, freq: s.freq.map_or(0, i32::from) }).collect(),
+            motion: self.motion,
+            queued: self.queued.unwrap_or(false),
+            power: self.power,
+            away: self.away.unwrap_or(false),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -326,7 +359,7 @@ fn long_rows(body: &LongBody, batch: u64, received: i64) -> Result<Vec<WatchRaw>
         .collect()
 }
 
-fn feed_matcher(state: &AppState, body: &LongBody, received: i64) {
+fn feed_matcher(state: &AppState, body: &LongBody, received: i64, scans_fed: bool) {
     let ts = |s: &Sample| s.ts.min(received + MAX_FUTURE_MS);
     let charging: std::collections::BTreeMap<i64, bool> = body.samples.iter().filter(|s| s.sensor_type == "charging").map(|s| (ts(s), s.value >= 0.5)).collect();
     let mut signals = Vec::new();
@@ -346,9 +379,11 @@ fn feed_matcher(state: &AppState, body: &LongBody, received: i64) {
     }
     counts.iter().for_each(|(t, n)| state.status.watch_samples(t, *n));
     state.watchmatch.signals(&body.device, signals);
-    scans.into_iter().for_each(|(t, aps)| {
-        state.watchmatch.scan(&body.device, t, received, &aps);
-    });
+    if !scans_fed {
+        scans.into_iter().for_each(|(t, aps)| {
+            state.watchmatch.scan(&body.device, t, received, &aps);
+        });
+    }
 }
 
 async fn flushed(state: &AppState, table: Table) -> Result<(), ApiError> {
@@ -366,11 +401,20 @@ async fn watch_long(state: AppState, body: LongBody) -> ApiResult {
     }
     let rows = long_rows(&body, batch, received)?;
     let stored = rows.len();
+    let scan = body.scan_body(received).map(|s| ingest(&state, &s, received, false)).transpose()?;
     state.sink.append_many(rows)?;
     flushed(&state, Table::WatchRaw).await?;
     state.storage.claim_id(&body.device, &key)?;
-    feed_matcher(&state, &body, received);
-    Ok(Json(json!({"stored": stored, "batch_id": batch})))
+    feed_matcher(&state, &body, received, scan.is_some());
+    let mut response = json!({"stored": stored, "batch_id": batch});
+    if let Some(out) = &scan {
+        response["room"] = json!(out.room.as_ref().map(|r| r.0.clone()));
+        merge(&mut response, attribution(Some(out)));
+        if out.duplicate {
+            response["duplicate"] = json!(true);
+        }
+    }
+    Ok(Json(response))
 }
 
 async fn watch_measurement(State(state): State<AppState>, Json(value): Json<Value>) -> ApiResult {
@@ -441,7 +485,7 @@ async fn watch_sensors(State(state): State<AppState>, Json(body): Json<SensorsBo
 }
 
 async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiResult {
-    let out = ingest(&state, &body, now_ms())?;
+    let out = ingest(&state, &body, now_ms(), true)?;
     let mut response = json!({"stored": out.stored, "room": out.room.as_ref().map(|r| r.0.clone())});
     merge(&mut response, attribution(Some(&out)));
     if out.duplicate {
@@ -455,7 +499,7 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     let (mut stored, mut duplicates) = (0, 0);
     let mut latest: Option<Outcome> = None;
     for scan in &body.scans {
-        let out = ingest(&state, scan, received)?;
+        let out = ingest(&state, scan, received, true)?;
         stored += out.stored;
         duplicates += usize::from(out.duplicate);
         if out.room.as_ref().is_some_and(|r| latest.as_ref().and_then(|l| l.room.as_ref()).is_none_or(|l| r.1 >= l.1)) {
@@ -1362,5 +1406,73 @@ nodes = [6]
         assert_eq!(h.state.watchmatch.effective(now_ms()).unwrap().unwrap().0, "schlafzimmer");
         call(&h.state, "POST", "/api/scan", Some(scan_at(now + 2000, json!({"device": "pixel-watch"})))).await;
         assert_eq!(lake_rows(&h, "watch_inference").iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    fn scan_form(batch: u64, ts: i64, id: &str, away: bool, motion: &str) -> Value {
+        let aps = [("aa:bb:cc:00:00:01", -45, 2412), ("aa:bb:cc:00:00:02", -67, 5180), ("aa:bb:cc:00:00:03", -82, 2437), ("aa:bb:cc:00:00:99", -90, 2462)];
+        let samples: Vec<Value> = aps.iter().map(|(b, r, f)| json!({"elapsed_ns": 900_000_000_000i64, "ts": ts, "sensor_type": "rssi", "sensor_name": "wifi", "value": *r as f64, "unit": "dBm", "sender": b, "freq": f})).collect();
+        json!({"device": "pixel-watch", "batch_id": batch, "sent_ts": ts + 5, "clock_offset_ms": 100, "app_version": "2.5", "samples": samples, "id": id, "motion": motion, "power": "normal", "away": away, "label": "kueche", "queued": true})
+    }
+
+    #[tokio::test]
+    async fn rssi_batch_in_scan_form_runs_the_full_phase_one_path() {
+        let head = format!("away_guard_minutes = 0\n[watchmatch]\nenabled = true\nmodel_dir = '{}'\nscan_fresh_s = 600\n", fixture_models().replace('\\', "/"));
+        let h = harness_with(true, &head, "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n");
+        let now = now_ms();
+        let body = scan_form(500, now, "pixel-watch-000001", false, "still");
+        let (status, resp) = call(&h.state, "POST", "/watch/measurement", Some(body.to_string())).await;
+        assert_eq!((status, resp["stored"].clone(), resp["batch_id"].clone(), resp["room"].clone()), (StatusCode::OK, json!(4), json!(500), json!("wohnzimmer")));
+        assert!(resp["probability"].as_f64().unwrap() > 0.9);
+        assert_eq!(resp["rooms"][0]["room"], json!("wohnzimmer"));
+        assert!(resp["aps"].as_array().is_some_and(|a| !a.is_empty()));
+        assert_eq!((h.state.storage.count("scans").unwrap(), h.state.storage.count("device_state").unwrap(), h.state.storage.count("predictions").unwrap()), (4, 1, 1));
+        let st = &h.state.storage.device_statuses().unwrap()[0];
+        assert_eq!((st.motion, st.power, st.away), (Some(Motion::Still), Some(Power::Normal), false));
+        assert_eq!(h.state.storage.scan_labels("pixel-watch").unwrap().iter().filter(|(_, l)| l.as_deref() == Some("kueche")).count(), 1);
+        let raw = lake_rows(&h, "watch_raw");
+        assert_eq!(some(&column(&raw, "sensor_type")), vec!["rssi".to_string(); 4]);
+        let labels = lake_rows(&h, "labels");
+        assert_eq!(some(&column(&labels, "source")), ["watch", "model"].map(String::from).to_vec());
+        assert_eq!(some(&column(&lake_rows(&h, "watch_inference"), "result_room")), vec!["wohnzimmer".to_string()]);
+        let (_, again) = call(&h.state, "POST", "/watch/measurement", Some(body.to_string())).await;
+        assert_eq!(again, json!({"stored": 0, "duplicate": true, "batch_id": 500}));
+        assert_eq!(h.state.storage.count("device_state").unwrap(), 1);
+        let schedule = "[[rooms.schedules]]
+days = ['weekdays']
+from = '06:00'
+to = '08:30'
+setpoint = 21.0
+";
+        let g = harness_with(false, "away_guard_minutes = 0
+", &format!("[[rooms]]
+name = 'a'
+nodes = [5]
+{schedule}"));
+        let monday_7 = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(7, 0, 0).unwrap();
+        for (batch, ts, id, away, motion) in [(502, now - 40 * 60_000, "pixel-watch-000002", true, "moving"), (503, now - 5 * 60_000, "pixel-watch-000003", true, "still")] {
+            assert_eq!(call(&g.state, "POST", "/watch/measurement", Some(scan_form(batch, ts, id, away, motion).to_string())).await.0, StatusCode::OK);
+        }
+        let away = control_step(&g.state, monday_7, now).await.unwrap();
+        assert!(away.iter().all(|w| (w.setpoint, w.reason) == (18.0, "away")));
+        call(&g.state, "POST", "/watch/measurement", Some(scan_form(504, now + 1, "pixel-watch-000004", false, "moving").to_string())).await;
+        let kinds = some(&column(&lake_rows(&g, "events"), "kind"));
+        assert_eq!((kinds.iter().filter(|k| *k == "presence_leave").count(), kinds.iter().filter(|k| *k == "presence_arrive").count()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn watch_offbody_value_one_means_on_the_wrist() {
+        let h = matcher_harness(&fixture_models());
+        let now = now_ms();
+        let mut worn = long_body(1, now, [-40, -60, -90]);
+        worn["samples"].as_array_mut().unwrap().push(json!({"elapsed_ns": 5_000, "ts": now - 1000, "sensor_type": "offbody", "sensor_name": "low_latency_offbody", "value": 1.0, "unit": "bool"}));
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(worn.to_string())).await.0, StatusCode::OK);
+        let mut off = long_body(2, now + 120_000, [-40, -60, -90]);
+        off["samples"].as_array_mut().unwrap().push(json!({"elapsed_ns": 6_000, "ts": now + 60_000, "sensor_type": "offbody", "sensor_name": "low_latency_offbody", "value": 0.0, "unit": "bool"}));
+        assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(off.to_string())).await.0, StatusCode::OK);
+        call(&h.state, "POST", "/watch/measurement", Some(long_body(3, now + 180_000, [-40, -60, -90]).to_string())).await;
+        let inference = lake_rows(&h, "watch_inference");
+        assert_eq!(some(&column(&inference, "state")), ["rest", "offbody", "offbody"].map(String::from).to_vec());
+        assert_eq!(some(&column(&inference, "result_room"))[0], "wohnzimmer");
+        assert_eq!(some(&column(&inference, "reason"))[1], "unknown_state");
     }
 }
