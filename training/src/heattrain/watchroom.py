@@ -148,7 +148,11 @@ def classify_state(cfg, tz, t, dev, sig):
 def assign_labels(lake, cfg, scans):
     if not scans:
         return
-    rows = lake.query("labels", [("epoch(ts)", None), ("epoch(from_ts)", "from_ts"), ("epoch(to_ts)", "to_ts"), ("room", None), ("device", "device")], f"source IN ({','.join(repr(s) for s in cfg['sources'])})", "ORDER BY ts")
+    rows = lake.query("labels", [("epoch(ts)", None), ("epoch(from_ts)", "from_ts"), ("epoch(to_ts)", "to_ts"), ("room", None), ("device", "device"), ("label_id", "label_id")], f"source IN ({','.join(repr(s) for s in cfg['sources'])})", "ORDER BY ts")
+    voided = {v for (v,) in lake.query("labels", [("voided_label_id", None)], "voided_label_id IS NOT NULL", need=("voided_label_id",))}
+    tap_from = datetime.fromisoformat(cfg["tap_labels_from"]).timestamp() if cfg.get("tap_labels_from") else None
+    rows = [r for r in rows if r[5] not in voided and not (tap_from is not None and r[0] >= tap_from and (r[1] is None or r[2] is None))]
+    rows = [r[:5] for r in rows]
     tol = cfg["label_tolerance_s"]
     rows = [(ts, f, to, name, d) if f is None or to is None or cfg.get("label_intervals", True) or to - f > 2 * tol else ((f + to) / 2, None, None, name, d) for ts, f, to, name, d in rows]
     t = np.array([s.ts for s in scans])
@@ -340,6 +344,15 @@ class Trainer:
                     best = (key, float(round(tau, 2)), float(round(delta, 2)), m)
         return best[1], best[2], best[3]
 
+    def noisy(self, P, y, k):
+        c = self.cfg
+        if c.get("noise_p_min") is None:
+            return np.zeros(len(y), dtype=bool)
+        own = P[np.arange(len(y)), y]
+        other = np.where(np.eye(k, dtype=bool)[y], -1.0, P).max(axis=1)
+        big = np.bincount(y, minlength=k)[y] >= c["noise_min_labels"]
+        return (P.sum(axis=1) > 0) & big & (own < c["noise_p_min"]) & (other > c["noise_p_other"])
+
     def kept_rooms(self, scans):
         counts = Counter(s.room for s in scans)
         rooms = sorted(r for r, n in counts.items() if n >= self.cfg["min_room_scans"])
@@ -355,21 +368,28 @@ class Trainer:
         senders = vocabulary(labelled, c)
         spec = feature_spec(c, senders, labelled)
         keep = [s for s in labelled if any(b in s.aps for b in senders)]
-        rooms = self.kept_rooms(keep)
-        keep = [s for s in keep if s.room in rooms]
-        X = np.stack([features(spec, s.hist or [s.aps]) for s in keep])
-        y = np.array([rooms.index(s.room) for s in keep])
-        days = np.array([day_of(s) for s in keep])
-        states = np.array([s.state or "all" for s in keep])
-        trans = transitions(rooms, links, c["hmm"])
-        trans_m = np.array([[trans[a][b] for b in rooms] for a in rooms])
-        order = sorted(range(len(keep)), key=lambda i: (keep[i].device, keep[i].ts))
-        cv = {}
-        for kind in c["candidates"]:
-            P = self.oof(kind, X, y, days, len(rooms))
-            ok = P.sum(axis=1) > 0
-            cv[kind] = (P, score(list(y[ok]), [int(p.argmax()) for p in P[ok]], rooms)["macro_f1"])
-        kind = max(cv, key=lambda k: cv[k][1])
+        dropped = 0
+        for attempt in range(2):
+            rooms = self.kept_rooms(keep)
+            keep = [s for s in keep if s.room in rooms]
+            X = np.stack([features(spec, s.hist or [s.aps]) for s in keep])
+            y = np.array([rooms.index(s.room) for s in keep])
+            days = np.array([day_of(s) for s in keep])
+            states = np.array([s.state or "all" for s in keep])
+            trans = transitions(rooms, links, c["hmm"])
+            trans_m = np.array([[trans[a][b] for b in rooms] for a in rooms])
+            order = sorted(range(len(keep)), key=lambda i: (keep[i].device, keep[i].ts))
+            cv = {}
+            for kind in c["candidates"]:
+                P = self.oof(kind, X, y, days, len(rooms))
+                ok = P.sum(axis=1) > 0
+                cv[kind] = (P, score(list(y[ok]), [int(p.argmax()) for p in P[ok]], rooms)["macro_f1"])
+            kind = max(cv, key=lambda k: cv[k][1])
+            noisy = self.noisy(cv[kind][0], y, len(rooms)) if attempt == 0 else np.zeros(len(keep), dtype=bool)
+            if not noisy.any():
+                break
+            dropped = int(noisy.sum())
+            keep = [s for s, n in zip(keep, noisy) if not n]
         P = self.smoothed(cv[kind][0], keep, order, trans_m)
         ok = P.sum(axis=1) > 0
         tau, delta, val = self.thresholds(P[ok], y[ok], rooms)
@@ -382,7 +402,7 @@ class Trainer:
         return {"rooms": rooms, "senders": senders, "spec": spec, "kind": kind, "models": models, "tau": tau, "delta": delta,
                 "transition": trans, "n_labels": {r: int((y == i).sum()) for i, r in enumerate(rooms)},
                 "window": (min(keep, key=lambda s: s.ts).ts, max(keep, key=lambda s: s.ts).ts), "X": X,
-                "metrics": {"cv_macro_f1": {k: v[1] for k, v in cv.items()}, "chosen": kind, "validation": {k: val[k] for k in ("coverage", "accuracy", "macro_f1")}}}
+                "metrics": {"cv_macro_f1": {k: v[1] for k, v in cv.items()}, "chosen": kind, "noise_dropped": dropped, "validation": {k: val[k] for k in ("coverage", "accuracy", "macro_f1")}}}
 
 
 def to_onnx(model, n):

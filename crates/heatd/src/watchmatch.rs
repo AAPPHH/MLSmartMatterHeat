@@ -384,6 +384,7 @@ struct Inner {
     dir_name: Option<String>,
     devices: HashMap<String, Device>,
     stays: HashMap<String, (String, i64)>,
+    stay_ids: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -592,7 +593,17 @@ impl WatchMatch {
         rows.iter().for_each(|r| self.record(r));
     }
 
-    pub fn note_stay(&self, device: &str, ts_ms: i64, label: Option<&str>) {
+    pub fn void_stay(&self, device: &str, label_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let hit = inner.stay_ids.get(device).is_some_and(|id| id == label_id);
+        if hit {
+            inner.stay_ids.remove(device);
+            inner.stays.remove(device);
+        }
+        hit
+    }
+
+    pub fn note_stay(&self, device: &str, ts_ms: i64, label: Option<&str>, label_id: Option<&str>) {
         if self.is_anchor(device) {
             return;
         }
@@ -600,10 +611,15 @@ impl WatchMatch {
         match label.filter(|l| !l.is_empty()) {
             Some(l) if inner.stays.get(device).is_none_or(|s| ts_ms >= s.1) => {
                 inner.stays.insert(device.into(), (l.into(), ts_ms));
+                match label_id {
+                    Some(id) => inner.stay_ids.insert(device.into(), id.into()),
+                    None => inner.stay_ids.remove(device),
+                };
             }
             Some(_) => {}
             None if inner.stays.get(device).is_some_and(|s| ts_ms > s.1 + self.cfg.label_tolerance_s * 1000) => {
                 inner.stays.remove(device);
+                inner.stay_ids.remove(device);
             }
             None => {}
         }

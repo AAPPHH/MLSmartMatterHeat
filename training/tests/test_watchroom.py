@@ -300,6 +300,45 @@ def test_short_interval_label_is_a_point_at_its_midpoint_and_long_ones_are_ignor
     assert [s.room for s in scans] == [None, "bad", None, None, "kueche", "kueche"]
 
 
+def test_voided_and_post_tap_point_labels_are_ignored(tmp_path, config):
+    import pyarrow as pa
+    from conftest import LABELS, write_table
+    from heattrain.watchroom import Lake, Scan, assign_labels
+    schema = pa.schema(list(LABELS) + [("label_id", pa.string()), ("voided_label_id", pa.string())])
+    tap = datetime.fromisoformat(config["tap_labels_from"]).timestamp()
+    ts = lambda t: datetime.fromtimestamp(t, timezone.utc) if t else None
+    row = lambda t, f, e, room, lid=None, void=None, source="watch": {"ts": ts(t), "from_ts": ts(f), "to_ts": ts(e), "room": room, "source": source, "device": "pixel", "label_id": lid, "voided_label_id": void}
+    rows = [row(tap - 5000, None, None, "old_point"), row(tap + 1000, None, None, "stay_point"), row(tap + 2000, tap + 1999, tap + 2001, "kept", "k"),
+            row(tap + 3000, tap + 2999, tap + 3001, "wrong", "w"), row(tap + 3500, None, None, "", None, "w", "void")]
+    write_table(tmp_path, "labels", rows, schema, "ts")
+    scans = [Scan(t, "pixel", {}) for t in (tap - 5000, tap + 1000, tap + 2000, tap + 3000)]
+    assign_labels(Lake(tmp_path), {**config, "label_intervals": False}, scans)
+    assert [s.room for s in scans] == ["old_point", None, "kept", None]
+    assign_labels(Lake(tmp_path), {**config, "label_intervals": False, "tap_labels_from": None}, scans)
+    assert [s.room for s in scans] == ["old_point", "stay_point", "kept", None]
+
+
+def test_confident_learning_drops_mislabelled_scans_only_in_rooms_with_enough_labels(config):
+    from heattrain.watchroom import Scan, Trainer
+    rng = np.random.default_rng(1)
+    scans = []
+    for room, base in (("a", -40.0), ("b", -80.0), ("c", -60.0)):
+        for i in range(40):
+            scans.append(Scan(1e9 + i * 60 + 86400 * (i % 4), "d", {"aa": base + rng.normal(0, 1), "bb": -60.0 + rng.normal(0, 1), "cc": -50.0 - (base + 60) / 2 + rng.normal(0, 1)}, room, "rest"))
+    flipped = [s for s in scans if s.room == "a"][:3]
+    for s in flipped:
+        s.room = "b"
+    cfg = {**small_cfg(config), "cv_folds": 4}
+    fit = Trainer(cfg).fit(scans, [])
+    dropped = fit["metrics"]["noise_dropped"]
+    assert 1 <= dropped <= 3
+    assert fit["n_labels"] == {"a": 37, "b": 43 - dropped, "c": 40}
+    off = Trainer({**cfg, "noise_p_min": None}).fit(scans, [])
+    assert off["metrics"]["noise_dropped"] == 0 and off["n_labels"]["b"] == 43
+    small = Trainer({**cfg, "noise_min_labels": 50}).fit(scans, [])
+    assert small["metrics"]["noise_dropped"] == 0
+
+
 def write_stream(path, batches, chop=0):
     schema = pa.schema([("ts", pa.timestamp("us", tz="UTC")), ("room", pa.dictionary(pa.int32(), pa.string())), ("source", pa.string())])
     with pa.OSFile(str(path), "wb") as sink, pa.ipc.new_stream(sink, schema) as writer:
