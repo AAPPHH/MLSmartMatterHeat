@@ -1,0 +1,9 @@
+[Unit]
+Description=heatd watchdog, sets all thermostats to 18 C when heatd stays down
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/aapphh/MLSmartMatterHeat/deploy/failsafe/heatd-failsafe.sh
+TimeoutStartSec=900

@@ -112,6 +112,34 @@ Wichtig an der Compose-Datei (`deploy/docker/compose.yaml`):
 
 `heatd` beendet sich bei `docker stop` über SIGTERM sauber. Logs: `docker compose logs -f heatd`. Update: `git pull && docker compose up -d --build`. Neustart nach neuem Modell: `docker compose restart heatd`.
 
+### Ausfallsicherheit: bei Minix-Ausfall alles auf 18 °C
+
+Die Comet Zero haben weder Zeitplan noch Fallback: sie behalten den zuletzt geschriebenen Sollwert. Drei Schichten:
+
+| Schicht | Wann | Was |
+|---|---|---|
+| A, heatd beim Beenden | SIGTERM/SIGINT (`docker stop`, Host-Shutdown) | schreibt `[failsafe] setpoint` (18,0) auf alle Knoten, max. `shutdown_timeout_s` (30 s) mit je 3 Versuchen, Ergebnis als Event `failsafe` im Lake; `stop_grace_period: 60s` in `compose.yaml` |
+| B, Watchdog auf dem Host | `deploy/failsafe/heatd-failsafe.timer`, alle 5 min | `/health` auf 127.0.0.1:8090 dreimal hintereinander tot: einmal `docker compose restart heatd`; beim naechsten Lauf immer noch tot: heatd stoppen (falls der Container noch laeuft, heatd schreibt dabei selbst 18) und 18 °C per chip-tool auf alle Knoten schreiben, einmal je Ausfall; danach `docker compose up -d` |
+| C, Obergrenze im Geraet | Start, nach Commissioning/Resubscribe, alle 6 h, bei jeder Abweichung | heatd schreibt `MaxHeatSetpointLimit` = `[failsafe] max_c` (22,0) auf alle Knoten; ein Live-Boost hebt sie unmittelbar vor dem Boost-Schreiben auf `boost_max_c` (28,5) und senkt sie direkt nach dem naechsten Schreiben unter 22 wieder ab. Faellt der Minix komplett aus (Strom, Hardware), bleibt hoechstens ein Boost haengen, im Normalbetrieb nie ueber 22 °C |
+
+Installation auf dem Minix (Image `heatd:local` und `paa/` muessen vorhanden sein):
+
+```bash
+sudo cp deploy/failsafe/heatd-failsafe.{service,timer} /etc/systemd/system/
+sudo systemctl enable --now heatd-failsafe.timer
+journalctl -t heatd-failsafe -n 20      # zusaetzlich /var/log/heatd-failsafe.log
+```
+
+Der Watchdog schreibt pro Knoten exakt diesen Befehl, in einem Einweg-Container mit denselben Volumes wie `compose.yaml` (nur wenn der heatd-Container nicht laeuft, wegen der Sperre auf `chip-storage/`):
+
+```bash
+docker run --rm --network host --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /usr/local/bin/chip-tool \
+  -v ~/MLSmartMatterHeat/chip-storage:/chip-storage -v ~/MLSmartMatterHeat/paa:/opt/paa-root-certs:ro heatd:local \
+  thermostat write occupied-heating-setpoint 1800 <node> 1 --storage-directory /chip-storage --paa-trust-store-path /opt/paa-root-certs
+```
+
+Die Knoten stehen in `heatd.toml` (`nodes = [..]`, Fallback 5 6 7 8, ueberschreibbar mit `FAILSAFE_NODES`). Wartung ohne Watchdog: `sudo touch /var/lib/heatd-failsafe/maintenance`, danach wieder loeschen. Der Zustand der Schichten steht in `/api/state` unter `failsafe` (Obergrenze je Knoten wie zuletzt geschrieben, letzter Shutdown, letzte Watchdog-Ausloesung aus `data/failsafe/watchdog.json`) und im Tagesbericht. Lehnt ein Geraet das Schreiben der Obergrenze ab, wird das geloggt und heatd arbeitet weiter; erneuter Versuch alle `retry_min` (10 min).
+
 ### systemd (Alternative)
 
 ```bash
