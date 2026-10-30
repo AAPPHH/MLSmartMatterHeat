@@ -98,10 +98,12 @@ commission_timeout_s = 180
 [[rooms]]
 name = "wohnzimmer"
 nodes = [5]
+home_setpoint = 20.0
 
 [[rooms]]
 name = "schlafzimmer"
 nodes = [6]
+home_setpoint = 20.0
 
 # [rooms.exploration]
 # enabled = false
@@ -113,6 +115,7 @@ nodes = [6]
 [[rooms]]
 name = "bad"
 nodes = [7]
+home_setpoint = 20.0
 
 [[rooms]]
 name = "kueche"

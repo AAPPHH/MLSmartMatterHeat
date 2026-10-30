@@ -220,7 +220,12 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
         .rooms
         .iter()
         .flat_map(|room| {
-            let (base, base_reason) = scheduled(room, now).map_or((config.default_setpoint, "default"), |s| (s, "schedule"));
+            let sleep_here = sleeping && config.sleep_room.as_deref() == Some(room.name.as_str());
+            let (base, base_reason) = match (scheduled(room, now), room.home_setpoint) {
+                (Some(s), _) => (s, "schedule"),
+                (None, Some(h)) if !sleep_here && occupancy != Occupancy::Away => (h, "home"),
+                _ => (config.default_setpoint, "default"),
+            };
             let window = window_open.contains(&room.name);
             let experiment = exploring.get(&room.name);
             let (setpoint, reason, rule) = if window {
@@ -231,7 +236,7 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
                 (e.setpoint.max(config.frost_setpoint), "exploration", "exploration")
             } else {
                 match held.contains(&room.name) {
-                    true if sleeping && config.sleep_room.as_deref() == Some(room.name.as_str()) => (base, "sleep", "presence"),
+                    _ if sleep_here => (base, "sleep", "presence"),
                     true => (config.occupied_setpoint, "occupied", "presence"),
                     false => (base, base_reason, "schedule"),
                 }
@@ -777,6 +782,35 @@ setpoint = 19.0
         let windows = windows.iter().map(|s| s.to_string()).collect();
         let d = raw(now, &config, p.as_ref(), &windows, &HashMap::new()).into_iter().find(|d| d.node == node).unwrap();
         (d.setpoint, d.reason)
+    }
+
+    #[test]
+    fn home_setpoint_applies_while_home_except_away_and_sleeping_bedroom() {
+        let config = Config::parse("default_setpoint = 18.0
+away_setpoint = 18.0
+occupied_setpoint = 20.0
+sleep_room = \"schlafzimmer\"
+[[rooms]]
+name = \"wohnzimmer\"
+nodes = [5]
+home_setpoint = 20.0
+[[rooms]]
+name = \"schlafzimmer\"
+nodes = [6]
+home_setpoint = 20.0
+[[rooms]]
+name = \"kueche\"
+nodes = [8]
+").unwrap();
+        let get = |p: Option<Presence>, node: u64| raw(at(27, 15, 0), &config, p.as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == node).map(|d| (d.setpoint, d.reason)).unwrap();
+        let home = || presence("flur", 1.0);
+        assert_eq!(get(home(), 5), (20.0, "home"));
+        assert_eq!(get(home(), 8), (18.0, "default"));
+        let away = Some(Presence { away: true, ..home().unwrap() });
+        assert_eq!(get(away, 5).0, 18.0);
+        let sleeping = Some(Presence { sleep: true, ..home().unwrap() });
+        assert_eq!(get(sleeping.clone(), 6), (18.0, "sleep"));
+        assert_eq!(get(sleeping, 5), (20.0, "home"));
     }
 
     #[test]

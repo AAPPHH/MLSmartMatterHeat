@@ -109,6 +109,8 @@ pub struct Room {
     pub exploration: Exploration,
     #[serde(default)]
     pub exterior: Vec<String>,
+    #[serde(default)]
+    pub home_setpoint: Option<f64>,
 }
 
 pub const NEIGHBOUR_KINDS: [&str; 4] = ["unknown", "wall", "ceiling", "open"];
