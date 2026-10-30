@@ -1,0 +1,10 @@
+[Unit]
+Description=heatd nightly training (thermal bundle + room model) in container
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=aapphh
+Nice=10
+ExecStart=/usr/bin/docker run --rm --cpus 2 --memory 3g -v /home/aapphh/MLSmartMatterHeat/data:/data:ro -v /home/aapphh/MLSmartMatterHeat/models:/models heattrain:local
