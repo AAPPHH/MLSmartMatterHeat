@@ -1,6 +1,7 @@
 #[cfg(test)]
 #[path = "../tests/acceptance.rs"]
 mod acceptance;
+mod boost;
 mod capture;
 mod config;
 mod explore;
@@ -23,6 +24,7 @@ mod dynamics_tests;
 mod rules;
 mod status;
 mod storage;
+mod thermal;
 mod watchmatch;
 #[cfg(test)]
 mod watchmatch_tests;
@@ -199,12 +201,14 @@ async fn serve(config: Config) -> Result<()> {
     lake::spawn_background(sink.clone());
     let status = status::Status::new(lake::now_us());
     status.register_nodes(config.all_nodes());
+    let boost = boost::Boost::new(&config);
     let config = Arc::new(config);
     context::spawn_background(sink.clone(), status.clone(), config.clone(), context::Io::live(&config));
     let watchmatch = watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone());
     watchmatch.spawn_background();
     let state = http::AppState {
         watchmatch,
+        boost: boost.clone(),
         sink: sink.clone(),
         latest: Default::default(),
         status,
@@ -218,6 +222,7 @@ async fn serve(config: Config) -> Result<()> {
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(lake::now_us() as u64)),
         config,
     };
+    boost::spawn_background(boost, std::path::PathBuf::from(&state.config.data_dir));
     rules::spawn_background(state.clone());
     capture::spawn(state.clone(), capture::Timing::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;

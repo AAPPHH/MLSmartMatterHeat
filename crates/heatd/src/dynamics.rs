@@ -1,3 +1,4 @@
+use crate::thermal::{backtest, newest_bundle_dir, BASELINE};
 use crate::report::{dur, hhmm, midnight_us, open_lake, opt, quote, rows, LakeDb, ROOM_MINUTE_SQL};
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
@@ -24,7 +25,8 @@ const DECISION_BEFORE_US: i64 = 3 * MIN_US;
 const DECISION_AFTER_US: i64 = MIN_US;
 pub const SUMMARY_DAYS: i64 = 14;
 pub const VIEWS: [&str; 5] = ["step_responses", "room_delta", "room_delta_daily", "radiator_summary", "radiator_pairs"];
-const DDL: &str = "CREATE OR REPLACE TABLE step_responses (room VARCHAR, node UBIGINT, t_start TIMESTAMP, source VARCHAR, direction VARCHAR, setpoint_old DOUBLE, setpoint_new DOUBLE, step_c DOUBLE, start_temp DOUBLE, dead_time_min DOUBLE, rate_c_per_h DOUBLE, rate_per_k DOUBLE, initial_valve_pct DOUBLE, rate_per_valve DOUBLE, time_to_target_min DOUBLE, overshoot_c DOUBLE, valve_mean_pct DOUBLE, valve_max_pct DOUBLE, outdoor_temp DOUBLE, radiation DOUBLE, others_heating INTEGER, exploration BOOLEAN, experiment_id VARCHAR)";
+const DDL: &str = "CREATE OR REPLACE TABLE step_responses (room VARCHAR, node UBIGINT, t_start TIMESTAMP, source VARCHAR, direction VARCHAR, setpoint_old DOUBLE, setpoint_new DOUBLE, step_c DOUBLE, start_temp DOUBLE, dead_time_min DOUBLE, rate_c_per_h DOUBLE, rate_per_k DOUBLE, initial_valve_pct DOUBLE, rate_per_valve DOUBLE, time_to_target_min DOUBLE, overshoot_c DOUBLE, valve_mean_pct DOUBLE, valve_max_pct DOUBLE, outdoor_temp DOUBLE, radiation DOUBLE, others_heating INTEGER, exploration BOOLEAN, experiment_id VARCHAR, variant VARCHAR, mode VARCHAR, planned_t_off_min DOUBLE, applied_t_off_min DOUBLE, explore_offset_min DOUBLE, predicted_peak_c DOUBLE, minutes_to_target_0_3 DOUBLE, valve_over_50_min DOUBLE, model_version VARCHAR)";
+const MEASURED_VIEW: &str = "CREATE OR REPLACE VIEW step_responses_measured AS SELECT * FROM step_responses WHERE mode = 'measured'";
 
 #[derive(Clone, Debug, Default)]
 pub struct Minute {
@@ -75,6 +77,15 @@ pub struct Step {
     pub others_heating: i32,
     pub exploration: bool,
     pub experiment_id: Option<String>,
+    pub variant: String,
+    pub mode: String,
+    pub planned_t_off: Option<f64>,
+    pub applied_t_off: Option<f64>,
+    pub explore_offset: Option<f64>,
+    pub predicted_peak: Option<f64>,
+    pub ttt_0_3: Option<f64>,
+    pub valve_over_50: Option<f64>,
+    pub model_version: Option<String>,
 }
 
 impl Step {
@@ -189,6 +200,11 @@ fn analyse(cx: &Env, series: &Series, idx: usize, next_start: usize, old: f64, n
         others_heating: others,
         exploration: transient.clone().any(|k| s[k].exploration),
         experiment_id: command.and_then(|c| c.experiment_id.clone()),
+        variant: BASELINE.into(),
+        mode: "measured".into(),
+        ttt_0_3: reached.map(|k| (k - idx) as f64),
+        valve_over_50: Some(transient.clone().filter(|&k| s[k].valve.is_some_and(|v| v > 50.0)).count() as f64),
+        ..Default::default()
     }
 }
 
@@ -261,6 +277,48 @@ fn first_nodes(conn: &Connection) -> Result<BTreeMap<String, u64>> {
     Ok(out)
 }
 
+fn boost_steps(conn: &Connection, from_us: i64, to_us: i64) -> Result<Vec<Step>> {
+    let nodes = first_nodes(conn)?;
+    let found = rows(conn, "SELECT detail FROM events WHERE kind = 'boost_cycle' AND detail IS NOT NULL ORDER BY ts", |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for text in found {
+        let Ok(d) = serde_json::from_str::<Json>(&text) else { continue };
+        let (Some(room), Some(start_ms), Some(variant), Some(mode)) = (d["room"].as_str(), d["start_ts_ms"].as_i64(), d["variant"].as_str(), d["mode"].as_str()) else { continue };
+        if d["status"].as_str() == Some("unavailable") || start_ms * 1000 < from_us || start_ms * 1000 >= to_us {
+            continue;
+        }
+        let f = |k: &str| d[k].as_f64();
+        out.push(Step {
+            room: room.into(),
+            node: nodes.get(room).copied().unwrap_or(0),
+            start_us: start_ms * 1000,
+            source: "boost".into(),
+            heat_up: true,
+            old: f("setpoint_old").unwrap_or(f64::NAN),
+            new: f("target").unwrap_or(f64::NAN),
+            start_temp: f("start_temp"),
+            time_to_target_min: f("minutes_to_target_0_3"),
+            overshoot_c: f("overshoot_c"),
+            outdoor: f("outdoor_temp"),
+            radiation: f("radiation"),
+            others_heating: d["others_heating"].as_i64().unwrap_or(0) as i32,
+            exploration: d["exploration"].as_bool().unwrap_or(false),
+            experiment_id: if mode == "live" { d["cycle_id"].as_str().map(String::from) } else { None },
+            variant: variant.into(),
+            mode: mode.into(),
+            planned_t_off: f("planned_t_off_min"),
+            applied_t_off: f("applied_t_off_min"),
+            explore_offset: f("explore_offset_min"),
+            predicted_peak: f("predicted_peak_c"),
+            ttt_0_3: f("minutes_to_target_0_3"),
+            valve_over_50: f("valve_over_50_min"),
+            model_version: d["model_version"].as_str().map(String::from),
+            ..Default::default()
+        });
+    }
+    Ok(out)
+}
+
 fn store(conn: &Connection, steps: &[Step]) -> Result<()> {
     conn.execute_batch(DDL)?;
     let mut app = conn.appender("step_responses")?;
@@ -288,7 +346,16 @@ fn store(conn: &Connection, steps: &[Step]) -> Result<()> {
             s.radiation,
             s.others_heating,
             s.exploration,
-            s.experiment_id
+            s.experiment_id,
+            s.variant,
+            s.mode,
+            s.planned_t_off,
+            s.applied_t_off,
+            s.explore_offset,
+            s.predicted_peak,
+            s.ttt_0_3,
+            s.valve_over_50,
+            s.model_version
         ])?;
     }
     app.flush()?;
@@ -301,9 +368,12 @@ pub fn open_dynamics(root: &Path, from: NaiveDate, to: NaiveDate) -> Result<Lake
     db.conn.execute_batch(&format!("SET VARIABLE from_us = {from_us}; SET VARIABLE to_us = {}; SET VARIABLE delta_to_us = {to_us};", to_us + TAIL_US))?;
     db.conn.execute_batch(ROOM_MINUTE_SQL).context("room_minute view")?;
     db.conn.execute_batch(ROOM_DELTA_SQL).context("room_delta views")?;
-    let steps = step_responses(&load_series(&db.conn)?, &load_commands(&db.conn)?, &first_nodes(&db.conn)?, to_us);
+    let mut steps = step_responses(&load_series(&db.conn)?, &load_commands(&db.conn)?, &first_nodes(&db.conn)?, to_us);
+    steps.retain(|s| s.source != "boost");
+    steps.extend(boost_steps(&db.conn, from_us, to_us)?);
     store(&db.conn, &steps)?;
-    db.conn.execute_batch(RADIATOR_SQL).context("radiator views")?;
+    db.conn.execute_batch(MEASURED_VIEW).context("measured view")?;
+    db.conn.execute_batch(&RADIATOR_SQL.replace("step_responses", "step_responses_measured")).context("radiator views")?;
     Ok(db)
 }
 
@@ -367,7 +437,7 @@ pub fn report_section(root: &Path, date: NaiveDate) -> Result<String> {
         c,
         &format!(
             "SELECT epoch_us(t_start), room, source, direction, step_c, start_temp, dead_time_min, rate_c_per_h, time_to_target_min, overshoot_c, valve_mean_pct, valve_max_pct, outdoor_temp, radiation, others_heating, exploration
-             FROM step_responses WHERE CAST(t_start AS DATE) = DATE '{date}' ORDER BY t_start, room"
+             FROM step_responses WHERE CAST(t_start AS DATE) = DATE '{date}' AND mode = 'measured' ORDER BY t_start, room"
         ),
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, (4..14).map(|i| r.get::<_, Option<f64>>(i)).collect::<duckdb::Result<_>>()?, r.get(14)?, r.get(15)?)),
     )?;
@@ -411,5 +481,42 @@ pub fn report_section(root: &Path, date: NaiveDate) -> Result<String> {
         }
         md.push_str("\nRelativ-Wert: Median des Verhaeltnisses der Aufheizrate je K Sprung gegen andere Raeume bei gleichzeitigem Sprung, aehnlicher Ventiloeffnung und Aussentemperatur. Abweichungen deuten auf hydraulischen Abgleich oder Vorlauftemperatur hin, sind aber nur ein erster Hinweis.\n\n");
     }
+    md.push_str(&boost_report(c)?);
+    Ok(md)
+}
+
+type BoostRow = (String, String, i64, Option<f64>, Option<f64>, Option<f64>);
+
+fn boost_report(c: &Connection) -> Result<String> {
+    let cfg = crate::config::Config::load(Path::new(&std::env::var("HEATD_CONFIG").unwrap_or_else(|_| "heatd.toml".into()))).map(|c| c.boost).unwrap_or_default();
+    let metrics = newest_bundle_dir(Path::new(&cfg.model_dir)).and_then(|(_, p)| std::fs::read_to_string(p.join("bundle.json")).ok()).and_then(|t| serde_json::from_str::<Json>(&t).ok()).map_or(Json::Null, |d| d["metrics"].clone());
+    let mut md = format!("### Aufheizen: baseline gegen grey_box und residual ({SUMMARY_DAYS} Tage)\n\nZiel: Raumluft-Spitze genau am Sollwert. baseline = Thermostat allein (gemessen), grey_box und residual = Schattenlauf (Prognose) bzw. live (gemessen). Spruenge ab 1 K; Ventil > 50 % in Minuten.\n\n");
+    let data: Vec<BoostRow> = rows(
+        c,
+        "SELECT room, variant, mode, count(*), avg(overshoot_c), avg(minutes_to_target_0_3), avg(valve_over_50_min) FROM step_responses WHERE direction = 'heat_up' AND step_c >= 1.0 GROUP BY room, variant, mode ORDER BY room, CASE variant WHEN 'baseline' THEN 0 WHEN 'grey_box' THEN 1 ELSE 2 END, mode",
+        |r| Ok((r.get::<_, String>(0)?, format!("{} / {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+    )?;
+    if data.is_empty() {
+        md.push_str("Keine Aufheizzyklen im Zeitraum.\n\n");
+        return Ok(md);
+    }
+    let days: BTreeMap<String, i64> = rows(c, "SELECT room, count(DISTINCT CAST(t_start AS DATE)) FROM step_responses WHERE mode = 'shadow' GROUP BY room", |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.into_iter().collect();
+    let live: BTreeMap<String, String> = rows(c, "SELECT DISTINCT room, variant FROM step_responses WHERE mode = 'live'", |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.into_iter().collect();
+    md.push_str("| Raum | Variante / Modus | Zyklen | mittl. Ueberschwingen K | bis Ziel min | Ventil > 50 % min | Backtest RMSE K | Live-Status |\n|---|---|---|---|---|---|---|---|\n");
+    for (room, label, n, over, ttt, v50) in data {
+        let variant = label.split(" / ").next().unwrap_or_default();
+        let key = [room.clone(), format!("{room}_0")].into_iter().find(|k| metrics["backtest"][k.as_str()].is_object()).unwrap_or_else(|| room.clone());
+        let rmse = if variant == BASELINE { None } else { backtest(&metrics, &key, variant).0 };
+        let status = if variant == BASELINE {
+            "-".to_string()
+        } else if live.get(&room).is_some_and(|v| v == variant) {
+            "live".to_string()
+        } else {
+            let left = (cfg.live_gate_days as i64 - days.get(&room).copied().unwrap_or(0)).max(0);
+            if left == 0 { "Gate erfuellt".to_string() } else { format!("Schatten, noch {left} Tage") }
+        };
+        let _ = writeln!(md, "| {room} | {label} | {n} | {} | {} | {} | {} | {status} |", de(over, 2), de(ttt, 0), de(v50, 0), de(rmse, 3));
+    }
+    md.push('\n');
     Ok(md)
 }

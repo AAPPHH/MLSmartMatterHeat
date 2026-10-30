@@ -226,6 +226,52 @@ impl Default for WatchMatchSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct BoostSection {
+    pub enabled: bool,
+    pub auto_live: bool,
+    pub live_gate_days: usize,
+    pub live_min_backtest_cycles: usize,
+    pub live_rooms_override: Vec<String>,
+    pub explore_min: f64,
+    pub model_dir: String,
+    pub reload_min: f64,
+    pub boost_setpoint: f64,
+    pub min_rise_k: f64,
+    pub hold_min: f64,
+    pub max_cycle_min: f64,
+    pub noise_r: f64,
+    pub q_r: f64,
+    pub q_a: f64,
+    pub p0: f64,
+    pub seed: Option<u64>,
+}
+
+impl Default for BoostSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_live: true,
+            live_gate_days: 7,
+            live_min_backtest_cycles: 3,
+            live_rooms_override: Vec::new(),
+            explore_min: 10.0,
+            model_dir: "/models/thermal".into(),
+            reload_min: 5.0,
+            boost_setpoint: 28.0,
+            min_rise_k: 1.0,
+            hold_min: 30.0,
+            max_cycle_min: 240.0,
+            noise_r: 0.15,
+            q_r: 0.5,
+            q_a: 0.05,
+            p0: 1.0,
+            seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct WindowSection {
     pub enabled: bool,
     pub window_slope_min: f64,
@@ -326,6 +372,7 @@ pub struct Config {
     pub poll_silence_s: u64,
     pub watchmatch: WatchMatchSection,
     pub window: WindowSection,
+    pub boost: BoostSection,
 }
 
 impl Default for Config {
@@ -366,6 +413,7 @@ impl Default for Config {
             poll_silence_s: 60,
             watchmatch: WatchMatchSection::default(),
             window: WindowSection::default(),
+            boost: BoostSection::default(),
         }
     }
 }
@@ -402,6 +450,9 @@ impl Config {
         config.watchmatch.state.sleep_minutes()?;
         if let Some(since) = &config.watchmatch.labels_since {
             chrono::DateTime::parse_from_rfc3339(since).map_err(|e| anyhow!("watchmatch.labels_since: {e}"))?;
+        }
+        if let Some(unknown) = config.boost.live_rooms_override.iter().find(|r| !known(r)) {
+            return Err(anyhow!("boost.live_rooms_override: unknown room {unknown}"));
         }
         if let Some(unknown) = config.sleep_room.as_ref().filter(|r| !known(r)) {
             return Err(anyhow!("sleep_room: unknown room {unknown}"));

@@ -1,0 +1,74 @@
+{
+ "version": "20260101T000000Z",
+ "created": "2026-01-01T00:00:00Z",
+ "dt_s": 60,
+ "history_min": 60,
+ "lag_step_min": 5,
+ "rooms": {
+  "t": {
+   "physics": {
+    "room": "t",
+    "structure": "rc2",
+    "params": {
+     "a1": 2.0,
+     "a2": 3.0,
+     "b1": 0.5,
+     "b2": 0.1,
+     "b3": 0.01,
+     "b4": 0.2,
+     "w": 0.6,
+     "ts": 45.0,
+     "ts_night": 40.0,
+     "c_wall": 0.05,
+     "c_ceiling": 0.02
+    },
+    "valve_gain": 0.35,
+    "night_hours": [
+     22,
+     5
+    ],
+    "names": [],
+    "neighbours": {
+     "wall": 2,
+     "ceiling": 1
+    }
+   },
+   "sensor_offset_c": 0.4,
+   "valid": true
+  }
+ },
+ "room_index": [
+  "t"
+ ],
+ "latent": {
+  "file": "latent.onnx",
+  "features": [
+   "sensor_lag_0",
+   "phys_air",
+   "valve_lag_0",
+   "room_t"
+  ]
+ },
+ "residual": {
+  "file": "residual.onnx",
+  "features": [
+   "valve_lag_0",
+   "phys_sensor_pred",
+   "outdoor_c",
+   "room_t"
+  ]
+ },
+ "metrics": {
+  "backtest": {
+   "t": {
+    "cycles": 5,
+    "grey_box": {
+     "rmse": 0.3
+    },
+    "residual": {
+     "rmse": 0.2
+    }
+   }
+  }
+ }
+}

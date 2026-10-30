@@ -33,6 +33,7 @@ pub struct AppState {
     pub tracker: Arc<Mutex<Tracker>>,
     pub batch_seq: Arc<AtomicU64>,
     pub watchmatch: WatchMatch,
+    pub boost: crate::boost::Boost,
 }
 
 impl AppState {
@@ -597,7 +598,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                     })
                 })
                 .collect();
-            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "nodes": nodes})
+            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
         })
         .collect();
     Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?})))
@@ -781,6 +782,7 @@ mod tests {
             commanded: Default::default(),
             explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
             tracker: Default::default(),
+            boost: Default::default(),
             batch_seq: Arc::new(AtomicU64::new(1)),
         };
         Harness { state, mock, _dir: dir }
