@@ -535,7 +535,9 @@ data class MatchP(val room: String, val p: Float)
 
 data class Match(val room: String?, val p: Float, val abstained: Boolean, val reason: String?, val top: List<MatchP>)
 
-class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true, val match: Match? = null)
+data class Alert(val id: String, val title: String, val text: String)
+
+class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true, val match: Match? = null, val alert: Alert? = null)
 
 object MatchView {
     private val REASONS = mapOf(
@@ -601,13 +603,19 @@ object ReplyJson {
             .put("top", JSONArray().also { a -> it.top.forEach { t -> a.put(JSONObject().put("room", t.room).put("p", t.p.toDouble())) } }).toString()
     }
 
+    fun alert(o: JSONObject?): Alert? = o?.let {
+        val title = it.optString("title")
+        val text = it.optString("text")
+        if (title.isEmpty() && text.isEmpty()) null else Alert(it.optString("id", title + text), title, text)
+    }
+
     fun matchOf(text: String?): Match? = try { match(text?.let { JSONObject(it) }) } catch (e: Exception) { null }
 
     fun parse(text: String): Reply = try {
         val o = JSONObject(text)
         Reply(
             if (o.isNull("probability")) null else o.optDouble("probability").toFloat().takeIf { !it.isNaN() },
-            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms"), match(o.optJSONObject("match"))
+            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms"), match(o.optJSONObject("match")), alert(o.optJSONObject("alert"))
         )
     } catch (e: Exception) { Reply(null, emptyList(), emptyList(), false) }
 
@@ -1144,6 +1152,9 @@ class Store(private val ctx: Context) {
     var rejected: Int
         get() = sp.getInt("rejected", 0)
         set(v) = sp.edit().putInt("rejected", v).apply()
+    var alertId: String?
+        get() = sp.getString("alertId", null)
+        set(v) = sp.edit().also { if (v == null) it.remove("alertId") else it.putString("alertId", v) }.apply()
     var lastPromptAlertAt: Long
         get() = sp.getLong("lastPromptAlertAt", 0L)
         set(v) = sp.edit().putLong("lastPromptAlertAt", v).apply()
