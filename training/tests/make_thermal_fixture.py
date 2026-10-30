@@ -14,6 +14,7 @@ from test_thermal import simulate
 OUT = Path(__file__).resolve().parents[2] / "crates" / "heatd" / "testdata"
 VERSION = "20261030T000000Z"
 FIXED_T_OFF = (0, 10, 30)
+START_HOUR = 6.5
 
 
 def base_params(tcfg, **over):
@@ -83,19 +84,24 @@ def rollout_cases(cfg, tcfg, ctx, target=21.0):
     R = next(r for r in ctx["rooms"] if r.valid)
     ks = np.array([R.d.n // 2])
     x0, S0, V0 = origin_state(cfg, R, ks)
-    x0[:], S0[:], V0[:] = 17.0, 17.0, 0.0
-    env = env_from(R, ks, cfg["horizon_min"])
-    env["others"][:] = 1.0
+    x0[:] = [[17.2, 16.9]]
+    S0[:] = 17.0 + 0.02 * np.arange(S0.shape[1])
+    V0[:] = 0.0
+    V0[0, 90:120] = 0.8
     H = cfg["horizon_min"]
+    hour = START_HOUR + np.arange(H)[None, :] / 60.0
+    const = lambda v: np.full((1, H), float(v))
+    env = {"tout": const(6.0), "wind": const(3.0), "rad": const(40.0), "night": (np.floor(hour) % 24 >= tcfg["night_hours"][0]) | (np.floor(hour) % 24 < tcfg["night_hours"][1]), "hour": hour, "others": const(1.0),
+           "nb": {k: (const(1.0), const(19.0)) for k in R.d.nb}, "amb": {"ambient_nvme_c": const(41.5), "ambient_pkg_w": const(7.2)}}
     for variant, kw in (("grey_box", {}), ("residual", {"latent": nets["latent"], "residual": nets["residual"]})):
         r = optimum_start(cfg, tcfg, R.doc, R.name, ctx["names"], x0, S0, V0, env, target, **kw)
         fixed = []
         for T in FIXED_T_OFF:
             o = rollout(cfg, tcfg, R.doc, R.name, ctx["names"], x0, S0, V0, env, boost_policy(np.array([float(T)]), target, R.doc["valve_gain"]), H, **kw)
             fixed.append({"t_off_min": T, "peak": o["air"].max(), "air": o["air"][0], "sensor": o["sensor"][0], "u": o["u"][0]})
-        out.append({"variant": variant, "room": R.name, "target": target, "boost_setpoint": cfg["boost_setpoint"], "horizon_min": H, "toff_max": cfg["toff_max"], "overshoot_tol": cfg["overshoot_tol"], "feedback": cfg["residual_feedback"],
-                    "x0": x0[0], "S0": S0[0], "V0": V0[0], "env": {"tout": env["tout"][0], "wind": env["wind"][0], "rad": env["rad"][0], "night": env["night"][0], "hour": env["hour"][0], "others": env["others"][0],
-                                                                  "nb": {k: [n[0], s[0]] for k, (n, s) in env["nb"].items()}},
+        out.append({"variant": variant, "room": R.name, "target": target, "horizon_min": H, "toff_max": cfg["toff_max"], "overshoot_tol": cfg["overshoot_tol"], "feedback": cfg["residual_feedback"],
+                    "x0": x0[0], "S0": S0[0], "V0": V0[0], "start_hour": START_HOUR,
+                    "env": {"tout": 6.0, "wind": 3.0, "rad": 40.0, "others": 1.0, "nb": {k: [1.0, 19.0] for k in R.d.nb}, "ambient": [41.5, 7.2, None]},
                     "t_off_min": r["t_off_min"], "predicted_peak_c": r["predicted_peak_c"], "air": r["air"], "sensor": r["sensor"], "peaks": r["peaks"], "fixed": fixed})
     return out
 
@@ -113,8 +119,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         out, bundle, ctx = build_bundle(conf, rooms, {}, Path(tmp), version=VERSION)
         cfg = dict(ctx["cfg"], residual_feedback=0.5)
-        dst = OUT / "thermal_bundle"
-        shutil.rmtree(dst, ignore_errors=True)
+        shutil.rmtree(OUT / "thermal_bundle", ignore_errors=True)
+        dst = OUT / "thermal_bundle" / VERSION
         dst.mkdir(parents=True)
         for f in ("bundle.json", "latent.onnx", "residual.onnx"):
             shutil.copy(out / f, dst / f)
@@ -122,7 +128,7 @@ def main():
         bj["residual"]["feedback"] = cfg["residual_feedback"]
         (dst / "bundle.json").write_text(json.dumps(bj, indent=1))
         phys, rc2, rc1 = physics_cases(tcfg)
-        fx = {"tol": 1e-4, "bundle_dir": "thermal_bundle", "dt_s": 60, "physics": phys, "kalman": kalman_cases(tcfg, rc2, rc1), "features": feature_cases(cfg, ctx, out, np.random.default_rng(0)),
+        fx = {"tol": 1e-4, "bundle_dir": f"thermal_bundle/{VERSION}", "dt_s": 60, "physics": phys, "kalman": kalman_cases(tcfg, rc2, rc1), "features": feature_cases(cfg, ctx, out, np.random.default_rng(0)),
               "rollouts": rollout_cases(cfg, tcfg, ctx)}
     (OUT / "thermal_ml_parity.json").write_text(json.dumps(jsonable(fx), indent=None, separators=(",", ":")))
 

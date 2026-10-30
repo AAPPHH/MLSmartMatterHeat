@@ -117,13 +117,16 @@ def test_ambient_loader_empty(tmp_path):
 def test_parity_fixture_in_repo():
     root = Path(__file__).resolve().parents[2] / "crates" / "heatd" / "testdata"
     fx = json.loads((root / "thermal_ml_parity.json").read_text())
-    b = json.loads((root / "thermal_bundle" / "bundle.json").read_text())
+    bundle = root / fx["bundle_dir"]
+    b = json.loads((bundle / "bundle.json").read_text())
+    assert bundle.parent.name == "thermal_bundle" and bundle.name == b["version"]
     assert {c["structure"] for c in fx["physics"]} == {"rc1", "rc2"} and {c["night"] for c in fx["physics"]} == {True, False}
     assert fx["features"] and all(len(f["residual_vector"]) == len(b["residual"]["features"]) for f in fx["features"])
     for r in fx["rollouts"]:
         peaks = np.array(r["peaks"])
         assert r["t_off_min"] == choose_t_off(peaks, np.arange(len(peaks)), r["target"], r["overshoot_tol"]) and len(r["air"]) == r["horizon_min"]
-    assert (root / "thermal_bundle" / b["latent"]["file"]).is_file()
+        assert len(peaks) == r["toff_max"] + 1 and r["feedback"] == b["residual"]["feedback"]
+    assert (bundle / b["latent"]["file"]).is_file()
 
 
 def test_grey_box_backtest_is_held_out(built):

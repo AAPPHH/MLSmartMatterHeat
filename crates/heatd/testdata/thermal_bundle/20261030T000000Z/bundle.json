@@ -1,6 +1,6 @@
 {
  "version": "20261030T000000Z",
- "created": "2026-10-30T09:03:21+00:00",
+ "created": "2026-10-30T09:42:45+00:00",
  "dt_s": 60,
  "history_min": 60,
  "lag_step_min": 5,
@@ -690,25 +690,25 @@
    }
   },
   "latent": {
-   "label_rmse_test": 2.181559205111893,
-   "kalman_agreement_rmse_test": 4.835581992271991,
-   "kalman_agreement_rmse_hot_test": 5.2242755186159515
+   "label_rmse_test": 2.181481491915639,
+   "kalman_agreement_rmse_test": 4.839308560920582,
+   "kalman_agreement_rmse_hot_test": 5.242253133144011
   },
   "backtest": {
    "wohnzimmer": {
-    "grey_box": 0.22224323230151388,
-    "residual": 0.22224323230151388,
-    "grey_box_air": 0.07961164864505223,
-    "residual_air": 0.7087799894314435,
+    "grey_box": 0.2405926297516356,
+    "residual": 0.2405926297516356,
+    "grey_box_air": 0.11249943517506879,
+    "residual_air": 0.7127156645386779,
     "cycles": 9,
     "days": 5.0,
     "in_sample": false
    },
    "schlafzimmer": {
-    "grey_box": 0.26360571920373654,
-    "residual": 0.26360571920373654,
-    "grey_box_air": 0.08675225791106102,
-    "residual_air": 0.7017929445577822,
+    "grey_box": 0.27084548703360506,
+    "residual": 0.27084548703360506,
+    "grey_box_air": 0.09730066823035513,
+    "residual_air": 0.6829034992458208,
     "cycles": 8,
     "days": 5.0,
     "in_sample": false
