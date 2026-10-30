@@ -265,7 +265,7 @@ def kalman(p, d, struct, cfg, collect=False):
             ss.append(s)
         if collect:
             xs.append((x1, x2))
-            ps.append(p22)
+            ps.append((p11, p12, p22) if collect == "full" else p22)
         a11, a12, a21, a22 = A11[k], A12[k], A21[k], A22[k]
         t11, t12 = a11 * p11 + a12 * p12, a11 * p12 + a12 * p22
         t21, t22 = a21 * p11 + a22 * p12, a21 * p12 + a22 * p22
