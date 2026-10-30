@@ -9,7 +9,7 @@ Pop-Location
 Push-Location "$PSScriptRoot\br"
 $Build = "build-$Variant"
 $TokenFile = Join-Path $PSScriptRoot "../secrets/br_watchdog_token"
-if (Test-Path $TokenFile) { Set-Content -Path "sdkconfig.$Variant.token.local" -Value ('CONFIG_BR_WATCHDOG_TOKEN="' + (Get-Content $TokenFile -Raw).Trim() + '"') -Encoding ascii }
+if (Test-Path $TokenFile) { Set-Content -Path "sdkconfig.$Variant.token.local" -Value ('CONFIG_BR_WATCHDOG_TOKEN="' + (Get-Content $TokenFile -Raw).Trim() + '"') -Encoding ascii } else { Remove-Item -Force -ErrorAction SilentlyContinue "sdkconfig.$Variant.token.local" }
 $IdfArgs = @("-B", $Build, "-DSDKCONFIG=$Build/sdkconfig", "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.$Variant$(if (Test-Path "sdkconfig.$Variant.local") { ";sdkconfig.$Variant.local" })$(if (Test-Path "sdkconfig.$Variant.token.local") { ";sdkconfig.$Variant.token.local" })")
 if (Test-Path $Build) { Remove-Item -Recurse -Force $Build }
 idf.py @IdfArgs set-target esp32s3; Step "br set-target"

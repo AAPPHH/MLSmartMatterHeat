@@ -1,10 +1,17 @@
 #include "watchdog.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/param.h>
 #include "driver/temperature_sensor.h"
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_openthread.h"
+#include "esp_openthread_lock.h"
+#include "esp_system.h"
+#include "openthread/thread.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -24,6 +31,10 @@
 #define NVS_KEY_CREDS "creds"
 #define CFG_MAGIC 0x57443031u
 #define BODY_MAX 4096
+#define STATUS_MAX 2048
+#define OTA_CHUNK 4096
+#define OTA_VALIDATE_GOOD_S 60
+#define OTA_VALIDATE_DEADLINE_S 600
 #define HDR_TOKEN "X-Heatd-Token"
 
 typedef struct {
@@ -37,6 +48,7 @@ static bool s_have_creds;
 static SemaphoreHandle_t s_lock;
 static temperature_sensor_handle_t s_tsens;
 static httpd_handle_t s_httpd;
+static volatile uint32_t s_ticks;
 
 static uint32_t uptime_s(void)
 {
@@ -157,13 +169,16 @@ static esp_err_t heartbeat_handler(httpd_req_t *req)
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char out[768];
+    char *out = malloc(STATUS_MAX);
+    if (!out) return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"err\":\"oom\"}");
     double c = 0;
     bool have = read_temp(&c);
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    wd_status_json(&s_state, uptime_s(), have, c, fw_version(), WD_MATTER_BUILT && s_have_creds, out, sizeof(out));
+    size_t n = wd_status_json(&s_state, uptime_s(), have, c, fw_version(), WD_MATTER_BUILT && s_have_creds, out, STATUS_MAX);
     xSemaphoreGive(s_lock);
-    return send_json(req, "200 OK", out);
+    esp_err_t r = n < STATUS_MAX ? send_json(req, "200 OK", out) : send_json(req, "500 Internal Server Error", "{\"ok\":false,\"err\":\"status_size\"}");
+    free(out);
+    return r;
 }
 
 static esp_err_t mode_handler(httpd_req_t *req)
@@ -236,12 +251,111 @@ static esp_err_t ambient_handler(httpd_req_t *req)
     return send_json(req, "200 OK", out);
 }
 
+static esp_err_t heap_handler(httpd_req_t *req)
+{
+    char out[128];
+    snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u}", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    return send_json(req, "200 OK", out);
+}
+
+static volatile bool s_ota_busy;
+
+static void reboot_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
+static esp_err_t ota_fail(httpd_req_t *req, const char *status, const char *err)
+{
+    char out[64];
+    snprintf(out, sizeof(out), "{\"ok\":false,\"err\":\"%s\"}", err);
+    s_ota_busy = false;
+    return send_json(req, status, out);
+}
+
+static esp_err_t ota_handler(httpd_req_t *req)
+{
+    if (!authorized(req)) return ESP_OK;
+    if (s_ota_busy) return send_json(req, "409 Conflict", "{\"ok\":false,\"err\":\"busy\"}");
+    s_ota_busy = true;
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part || req->content_len == 0 || req->content_len > part->size) return ota_fail(req, "400 Bad Request", part ? "size" : "no_slot");
+    char *buf = malloc(OTA_CHUNK);
+    if (!buf) return ota_fail(req, "500 Internal Server Error", "oom");
+    esp_ota_handle_t h;
+    if (esp_ota_begin(part, req->content_len, &h) != ESP_OK) {
+        free(buf);
+        return ota_fail(req, "500 Internal Server Error", "begin");
+    }
+    size_t got = 0;
+    const char *err = NULL;
+    while (got < req->content_len && !err) {
+        int r = httpd_req_recv(req, buf, MIN(OTA_CHUNK, req->content_len - got));
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) err = "recv";
+        else if (esp_ota_write(h, buf, (size_t)r) != ESP_OK) err = "write";
+        else got += (size_t)r;
+    }
+    free(buf);
+    if (err) {
+        esp_ota_abort(h);
+        return ota_fail(req, "400 Bad Request", err);
+    }
+    if (esp_ota_end(h) != ESP_OK) return ota_fail(req, "400 Bad Request", "image_invalid");
+    esp_app_desc_t nd;
+    if (esp_ota_get_partition_description(part, &nd) != ESP_OK || strcmp(nd.project_name, esp_app_get_description()->project_name) != 0) return ota_fail(req, "400 Bad Request", "wrong_project");
+    if (esp_ota_set_boot_partition(part) != ESP_OK) return ota_fail(req, "500 Internal Server Error", "set_boot");
+    ESP_LOGW(TAG, "ota: %u bytes written to %s, version %s, rebooting", (unsigned)got, part->label, nd.version);
+    char out[128];
+    snprintf(out, sizeof(out), "{\"ok\":true,\"bytes\":%u,\"slot\":\"%s\",\"version\":\"%s\"}", (unsigned)got, part->label, nd.version);
+    esp_err_t sr = send_json(req, "200 OK", out);
+    xTaskCreate(reboot_task, "ota_reboot", 2048, NULL, 5, NULL);
+    return sr;
+}
+
+static bool thread_attached(void)
+{
+    otInstance *inst = esp_openthread_get_instance();
+    if (!inst || !esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) return false;
+    otDeviceRole role = otThreadGetDeviceRole(inst);
+    esp_openthread_lock_release();
+    return role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER;
+}
+
+static void validate_task(void *arg)
+{
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) != ESP_OK || st != ESP_OTA_IMG_PENDING_VERIFY) {
+        vTaskDelete(NULL);
+        return;
+    }
+    uint32_t good = 0, last_ticks = s_ticks;
+    for (uint32_t t = 0; t < OTA_VALIDATE_DEADLINE_S; t++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        bool ok = s_ticks != last_ticks && s_httpd && thread_attached();
+        last_ticks = s_ticks;
+        good = ok ? good + 1 : 0;
+        if (good >= OTA_VALIDATE_GOOD_S) {
+            esp_ota_mark_app_valid_cancel_rollback();
+            ESP_LOGW(TAG, "ota: new image marked valid");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    ESP_LOGE(TAG, "ota: new image never reached watchdog + Thread for %us, rolling back", OTA_VALIDATE_GOOD_S);
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+    vTaskDelete(NULL);
+}
+
 static const httpd_uri_t s_uris[] = {
     {.uri = "/watchdog/heartbeat", .method = HTTP_POST, .handler = heartbeat_handler},
     {.uri = "/watchdog/status", .method = HTTP_GET, .handler = status_handler},
     {.uri = "/watchdog/mode", .method = HTTP_POST, .handler = mode_handler},
     {.uri = "/watchdog/credentials", .method = HTTP_POST, .handler = credentials_handler},
     {.uri = "/ambient", .method = HTTP_GET, .handler = ambient_handler},
+    {.uri = "/ota", .method = HTTP_POST, .handler = ota_handler},
+    {.uri = "/watchdog/heap", .method = HTTP_GET, .handler = heap_handler},
 };
 #define URI_COUNT (sizeof(s_uris) / sizeof(s_uris[0]))
 
@@ -277,20 +391,31 @@ static void watchdog_task(void *arg)
 {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        wd_creds_t *cr = NULL;
         xSemaphoreTake(s_lock, portMAX_DELAY);
         uint32_t now = uptime_s();
         wd_action_t act = wd_tick(&s_state, now);
         wd_state_t snap = s_state;
-        bool have_creds = s_have_creds;
+        if (act.kind == WD_ACT_SEND && s_have_creds) {
+            cr = malloc(sizeof(*cr));
+            if (cr) memcpy(cr, &s_creds, sizeof(*cr));
+        }
         xSemaphoreGive(s_lock);
+        s_ticks++;
         if (act.kind == WD_ACT_TRIGGERED) {
             if (snap.cfg.armed) ESP_LOGW(TAG, "no heartbeat for %us: sending %.1f to %u nodes", (unsigned)snap.cfg.timeout_s, snap.cfg.setpoint_cc / 100.0, (unsigned)snap.cfg.node_count);
             else log_dry_run(&snap);
         }
         if (act.kind != WD_ACT_SEND) continue;
         char err[WD_ERR_LEN] = "";
-        esp_err_t r = have_creds ? wd_matter_write_setpoint(&s_creds, snap.cfg.nodes[act.node_idx], snap.cfg.endpoint, snap.cfg.setpoint_cc, err, sizeof(err)) : ESP_ERR_INVALID_STATE;
-        if (!have_creds) strlcpy(err, "no_credentials", sizeof(err));
+        esp_err_t r = ESP_ERR_INVALID_STATE;
+        if (cr) {
+            r = wd_matter_write_setpoint(cr, snap.cfg.nodes[act.node_idx], snap.cfg.endpoint, snap.cfg.setpoint_cc, err, sizeof(err));
+            memset(cr, 0, sizeof(*cr));
+            free(cr);
+        } else {
+            strlcpy(err, "no_credentials", sizeof(err));
+        }
         xSemaphoreTake(s_lock, portMAX_DELAY);
         wd_report(&s_state, act.node_idx, r == ESP_OK, err, uptime_s());
         xSemaphoreGive(s_lock);
@@ -312,5 +437,6 @@ void br_watchdog_start(void)
     if (strlen(CONFIG_BR_WATCHDOG_TOKEN) == 0) ESP_LOGE(TAG, "BR_WATCHDOG_TOKEN empty: all watchdog writes are rejected");
     start_http();
     xTaskCreate(watchdog_task, "br_watchdog", 6144, NULL, 4, NULL);
+    xTaskCreate(validate_task, "ota_validate", 3072, NULL, 3, NULL);
     ESP_LOGI(TAG, "started: mode %s, timeout %us, creds %s", cfg.armed ? "armed" : "dry_run", (unsigned)cfg.timeout_s, s_have_creds ? "present" : "absent");
 }

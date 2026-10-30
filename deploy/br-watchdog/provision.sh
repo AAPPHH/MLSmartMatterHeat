@@ -96,7 +96,9 @@ make_credentials() {
     openssl ec -in "$WORK/ctl_key.pem" -outform DER -out "$WORK/ctl_key.der" 2>/dev/null
     cert convert-cert -x rcac.der rcac.hex
     cert convert-cert -x icac.der icac.hex
-    cert gen-cert --type n --subject-chip-id "$nid" --subject-fab-id "$fab" --ca-key "$(ec_der_hex "$WORK/ica_key.bin")" --ca-cert icac.der --key ctl_key.pem --lifetime 4294967295 --out noc.hex --out-format chip-hex
+    ec_der_hex "$WORK/ica_key.bin" > "$WORK/ica_key.hex"
+    chmod 600 "$WORK/ica_key.hex"
+    cert gen-cert --type n --subject-chip-id "$nid" --subject-fab-id "$fab" --ca-key ica_key.hex --ca-cert icac.der --key ctl_key.pem --lifetime 4294967295 --out noc.hex --out-format chip-hex
     cert convert-cert -p noc.hex noc_check.pem
     cert convert-cert -p rcac.der rcac.pem
     cert convert-cert -p icac.der icac.pem
