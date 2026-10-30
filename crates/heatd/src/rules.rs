@@ -448,6 +448,52 @@ pub fn clamp_setpoint(readings: &[Reading], node: u64, setpoint: f64) -> f64 {
     setpoint.clamp(lo, hi)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now: NaiveDateTime, now_ms: i64, window_busy: &HashSet<String>, away: bool, exploring: &HashMap<String, Experiment>) {
+    if !state.boost.enabled() {
+        return;
+    }
+    let held = |room: &Room| state.commanded.lock().unwrap().holding(&room.nodes);
+    let rooms: Vec<crate::boost::RoomIn> = state
+        .config
+        .rooms
+        .iter()
+        .filter_map(|room| {
+            let want = wants.iter().find(|w| w.room == room.name)?;
+            let blocked = if window_busy.contains(&room.name) {
+                Some("window_open")
+            } else if away {
+                Some("away")
+            } else if held(room) {
+                Some("manual_hold")
+            } else if exploring.contains_key(&room.name) {
+                Some("exploration")
+            } else {
+                None
+            };
+            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked })
+        })
+        .collect();
+    let now_us = lake::now_us();
+    let out = state.boost.step(&crate::boost::StepIn { now_ms, hour: f64::from(now.hour()) + f64::from(now.minute()) / 60.0, outdoor: state.status.outdoor(now_us), radiation: state.status.radiation(now_us), rooms: &rooms });
+    out.events.into_iter().for_each(|e| log("boost event", state.sink.append(e)));
+    for want in wants.iter_mut() {
+        match out.directives.get(&want.room) {
+            Some(crate::boost::Directive::Boost { experiment_id }) => {
+                want.setpoint = clamp_setpoint(readings, want.node, state.config.boost.boost_setpoint);
+                want.reason = "boost";
+                want.rule = "boost";
+                want.experiment_id = Some(experiment_id.clone());
+            }
+            Some(crate::boost::Directive::Switch) => {
+                want.reason = "boost_off";
+                want.rule = "boost";
+            }
+            None => {}
+        }
+    }
+}
+
 pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> Result<Vec<Desired>> {
     for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes) {
         log("presence event", state.sink.append(presence_event(&device, transition)));
@@ -485,7 +531,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         log("occupancy event", state.sink.append(lake::Event { ts: to * 1000, ..event }));
     }
     let readings = state.latest.all();
-    let wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint), ..w }).collect();
+    let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint), ..w }).collect();
+    boost_step(state, &mut wants, &readings, now, now_ms, &window_busy, away, &exploring);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
     };
@@ -515,7 +562,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                 continue;
             }
             let last_write = commands.last_write.get(&want.node).copied();
-            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration");
+            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off");
             let bypass = hold_ended || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
             if !bypass && last_write.is_some_and(|(t, _)| now_ms - t < interval_ms) {
                 if commands.deferred.get(&want.node).is_none_or(|d| (d - want.setpoint).abs() >= DESIRED_EPS_C) {
@@ -591,6 +638,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
 pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
     if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND].contains(&report.attribute.as_str()) {
         state.windows.lock().unwrap().observe(&state.config, report.node, &report.attribute, report.value, now_ms);
+        state.boost.observe(report.node, &report.attribute, report.value, now_ms);
         return;
     }
     if report.attribute != OCCUPIED_HEATING_SETPOINT.snake {

@@ -73,6 +73,7 @@ struct Inner {
     weather_ok_us: Option<i64>,
     weather_rows: u64,
     outdoor: Option<(i64, f64, Option<f64>)>,
+    radiation: Option<(i64, f64)>,
     last_roll: Option<(i64, bool)>,
 }
 
@@ -122,6 +123,14 @@ impl Status {
 
     pub fn outdoor_obs(&self, ts_us: i64, temp_c: f64, wind_ms: Option<f64>) {
         self.0.lock().unwrap().outdoor = Some((ts_us, temp_c, wind_ms));
+    }
+
+    pub fn radiation_obs(&self, ts_us: i64, wm2: Option<f64>) {
+        self.0.lock().unwrap().radiation = wm2.map(|v| (ts_us, v));
+    }
+
+    pub fn radiation(&self, now_us: i64) -> Option<f64> {
+        self.0.lock().unwrap().radiation.filter(|o| now_us - o.0 <= OUTDOOR_MAX_AGE_US).map(|o| o.1)
     }
 
     pub fn outdoor(&self, now_us: i64) -> Option<(f64, Option<f64>)> {
