@@ -25,7 +25,7 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 
 Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `2`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
 
-Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
+Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
 
 ## Hot path (raw Arrow IPC streams)
 
@@ -293,6 +293,21 @@ key: dict<utf8>
 value: utf8
 valid_from: timestamp[us,UTC]
 ```
+
+### ambient
+
+Producer: `POST /api/ambient` (Minix collector `deploy/ambient/ambient.py`, optional Border Router HTTP source). Proxies for the unmeasured ambient/heat-load of the house (device temperatures and power), used as features by the thermal model. Partitioned by date.
+
+```schema ambient
+ts: timestamp[us,UTC]
+source: dict<utf8>
+sensor: dict<utf8>
+value: f64
+unit: dict<utf8>
+```
+
+- `source`: `minix` or `br`. `sensor`: `nvme_c` (NVMe temperature), `pkg_w` (CPU package power, mean over the sample interval), `die_c` (ESP32-S3 die temperature, Border Router; see `docs/ambient-sources.md` for the firmware gap). `unit`: `C`, `W`. One row per reading; `ts` is the sample time sent by the collector.
+- `POST /api/ambient` body `{"source": "minix", "ts": <epoch ms>, "readings": [{"sensor": "nvme_c", "value": 41.0, "unit": "C"}]}` returns `{"stored": n}`. Rejected with 400: unknown `source`, empty `readings`, more than 32 readings, `sensor` not matching `^[a-z0-9_]{1,16}$`, `unit` not 1..8 ASCII alphanumeric characters, non-finite `value`, `ts` more than 1 day in the future or 30 days in the past.
 
 ## Abweichungen
 

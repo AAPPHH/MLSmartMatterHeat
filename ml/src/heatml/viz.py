@@ -1,7 +1,10 @@
-from datetime import datetime
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import duckdb
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.cluster import HDBSCAN
 from heatml.data import Snapshot
 
@@ -62,4 +65,122 @@ def build(snapshot, out, config=VIZ):
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     Embedding(Snapshot(snapshot).scans(labelled_only=False), config).fit().figure().write_html(out, include_plotlyjs=True)
+    return out
+
+
+USAGE = {
+    "valve_cluster": 513, "valve_attribute": 8, "max_age_min": 6, "low_pct": 10.0, "high_pct": 50.0,
+    "palette": ["#E8710A", "#6CB4FF", "#F5C542", "#B48CFF", "#4DD0B5", "#F28BB4", "#9BD45A", "#FF6B6B"],
+    "heat_scale": "YlOrRd",
+}
+
+
+class HeatingUsage:
+    def __init__(self, lake_dir, config=USAGE):
+        self.lake, self.config = Path(lake_dir), config
+        self.rooms = self.room_nodes()
+        self.minutes = self.valve_minutes()
+
+    def parquet(self, table):
+        files = sorted(self.lake.glob(f"parquet/{table}/date=*/**/part.parquet"))
+        return "[" + ", ".join("'" + f.as_posix().replace("'", "''") + "'" for f in files) + "]" if files else None
+
+    def query(self, sql):
+        con = duckdb.connect()
+        try:
+            return con.execute(sql).fetchall()
+        finally:
+            con.close()
+
+    def room_nodes(self):
+        files = self.parquet("meta")
+        if not files:
+            return {}
+        rows = self.query(f"SELECT arg_max(value, ts) FROM read_parquet({files}, union_by_name = true) WHERE key = 'rooms'")
+        rooms = json.loads(rows[0][0]) if rows and rows[0][0] else []
+        return {r["name"]: [int(n) for n in r.get("nodes", [])] for r in rooms if r.get("nodes")}
+
+    def valve_minutes(self):
+        files = self.parquet("attribute_reports")
+        if not files or not self.rooms:
+            return {}
+        c = self.config
+        rows = self.query(
+            f"SELECT node, epoch_us(ts) // 1000000, coalesce(v_f64, v_i64::DOUBLE) FROM read_parquet({files}, union_by_name = true, hive_partitioning = true) "
+            f"WHERE cluster = {c['valve_cluster']} AND attribute = {c['valve_attribute']} AND (v_f64 IS NOT NULL OR v_i64 IS NOT NULL) ORDER BY node, ts")
+        if not rows:
+            return {}
+        first = min(r[1] for r in rows) // 60
+        last = max(r[1] for r in rows) // 60 + c["max_age_min"] + 1
+        grid = (np.arange(first, last) + 1) * 60 - 1
+        per_node = {}
+        for node, ts, value in rows:
+            per_node.setdefault(node, ([], []))
+            per_node[node][0].append(ts)
+            per_node[node][1].append(value)
+        series = {}
+        for node, (ts, value) in per_node.items():
+            ts, value = np.array(ts), np.array(value, dtype=float)
+            idx = np.searchsorted(ts, grid, side="right") - 1
+            ok = (idx >= 0) & (grid - ts[np.maximum(idx, 0)] <= c["max_age_min"] * 60) & (value[np.maximum(idx, 0)] >= 0) & (value[np.maximum(idx, 0)] <= 100)
+            series[node] = np.where(ok, value[np.maximum(idx, 0)], np.nan)
+        out = {}
+        for room, nodes in self.rooms.items():
+            stack = np.array([series[n] for n in nodes if n in series])
+            if stack.size and not np.all(np.isnan(stack)):
+                count = (~np.isnan(stack)).sum(axis=0)
+                out[room] = (first, np.where(count > 0, np.nansum(stack, axis=0) / np.maximum(count, 1), np.nan))
+        return out
+
+    def days(self):
+        if not self.minutes:
+            return []
+        lo = min(first for first, _ in self.minutes.values())
+        hi = max(first + len(v) for first, v in self.minutes.values())
+        day = lambda m: datetime.fromtimestamp(m * 60, timezone.utc).date()
+        return [day(lo) + timedelta(days=i) for i in range((day(hi - 1) - day(lo)).days + 1)]
+
+    def tables(self):
+        days = self.days()
+        day_index = {d: i for i, d in enumerate(days)}
+        hours = {r: np.zeros((len(days), 24)) for r in self.minutes}
+        mins = {r: np.zeros((len(days), 2)) for r in self.minutes}
+        c = self.config
+        for room, (first, v) in self.minutes.items():
+            for i in np.flatnonzero(~np.isnan(v)):
+                t = datetime.fromtimestamp((first + int(i)) * 60, timezone.utc)
+                d = day_index.get(t.date())
+                if d is None:
+                    continue
+                hours[room][d, t.hour] += v[i] / 100 / 60
+                mins[room][d, 0] += v[i] > c["low_pct"]
+                mins[room][d, 1] += v[i] > c["high_pct"]
+        return days, hours, mins
+
+    def figure(self):
+        cfg = self.config
+        days, hours, mins = self.tables()
+        rooms = sorted(hours)
+        labels = [d.strftime("%d.%m.") for d in days]
+        total = sum((h.sum() for h in hours.values()), 0.0)
+        fig = make_subplots(rows=len(rooms) + 2, cols=1, specs=[[{"type": "xy"}]] * (len(rooms) + 1) + [[{"type": "table"}]],
+                            subplot_titles=["Ventilstunden je Tag und Heizkoerper"] + [f"{r}: Ventilstunden je Tag x Stunde (UTC)" for r in rooms] + ["Summen"],
+                            row_heights=[2] + [1] * len(rooms) + [1 + len(rooms) / 2], vertical_spacing=0.04)
+        for i, room in enumerate(rooms):
+            fig.add_trace(go.Bar(x=labels, y=hours[room].sum(axis=1), name=room, marker={"color": cfg["palette"][i % len(cfg["palette"])]}), row=1, col=1)
+            fig.add_trace(go.Heatmap(z=hours[room], x=list(range(24)), y=labels, colorscale=cfg["heat_scale"], zmin=0, zmax=1, colorbar={"title": "h", "len": 0.1} if i == 0 else None, showscale=i == 0,
+                                     hovertemplate="%{y} %{x}:00<br>%{z:.2f} Ventilstunden<extra>" + room + "</extra>"), row=i + 2, col=1)
+            fig.update_yaxes(type="category", autorange="reversed", row=i + 2, col=1)
+        fig.update_layout(barmode="stack")
+        rows = [[r, f"{hours[r].sum():.2f}", f"{mins[r][:, 0].sum():.0f}", f"{mins[r][:, 1].sum():.0f}", f"{100 * hours[r].sum() / total:.0f} %" if total else "-"] for r in rooms]
+        rows.append(["Haus gesamt", f"{total:.2f}", f"{sum(m[:, 0].sum() for m in mins.values()):.0f}", f"{sum(m[:, 1].sum() for m in mins.values()):.0f}", "100 %" if total else "-"])
+        fig.add_trace(go.Table(header={"values": ["Heizkoerper", "Ventilstunden", f"Min > {cfg['low_pct']:.0f} %", f"Min > {cfg['high_pct']:.0f} %", "Anteil Haus"]}, cells={"values": list(map(list, zip(*rows)))}), row=len(rooms) + 2, col=1)
+        fig.update_layout(title=f"Heizbetrieb · {len(days)} Tage · {len(rooms)} Heizkoerper · Ventilstunden = Summe PIHeatingDemand-Anteil x Zeit", template="plotly_dark", height=300 * (len(rooms) + 2), legend={"orientation": "h"})
+        return fig
+
+
+def build_usage(lake_dir, out, config=USAGE):
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    HeatingUsage(lake_dir, config).figure().write_html(out, include_plotlyjs=True)
     return out

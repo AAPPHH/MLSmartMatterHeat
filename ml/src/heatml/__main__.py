@@ -3,11 +3,13 @@ from collections import Counter
 from heatml.cluster import PlaceClusterer, SemiSupervisedRoom
 from heatml.data import REPO_ROOT, Snapshot
 from heatml.room import RoomClassifier
-from heatml.viz import build
+from heatml.viz import build, build_usage
 
 CONFIG = {
     "snapshot": None,
     "viz_out": REPO_ROOT / "data" / "umap3d.html",
+    "lake_dir": REPO_ROOT / "data" / "lake",
+    "usage_out": REPO_ROOT / "data" / "usage.html",
     "model_dir": REPO_ROOT / "models",
     "room": {
         "rssi_floor": -100.0, "rssi_span": 70.0,
@@ -64,14 +66,19 @@ def viz(config):
     print(build(config["snapshot"], config["viz_out"]))
 
 
-COMMANDS = {"train": train, "cluster": cluster, "viz": viz}
+def usage(config):
+    print(build_usage(config["lake_dir"], config["usage_out"]))
+
+
+COMMANDS = {"train": train, "cluster": cluster, "viz": viz, "usage": usage}
+ARGS = {"usage": ("lake_dir", "usage_out")}
 
 
 def main(argv):
     if len(argv) < 2 or argv[1] not in COMMANDS:
         sys.exit(f"usage: python -m heatml {{{'|'.join(COMMANDS)}}}")
     config = dict(CONFIG)
-    for key, value in zip(("snapshot", "viz_out"), argv[2:]):
+    for key, value in zip(ARGS.get(argv[1], ("snapshot", "viz_out")), argv[2:]):
         config[key] = value
     COMMANDS[argv[1]](config)
 

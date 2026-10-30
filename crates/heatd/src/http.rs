@@ -131,6 +131,8 @@ pub fn router(state: AppState) -> Router {
         .route("/watch/measurement", post(watch_measurement))
         .route("/watch/sensors", post(watch_sensors))
         .route("/watch/label", post(label))
+        .route("/api/ambient", post(ambient))
+        .route("/api/usage", get(usage))
         .with_state(state)
 }
 
@@ -666,6 +668,67 @@ async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> Ap
         eprintln!("labels: {e}");
     }
     Ok(Json(json!({"labelled": labelled})))
+}
+
+#[derive(Deserialize)]
+struct AmbientBody {
+    source: String,
+    ts: i64,
+    readings: Vec<AmbientReading>,
+}
+
+#[derive(Deserialize)]
+struct AmbientReading {
+    sensor: String,
+    value: f64,
+    unit: String,
+}
+
+const AMBIENT_SOURCES: [&str; 2] = ["minix", "br"];
+const AMBIENT_MAX_READINGS: usize = 32;
+const AMBIENT_FUTURE_MS: i64 = 86_400_000;
+const AMBIENT_PAST_MS: i64 = 30 * 86_400_000;
+
+async fn ambient(State(state): State<AppState>, Json(body): Json<AmbientBody>) -> ApiResult {
+    if !AMBIENT_SOURCES.contains(&body.source.as_str()) {
+        return Err(ApiError::bad("source must be minix or br"));
+    }
+    if body.readings.is_empty() || body.readings.len() > AMBIENT_MAX_READINGS {
+        return Err(ApiError::bad("readings must hold 1..32 entries"));
+    }
+    let now = now_ms();
+    if body.ts > now + AMBIENT_FUTURE_MS || body.ts < now - AMBIENT_PAST_MS {
+        return Err(ApiError::bad("ts out of range"));
+    }
+    for r in &body.readings {
+        let sensor_ok = (1..=16).contains(&r.sensor.len()) && r.sensor.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        let unit_ok = (1..=8).contains(&r.unit.len()) && r.unit.bytes().all(|b| b.is_ascii_alphanumeric());
+        if !sensor_ok || !unit_ok || !r.value.is_finite() {
+            return Err(ApiError::bad("reading needs sensor ^[a-z0-9_]{1,16}$, unit 1..8 alphanumeric characters and a finite value"));
+        }
+    }
+    let rows: Vec<lake::Ambient> = body.readings.into_iter().map(|r| lake::Ambient { ts: body.ts * 1000, source: body.source.clone(), sensor: r.sensor, value: r.value, unit: r.unit }).collect();
+    let stored = rows.len();
+    state.sink.append_many(rows)?;
+    Ok(Json(json!({"stored": stored})))
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    from: String,
+    to: String,
+}
+
+async fn usage(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<UsageQuery>) -> ApiResult {
+    let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| ApiError::bad("from and to must be YYYY-MM-DD"));
+    let (from, to) = (parse(&q.from)?, parse(&q.to)?);
+    if to < from || (to - from).num_days() > 92 {
+        return Err(ApiError::bad("range must satisfy from <= to and at most 93 days"));
+    }
+    state.sink.flush()?;
+    let root = state.sink.root().to_path_buf();
+    let result = tokio::task::spawn_blocking(move || crate::report::usage_json(&root, from, to)).await.map_err(anyhow::Error::from)??;
+    Ok(Json(result))
 }
 
 #[cfg(test)]
@@ -1900,5 +1963,48 @@ nodes = [5]
         assert_eq!(some(&column(&inference, "state")), ["rest", "offbody", "offbody"].map(String::from).to_vec());
         assert_eq!(some(&column(&inference, "result_room"))[0], "wohnzimmer");
         assert_eq!(some(&column(&inference, "reason"))[1], "unknown_state");
+    }
+
+    #[tokio::test]
+    async fn ambient_readings_are_validated_and_stored() {
+        let h = harness(false);
+        let now = now_ms();
+        let body = |source: &str, ts: i64, readings: Value| json!({"source": source, "ts": ts, "readings": readings}).to_string();
+        let good = json!([{"sensor": "nvme_c", "value": 41.5, "unit": "C"}, {"sensor": "pkg_w", "value": 3.25, "unit": "W"}]);
+        let (status, reply) = call(&h.state, "POST", "/api/ambient", Some(body("minix", now, good.clone()))).await;
+        assert_eq!((status, reply["stored"].clone()), (StatusCode::OK, json!(2)));
+        let rows = lake_rows(&h, "ambient");
+        assert_eq!(some(&column(&rows, "sensor")), vec!["nvme_c", "pkg_w"]);
+        assert_eq!(some(&column(&rows, "source")), vec!["minix", "minix"]);
+        assert_eq!(some(&column(&rows, "value")), vec!["41.5", "3.25"]);
+        assert_eq!(some(&column(&rows, "unit")), vec!["C", "W"]);
+        assert_eq!(some(&column(&rows, "ts"))[0], (now * 1000).to_string());
+        let bad_reading = |r: Value| body("minix", now, json!([r]));
+        let bad = [
+            body("pc", now, good.clone()),
+            body("minix", now, json!([])),
+            body("minix", now + 2 * 86_400_000, good.clone()),
+            body("minix", now - 31 * 86_400_000, good.clone()),
+            bad_reading(json!({"sensor": "Nvme C", "value": 1.0, "unit": "C"})),
+            bad_reading(json!({"sensor": "nvme_c", "value": 1.0, "unit": ""})),
+            body("minix", now, json!(vec![json!({"sensor": "a", "value": 1.0, "unit": "C"}); 33])),
+            "{\"source\":\"minix\"}".to_string(),
+        ];
+        for b in bad {
+            assert!(call(&h.state, "POST", "/api/ambient", Some(b.clone())).await.0.is_client_error(), "{b}");
+        }
+        assert_eq!(lake_rows(&h, "ambient").iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_validates_the_range_and_returns_the_structure() {
+        let h = harness(false);
+        assert_eq!(call(&h.state, "GET", "/api/usage?from=2026-10-20&to=2026-10-19", None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&h.state, "GET", "/api/usage?from=x&to=2026-10-19", None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&h.state, "GET", "/api/usage?from=2026-01-01&to=2026-10-19", None).await.0, StatusCode::BAD_REQUEST);
+        let (status, body) = call(&h.state, "GET", "/api/usage?from=2026-10-19&to=2026-10-20", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((body["from"].clone(), body["days"].clone()), (json!("2026-10-19"), json!([])));
+        assert_eq!(body["totals"]["house"]["valve_hours"], json!(0.0));
     }
 }

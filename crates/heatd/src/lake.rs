@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const COMMIT: &str = env!("HEATD_COMMIT");
 pub const ROW_GROUP_ROWS: usize = 65_536;
 pub const EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
@@ -83,10 +83,11 @@ pub enum Table {
     Meta,
     WatchSensors,
     WatchInference,
+    Ambient,
 }
 
 impl Table {
-    pub const ALL: [Table; 9] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference];
+    pub const ALL: [Table; 10] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference, Table::Ambient];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -99,6 +100,7 @@ impl Table {
             Table::Meta => "meta",
             Table::WatchSensors => "watch_sensors",
             Table::WatchInference => "watch_inference",
+            Table::Ambient => "ambient",
         }
     }
 
@@ -150,6 +152,7 @@ impl Table {
                 fld("confidence", DataType::Float32, false), fld("abstained", DataType::Boolean, false), fld("reason", dict(), true), fld("distance", DataType::Float32, true),
                 fld("state", dict(), false), fld("features_hash", DataType::Utf8, false), fld("model_version", dict(), false),
             ],
+            Table::Ambient => vec![tsf("ts", false), fld("source", dict(), false), fld("sensor", dict(), false), fld("value", DataType::Float64, false), fld("unit", dict(), false)],
         };
         let metadata = HashMap::from([("schema_version".to_string(), SCHEMA_VERSION.to_string()), ("heatd_commit".to_string(), COMMIT.to_string()), ("table".to_string(), self.name().to_string())]);
         Arc::new(Schema::new_with_metadata(fields, metadata))
@@ -502,6 +505,23 @@ impl Row for WatchSensor {
             ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.sensor_name)), prim::<Int32Type, _>(rows, |r| Some(r.android_type)), dict_col(rows, |r| r.vendor.as_deref()),
             prim::<Float32Type, _>(rows, |r| r.resolution), prim::<Float32Type, _>(rows, |r| r.max_range), dict_col(rows, |r| r.app_version.as_deref()),
         ];
+        Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ambient {
+    pub ts: i64,
+    pub source: String,
+    pub sensor: String,
+    pub value: f64,
+    pub unit: String,
+}
+
+impl Row for Ambient {
+    const TABLE: Table = Table::Ambient;
+    fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
+        let cols = vec![ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.source)), dict_col(rows, |r| Some(&r.sensor)), prim::<Float64Type, _>(rows, |r| Some(r.value)), dict_col(rows, |r| Some(&r.unit))];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }
 }

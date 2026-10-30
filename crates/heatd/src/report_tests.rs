@@ -411,3 +411,52 @@ fn daily_report_has_a_watch_section() {
     assert!(md.contains("Watch scans: 7 access-point rows"), "{md}");
     assert!((s.watch_battery_per_h.unwrap() - 20.0).abs() < 1e-6);
 }
+
+fn usage_lake(root: &Path) {
+    let clock = start() + 12 * HOUR_US;
+    let sink = Sink::open_with_clock(LakeConfig::new(root), Arc::new(move || clock)).unwrap();
+    write_meta(&sink, &config(), start()).unwrap();
+    for m in 0..1440 {
+        sink.append(attr(1, m, 513, 0, 2000)).unwrap();
+        let valve = match m {
+            120..=179 => 60,
+            180..=239 => 255,
+            300..=359 => 100,
+            _ => 0,
+        };
+        sink.append(attr(1, m, 513, 8, valve)).unwrap();
+        sink.append(attr(2, m, 513, 0, 1900)).unwrap();
+    }
+    for h in 0..24 {
+        sink.append(Weather { ts: start() + h * HOUR_US, kind: "obs".into(), fetched_ts: start() + h * HOUR_US + 300_000_000, temp_c: Some(5.0), ..Default::default() }).unwrap();
+    }
+    sink.roll_day(day()).unwrap();
+    sink.close().unwrap();
+}
+
+#[test]
+fn usage_counts_valve_hours_ignores_invalid_and_weights_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    usage_lake(dir.path());
+    let usage = usage(dir.path(), day(), day()).unwrap();
+    let a = &usage[&day()]["a"];
+    close(Some(a.valve_hours), 1.6);
+    close(Some(a.minutes_over_10), 120.0);
+    close(Some(a.minutes_over_50), 120.0);
+    close(Some(a.hourly[2]), 0.6);
+    close(Some(a.hourly[3]), 0.0);
+    close(Some(a.hourly[5]), 1.0);
+    close(Some(a.heat_proxy), 24.0);
+    assert_eq!(a.first_us, Some(start() + 120 * MIN));
+    assert_eq!(a.last_us, Some(start() + 359 * MIN));
+    let b = &usage[&day()]["b"];
+    assert_eq!((b.valve_hours, b.first_us), (0.0, None));
+    let md = usage_section(dir.path(), day()).unwrap();
+    assert!(md.contains("## Heizbetrieb") && md.contains("| a | 1.60 | 120 | 120 | 02:00 | 05:59 | 100 % |") && md.contains("Haus gesamt"), "{md}");
+    let json = usage_json(dir.path(), day(), day()).unwrap();
+    close(json["totals"]["house"]["valve_hours"].as_f64(), 1.6);
+    close(json["days"][0]["rooms"]["a"]["share_of_house"].as_f64(), 1.0);
+    assert_eq!(json["days"][0]["rooms"]["a"]["hourly_valve_hours"].as_array().unwrap().len(), 24);
+    assert_eq!(json["days"][0]["rooms"]["a"]["first"], "2026-10-20T02:00:00Z");
+    assert!(build(dir.path(), day()).unwrap().0.contains("## Heizbetrieb"));
+}

@@ -153,3 +153,47 @@ def test_viz_builds_umap(tmp_path, filled):
     from heatml.viz import build
     html = build(make_viz_db(tmp_path / "s.duckdb", filled), tmp_path / "d.html").read_text(encoding="utf-8")
     assert "UMAP 3D" in html and ("Cluster" in html) and (("kueche" in html) == filled)
+
+
+def make_usage_lake(root):
+    import duckdb
+    con = duckdb.connect()
+    base = 1_792_000_000 // 86400 * 86400
+    rows = []
+    for day in range(3):
+        for minute in range(0, 1440):
+            ts = base + day * 86400 + minute * 60
+            hour = minute // 60
+            rows.append((1, ts, 60 if hour in (6, 7) else 0))
+            rows.append((2, ts, 100 if hour == 18 and day == 1 else (255 if hour == 12 else 0)))
+    con.execute("CREATE TABLE ar(node UBIGINT, ts TIMESTAMP, cluster UINTEGER, attribute UINTEGER, v_i64 BIGINT, v_f64 DOUBLE)")
+    con.executemany("INSERT INTO ar VALUES (?, to_timestamp(?), 513, 8, ?, NULL)", rows)
+    for node in (1, 2):
+        part = root / f"parquet/attribute_reports/date=2026-10-20/node={node}"
+        part.mkdir(parents=True)
+        con.execute(f"COPY (SELECT ts, cluster, attribute, v_i64, v_f64 FROM ar WHERE node = {node}) TO '{(part / 'part.parquet').as_posix()}' (FORMAT parquet)")
+    (root / "parquet/meta/date=2026-10-20").mkdir(parents=True)
+    con.execute(f"COPY (SELECT now() AS ts, 'rooms' AS key, '[{{\"name\":\"a\",\"nodes\":[1]}},{{\"name\":\"b\",\"nodes\":[2]}}]' AS value) TO '{(root / 'parquet/meta/date=2026-10-20/part.parquet').as_posix()}' (FORMAT parquet)")
+    con.close()
+
+
+def test_usage_valve_hours_and_html(tmp_path):
+    from heatml.__main__ import CONFIG, usage
+    from heatml.viz import HeatingUsage
+    make_usage_lake(tmp_path)
+    u = HeatingUsage(tmp_path)
+    days, hours, mins = u.tables()
+    assert len(days) >= 3 and set(hours) == {"a", "b"}
+    assert hours["a"].sum() == pytest.approx(3 * 2 * 0.6, abs=0.02)
+    assert hours["b"].sum() == pytest.approx(1.0, abs=0.02)
+    assert mins["a"][:, 0].sum() == pytest.approx(3 * 120, abs=3)
+    assert hours["b"][:, 12].sum() == 0
+    out = tmp_path / "out" / "usage.html"
+    usage({**CONFIG, "lake_dir": tmp_path, "usage_out": out})
+    html = out.read_text(encoding="utf-8")
+    assert "Ventilstunden" in html and "Haus gesamt" in html and "Heatmap" in html.replace("heatmap", "Heatmap")
+
+
+def test_usage_empty_lake(tmp_path):
+    from heatml.viz import build_usage
+    assert "Haus gesamt" in build_usage(tmp_path, tmp_path / "e.html").read_text(encoding="utf-8")
