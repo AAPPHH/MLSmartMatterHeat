@@ -16,7 +16,9 @@ HEATING_CLUSTER = 513
 
 def read_arrows(directory, table):
     batches = []
-    for f in sorted(Path(directory).glob(f"{table}__*.arrows")):
+    root = Path(directory)
+    files = sorted(root.glob(f"{table}__*.arrows")) + sorted((root / table).glob("*.arrows")) + sorted((root / "raw" / table).glob("*.arrows"))
+    for f in files:
         try:
             with open(f, "rb") as fh:
                 reader = ipc.open_stream(fh)
@@ -73,11 +75,24 @@ def load_parquet(root, exclude):
     return [(float(a), int(b), int(c), float(d)) for a, b, c, d in reports], weather, meta
 
 
+def merge_rows(*parts):
+    seen, out = set(), []
+    for rows in parts:
+        for r in rows:
+            key = tuple(round(x * 1e6) if isinstance(x, float) and i == 0 else x for i, x in enumerate(r))
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+    return out
+
+
 def load_lake(path, exclude=("legacy",)):
     p = Path(path)
+    parts = []
     if (p / "parquet").is_dir():
-        return load_parquet(p, exclude)
-    return load_raw(p, exclude)
+        parts.append(load_parquet(p, exclude))
+    parts.append(load_raw(p, exclude))
+    return tuple(merge_rows(*(x[i] for x in parts)) for i in range(3))
 
 
 def latest_meta(meta):

@@ -30,7 +30,7 @@ CONFIG = {
     },
     "thermalml": {
         "history_min": 60, "lag_step_min": 5, "boost_cap_min": 240, "boost_valve": 0.5, "others_valve": 0.05, "ambient_stale_s": 900.0,
-        "cold_valve": 0.02, "cold_min": 60, "min_valid_hours": 24.0, "chunk": 20000,
+        "cold_valve": 0.02, "cold_min": 60, "min_valid_hours": 24.0, "min_train_hours": 12.0, "valid_max_persistence_ratio": 1.0, "chunk": 20000,
         "decay_valve_from": 0.3, "decay_lookback_min": 10, "decay_min_min": 30, "decay_max_min": 90, "decay_min_points": 8, "decay_tau": [3.0, 90.0], "decay_drift_k_per_min": 0.02, "decay_max_rmse": 0.2, "decay_min_amp": 0.05,
         "min_latent_labels": 200, "min_residual_rows": 1000, "max_abs_target": 2.0, "residual_feedback": 0.25, "feedback_grid": [0.0, 0.25, 0.5, 1.0], "seed": 0,
         "xgb_latent": {"n_estimators": 150, "max_depth": 4, "learning_rate": 0.08, "subsample": 0.8, "min_child_weight": 5},

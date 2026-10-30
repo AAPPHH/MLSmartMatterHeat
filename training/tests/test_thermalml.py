@@ -149,3 +149,54 @@ def test_decay_labels_stop_at_split_edges():
     R = SimpleNamespace(d=SimpleNamespace(n=n, u=u, y=y), test=test)
     lab, count = decay_labels(R, cfg)
     assert count == 1 and np.isfinite(lab[30:70]).all() and np.isnan(lab[70:]).all()
+
+
+def write_real_shape_lake(root, hours=21):
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+    import pyarrow.parquet as pq
+    from datetime import datetime, timezone
+    rooms = {"wohnzimmer": 5, "schlafzimmer": 6}
+    t0 = datetime(2026, 10, 29, 12, 41, tzinfo=timezone.utc).timestamp()
+    rows = []
+    for i, (name, node) in enumerate(rooms.items()):
+        d, _, _ = simulate(hours=hours, seed=i, report_p=1.0, invalid=0)
+        for k in range(0, d.n, 5):
+            ts = datetime.fromtimestamp(t0 + k * 60, timezone.utc)
+            src = "poll" if k % 10 else "subscription"
+            rows.append((ts, node, 0, None, int(round(d.y[k] * 100)), src))
+            rows.append((ts, node, 8, None, 134 if k % 100 == 0 else int(round(d.u[k] * 100)), src))
+            rows.append((ts, node, 18, None, 1800, src))
+            rows.append((ts, node, 28, None, 4, src))
+        rows.append((datetime.fromtimestamp(t0 - 3600, timezone.utc), node, 0, 17.5, None, "legacy"))
+    schema = pa.schema([("ts", pa.timestamp("us", tz="UTC")), ("mono_ns", pa.int64()), ("node", pa.uint64()), ("endpoint", pa.uint16()), ("cluster", pa.uint32()), ("attribute", pa.uint32()), ("v_i64", pa.int64()), ("v_f64", pa.float64()), ("source", pa.string())])
+    cols = lambda rs: pa.table({"ts": [r[0] for r in rs], "mono_ns": [0] * len(rs), "node": [r[1] for r in rs], "endpoint": [1] * len(rs), "cluster": [513] * len(rs), "attribute": [r[2] for r in rs], "v_i64": [r[4] for r in rs], "v_f64": [r[3] for r in rs], "source": [r[5] for r in rs]}, schema=schema)
+    rows.sort(key=lambda r: r[0])
+    half = len(rows) // 2
+    raw = root / "raw" / "attribute_reports"
+    raw.mkdir(parents=True)
+    for name, part in (("2026-10-29.arrows", rows[:half + 7]), ("2026-10-30.arrows", rows[half:])):
+        with ipc.new_stream(raw / name, schema) as w:
+            w.write_table(cols(part))
+    pq_dir = root / "parquet" / "attribute_reports" / "date=2026-10-29"
+    pq_dir.mkdir(parents=True)
+    pq.write_table(cols(rows[:half]), pq_dir / "part.parquet")
+    wt = pa.table({"ts": [datetime.fromtimestamp(t0 + h * 3600, timezone.utc) for h in range(hours + 2)], "issued_ts": [None] * (hours + 2), "kind": ["obs"] * (hours + 2), "temp_c": [9.0 + (h % 12) * 0.3 for h in range(hours + 2)], "wind_ms": [3.0] * (hours + 2), "radiation_wm2": [0.0] * (hours + 2)})
+    (root / "raw" / "weather").mkdir()
+    with ipc.new_stream(root / "raw" / "weather" / "2026-10-29.arrows", wt.schema) as w:
+        w.write_table(wt)
+    return root, len(rows)
+
+
+def test_real_lake_shape_raw_and_parquet_merge(tmp_path):
+    from heattrain.thermal import load_lake
+    from heattrain.thermalml import thermalml
+    root, n = write_real_shape_lake(tmp_path / "lake")
+    reports, weather, meta = load_lake(root, ("legacy",))
+    assert len(reports) == n - 2 and len(weather) == 23
+    assert max(r[0] for r in reports) - min(r[0] for r in reports) > 20 * 3600
+    out, b = thermalml(CONF, root, tmp_path / "models")
+    m = b["metrics"]
+    assert m["n_latent_labels"] > 0 and m["n_residual_rows"] > 0 and set(m["offsets"]) == {"node5", "node6"}
+    for r in b["rooms"].values():
+        assert r["trainable"] and not r["valid"] and any("required for a valid room" in x for x in r["reasons"])

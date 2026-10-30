@@ -110,6 +110,8 @@ class RoomML:
     d: object
     doc: dict
     valid: bool
+    trainable: bool = False
+    reasons: list = field(default_factory=list)
     offset: float = 0.0
     n_cold: int = 0
     offset_tr: float = 0.0
@@ -216,13 +218,25 @@ def decay_labels(R, cfg):
 def prepare_room(d, doc, cfg, tcfg, others, ambient, test):
     span_h = d.n * d.dt / 3600
     p = doc["params"]
-    ok = span_h >= cfg["min_valid_hours"] and all(np.isfinite(v) for v in p.values()) and doc["metrics"][doc["structure"]]["rmse_horizon"] is not None and d.u.std() >= tcfg["min_valve_std"]
-    R = RoomML(d, doc, bool(ok))
+    m = doc["metrics"][doc["structure"]]
+    reasons = []
+    if not all(np.isfinite(v) for v in p.values()) or m["rmse_horizon"] is None:
+        reasons.append("physics fit not finite or without held-out horizon error")
+    if d.u.std() < tcfg["min_valve_std"]:
+        reasons.append(f"valve demand std {d.u.std():.3f} < {tcfg['min_valve_std']}")
+    if span_h < cfg["min_train_hours"]:
+        reasons.append(f"span {span_h:.1f} h < {cfg['min_train_hours']} h minimum for labels")
+    trainable = not reasons
+    if span_h < cfg["min_valid_hours"]:
+        reasons.append(f"span {span_h:.1f} h < {cfg['min_valid_hours']} h required for a valid room")
+    if trainable and m["rmse_persistence"] is not None and m["rmse_horizon"] > m["rmse_persistence"] * cfg["valid_max_persistence_ratio"]:
+        reasons.append(f"physics {m['rmse_horizon']:.3f} K does not beat persistence {m['rmse_persistence']:.3f} K at {m['horizon_min']} min")
+    R = RoomML(d, doc, not reasons, trainable, reasons)
     R.test = test
     R.others, R.hour = others, local_hour(R.times(), tcfg["timezone"])
     R.amb = ambient_ctx(ambient, R.times(), cfg["ambient_stale_s"])
     R.yc = causal(d.y)
-    if not R.valid:
+    if not R.trainable:
         return R
     ks, v, s, xs, ps = kalman(p, d, doc["structure"], tcfg, collect=True)
     R.xs, R.kair = xs, xs[:, 1]
@@ -298,7 +312,7 @@ def fit_nets(cfg, rooms, names, lat_names, full):
     lat_cols = [ci[n] for n in lat_names]
     Xl, yl, Xr, yr = [], [], [], []
     for R in rooms:
-        if not R.valid or len(R.ks) == 0:
+        if not R.trainable or len(R.ks) == 0:
             continue
         m = np.ones(len(R.ks), bool) if full else ~R.test[R.ks]
         lab = R.lab if full else R.lab_tr
@@ -384,7 +398,7 @@ def holdout_eval(cfg, tcfg, rooms, names, nets, split):
     if nets["residual"] is None:
         return {"split": split, "n_origins": 0, "horizons": {}}
     for R in rooms:
-        if not R.valid or R.d.n < Hm + cfg["boost_cap_min"] + 3:
+        if not R.trainable or R.d.n < Hm + cfg["boost_cap_min"] + 3:
             continue
         ok = np.lib.stride_tricks.sliding_window_view(R.test, Hm + 1).all(1)
         ks = np.array([k for k in range(cfg["boost_cap_min"] + 1, R.d.n - Hm - 1, cfg["eval_stride"]) if ok[k]], int)
@@ -439,7 +453,7 @@ def latent_series(R, net):
 def evaluate_cycles(cfg, tcfg, rooms, names, split_nets, final_nets):
     bt, table = {}, {}
     for R in rooms:
-        if not R.valid:
+        if not R.trainable:
             continue
         cyc = find_cycles(R, cfg)
         lat_split, lat_final = latent_series(R, split_nets["latent"]), latent_series(R, final_nets["latent"])
@@ -566,14 +580,15 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
     index = [R.name for R in rooms]
     names, lat_names = feature_names(cfg, index, "residual"), feature_names(cfg, index, "latent")
     for R in rooms:
-        if R.valid:
+        if R.trainable:
             fill_rows(R, cfg, names)
     for R in rooms:
-        if R.valid and not len(R.ks):
-            R.valid = False
+        if R.trainable and not len(R.ks):
+            R.valid = R.trainable = False
+            R.reasons.append("no usable rows after history window")
     nets_split = fit_nets(cfg, rooms, names, lat_names, False)
     nets_final = fit_nets(cfg, rooms, names, lat_names, True)
-    metrics = {"split": split, "n_latent_labels": nets_final["n_latent"], "n_residual_rows": nets_final["n_residual"], "offsets": {R.name: {"sensor_offset_c": R.offset, "cold_minutes": R.n_cold} for R in rooms if R.valid}}
+    metrics = {"split": split, "n_latent_labels": nets_final["n_latent"], "n_residual_rows": nets_final["n_residual"], "offsets": {R.name: {"sensor_offset_c": R.offset, "cold_minutes": R.n_cold} for R in rooms if R.trainable}}
     evals = {g: holdout_eval(dict(cfg, residual_feedback=g), tcfg, rooms, names, nets_split, split) for g in cfg["feedback_grid"]}
     score = lambda e: float(np.mean([v["residual_rmse"] for v in e["horizons"].values()])) if e["horizons"] else math.inf
     best = min(evals, key=lambda g: score(evals[g]))
@@ -585,7 +600,7 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
         lat = {"label_rmse_test": [], "kalman_agreement_rmse_test": [], "kalman_agreement_rmse_hot_test": []}
         ci = {n: i for i, n in enumerate(names)}
         for R in rooms:
-            if not R.valid or not len(R.ks):
+            if not R.trainable or not len(R.ks):
                 continue
             t = R.test[R.ks]
             if not t.any():
@@ -604,7 +619,7 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
     files = {"latent": None, "residual": None}
     parity = {}
     if avail:
-        X = np.vstack([R.F[: cfg["parity_rows"]] for R in rooms if R.valid and len(R.ks)])
+        X = np.vstack([R.F[: cfg["parity_rows"]] for R in rooms if R.trainable and len(R.ks)])
         X = parity_input(cfg, X, np.random.default_rng(cfg["seed"]))
         parity["room_temp"] = export_net(cfg, nets_final["latent"], len(names), out / "latent.onnx", "room_temp", X)
         parity["delta"] = export_net(cfg, nets_final["residual"], len(names), out / "residual.onnx", "delta", X)
@@ -614,7 +629,7 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
     metrics["onnx_parity_max_abs"] = parity
     metrics["backtest_note"] = "rmse of predicted vs measured sensor over heat-up cycles (out-of-sample unless in_sample=true); *_air vs own air estimate"
     bundle = {"version": version, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "dt_s": int(tcfg["dt_s"]), "history_min": cfg["history_min"], "lag_step_min": cfg["lag_step_min"],
-              "rooms": {R.name: {"physics": R.doc, "sensor_offset_c": R.offset, "valid": bool(R.valid)} for R in rooms}, "room_index": index,
+              "rooms": {R.name: {"physics": R.doc, "sensor_offset_c": R.offset, "valid": bool(R.valid), "trainable": bool(R.trainable), "reasons": R.reasons} for R in rooms}, "room_index": index,
               "latent": files["latent"], "residual": files["residual"], "metrics": metrics, "warnings": warn, "source": str(src)}
     (out / "bundle.json").write_text(json.dumps(jsonable(bundle), indent=1))
     (out / "cycles.json").write_text(json.dumps(jsonable(table), indent=1))
