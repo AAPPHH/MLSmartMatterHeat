@@ -37,6 +37,7 @@ pub struct NodeStatus {
 }
 
 const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
+const STARTUP_GRACE_US: i64 = 600_000_000;
 const BATTERY_KEEP_US: i64 = 86_400_000_000;
 const BATTERY_MAX_STEP_US: i64 = 1_800_000_000;
 const BATTERY_MIN_HOURS: f64 = 0.5;
@@ -75,6 +76,8 @@ struct Inner {
     outdoor: Option<(i64, f64, Option<f64>)>,
     radiation: Option<(i64, f64)>,
     last_roll: Option<(i64, bool)>,
+    control_us: Option<i64>,
+    br: Option<crate::br_watchdog::BrSnapshot>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -164,6 +167,35 @@ impl Status {
 
     pub fn rolled(&self, ts_us: i64, ok: bool) {
         self.0.lock().unwrap().last_roll = Some((ts_us, ok));
+    }
+
+    pub fn control_step_done(&self, ts_us: i64) {
+        self.0.lock().unwrap().control_us = Some(ts_us);
+    }
+
+    pub fn control_healthy(&self, now_us: i64, stale_us: i64, silent_us: i64) -> bool {
+        let inner = self.0.lock().unwrap();
+        let in_grace = now_us - inner.started_us <= STARTUP_GRACE_US;
+        let reachable = inner.nodes.is_empty() || inner.nodes.values().any(|n| n.state == SubState::Subscribed || (n.state == SubState::Unknown && in_grace));
+        let all_silent = !inner.nodes.is_empty() && inner.nodes.values().all(|n| now_us - n.last_report_us.unwrap_or(inner.started_us) > silent_us);
+        inner.control_us.is_some_and(|t| now_us - t <= stale_us) && reachable && !all_silent
+    }
+
+    pub fn all_silent(&self, now_us: i64, silent_us: i64) -> bool {
+        let inner = self.0.lock().unwrap();
+        !inner.nodes.is_empty() && inner.nodes.values().all(|n| now_us - n.last_report_us.unwrap_or(inner.started_us) > silent_us)
+    }
+
+    pub fn set_br(&self, snapshot: crate::br_watchdog::BrSnapshot) {
+        self.0.lock().unwrap().br = Some(snapshot);
+    }
+
+    pub fn br_view(&self, now_us: i64) -> Option<Value> {
+        self.0.lock().unwrap().br.as_ref().map(|b| b.view(now_us))
+    }
+
+    pub fn br_alert(&self) -> Option<Value> {
+        self.0.lock().unwrap().br.as_ref().and_then(|b| b.alert())
     }
 
     pub fn last_report_us(&self, node: u64) -> Option<i64> {

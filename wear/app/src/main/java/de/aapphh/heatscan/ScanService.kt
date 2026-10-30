@@ -792,6 +792,7 @@ class ScanService : Service() {
     private fun send(server: String, path: String, body: String, net: Network?): Int = try {
         val reply = Poster.send(server, path, body, net)
         if (reply.code in 200..299) store.setReply(ReplyJson.parse(reply.text), ReplyJson.postedAps(body))
+        if (reply.code in 200..299) ReplyJson.parse(reply.text).alert?.let { Alerter.show(this, store, it) }
         if (reply.code in 200..299) Poster.room(reply.text).let { if (it.isNotEmpty()) lastRoom = it; (if (it in Defaults.ROOMS) it else null).let { g -> if (store.guess != g) store.guess = g } }
         if (reply.code in 200..299 && ReplyJson.postedAps(body)) onReplyGuess(body, reply.text)
         reply.code
@@ -909,6 +910,28 @@ class ScanService : Service() {
             c, 0, Intent(c, TickReceiver::class.java).setAction(ACTION_TICK),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+    }
+}
+
+object Alerter {
+    private const val CHANNEL = "br_alert"
+    private const val ID = 4
+
+    fun show(c: Context, store: Store, alert: Alert) {
+        if (store.alertId == alert.id) return
+        try {
+            val nm = c.getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(NotificationChannel(CHANNEL, "Heizung Alarm", NotificationManager.IMPORTANCE_HIGH).apply { enableVibration(true) })
+            nm.notify(ID, Notification.Builder(c, CHANNEL)
+                .setContentTitle(alert.title)
+                .setContentText(alert.text)
+                .setStyle(Notification.BigTextStyle().bigText(alert.text))
+                .setSmallIcon(R.drawable.ic_launcher)
+                .build())
+            store.alertId = alert.id
+        } catch (e: Exception) {
+            Trace.w("alert_failed", e)
+        }
     }
 }
 

@@ -1046,6 +1046,14 @@ class CoreTest {
     }
 
     @Test
+    fun replyAlertParsing() {
+        val a = ReplyJson.parse("""{"stored":1,"alert":{"id":"thread_down@5","title":"Heizung","text":"Thermostate stumm"}}""").alert!!
+        assertEquals(Alert("thread_down@5", "Heizung", "Thermostate stumm"), a)
+        assertEquals(null, ReplyJson.parse("""{"stored":1}""").alert)
+        assertEquals(null, ReplyJson.parse("""{"alert":{}}""").alert)
+    }
+
+    @Test
     fun matchParsingAndText() {
         val m = ReplyJson.parse("""{"stored":4,"room":"flur","match":{"room":"wohnzimmer","p":0.62,"abstained":false,"reason":null,"top":[{"room":"wohnzimmer","p":0.62},{"room":"bad","p":0.2},{"room":"kueche","p":0.09}],"model":"v1"}}""").match!!
         assertEquals("wohnzimmer", m.room)

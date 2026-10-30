@@ -101,6 +101,18 @@ impl Commands {
         self.sent.get(&node).map(|s| s.target)
     }
 
+    pub fn forget_desired_writes(&mut self) {
+        self.sent.clear();
+        self.device.clear();
+        self.last_write.clear();
+        self.deferred.clear();
+    }
+
+    #[cfg(test)]
+    pub fn test_hold(&mut self, node: u64, value: f64) {
+        self.holds.insert(node, Hold { value, since_ms: 0 });
+    }
+
     pub fn holding(&self, nodes: &[u64]) -> bool {
         nodes.iter().any(|n| self.holds.contains_key(n))
     }
@@ -699,8 +711,10 @@ pub fn spawn_background(state: AppState) {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            if let Err(e) = control_step(&looper, Local::now().naive_local(), now_ms()).await {
-                eprintln!("control step: {e}");
+            match control_step(&looper, Local::now().naive_local(), now_ms()).await {
+                Ok(_) if !looper.failsafe.stopping() => looper.status.control_step_done(lake::now_us()),
+                Ok(_) => {}
+                Err(e) => eprintln!("control step: {e}"),
             }
         }
     });

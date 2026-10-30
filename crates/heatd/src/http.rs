@@ -558,6 +558,9 @@ async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiR
     if out.duplicate {
         response["duplicate"] = json!(true);
     }
+    if let Some(alert) = state.status.br_alert() {
+        response["alert"] = alert;
+    }
     Ok(Json(response))
 }
 
@@ -581,6 +584,9 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     merge(&mut response, attribution(latest.as_ref()));
     if let Some((_, m)) = matched {
         response["match"] = m;
+    }
+    if let Some(alert) = state.status.br_alert() {
+        response["alert"] = alert;
     }
     Ok(Json(response))
 }
@@ -617,7 +623,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?, "failsafe": state.failsafe.view()})))
+    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?, "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 async fn snapshot(State(state): State<AppState>) -> ApiResult {
