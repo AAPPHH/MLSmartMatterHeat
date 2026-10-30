@@ -11,14 +11,8 @@ The thermal model has no room thermometer and no measurement of the house heat l
 
 A missing sensor is skipped; a failed POST is logged to stderr and the next cycle continues. All settings are the plain dict `CONFIG` at the top of the script.
 
-## Border Router die temperature (gap)
+## Border Router die temperature
 
-Checked in `firmware/br` and in the used component `esp-thread-br/components/esp_ot_br_server` (REST routes in `src/openapi.yaml`): the ESP32-S3 BR firmware exposes no temperature. The REST API serves only OpenThread data (`/diagnostics`, `/node`, `/node/...`, dataset, Wi-Fi config); the OpenThread diagnostic TLVs contain no chip temperature either. `die_c` therefore cannot be collected without a firmware change.
+`firmware/br/main/watchdog.c` installs the on-chip sensor (`esp_driver_tsens`, range -10..80 C) and serves `GET /ambient` on the watchdog's own HTTP server (port 80) as `{"die_temperature_c": 41.5}`; the same value is in `GET /watchdog/status`. The BR web UI of `esp_ot_br_server` is not enabled in this firmware, so the watchdog runs its own httpd (see `deploy/br-watchdog/README.md`). It exists in source and builds, but is not flashed yet. The REST API of `esp_ot_br_server` itself has no temperature, and the OpenThread diagnostic TLVs contain none either.
 
-Firmware change that closes the gap (not done, nothing flashed):
-
-1. In `firmware/br/main/esp_ot_br.c` install the on-chip sensor with the `esp_driver_tsens` component (`#include "driver/temperature_sensor.h"`, `temperature_sensor_install` with range -10..80 C, `temperature_sensor_enable`).
-2. Register one more `httpd` URI (for example `GET /ambient`) on the server started by `esp_br_web_start`, answering `{"die_temperature_c": <temperature_sensor_get_celsius>}`; the web server handle is created inside `esp_ot_br_server`, so either add the route there or start a second small `esp_http_server` instance on another port.
-3. Add `esp_driver_tsens` to the `REQUIRES` of `firmware/br/main/CMakeLists.txt`.
-
-Collector side is ready: set `CONFIG["br_http"]["enabled"] = True` and point `url` / `json_path` at the endpoint (default `http://192.168.178.33/ambient`, key `die_temperature_c`). It is disabled by default and posts with `source = "br"`, `sensor = "die_c"`, unit `C`. Until the firmware exists, `die_c` stays missing and the model treats it as NaN.
+Collector side: set `CONFIG["br_http"]["enabled"] = True` and point `url` / `json_path` at the endpoint (default `http://192.168.178.33/ambient`, key `die_temperature_c`). It is disabled by default and posts with `source = "br"`, `sensor = "die_c"`, unit `C`. Until the new firmware is flashed, `die_c` stays missing and the model treats it as NaN.

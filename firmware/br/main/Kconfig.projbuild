@@ -1,0 +1,17 @@
+menu "BR Watchdog"
+
+    config BR_WATCHDOG_TOKEN
+        string "Shared secret for the X-Heatd-Token header"
+        default ""
+        help
+            Empty means every watchdog write endpoint answers 401.
+            Put the real value in sdkconfig.<variant>.local, never in the repo.
+
+    config BR_WATCHDOG_MATTER
+        bool "Armed path: Matter controller write on the border router"
+        default n
+        help
+            Needs the esp-matter controller component, which is not integrated.
+            With this off the watchdog runs dry_run only and refuses mode armed.
+
+endmenu

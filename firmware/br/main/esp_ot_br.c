@@ -29,6 +29,7 @@
 
 #include "border_router_launch.h"
 #include "esp_br_web.h"
+#include "watchdog.h"
 
 #define TAG "esp_ot_br"
 
@@ -104,5 +105,6 @@ void app_main(void)
     esp_br_web_start("/spiffs");
 #endif
 
+    br_watchdog_start();
     launch_openthread_border_router(&openthread_config, &rcp_update_config);
 }
