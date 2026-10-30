@@ -8,26 +8,21 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const HISTORY_MIN: usize = 60;
-const KEEP_MS: i64 = 3 * 3_600_000;
+const OTHERS_VALVE: f64 = 0.05;
+const AMBIENT_STALE_MS: i64 = 900_000;
+const KEEP_MS: i64 = 5 * 3_600_000;
 const STALE_MS: i64 = 30 * 60_000;
 const GAP_RESET_MIN: i64 = 360;
 const OFF_EPS_MIN: f64 = 1.0;
 const GATE_REFRESH_MIN: u64 = 60;
 
-fn value_at(points: &VecDeque<(i64, f64)>, t_ms: i64, interpolate: bool) -> Option<f64> {
+fn value_at(points: &VecDeque<(i64, f64)>, t_ms: i64) -> Option<f64> {
     let i = points.partition_point(|p| p.0 <= t_ms);
-    let before = i.checked_sub(1).map(|j| points[j]);
-    match (before, points.get(i)) {
-        (Some((t0, v0)), Some(&(t1, v1))) if interpolate && t1 > t0 => Some(v0 + (v1 - v0) * (t_ms - t0) as f64 / (t1 - t0) as f64),
-        (Some((_, v)), _) => Some(v),
-        (None, Some(&(_, v))) => Some(v),
-        _ => None,
-    }
+    i.checked_sub(1).map(|j| points[j].1).or_else(|| points.front().map(|p| p.1))
 }
 
-fn grid(points: &VecDeque<(i64, f64)>, now_min: i64, interpolate: bool) -> Vec<f64> {
-    (0..=HISTORY_MIN as i64).filter_map(|i| value_at(points, (now_min - HISTORY_MIN as i64 + i) * 60_000, interpolate)).collect()
+fn grid(points: &VecDeque<(i64, f64)>, now_ms: i64, back_min: usize) -> Vec<f64> {
+    (0..=back_min as i64).filter_map(|i| value_at(points, now_ms - (back_min as i64 - i) * 60_000)).collect()
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +50,7 @@ struct Cycle {
     start_temp: f64,
     live: Option<&'static str>,
     offset_min: f64,
+    base: Option<f64>,
     applied: Option<f64>,
     phase: Phase,
     plans: BTreeMap<&'static str, Rec>,
@@ -82,6 +78,7 @@ struct RoomState {
     cycle: Option<Cycle>,
     last_desired: Option<f64>,
     dirty: bool,
+    air: HashMap<&'static str, f64>,
 }
 
 pub struct RoomIn {
@@ -116,7 +113,7 @@ struct Inner {
     links: Vec<(String, String, String)>,
     bundle: Option<Arc<Bundle>>,
     dir_name: Option<String>,
-    ambient: HashMap<String, f64>,
+    ambient: HashMap<String, (f64, i64)>,
     rng: Rng,
     live: HashMap<String, (String, String)>,
     gate_days: HashMap<String, usize>,
@@ -163,7 +160,7 @@ fn pick_live(inner: &Inner, room: &str, forced: bool) -> Option<(String, String)
 impl Boost {
     pub fn new(config: &Config) -> Self {
         let cfg = config.boost.clone();
-        let rooms = config.rooms.iter().map(|r| RoomState { name: r.name.clone(), nodes: r.nodes.clone(), sensor: VecDeque::new(), valve: VecDeque::new(), est: None, cycle: None, last_desired: None, dirty: false }).collect();
+        let rooms = config.rooms.iter().map(|r| RoomState { name: r.name.clone(), nodes: r.nodes.clone(), sensor: VecDeque::new(), valve: VecDeque::new(), est: None, cycle: None, last_desired: None, dirty: false, air: HashMap::new() }).collect();
         let links = config.neighbours.iter().map(|n| (n.a.clone(), n.b.clone(), n.kind.clone())).collect();
         let seed = cfg.seed.or(config.exploration_seed).unwrap_or_else(|| crate::lake::now_us() as u64);
         let boost = Self(Arc::new(Mutex::new(Inner { cfg, rooms, links, bundle: None, dir_name: None, ambient: HashMap::new(), rng: Rng::new(seed ^ 0xB005), live: HashMap::new(), gate_days: HashMap::new(), env: Env::default(), hour: None })));
@@ -194,9 +191,13 @@ impl Boost {
         Ok(true)
     }
 
-    #[allow(dead_code)]
     pub fn note_ambient(&self, sensor: &str, value: f64) {
-        self.0.lock().unwrap().ambient.insert(sensor.to_string(), value);
+        self.0.lock().unwrap().ambient.insert(sensor.to_string(), (value, crate::lake::now_us() / 1000));
+    }
+
+    #[cfg(test)]
+    pub fn ambient_value(&self, sensor: &str) -> Option<f64> {
+        self.0.lock().unwrap().ambient.get(sensor).map(|a| a.0)
     }
 
     pub fn set_gate_days(&self, days: HashMap<String, usize>) {
@@ -245,16 +246,6 @@ impl Boost {
         let inner = self.0.lock().unwrap();
         let Some(rs) = inner.rooms.iter().find(|r| r.name == room) else { return Value::Null };
         let live = inner.live.get(room);
-        let ctx_air = |variant: &str| -> Option<f64> {
-            let (bundle, key) = (inner.bundle.as_ref()?, room_key(&inner, room)?);
-            let est = rs.est.as_ref()?;
-            let ctx = inner.ctx(rs, bundle, &key, est.k.x, 0.0, 0.0, inner.hour_now(), crate::lake::now_us() / 60_000_000)?;
-            if variant == GREY {
-                Some(est.k.x.1)
-            } else {
-                ctx.learned_air().ok()
-            }
-        };
         let mut per = serde_json::Map::new();
         for v in VARIANTS {
             let rec = rs.cycle.as_ref().and_then(|c| c.plans.get(v));
@@ -275,7 +266,7 @@ impl Boost {
                     "mode": rs.cycle.as_ref().map_or_else(|| if live.is_some_and(|l| l.0 == v) { "live" } else { "shadow" }, |c| if c.live == Some(v) { "live" } else { "shadow" }),
                     "planned_t_off": rec.and_then(|r| r.planned_from_start),
                     "predicted_peak": rec.and_then(|r| r.peak),
-                    "air_estimate": ctx_air(v),
+                    "air_estimate": rs.air.get(v),
                     "live_candidate": live.is_some_and(|l| l.0 == v),
                 }),
             );
@@ -378,7 +369,7 @@ impl Inner {
             Some(est) => {
                 let h = 1.0 / 60.0;
                 while est.min < minute {
-                    let u = value_at(&rs.valve, est.min * 60_000, false).unwrap_or(0.0);
+                    let u = value_at(&rs.valve, est.min * 60_000).unwrap_or(0.0);
                     est.k.predict(&room.phys.terms(u, &env, h), cfg.q_r * h, cfg.q_a * h);
                     est.min += 1;
                 }
@@ -389,10 +380,13 @@ impl Inner {
         }
     }
 
+    fn others_heating(&self, room: &str) -> usize {
+        self.rooms.iter().filter(|o| o.name != room).filter(|o| o.valve.back().is_some_and(|v| v.1 > OTHERS_VALVE)).count()
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn ctx<'a>(&'a self, rs: &'a RoomState, bundle: &'a Bundle, key: &'a str, x: (f64, f64), target: f64, since: f64, hour: f64, now_min: i64) -> Option<Ctx<'a>> {
+    fn ctx<'a>(&'a self, rs: &'a RoomState, bundle: &'a Bundle, key: &'a str, x: (f64, f64), target: f64, hour: f64, now_ms: i64) -> Option<Ctx<'a>> {
         let idx = self.rooms.iter().position(|r| r.name == rs.name)?;
-        let others = self.rooms.iter().filter(|o| o.name != rs.name).filter(|o| o.valve.back().is_some_and(|v| v.1 > 0.0)).count() as f64;
         Some(Ctx {
             phys: &bundle.rooms.get(key)?.phys,
             bundle,
@@ -401,12 +395,10 @@ impl Inner {
             env: self.env_for(idx, hour),
             hour,
             target,
-            boost_sp: self.cfg.boost_setpoint,
-            sensor: grid(&rs.sensor, now_min, true),
-            valve: grid(&rs.valve, now_min, false),
-            others,
-            since: since.min(SINCE_CAP_MIN),
-            ambient: AMBIENT.map(|s| self.ambient.get(s).copied().unwrap_or(f64::NAN)),
+            sensor: grid(&rs.sensor, now_ms, SENSOR_HISTORY_MIN),
+            valve: grid(&rs.valve, now_ms, VALVE_HISTORY_MIN),
+            others: self.others_heating(&rs.name) as f64,
+            ambient: AMBIENT.map(|s| self.ambient.get(s).filter(|a| now_ms - a.1 <= AMBIENT_STALE_MS).map_or(f64::NAN, |a| a.0)),
             h: 1.0 / 60.0,
         })
     }
@@ -451,6 +443,7 @@ impl Inner {
         if std::mem::take(&mut rs.dirty) {
             self.replan(idx, now_ms, input.hour);
         }
+        self.refresh_air(idx, now_ms, input.hour);
         let hold_min = self.cfg.hold_min;
         let Some(cycle) = self.rooms[idx].cycle.as_mut() else { return };
         if cycle.live.is_some() && cycle.phase == Phase::Boosting {
@@ -471,6 +464,19 @@ impl Inner {
         }
     }
 
+    fn refresh_air(&mut self, idx: usize, now_ms: i64, hour: f64) {
+        let Some(bundle) = self.bundle.clone() else { return };
+        let name = self.rooms[idx].name.clone();
+        let (Some(key), Some(est)) = (room_key(self, &name), self.rooms[idx].est.as_ref()) else { return };
+        let mut air = HashMap::from([(GREY, est.k.x.1)]);
+        if self.available(RESIDUAL, &name) {
+            if let Some(a) = self.ctx(&self.rooms[idx], &bundle, &key, est.k.x, 0.0, hour, now_ms).and_then(|c| c.learned_air().ok()) {
+                air.insert(RESIDUAL, a);
+            }
+        }
+        self.rooms[idx].air = air;
+    }
+
     fn open(&mut self, idx: usize, want: &RoomIn, input: &StepIn, rise: f64) {
         let name = want.room.clone();
         let Some(bundle) = self.bundle.clone() else { return };
@@ -480,7 +486,7 @@ impl Inner {
         if !bundle.rooms[&key].valid || rs.est.is_none() || input.now_ms - t > STALE_MS || temp >= want.setpoint - REACH_C {
             return;
         }
-        let others = self.rooms.iter().filter(|o| o.name != name).filter(|o| o.valve.back().is_some_and(|v| v.1 > 0.0)).count() as i64;
+        let others = self.others_heating(&name) as i64;
         let offset_min = if self.live.contains_key(&name) { (self.rng.unit() * 2.0 - 1.0) * self.cfg.explore_min } else { 0.0 };
         let live = self.live.get(&name).and_then(|l| VARIANTS.into_iter().find(|v| *v == l.0)).filter(|v| self.available(v, &name));
         self.rooms[idx].cycle = Some(Cycle {
@@ -491,6 +497,7 @@ impl Inner {
             start_temp: temp,
             live,
             offset_min,
+            base: None,
             applied: None,
             phase: Phase::Hold,
             plans: BTreeMap::new(),
@@ -521,10 +528,11 @@ impl Inner {
         let elapsed = (now_ms - cycle.start_ms) as f64 / 60_000.0;
         let remaining = (self.cfg.max_cycle_min - elapsed).max(0.0) as usize;
         let v50_so_far = cycle.samples.iter().filter(|s| s.1 > 50.0).count() as f64;
-        let Some(ctx) = self.ctx(rs, &bundle, &key, est.k.x, cycle.target, elapsed, hour, now_ms.div_euclid(60_000)) else { return };
+        let Some(ctx) = self.ctx(rs, &bundle, &key, est.k.x, cycle.target, hour, now_ms) else { return };
+        let live_fixed = cycle.live.is_some() && cycle.base.is_some_and(|b| elapsed >= b);
         let mut results: Vec<(&'static str, Rec)> = Vec::new();
         for v in VARIANTS {
-            if cycle.plans.get(v).is_some_and(|r| r.frozen) {
+            if cycle.plans.get(v).is_some_and(|r| r.frozen) || (live_fixed && cycle.live == Some(v)) {
                 continue;
             }
             let rec = if !self.available(v, &name) {
@@ -551,9 +559,10 @@ impl Inner {
             rec.frozen |= rec.planned_from_start.is_some_and(|p| elapsed >= p && cycle.live != Some(v));
             cycle.plans.insert(v, rec);
         }
-        if cycle.phase != Phase::Hold || cycle.applied.is_none() {
+        if !live_fixed && (cycle.phase != Phase::Hold || cycle.applied.is_none()) {
             let planned = cycle.live.and_then(|v| cycle.plans.get(v)).and_then(|r| r.planned_from_start);
             if let Some(p) = planned {
+                cycle.base = Some(p);
                 cycle.applied = Some((p + cycle.offset_min).clamp(0.0, max_cycle));
             } else if cycle.live.is_some() {
                 cycle.live = None;
@@ -620,9 +629,7 @@ pub fn spawn_background(boost: Boost, root: PathBuf) {
             let r = root.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Err(e) = b.reload() {
-                    if b.0.lock().unwrap().bundle.is_none() {
-                        eprintln!("boost: {e:#}");
-                    }
+                    eprintln!("boost: {e:#}");
                 }
                 if ticks.is_multiple_of(GATE_REFRESH_MIN.div_ceil((reload.as_secs() / 60).max(1))) {
                     match gate_days(&r, chrono::Utc::now().date_naive(), 30) {

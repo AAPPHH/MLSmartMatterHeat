@@ -13,7 +13,14 @@ pub const VARIANTS: [&str; 2] = [GREY, RESIDUAL];
 pub const AMBIENT: [&str; 3] = ["nvme_c", "pkg_w", "die_c"];
 pub const SINCE_CAP_MIN: f64 = 240.0;
 pub const REACH_C: f64 = 0.3;
-const SIM_MIN: usize = 240;
+pub const BOOST_VALVE: f64 = 0.5;
+pub const HORIZON_MIN: usize = 300;
+pub const TOFF_MAX: usize = 180;
+pub const OVERSHOOT_TOL: f64 = 0.3;
+pub const SENSOR_HISTORY_MIN: usize = 60;
+pub const VALVE_HISTORY_MIN: usize = 240;
+const DT_S: i64 = 60;
+const LAG_STEP_MIN: i64 = 5;
 
 #[derive(Clone, Debug, Default)]
 pub struct Env {
@@ -98,7 +105,7 @@ impl Physics {
 #[derive(Clone, Copy, Debug)]
 pub struct Kalman {
     pub x: (f64, f64),
-    p: (f64, f64, f64),
+    pub p: (f64, f64, f64),
 }
 
 impl Kalman {
@@ -177,7 +184,6 @@ pub struct FeatIn<'a> {
     pub radiation: f64,
     pub hour: f64,
     pub others: f64,
-    pub since: f64,
     pub phys_sensor: f64,
     pub phys_air: f64,
     pub ambient: [f64; 3],
@@ -186,6 +192,10 @@ pub struct FeatIn<'a> {
 
 fn lagged(series: &[f64], lag: usize) -> f64 {
     series.len().checked_sub(1 + lag).map_or_else(|| series.first().copied().unwrap_or(f64::NAN), |i| series[i])
+}
+
+pub fn since_boost(valve: &[f64]) -> f64 {
+    (0..VALVE_HISTORY_MIN).find(|j| lagged(valve, *j) >= BOOST_VALVE && lagged(valve, j + 1) < BOOST_VALVE).map_or(SINCE_CAP_MIN, |j| j as f64)
 }
 
 pub fn featurize(feats: &[Feat], i: &FeatIn) -> Vec<f32> {
@@ -201,7 +211,7 @@ pub fn featurize(feats: &[Feat], i: &FeatIn) -> Vec<f32> {
                 Feat::HourSin => angle.sin(),
                 Feat::HourCos => angle.cos(),
                 Feat::Others => i.others,
-                Feat::SinceBoost => i.since.min(SINCE_CAP_MIN),
+                Feat::SinceBoost => since_boost(i.valve),
                 Feat::PhysSensor => i.phys_sensor,
                 Feat::PhysAir => i.phys_air,
                 Feat::Ambient(k) => i.ambient[*k],
@@ -215,22 +225,32 @@ pub struct Net {
     session: Mutex<Session>,
     feats: Vec<Feat>,
     output: &'static str,
+    pub feedback: f64,
 }
 
 impl Net {
     fn load(dir: &Path, spec: &Value, output: &'static str) -> Result<Self> {
+        let feedback = if output == "delta" { spec["feedback"].as_f64().ok_or_else(|| anyhow!("residual without feedback"))? } else { 0.0 };
         let file = spec["file"].as_str().ok_or_else(|| anyhow!("no file"))?;
         let feats = spec["features"].as_array().ok_or_else(|| anyhow!("no features"))?.iter().map(|f| parse_feat(f.as_str().unwrap_or_default())).collect::<Result<Vec<_>>>()?;
         let session = Session::builder()?.commit_from_file(dir.join(file)).with_context(|| format!("load {file}"))?;
-        Ok(Self { session: Mutex::new(session), feats, output })
+        Ok(Self { session: Mutex::new(session), feats, output, feedback })
     }
 
     pub fn run(&self, i: &FeatIn) -> Result<f64> {
-        let x = featurize(&self.feats, i);
+        self.run_many(std::slice::from_ref(i))?.first().copied().ok_or_else(|| anyhow!("empty output {}", self.output))
+    }
+
+    pub fn run_many(&self, inputs: &[FeatIn]) -> Result<Vec<f64>> {
+        let width = self.feats.len();
+        let x: Vec<f32> = inputs.iter().flat_map(|i| featurize(&self.feats, i)).collect();
         let mut session = self.session.lock().unwrap();
-        let outputs = session.run(ort::inputs!["x" => Tensor::from_array(([1usize, x.len()], x))?])?;
+        let outputs = session.run(ort::inputs!["x" => Tensor::from_array(([inputs.len(), width], x))?])?;
         let (_, v) = outputs[self.output].try_extract_tensor::<f32>()?;
-        v.first().map(|v| f64::from(*v)).ok_or_else(|| anyhow!("empty output {}", self.output))
+        if v.len() < inputs.len() {
+            bail!("output {} has {} rows for {}", self.output, v.len(), inputs.len());
+        }
+        Ok(v.iter().take(inputs.len()).map(|v| f64::from(*v)).collect())
     }
 
     #[cfg(test)]
@@ -257,6 +277,11 @@ impl Bundle {
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("bundle.json");
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?)?;
+        for (key, want) in [("dt_s", DT_S), ("history_min", SENSOR_HISTORY_MIN as i64), ("lag_step_min", LAG_STEP_MIN)] {
+            if doc[key].as_i64() != Some(want) {
+                bail!("bundle {} refused: {key} is {}, this heatd build needs {want}", path.display(), doc[key]);
+            }
+        }
         let mut rooms = HashMap::new();
         for (name, r) in doc["rooms"].as_object().ok_or_else(|| anyhow!("bundle: no rooms"))? {
             match Physics::from_doc(&r["physics"]) {
@@ -287,6 +312,9 @@ impl Bundle {
 
 pub fn backtest(metrics: &Value, room: &str, variant: &str) -> (Option<f64>, usize) {
     let r = &metrics["backtest"][room];
+    if r["in_sample"].as_bool() == Some(true) {
+        return (None, 0);
+    }
     let rmse = r[variant]["rmse"].as_f64().or_else(|| r[variant].as_f64()).or_else(|| r[format!("{variant}_rmse")].as_f64());
     let cycles = r["cycles"].as_u64().or_else(|| r[variant]["cycles"].as_u64()).unwrap_or(0);
     (rmse, cycles as usize)
@@ -321,41 +349,31 @@ pub struct Ctx<'a> {
     pub env: Env,
     pub hour: f64,
     pub target: f64,
-    pub boost_sp: f64,
     pub sensor: Vec<f64>,
     pub valve: Vec<f64>,
     pub others: f64,
-    pub since: f64,
     pub ambient: [f64; 3],
     pub h: f64,
+}
+
+struct Lane {
+    off: usize,
+    x: (f64, f64),
+    sensor: Vec<f64>,
+    valve: Vec<f64>,
+    sim: Sim,
+}
+
+fn first_best(pool: impl Iterator<Item = usize>, key: impl Fn(usize) -> f64) -> Option<usize> {
+    pool.fold(None, |best, i| match best {
+        Some(b) if key(i) >= key(b) => Some(b),
+        _ => Some(i),
+    })
 }
 
 impl Ctx<'_> {
     fn env_at(&self, k: usize) -> Env {
         Env { night: self.phys.is_night(self.hour + k as f64 / 60.0), ..self.env.clone() }
-    }
-
-    fn setpoint(&self, k: usize, t_off: usize) -> f64 {
-        if k < t_off {
-            self.boost_sp
-        } else {
-            self.target
-        }
-    }
-
-    pub fn grey(&self, t_off: usize) -> Sim {
-        let mut x = self.x;
-        let mut sim = Sim { peak: x.1, ..Default::default() };
-        for k in 0..SIM_MIN {
-            let u = self.phys.pi(self.setpoint(k, t_off), self.phys.sensor(x));
-            x = self.phys.step(x, u, &self.env_at(k), self.h);
-            sim.peak = sim.peak.max(x.1);
-            sim.valve50 += f64::from(u8::from(u > 0.5));
-            if sim.ttt.is_none() && x.1 >= self.target - REACH_C {
-                sim.ttt = Some((k + 1) as f64);
-            }
-        }
-        sim
     }
 
     fn feat_in<'a>(&'a self, sensor: &'a [f64], valve: &'a [f64], k: usize, x: (f64, f64), phys_sensor: f64) -> FeatIn<'a> {
@@ -366,7 +384,6 @@ impl Ctx<'_> {
             radiation: self.env.rad,
             hour: self.hour + k as f64 / 60.0,
             others: self.others,
-            since: self.since + k as f64,
             phys_sensor,
             phys_air: x.1,
             ambient: self.ambient,
@@ -388,50 +405,50 @@ impl Ctx<'_> {
         }
     }
 
-    pub fn residual(&self, t_off: usize) -> Result<Sim> {
-        let (latent, residual) = self.nets()?;
-        let (mut x, mut sensor, mut valve) = (self.x, self.sensor.clone(), self.valve.clone());
-        let mut sim = Sim { peak: f64::NEG_INFINITY, ..Default::default() };
-        for k in 0..SIM_MIN {
-            let u = self.phys.pi(self.setpoint(k, t_off), *sensor.last().unwrap_or(&self.target));
-            if let Some(last) = valve.last_mut() {
-                *last = u;
+    pub fn simulate(&self, variant: &str, offs: &[usize]) -> Result<Vec<Sim>> {
+        let nets = if variant == GREY { None } else { Some(self.nets()?) };
+        let mut lanes: Vec<Lane> = offs.iter().map(|off| Lane { off: *off, x: self.x, sensor: self.sensor.clone(), valve: self.valve.clone(), sim: Sim { peak: f64::NEG_INFINITY, ..Default::default() } }).collect();
+        for k in 0..HORIZON_MIN {
+            let env = self.env_at(k);
+            let mut stepped = Vec::with_capacity(lanes.len());
+            for l in lanes.iter_mut() {
+                let sen = self.phys.sensor(l.x);
+                if k > 0 {
+                    l.sensor.push(sen);
+                }
+                let u = if k < l.off { 1.0 } else { self.phys.pi(self.target, sen) };
+                match (k, l.valve.last_mut()) {
+                    (0, Some(last)) => *last = u,
+                    _ => l.valve.push(u),
+                }
+                l.sim.valve50 += f64::from(u8::from(u > 0.5));
+                stepped.push(self.phys.step(l.x, u, &env, self.h));
             }
-            let next = self.phys.step(x, u, &self.env_at(k), self.h);
-            let phys_sensor = self.phys.sensor(next);
-            let input = self.feat_in(&sensor, &valve, k, x, phys_sensor);
-            let (air, delta) = (latent.run(&input)?, residual.run(&input)?);
-            sim.peak = sim.peak.max(air);
-            sim.valve50 += f64::from(u8::from(u > 0.5));
-            if sim.ttt.is_none() && air >= self.target - REACH_C {
-                sim.ttt = Some((k + 1) as f64);
+            let (air, delta) = match nets {
+                None => (lanes.iter().map(|l| l.x.1).collect::<Vec<_>>(), None),
+                Some((latent, residual)) => {
+                    let ins: Vec<FeatIn> = lanes.iter().zip(&stepped).map(|(l, n)| self.feat_in(&l.sensor, &l.valve, k, l.x, self.phys.sensor(*n))).collect();
+                    (latent.run_many(&ins)?, Some((residual.run_many(&ins)?, residual.feedback)))
+                }
+            };
+            for (j, (l, n)) in lanes.iter_mut().zip(stepped).enumerate() {
+                l.sim.peak = l.sim.peak.max(air[j]);
+                if l.sim.ttt.is_none() && air[j] >= self.target - REACH_C {
+                    l.sim.ttt = Some((k + 1) as f64);
+                }
+                let d = delta.as_ref().map_or(0.0, |(d, g)| g * d[j]);
+                l.x = (n.0 + d, n.1 + d);
             }
-            sensor.push(phys_sensor + delta);
-            valve.push(u);
-            x = next;
         }
-        Ok(sim)
+        Ok(lanes.into_iter().map(|l| l.sim).collect())
     }
 
     pub fn plan(&self, variant: &str, max_off: usize) -> Result<(usize, Sim)> {
-        let run = |t_off: usize| if variant == GREY { Ok(self.grey(t_off)) } else { self.residual(t_off) };
-        let none = run(0)?;
-        if none.peak >= self.target {
-            return Ok((0, none));
-        }
-        let all = run(max_off)?;
-        if all.peak <= self.target {
-            return Ok((max_off, all));
-        }
-        let (mut lo, mut hi) = (0, max_off);
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if run(mid)?.peak <= self.target {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok((lo, run(lo)?))
+        let offs: Vec<usize> = (0..=max_off.min(TOFF_MAX)).collect();
+        let sims = self.simulate(variant, &offs)?;
+        let target = self.target;
+        let feasible = first_best((0..sims.len()).filter(|i| sims[*i].peak <= target + OVERSHOOT_TOL), |i| (sims[i].peak - target).abs());
+        let i = feasible.or_else(|| first_best(0..sims.len(), |i| sims[i].peak)).ok_or_else(|| anyhow!("no t_off candidates"))?;
+        Ok((offs[i], sims[i].clone()))
     }
 }
