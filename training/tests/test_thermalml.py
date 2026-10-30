@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 from dataclasses import replace
 import numpy as np
 import onnxruntime as ort
@@ -110,3 +111,15 @@ def test_little_data_never_crashes(tmp_path):
 
 def test_ambient_loader_empty(tmp_path):
     assert load_ambient(tmp_path) == {}
+
+
+def test_parity_fixture_in_repo():
+    root = Path(__file__).resolve().parents[2] / "crates" / "heatd" / "testdata"
+    fx = json.loads((root / "thermal_ml_parity.json").read_text())
+    b = json.loads((root / "thermal_bundle" / "bundle.json").read_text())
+    assert {c["structure"] for c in fx["physics"]} == {"rc1", "rc2"} and {c["night"] for c in fx["physics"]} == {True, False}
+    assert fx["features"] and all(len(f["residual_vector"]) == len(b["residual"]["features"]) for f in fx["features"])
+    for r in fx["rollouts"]:
+        peaks = np.array(r["peaks"])
+        assert r["t_off_min"] == choose_t_off(peaks, np.arange(len(peaks)), r["target"], r["overshoot_tol"]) and len(r["air"]) == r["horizon_min"]
+    assert (root / "thermal_bundle" / b["latent"]["file"]).is_file()

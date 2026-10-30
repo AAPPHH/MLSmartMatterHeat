@@ -484,6 +484,22 @@ def optimum_start(cfg, tcfg, doc, room, names, x0, S0, V0, env, target, latent=N
     return {"t_off_min": int(cand[i]), "predicted_peak_c": float(peak[i]), "peaks": peak, "air": out["air"][i], "sensor": out["sensor"][i], "candidates": cand}
 
 
+def jsonable(x):
+    if isinstance(x, dict):
+        return {k: jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [jsonable(v) for v in x]
+    if isinstance(x, np.ndarray):
+        return jsonable(x.tolist())
+    if isinstance(x, (float, np.floating)):
+        return None if not np.isfinite(x) else float(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, np.bool_):
+        return bool(x)
+    return x
+
+
 def to_onnx(model, n, output, lag=None):
     proto = convert_sklearn(model, initial_types=[("x", FloatTensorType([None, n]))], target_opset={"": 15, "ai.onnx.ml": 3})
     g = proto.graph
@@ -589,8 +605,8 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
     bundle = {"version": version, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "dt_s": int(tcfg["dt_s"]), "history_min": cfg["history_min"], "lag_step_min": cfg["lag_step_min"],
               "rooms": {R.name: {"physics": R.doc, "sensor_offset_c": R.offset, "valid": bool(R.valid)} for R in rooms}, "room_index": index,
               "latent": files["latent"], "residual": files["residual"], "metrics": metrics, "warnings": warn, "source": str(src)}
-    (out / "bundle.json").write_text(json.dumps(bundle, indent=1, default=float))
-    (out / "cycles.json").write_text(json.dumps(table, indent=1, default=float))
+    (out / "bundle.json").write_text(json.dumps(jsonable(bundle), indent=1))
+    (out / "cycles.json").write_text(json.dumps(jsonable(table), indent=1))
     return out, bundle, {"rooms": rooms, "names": names, "lat_names": lat_names, "nets": nets_final, "cfg": cfg}
 
 
