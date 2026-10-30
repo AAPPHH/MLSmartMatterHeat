@@ -30,6 +30,7 @@ pub struct AttributeSpec {
 
 pub const LOCAL_TEMPERATURE: AttributeSpec = AttributeSpec { id: 0x0000, pascal: "LocalTemperature", snake: "local_temperature", kebab: "local-temperature", scale: 100.0 };
 pub const OCCUPIED_HEATING_SETPOINT: AttributeSpec = AttributeSpec { id: 0x0012, pascal: "OccupiedHeatingSetpoint", snake: "occupied_heating_setpoint", kebab: "occupied-heating-setpoint", scale: 100.0 };
+pub const MAX_HEAT_SETPOINT_LIMIT: AttributeSpec = AttributeSpec { id: 0x0016, pascal: "MaxHeatSetpointLimit", snake: "max_heat_setpoint_limit", kebab: "max-heat-setpoint-limit", scale: 100.0 };
 pub const SYSTEM_MODE: AttributeSpec = AttributeSpec { id: 0x001C, pascal: "SystemMode", snake: "system_mode", kebab: "system-mode", scale: 1.0 };
 pub const WATCHED: [&AttributeSpec; 3] = [&LOCAL_TEMPERATURE, &OCCUPIED_HEATING_SETPOINT, &SYSTEM_MODE];
 pub const PI_HEATING_DEMAND: AttributeSpec = AttributeSpec { id: 0x0008, pascal: "PIHeatingDemand", snake: "pi_heating_demand", kebab: "pi-heating-demand", scale: 1.0 };
@@ -115,6 +116,7 @@ pub trait MatterController: Send + Sync {
     async fn commission(&self, node: NodeId, pairing_code: &str, thread_dataset_hex: &str) -> Result<()>;
     async fn read_thermostat(&self, node: NodeId) -> Result<ThermostatState>;
     async fn write_heating_setpoint(&self, node: NodeId, celsius: f64) -> Result<()>;
+    async fn write_max_heat_limit(&self, node: NodeId, celsius: f64) -> Result<()>;
     async fn write_system_mode(&self, node: NodeId, mode: u8) -> Result<()>;
     async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>>;
     async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>>;

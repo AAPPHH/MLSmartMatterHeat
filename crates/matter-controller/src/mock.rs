@@ -24,6 +24,8 @@ struct Inner {
     captures: Vec<(NodeId, Sender<CaptureItem>)>,
     poll_failing: bool,
     setpoint_writes: Vec<(NodeId, f64)>,
+    limit_writes: Vec<(NodeId, f64)>,
+    limit_rejecting: bool,
 }
 
 pub struct MockController {
@@ -58,6 +60,14 @@ impl MockController {
         let value = TypedValue::from_json(&serde_json::json!(raw_value.round() as i64));
         let raw = format!("  {name}: {}", value.v_i64.unwrap_or(0)).into_bytes();
         CaptureItem::Attribute(RawAttribute { node, endpoint: self.endpoint, cluster, attribute: id, name: name.into(), raw, value, source })
+    }
+
+    pub fn set_limit_rejecting(&self, rejecting: bool) {
+        self.inner.lock().unwrap().limit_rejecting = rejecting;
+    }
+
+    pub fn limit_writes(&self) -> Vec<(NodeId, f64)> {
+        self.inner.lock().unwrap().limit_writes.clone()
     }
 
     pub fn setpoint_writes(&self) -> Vec<(NodeId, f64)> {
@@ -156,6 +166,18 @@ impl MatterController for MockController {
         inner.nodes.get_mut(&node).ok_or(Error::UnknownNode(node))?.setpoint = value;
         inner.setpoint_writes.push((node, value));
         self.publish(&mut inner, node, OCCUPIED_HEATING_SETPOINT.snake, value);
+        Ok(())
+    }
+
+    async fn write_max_heat_limit(&self, node: NodeId, celsius: f64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.nodes.contains_key(&node) {
+            return Err(Error::UnknownNode(node));
+        }
+        if inner.limit_rejecting {
+            return Err(Error::Command(format!("write MaxHeatSetpointLimit: status = 0x87 (CONSTRAINT_ERROR) node {node}")));
+        }
+        inner.limit_writes.push((node, f64::from(centi_degrees(celsius)) / 100.0));
         Ok(())
     }
 
@@ -276,6 +298,10 @@ mod tests {
         assert_eq!(mock.read_thermostat(7).await.unwrap().local_temperature_c, Some(17.9));
         assert!(matches!(mock.read_thermostat(9).await, Err(Error::UnknownNode(9))));
         assert_eq!(mock.setpoint_writes(), vec![(7, 17.0)]);
+        mock.write_max_heat_limit(7, 22.0).await.unwrap();
+        assert_eq!(mock.limit_writes(), vec![(7, 22.0)]);
+        mock.set_limit_rejecting(true);
+        assert!(mock.write_max_heat_limit(7, 22.0).await.is_err());
         mock.write_system_mode(7, 0).await.unwrap();
         assert_eq!(mock.read_thermostat(7).await.unwrap().system_mode, Some(0));
         assert!(matches!(mock.write_system_mode(9, 4).await, Err(Error::UnknownNode(9))));

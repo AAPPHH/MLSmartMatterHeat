@@ -1,7 +1,7 @@
 use crate::capture::{CaptureItem, CaptureParser, SOURCE_POLL};
 use crate::{
     centi_degrees, parse_number, AttributeReport, AttributeSpec, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
-    NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, SYSTEM_MODE, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
+    MAX_HEAT_SETPOINT_LIMIT, NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, SYSTEM_MODE, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -120,6 +120,14 @@ impl ChipToolConfig {
 
     fn write_setpoint_parts(&self, node: NodeId, celsius: f64) -> Vec<String> {
         self.write_parts(&OCCUPIED_HEATING_SETPOINT, centi_degrees(celsius).into(), node)
+    }
+
+    fn write_max_heat_limit_parts(&self, node: NodeId, celsius: f64) -> Vec<String> {
+        self.write_parts(&MAX_HEAT_SETPOINT_LIMIT, centi_degrees(celsius).into(), node)
+    }
+
+    pub fn write_max_heat_limit_args(&self, node: NodeId, celsius: f64) -> Vec<String> {
+        self.args(&self.write_max_heat_limit_parts(node, celsius))
     }
 
     fn write_system_mode_parts(&self, node: NodeId, mode: u8) -> Vec<String> {
@@ -857,6 +865,13 @@ impl MatterController for ChipToolController {
         }
     }
 
+    async fn write_max_heat_limit(&self, node: NodeId, celsius: f64) -> Result<()> {
+        match &self.session {
+            Some(session) => session.write(self.config.write_max_heat_limit_parts(node, celsius)).await,
+            None => check_output(&self.run(self.config.write_max_heat_limit_args(node, celsius), self.config.timeout_s).await?),
+        }
+    }
+
     async fn write_system_mode(&self, node: NodeId, mode: u8) -> Result<()> {
         match &self.session {
             Some(session) => session.write(self.config.write_system_mode_parts(node, mode)).await,
@@ -936,6 +951,7 @@ mod tests {
         );
         assert_eq!(c.read_args(&LOCAL_TEMPERATURE, 5), expect(&["thermostat", "read", "local-temperature", "5", "1"]));
         assert_eq!(c.write_setpoint_args(5, 21.5), expect(&["thermostat", "write", "occupied-heating-setpoint", "2150", "5", "1"]));
+        assert_eq!(c.write_max_heat_limit_args(5, 22.0), expect(&["thermostat", "write", "max-heat-setpoint-limit", "2200", "5", "1"]));
         assert_eq!(c.write_system_mode_args(5, 4), expect(&["thermostat", "write", "system-mode", "4", "5", "1"]));
         assert_eq!(c.write_system_mode_parts(5, 0).join(" "), "thermostat write system-mode 0 5 1");
         assert_eq!(c.interactive_args(), expect(&["interactive", "start"]));
