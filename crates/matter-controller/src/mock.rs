@@ -25,6 +25,7 @@ struct Inner {
     poll_failing: bool,
     setpoint_writes: Vec<(NodeId, f64)>,
     limit_writes: Vec<(NodeId, f64)>,
+    write_log: Vec<(&'static str, NodeId, f64)>,
     limit_rejecting: bool,
 }
 
@@ -64,6 +65,10 @@ impl MockController {
 
     pub fn set_limit_rejecting(&self, rejecting: bool) {
         self.inner.lock().unwrap().limit_rejecting = rejecting;
+    }
+
+    pub fn write_log(&self) -> Vec<(&'static str, NodeId, f64)> {
+        self.inner.lock().unwrap().write_log.clone()
     }
 
     pub fn limit_writes(&self) -> Vec<(NodeId, f64)> {
@@ -165,6 +170,7 @@ impl MatterController for MockController {
         let value = f64::from(centi_degrees(celsius)) / 100.0;
         inner.nodes.get_mut(&node).ok_or(Error::UnknownNode(node))?.setpoint = value;
         inner.setpoint_writes.push((node, value));
+        inner.write_log.push(("setpoint", node, value));
         self.publish(&mut inner, node, OCCUPIED_HEATING_SETPOINT.snake, value);
         Ok(())
     }
@@ -178,6 +184,7 @@ impl MatterController for MockController {
             return Err(Error::Command(format!("write MaxHeatSetpointLimit: status = 0x87 (CONSTRAINT_ERROR) node {node}")));
         }
         inner.limit_writes.push((node, f64::from(centi_degrees(celsius)) / 100.0));
+        inner.write_log.push(("limit", node, f64::from(centi_degrees(celsius)) / 100.0));
         Ok(())
     }
 

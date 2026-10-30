@@ -327,7 +327,7 @@ pub fn spawn(state: AppState, timing: Timing) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::storage::Storage;
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(secs, vec![60, 120, 240, 480, 960, 960, 960]);
     }
 
-    fn state(dir: &std::path::Path, mock: Arc<MockController>) -> AppState {
+    pub(crate) fn state(dir: &std::path::Path, mock: Arc<MockController>) -> AppState {
         let toml = format!("poll_silence_s = 0
 inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_str().unwrap().replace('\\', "/"));
         let config = Config::parse(&toml).unwrap();
@@ -452,6 +452,7 @@ inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_s
             explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
             tracker: Default::default(),
             boost: Default::default(),
+            failsafe: Default::default(),
             batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }

@@ -272,6 +272,25 @@ impl Default for BoostSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct FailsafeSection {
+    pub setpoint: f64,
+    pub max_c: f64,
+    pub boost_max_c: f64,
+    pub shutdown_timeout_s: u64,
+    pub attempts: usize,
+    pub reconcile_s: u64,
+    pub retry_min: f64,
+    pub reassert_h: f64,
+}
+
+impl Default for FailsafeSection {
+    fn default() -> Self {
+        Self { setpoint: 18.0, max_c: 22.0, boost_max_c: 28.5, shutdown_timeout_s: 30, attempts: 3, reconcile_s: 60, retry_min: 10.0, reassert_h: 6.0 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct WindowSection {
     pub enabled: bool,
     pub window_slope_min: f64,
@@ -373,6 +392,7 @@ pub struct Config {
     pub watchmatch: WatchMatchSection,
     pub window: WindowSection,
     pub boost: BoostSection,
+    pub failsafe: FailsafeSection,
 }
 
 impl Default for Config {
@@ -414,6 +434,7 @@ impl Default for Config {
             watchmatch: WatchMatchSection::default(),
             window: WindowSection::default(),
             boost: BoostSection::default(),
+            failsafe: FailsafeSection::default(),
         }
     }
 }

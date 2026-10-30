@@ -5,6 +5,7 @@ mod boost;
 mod capture;
 mod config;
 mod explore;
+mod failsafe;
 mod context;
 mod dynamics;
 #[cfg(test)]
@@ -209,6 +210,7 @@ async fn serve(config: Config) -> Result<()> {
     let state = http::AppState {
         watchmatch,
         boost: boost.clone(),
+        failsafe: failsafe::Failsafe::new(&config.failsafe, Some(Path::new(&config.data_dir).join("failsafe"))),
         sink: sink.clone(),
         latest: Default::default(),
         status,
@@ -223,11 +225,16 @@ async fn serve(config: Config) -> Result<()> {
         config,
     };
     boost::spawn_background(boost, std::path::PathBuf::from(&state.config.data_dir));
+    failsafe::spawn_background(state.clone());
     rules::spawn_background(state.clone());
     capture::spawn(state.clone(), capture::Timing::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);
-    axum::serve(listener, http::router(state)).with_graceful_shutdown(shutdown_signal()).await?;
+    let stopper = state.clone();
+    axum::serve(listener, http::router(state)).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        failsafe::shutdown(&stopper).await;
+    }).await?;
     sink.append(lake::Event::now(lake::kind::SHUTDOWN, "heatd"))?;
     sink.close()?;
     Ok(())

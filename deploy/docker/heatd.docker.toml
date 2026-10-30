@@ -140,3 +140,9 @@ max_timeout_min = 60.0
 probe_min = 10.0
 probe_drop_k = 0.5
 max_events_per_hour = 4
+
+[failsafe]
+setpoint = 18.0
+max_c = 22.0
+boost_max_c = 28.5
+shutdown_timeout_s = 30

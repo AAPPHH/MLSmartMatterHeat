@@ -34,6 +34,7 @@ pub struct AppState {
     pub batch_seq: Arc<AtomicU64>,
     pub watchmatch: WatchMatch,
     pub boost: crate::boost::Boost,
+    pub failsafe: crate::failsafe::Failsafe,
 }
 
 impl AppState {
@@ -616,7 +617,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?})))
+    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?, "failsafe": state.failsafe.view()})))
 }
 
 async fn snapshot(State(state): State<AppState>) -> ApiResult {
@@ -810,6 +811,7 @@ mod tests {
             sink: sink.clone(),
             latest: Default::default(),
             status: status.clone(),
+            failsafe: crate::failsafe::Failsafe::new(&config.failsafe, None),
             config: Arc::new(config),
             model,
             controller: mock.clone(),
@@ -1607,6 +1609,8 @@ occupied_setpoint = 30.0
 ", "[[rooms]]
 name = 'wohnzimmer'
 nodes = [5]
+[failsafe]
+max_c = 25.0
 ");
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         let t0 = now_ms();

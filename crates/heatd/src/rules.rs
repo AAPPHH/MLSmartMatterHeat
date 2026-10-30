@@ -443,9 +443,13 @@ pub fn setpoint_limits(readings: &[Reading], node: u64) -> (f64, f64) {
     }
 }
 
-pub fn clamp_setpoint(readings: &[Reading], node: u64, setpoint: f64) -> f64 {
+pub fn clamp_setpoint(readings: &[Reading], node: u64, setpoint: f64, cap: f64) -> f64 {
     let (lo, hi) = setpoint_limits(readings, node);
-    setpoint.clamp(lo, hi)
+    setpoint.clamp(lo, hi.min(cap))
+}
+
+fn clamp_boost(readings: &[Reading], node: u64, setpoint: f64, cap: f64) -> f64 {
+    setpoint.clamp(setpoint_limits(readings, node).0, cap)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -480,7 +484,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
     for want in wants.iter_mut() {
         match out.directives.get(&want.room) {
             Some(crate::boost::Directive::Boost { experiment_id }) => {
-                want.setpoint = clamp_setpoint(readings, want.node, state.config.boost.boost_setpoint);
+                want.setpoint = clamp_boost(readings, want.node, state.config.boost.boost_setpoint, state.failsafe.boost_max_c());
                 want.reason = "boost";
                 want.rule = "boost";
                 want.experiment_id = Some(experiment_id.clone());
@@ -494,7 +498,22 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
     }
 }
 
+pub(crate) async fn send_setpoint(state: &AppState, node: u64, setpoint: f64) -> matter_controller::Result<()> {
+    let target = || Some(setpoint);
+    if setpoint > state.failsafe.max_c() {
+        crate::failsafe::ensure(state, node, &target, false).await;
+    }
+    let outcome = state.controller.write_heating_setpoint(node, setpoint).await;
+    if outcome.is_ok() {
+        crate::failsafe::ensure(state, node, &target, false).await;
+    }
+    outcome
+}
+
 pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> Result<Vec<Desired>> {
+    if state.failsafe.stopping() {
+        return Ok(Vec::new());
+    }
     for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes) {
         log("presence event", state.sink.append(presence_event(&device, transition)));
     }
@@ -531,7 +550,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         log("occupancy event", state.sink.append(lake::Event { ts: to * 1000, ..event }));
     }
     let readings = state.latest.all();
-    let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint), ..w }).collect();
+    let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, &window_busy, away, &exploring);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
@@ -540,7 +559,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     if let Some((room, _)) = step.pending.as_ref().filter(|_| fresh) {
         for want in wants.iter().filter(|w| &w.room == room && w.reason != "window_open") {
             let old = current(&state.commanded.lock().unwrap(), want.node);
-            let target = clamp_setpoint(&readings, want.node, state.config.occupied_setpoint);
+            let target = clamp_setpoint(&readings, want.node, state.config.occupied_setpoint, state.failsafe.max_c());
             if old.is_some_and(|o| (o - target).abs() < state.config.setpoint_deadband) {
                 continue;
             }
@@ -579,7 +598,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         let sink = state.sink.clone();
         log("decision flush", tokio::task::spawn_blocking(move || sink.flush()).await.map_err(anyhow::Error::from).and_then(|r| r.map(|_| ())));
         state.commanded.lock().unwrap().sent.insert(want.node, Sent { target: want.setpoint, previous: old, written_ms: now_ms, acked: None });
-        let outcome = state.controller.write_heating_setpoint(want.node, want.setpoint).await;
+        let outcome = send_setpoint(state, want.node, want.setpoint).await;
         let error = outcome.as_ref().err().map(|e| e.to_string());
         log("decision result", state.sink.append(result_row(&decision, want.reason, error)));
         match outcome {
@@ -871,8 +890,10 @@ setpoint=21.0").unwrap();
         assert_eq!(setpoint_limits(&limits, 5), (10.0, 25.0));
         assert_eq!(setpoint_limits(&limits, 6), (7.5, 28.5));
         assert_eq!(setpoint_limits(&limits, 7), (7.5, 28.5));
-        assert_eq!([7.0, 8.0, 40.0].map(|v| clamp_setpoint(&[], 5, v)), [7.5, 8.0, 28.5]);
-        assert_eq!(clamp_setpoint(&limits, 5, 8.0), 10.0);
+        assert_eq!([7.0, 8.0, 40.0].map(|v| clamp_setpoint(&[], 5, v, 28.5)), [7.5, 8.0, 28.5]);
+        assert_eq!([7.0, 8.0, 40.0].map(|v| clamp_setpoint(&[], 5, v, 22.0)), [7.5, 8.0, 22.0]);
+        assert_eq!(clamp_setpoint(&limits, 5, 8.0, 22.0), 10.0);
+        assert_eq!(clamp_boost(&[], 5, 28.0, 28.5), 28.0);
     }
 
     #[test]
