@@ -79,4 +79,4 @@ What is needed to finish: add `espressif/esp_matter` (controller enabled, `CONFI
 
 ## Build result
 
-Filled in by the build, see the commit message.
+IDF v5.5.4, esp32s3, wifi variant: `esp_ot_br.bin` 0x174630 bytes (1,525,296) in a 0x200000 OTA slot, 27% free. The previous firmware was 1,497,952 bytes, so the watchdog costs about 27 KB. Host test: `bash firmware/br/test/run.sh` (gcc, cJSON from IDF), 5572 checks. Nothing was flashed or run on the device; HTTP handlers, NVS, the sensor and the task are compile-checked only.
