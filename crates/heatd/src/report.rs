@@ -394,6 +394,13 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
     }
 
+    match usage_section(root, date) {
+        Ok(section) => md.push_str(&section),
+        Err(e) => {
+            let _ = writeln!(md, "\n## Heizbetrieb\n\nNicht verfuegbar: {e:#}");
+        }
+    }
+
     md.push_str("\n## Events by kind\n\n");
     let kinds = rows(c, &format!("SELECT kind, count(*) FROM events WHERE {day} GROUP BY kind ORDER BY kind"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let _ = writeln!(md, "{}\n", if kinds.is_empty() { "none".into() } else { kinds.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ") });
@@ -489,4 +496,118 @@ pub async fn daily_loop(sink: Sink, status: Status) {
         let (s, st) = (sink.clone(), status.clone());
         let _ = tokio::task::spawn_blocking(move || daily_job(&s, &st, false)).await;
     }
+}
+
+const USAGE_LOW_PCT: f64 = 10.0;
+const USAGE_HIGH_PCT: f64 = 50.0;
+const HOUSE: &str = "Haus gesamt";
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RoomUsage {
+    pub valve_hours: f64,
+    pub minutes_over_10: f64,
+    pub minutes_over_50: f64,
+    pub first_us: Option<i64>,
+    pub last_us: Option<i64>,
+    pub hourly: [f64; 24],
+    pub heat_proxy: f64,
+}
+
+impl RoomUsage {
+    fn add(&mut self, other: &RoomUsage) {
+        self.valve_hours += other.valve_hours;
+        self.minutes_over_10 += other.minutes_over_10;
+        self.minutes_over_50 += other.minutes_over_50;
+        self.heat_proxy += other.heat_proxy;
+        self.first_us = self.first_us.into_iter().chain(other.first_us).min();
+        self.last_us = self.last_us.into_iter().chain(other.last_us).max();
+        self.hourly.iter_mut().zip(other.hourly).for_each(|(a, b)| *a += b);
+    }
+
+    fn json(&self, house: &RoomUsage) -> Value {
+        let share = |v: f64, total: f64| (total > 0.0).then(|| v / total);
+        let iso = |us: Option<i64>| us.and_then(chrono::DateTime::from_timestamp_micros).map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        serde_json::json!({
+            "valve_hours": self.valve_hours, "minutes_over_10": self.minutes_over_10, "minutes_over_50": self.minutes_over_50,
+            "first": iso(self.first_us), "last": iso(self.last_us), "hourly_valve_hours": self.hourly,
+            "share_of_house": share(self.valve_hours, house.valve_hours), "heat_proxy_kh": self.heat_proxy, "heat_proxy_share": share(self.heat_proxy, house.heat_proxy),
+        })
+    }
+}
+
+pub type Usage = BTreeMap<NaiveDate, BTreeMap<String, RoomUsage>>;
+
+pub fn usage(root: &Path, from: NaiveDate, to: NaiveDate) -> Result<Usage> {
+    let db = open_room_minute(root, from, to)?;
+    let valid = "gap_mask & 4 = 0 AND valve_pct BETWEEN 0 AND 100";
+    let heat = "gap_mask & 13 = 0 AND valve_pct BETWEEN 0 AND 100";
+    let data = rows(
+        &db.conn,
+        &format!(
+            "SELECT room, strftime(t, '%Y-%m-%d'), hour(t), coalesce(sum(valve_pct) FILTER (WHERE {valid}), 0) / 6000.0, count(*) FILTER (WHERE {valid} AND valve_pct > {USAGE_LOW_PCT}), count(*) FILTER (WHERE {valid} AND valve_pct > {USAGE_HIGH_PCT}),
+                    coalesce(sum(valve_pct / 100.0 * greatest(actual - outdoor_temp, 0)) FILTER (WHERE {heat}), 0) / 60.0, epoch_us(min(t) FILTER (WHERE {valid} AND valve_pct > {USAGE_LOW_PCT})), epoch_us(max(t) FILTER (WHERE {valid} AND valve_pct > {USAGE_LOW_PCT}))
+             FROM room_minute WHERE epoch_us(t) >= {} AND epoch_us(t) < {} GROUP BY room, 2, 3 ORDER BY 2, 1, 3",
+            midnight_us(from),
+            midnight_us(to + chrono::Duration::days(1))
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i32>(2)?, r.get::<_, f64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, f64>(6)?, r.get::<_, Option<i64>>(7)?, r.get::<_, Option<i64>>(8)?)),
+    )?;
+    let mut out = Usage::new();
+    for (room, day, hour, hours, over_10, over_50, proxy, first, last) in data {
+        let entry = out.entry(day.parse()?).or_default().entry(room).or_default();
+        entry.hourly[hour as usize % 24] += hours;
+        entry.add(&RoomUsage { valve_hours: hours, minutes_over_10: over_10 as f64, minutes_over_50: over_50 as f64, first_us: first, last_us: last, heat_proxy: proxy, ..Default::default() });
+    }
+    Ok(out)
+}
+
+fn house_total<'a>(rooms: impl Iterator<Item = &'a RoomUsage>) -> RoomUsage {
+    let mut total = RoomUsage::default();
+    rooms.for_each(|r| total.add(r));
+    total
+}
+
+fn rooms_json<'a>(rooms: impl Iterator<Item = (&'a String, &'a RoomUsage)>, house: &RoomUsage) -> Value {
+    Value::Object(rooms.map(|(k, v)| (k.clone(), v.json(house))).collect())
+}
+
+pub fn usage_json(root: &Path, from: NaiveDate, to: NaiveDate) -> Result<Value> {
+    roll_missing(root, from - chrono::Duration::days(2), to, chrono::Utc::now().date_naive());
+    let data = usage(root, from, to)?;
+    let mut totals: BTreeMap<String, RoomUsage> = BTreeMap::new();
+    let mut days = Vec::new();
+    for (date, rooms) in &data {
+        let house = house_total(rooms.values());
+        days.push(serde_json::json!({"date": date.to_string(), "rooms": rooms_json(rooms.iter(), &house), "house": house.json(&house)}));
+        rooms.iter().for_each(|(k, v)| totals.entry(k.clone()).or_default().add(v));
+    }
+    let house = house_total(totals.values());
+    Ok(serde_json::json!({
+        "from": from.to_string(), "to": to.to_string(), "days": days,
+        "totals": {"rooms": rooms_json(totals.iter(), &house), "house": house.json(&house)},
+        "note": "heat_proxy_kh = sum of valve fraction x max(sensor - outdoor, 0) x hours, a relative estimate and not measured energy; the current UTC day is included only after the 03:00 roll",
+    }))
+}
+
+pub fn usage_section(root: &Path, date: NaiveDate) -> Result<String> {
+    let data = usage(root, date, date)?;
+    let rooms = data.get(&date).cloned().unwrap_or_default();
+    let house = house_total(rooms.values());
+    let mut md = String::from("\n## Heizbetrieb\n\n");
+    if rooms.is_empty() {
+        md.push_str("Keine Ventildaten.\n");
+        return Ok(md);
+    }
+    md.push_str("Ventilstunden = Summe PIHeatingDemand-Anteil x Zeit (Werte ueber 100 % ignoriert). Waermeproxy = Ventilanteil x (Sensor - Aussen) x Zeit in K*h, nur eine relative Schaetzung, keine Messung. Zeiten UTC.\n\n| Raum | Ventilstunden | Min > 10 % | Min > 50 % | erstes Heizen | letztes Heizen | Anteil Haus | Waermeproxy (Schaetzung) | Anteil Proxy |\n|---|---|---|---|---|---|---|---|---|\n");
+    let pct = |v: f64, total: f64| if total > 0.0 { format!("{:.0} %", 100.0 * v / total) } else { "-".into() };
+    let when = |us: Option<i64>| us.map_or("-".into(), |u| hhmm(u)[..5].to_string());
+    let all: Vec<(&str, &RoomUsage)> = rooms.iter().map(|(k, v)| (k.as_str(), v)).chain(std::iter::once((HOUSE, &house))).collect();
+    for (room, u) in &all {
+        let _ = writeln!(md, "| {room} | {:.2} | {:.0} | {:.0} | {} | {} | {} | {:.2} | {} |", u.valve_hours, u.minutes_over_10, u.minutes_over_50, when(u.first_us), when(u.last_us), pct(u.valve_hours, house.valve_hours), u.heat_proxy, pct(u.heat_proxy, house.heat_proxy));
+    }
+    md.push_str("\nStundenprofil (Ventilstunden je UTC-Stunde 00..23)\n\n");
+    for (room, u) in &all {
+        let _ = writeln!(md, "- {room}: {}", u.hourly.iter().map(|h| format!("{h:.2}")).collect::<Vec<_>>().join(" "));
+    }
+    Ok(md)
 }
