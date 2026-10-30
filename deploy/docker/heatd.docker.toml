@@ -39,6 +39,13 @@ neighbours = [
     { a = "flur", b = "schlafzimmer", kind = "open" },
 ]
 
+[br_watchdog]
+enabled = true
+url = "http://192.168.178.33"
+token_file = "/secrets/br_watchdog_token"
+interval_s = 30
+timeout_s = 600
+
 [heat_source]
 kind = "oil"
 scope = "central"

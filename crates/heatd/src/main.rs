@@ -2,6 +2,9 @@
 #[path = "../tests/acceptance.rs"]
 mod acceptance;
 mod boost;
+mod br_watchdog;
+#[cfg(test)]
+mod br_watchdog_tests;
 mod capture;
 mod config;
 mod explore;
@@ -224,6 +227,9 @@ async fn serve(config: Config) -> Result<()> {
     };
     boost::spawn_background(boost, std::path::PathBuf::from(&state.config.data_dir));
     rules::spawn_background(state.clone());
+    if state.config.br_watchdog.enabled {
+        br_watchdog::spawn(state.clone());
+    }
     capture::spawn(state.clone(), capture::Timing::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);

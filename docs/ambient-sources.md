@@ -22,3 +22,5 @@ Firmware change that closes the gap (not done, nothing flashed):
 3. Add `esp_driver_tsens` to the `REQUIRES` of `firmware/br/main/CMakeLists.txt`.
 
 Collector side is ready: set `CONFIG["br_http"]["enabled"] = True` and point `url` / `json_path` at the endpoint (default `http://192.168.178.33/ambient`, key `die_temperature_c`). It is disabled by default and posts with `source = "br"`, `sensor = "die_c"`, unit `C`. Until the firmware exists, `die_c` stays missing and the model treats it as NaN.
+
+With the router watchdog (`docs/br-watchdog.md`) heatd itself reads `die_temperature_c` from `GET /watchdog/status` every 30 s and stores it as source `br`, sensor `die_c`; the `br_http` source of the collector can stay disabled.

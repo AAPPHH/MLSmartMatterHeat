@@ -401,6 +401,15 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
     }
 
+    md.push_str("\n## Router-Watchdog\n\n");
+    let br = rows(c, &format!("SELECT epoch_us(ts), detail FROM events WHERE kind = 'br_watchdog' AND {day} ORDER BY ts"), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    if br.is_empty() {
+        md.push_str("Keine Aenderungen, Router und Thermostate durchgehend erreichbar.\n");
+    }
+    for (us, detail) in br.iter().take(50) {
+        let _ = writeln!(md, "- {} {}", hhmm(*us), detail.as_deref().unwrap_or(""));
+    }
+
     md.push_str("\n## Events by kind\n\n");
     let kinds = rows(c, &format!("SELECT kind, count(*) FROM events WHERE {day} GROUP BY kind ORDER BY kind"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let _ = writeln!(md, "{}\n", if kinds.is_empty() { "none".into() } else { kinds.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ") });
