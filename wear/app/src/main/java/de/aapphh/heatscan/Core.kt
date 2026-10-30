@@ -14,6 +14,7 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 data class Ap(val bssid: String, val rssi: Int, val freq: Int)
 
@@ -50,16 +51,26 @@ object LabelEvent {
 
     const val POINT_MS = 1_000L
 
-    fun entry(device: String, from: Long, to: Long, label: String, heat: Boolean = true): JSONObject =
-        JSONObject().put("ts", to).put("kind", KIND).put("device", device).put("from", from).put("to", to).put("label", label).put("heat", heat)
+    fun newId(): String = UUID.randomUUID().toString()
 
-    fun point(device: String, at: Long, label: String, heat: Boolean): JSONObject = entry(device, at - POINT_MS, at + POINT_MS, label, heat)
+    fun entry(device: String, from: Long, to: Long, label: String, heat: Boolean = true, id: String = newId()): JSONObject =
+        JSONObject().put("ts", to).put("kind", KIND).put("device", device).put("from", from).put("to", to).put("label", label).put("heat", heat).put("label_id", id)
+
+    fun point(device: String, at: Long, label: String, heat: Boolean, id: String = newId()): JSONObject = entry(device, at - POINT_MS, at + POINT_MS, label, heat, id)
+
+    fun voidEntry(device: String, id: String, ts: Long): JSONObject = JSONObject().put("ts", ts).put("kind", KIND).put("device", device).put("void", id)
 
     fun isLabel(o: JSONObject) = o.optString("kind") == KIND
 
-    fun watchBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("to")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("room", o.getString("label")).put("source", "watch").put("heat", o.optBoolean("heat", true)).toString()
+    fun isVoid(o: JSONObject) = o.has("void")
 
-    fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).put("heat", o.optBoolean("heat", true)).toString()
+    fun voidBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("label_id", o.getString("void")).put("ts", o.getLong("ts")).toString()
+
+    private fun withId(b: JSONObject, o: JSONObject): String = b.also { if (o.has("label_id")) it.put("label_id", o.getString("label_id")) }.toString()
+
+    fun watchBody(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("to")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("room", o.getString("label")).put("source", "watch").put("heat", o.optBoolean("heat", true)).let { withId(it, o) }
+
+    fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).put("heat", o.optBoolean("heat", true)).let { withId(it, o) }
 }
 
 object Heat {
@@ -94,7 +105,7 @@ object Prompt {
 
 enum class Verdict { FRESH, STALE, EMPTY }
 
-enum class TapKind { WAIT, OK, QUEUED, THROTTLED, FAILED }
+enum class TapKind { WAIT, OK, QUEUED, THROTTLED, FAILED, VOIDED }
 
 data class TapView(val kind: TapKind, val title: String, val sub: String = "")
 
@@ -114,12 +125,19 @@ object Tap {
     const val FALLBACK_WAIT_S = 30
     const val GAP_WAIT_S = 2
     const val SHOW_MS = 4_000L
+    const val UNDO_MS = 10_000L
     const val ACK_WAIT_MS = 15_000L
     const val WAIT = "wait"
     const val OK = "ok"
     const val QUEUED = "queued"
     const val THROTTLED = "throttled"
     const val FAILED = "failed:"
+    const val VOIDED = "voided"
+    const val UNDO = "Rückgängig"
+
+    fun undoable(kind: TapKind?) = kind == TapKind.OK || kind == TapKind.QUEUED
+
+    fun showMs(kind: TapKind?) = if (undoable(kind)) UNDO_MS else SHOW_MS
 
     fun verdict(updated: Boolean, count: Int, newestUs: Long, tapElapsedMs: Long): Verdict = when {
         count == 0 -> Verdict.EMPTY
@@ -149,6 +167,7 @@ object Tap {
         state == WAIT -> TapView(TapKind.WAIT, "Messe…")
         state == OK -> TapView(TapKind.OK, "✓ Messung gespeichert – " + Rings.name(room))
         state == QUEUED -> TapView(TapKind.QUEUED, "✓ Gespeichert (wird gesendet)", Rings.name(room))
+        state == VOIDED -> TapView(TapKind.VOIDED, "Label verworfen", Rings.name(room))
         state == THROTTLED -> TapView(TapKind.THROTTLED, "Zu schnell – in ${maxOf(1, remainingS(untilMs, nowMs))} s nochmal tippen")
         state.startsWith(FAILED) -> TapView(TapKind.FAILED, "Fehlgeschlagen – erneut versuchen", state.removePrefix(FAILED))
         else -> null
@@ -212,6 +231,7 @@ class StayTracker {
     var askLoud = false
     var askWake = false
     var lastAskAt = 0L
+    var labelId: String? = null
 
     fun holding(now: Long): String? = label?.takeIf { Span.ms(now, confirmedAt) in 0 until CAP_MS }
 
@@ -225,8 +245,15 @@ class StayTracker {
         else -> maxOf(lastTs, Span.ms(now, BACK_MS))
     }
 
+    fun void(id: String): Boolean {
+        if (labelId == null || labelId != id) return false
+        reset()
+        return true
+    }
+
     private fun end() {
         label = null
+        labelId = null
         diff = 0
         gDiff = 0
         gMoved = false
@@ -260,7 +287,7 @@ class StayTracker {
         needAsk = true
     }
 
-    fun confirm(room: String, now: Long) {
+    fun confirm(room: String, now: Long, id: String? = null) {
         val start = when {
             pending(now) && askWake -> if (fresh(now)) lastFp else emptyMap()
             pending(now) -> askFp
@@ -270,6 +297,7 @@ class StayTracker {
         fp = start
         n = 1
         label = room
+        labelId = id
         confirmedAt = now
         needAsk = false
         askAt = 0L
@@ -354,7 +382,7 @@ class StayTracker {
         .put("label", label ?: JSONObject.NULL).put("confirmedAt", confirmedAt).put("fp", Fingerprint.json(fp)).put("n", n).put("moved", moved)
         .put("diff", diff).put("diffAt", diffAt).put("gDiff", gDiff).put("gAt", gAt).put("gMoved", gMoved).put("needAsk", needAsk)
         .put("lastFp", Fingerprint.json(lastFp)).put("lastTs", lastTs).put("askAt", askAt).put("askSince", askSince).put("askTs", askTs)
-        .put("askFp", Fingerprint.json(askFp)).put("askGuess", askGuess ?: JSONObject.NULL).put("askChange", askChange).put("askLoud", askLoud).put("askWake", askWake).put("lastAskAt", lastAskAt).toString()
+        .put("askFp", Fingerprint.json(askFp)).put("askGuess", askGuess ?: JSONObject.NULL).put("askChange", askChange).put("askLoud", askLoud).put("askWake", askWake).put("lastAskAt", lastAskAt).put("labelId", labelId ?: JSONObject.NULL).toString()
 
     companion object {
         const val CAP_MS = 7_200_000L
@@ -387,6 +415,7 @@ class StayTracker {
                 t.askLoud = o.optBoolean("askLoud")
                 t.askWake = o.optBoolean("askWake")
                 t.lastAskAt = o.optLong("lastAskAt")
+                t.labelId = if (o.isNull("labelId")) null else o.optString("labelId")
             } catch (e: Exception) {
                 Log.w(TAG, "stay parse failed", e)
             }
@@ -797,7 +826,7 @@ object Summary {
 object Payload {
     fun build(
         ts: Long, device: String, label: String?, aps: List<Ap>,
-        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null, heat: Boolean? = null
+        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null, heat: Boolean? = null, labelId: String? = null
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
@@ -809,6 +838,7 @@ object Payload {
         .put("away", away)
         .also { if (bedtime != null) it.put("bedtime", bedtime) }
         .also { if (heat != null) it.put("heat", heat) }
+        .also { if (labelId != null) it.put("label_id", labelId) }
         .put("aps", JSONArray().also { arr ->
             aps.forEach { arr.put(JSONObject().put("bssid", it.bssid.lowercase()).put("rssi", it.rssi).put("freq", it.freq)) }
         })
@@ -1075,6 +1105,9 @@ class Store(private val ctx: Context) {
         sp.edit().putLong("batchSeq", n).commit()
         n
     }
+    var lastLabelId: String
+        get() = sp.getString("lastLabelId", "") ?: ""
+        set(v) = sp.edit().putString("lastLabelId", v).apply()
     var labels404: Long
         get() = sp.getLong("labels404", 0L)
         set(v) = sp.edit().putLong("labels404", v).apply()

@@ -36,6 +36,7 @@ object Measure {
     const val PATH = "/watch/measurement"
     const val PATH_SENSORS = "/watch/sensors"
     const val PATH_LABEL = "/watch/label"
+    const val PATH_VOID = "/watch/label/void"
     val META_KEYS = listOf("kind", "ts", "queued")
     val FALLBACK_CODES = setOf(400, 404, 405, 422)
 }

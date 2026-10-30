@@ -303,7 +303,11 @@ class CoreTest {
         assertFalse(LabelEvent.isLabel(Payload.build(1, "w", null, emptyList())))
         assertEquals(9L, e.getLong("ts"))
         val b = JSONObject(LabelEvent.body(e))
-        assertEquals(setOf("device", "from", "to", "label", "heat"), b.keys().asSequence().toSet())
+        assertEquals(setOf("device", "from", "to", "label", "heat", "label_id"), b.keys().asSequence().toSet())
+        assertEquals(e.getString("label_id"), b.getString("label_id"))
+        assertEquals(36, b.getString("label_id").length)
+        assertEquals(e.getString("label_id"), JSONObject(LabelEvent.watchBody(e)).getString("label_id"))
+        assertFalse(JSONObject(LabelEvent.body(JSONObject(e.toString()).also { it.remove("label_id") })).has("label_id"))
         assertEquals("w", b.getString("device"))
         assertEquals(5L, b.getLong("from"))
         assertEquals(9L, b.getLong("to"))
@@ -311,6 +315,54 @@ class CoreTest {
         assertTrue(b.getBoolean("heat"))
         assertFalse(JSONObject(LabelEvent.body(LabelEvent.entry("w", 5, 9, "bad", false))).getBoolean("heat"))
         assertTrue(Defaults.ROOMS.all { Regex("^[a-z_]{1,32}$").matches(it) })
+    }
+
+    @Test
+    fun voidEventIsAQueuedLabelSpecialWithItsOwnBody() {
+        val l = LabelEvent.point("w", 100, "bad", true, "id-1")
+        val v = LabelEvent.voidEntry("w", "id-1", 500)
+        assertTrue(LabelEvent.isLabel(v) && LabelEvent.isVoid(v) && !LabelEvent.isVoid(l))
+        assertTrue(Special.isSpecial(v))
+        val b = JSONObject(LabelEvent.voidBody(v))
+        assertEquals(setOf("device", "label_id", "ts"), b.keys().asSequence().toSet())
+        assertEquals("id-1", b.getString("label_id"))
+        assertEquals(500L, b.getLong("ts"))
+        val q = ScanQueue(null, 100, 1_000_000)
+        q.add(l, 1)
+        q.add(v, 2)
+        val seen = mutableListOf<Boolean>()
+        val r = Flusher(10).run(q, 5, { 200 }, { 200 }, { e -> seen.add(LabelEvent.isVoid(e)); 200 })
+        assertEquals(listOf(false, true), seen)
+        assertEquals(0, q.size)
+        assertEquals(2, r.sent)
+    }
+
+    @Test
+    fun voidClearsOnlyTheStayThatThatLabelSet() {
+        val t = StayTracker()
+        t.confirm("bad", 1_000, "a")
+        assertEquals("a", StayTracker.parse(t.json()).labelId)
+        assertFalse(t.void("b"))
+        assertEquals("bad", t.holding(2_000))
+        assertTrue(StayTracker.parse(t.json()).void("a"))
+        assertTrue(t.void("a"))
+        assertNull(t.holding(2_000))
+        assertNull(t.labelId)
+        assertFalse(t.void("a"))
+        t.confirm("bad", 1_000)
+        assertFalse(t.void("a"))
+        assertEquals("bad", t.holding(2_000))
+    }
+
+    @Test
+    fun voidedViewAndUndoWindow() {
+        assertEquals(TapView(TapKind.VOIDED, "Label verworfen", "Bad"), Tap.view(Tap.VOIDED, "bad", 0, 0))
+        assertTrue(Tap.undoable(TapKind.OK) && Tap.undoable(TapKind.QUEUED))
+        assertFalse(Tap.undoable(TapKind.VOIDED) || Tap.undoable(TapKind.FAILED) || Tap.undoable(null))
+        assertEquals(10_000L, Tap.showMs(TapKind.OK))
+        assertEquals(Tap.SHOW_MS, Tap.showMs(TapKind.VOIDED))
+        assertEquals("sent", Payload.build(1, "d", "bad", emptyList(), labelId = "sent").getString("label_id"))
+        assertFalse(Payload.build(1, "d", "bad", emptyList()).has("label_id"))
     }
 
     private fun fp(vararg v: Pair<String, Int>) = v.map { Ap(it.first, it.second, 5180) }

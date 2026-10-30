@@ -167,10 +167,10 @@ class MainActivity : ComponentActivity() {
                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                 }
                 if (prompt) {
-                    delay(2000)
+                    delay(if (Tap.undoable(kind)) Tap.UNDO_MS else 2000)
                     finish()
                 } else {
-                    delay(Tap.SHOW_MS)
+                    delay(Tap.showMs(kind))
                     tapped = null
                 }
             }
@@ -231,9 +231,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
             view?.let {
-                Column(Modifier.fillMaxSize().background(TapColors.of(it.kind)).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+                Column(Modifier.fillMaxSize().background(TapColors.of(it.kind)).pointerInput(Unit) { detectTapGestures { } }.padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
                     Text(it.title, fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
                     if (it.sub.isNotEmpty()) Text(it.sub, Modifier.padding(top = 6.dp), fontSize = 12.sp, color = Color.White, textAlign = TextAlign.Center)
+                    if (Tap.undoable(it.kind) && version.let { store.lastLabelId.isNotEmpty() }) Text(
+                        Tap.UNDO,
+                        Modifier.padding(top = 10.dp).clip(RoundedCornerShape(50)).background(Color.Black).clickable { LabelRecorder.undo(this@MainActivity) }.padding(horizontal = 16.dp, vertical = 6.dp),
+                        fontSize = 12.sp, color = Color.White, maxLines = 1
+                    )
                 }
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -389,5 +394,6 @@ private object TapColors {
         TapKind.THROTTLED -> Color(0xFFB36B00)
         TapKind.FAILED -> Color(0xFFB3261E)
         TapKind.WAIT -> Color(0xFF202020)
+        TapKind.VOIDED -> Color(0xFF3A3A3A)
     }
 }

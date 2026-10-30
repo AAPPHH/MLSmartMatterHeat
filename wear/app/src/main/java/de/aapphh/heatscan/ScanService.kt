@@ -763,9 +763,9 @@ class ScanService : Service() {
         try {
             io.execute {
                 val wall = System.currentTimeMillis()
-                if (manual) LabelRecorder.point(applicationContext, manualRoom, ts, manualHeat, false)
+                val labelId = if (manual) LabelRecorder.point(applicationContext, manualRoom, ts, manualHeat, false) else null
                 val d = if (learn || (manual && !manualHeat)) Decision() else if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
-                val body = Payload.build(ts, store.device, if (manual) (if (manualHeat) manualRoom else null) else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime(), if (manual && !manualHeat || learn) false else null)
+                val body = Payload.build(ts, store.device, if (manual) (if (manualHeat) manualRoom else null) else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime(), if (manual && !manualHeat || learn) false else null, labelId)
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
@@ -822,6 +822,11 @@ class ScanService : Service() {
     }
 
     private fun sendLabel(server: String, e: JSONObject, net: Network?): Int {
+        if (LabelEvent.isVoid(e)) {
+            val b = LabelEvent.voidBody(e)
+            val c = plain(server, Measure.PATH_VOID, b, net)
+            return if (c in Measure.FALLBACK_CODES) plain(server, "/api/label/void", b, net) else c
+        }
         val c = plain(server, Measure.PATH_LABEL, LabelEvent.watchBody(e), net)
         return if (c in Measure.FALLBACK_CODES) plain(server, "/api/label", LabelEvent.body(e), net) else c
     }
@@ -1007,15 +1012,42 @@ object LabelRecorder {
         }
     }
 
-    fun point(c: Context, room: String, at: Long, heat: Boolean, flush: Boolean = true) {
+    fun undo(c: Context) {
+        val app = c.applicationContext
+        try {
+            io.execute { void(app) }
+        } catch (e: RejectedExecutionException) {
+            Trace.i("label_void_rejected")
+        }
+    }
+
+    private fun void(c: Context) {
+        val store = Store(c)
+        val id = store.lastLabelId
+        if (id.isEmpty()) return
+        val now = System.currentTimeMillis()
+        ScanQueue.get(c).add(LabelEvent.voidEntry(store.device, id, now), now)
+        store.stay { it.void(id) }
+        store.lastLabelId = ""
+        store.manualUntil = 0L
+        store.manual = Tap.VOIDED
+        store.refreshTile()
+        Trace.i("label_void", "id" to id)
+        ScanService.instance?.flush("label")
+    }
+
+    fun point(c: Context, room: String, at: Long, heat: Boolean, flush: Boolean = true): String {
         val store = Store(c)
         val now = System.currentTimeMillis()
-        ScanQueue.get(c).add(LabelEvent.point(store.device, at, room, heat), now)
-        if (heat) store.stay { it.confirm(room, now) }
+        val id = LabelEvent.newId()
+        ScanQueue.get(c).add(LabelEvent.point(store.device, at, room, heat, id), now)
+        store.lastLabelId = id
+        if (heat) store.stay { it.confirm(room, now, id) }
         store.refreshTile()
         Trace.i("label", "room" to room, "from" to at - LabelEvent.POINT_MS, "to" to at + LabelEvent.POINT_MS, "heat" to heat)
         ScanService.instance?.onLabel()
         if (flush) ScanService.instance?.flush("label")
+        return id
     }
 
     fun record(c: Context, room: String, notify: Boolean = true) {
