@@ -183,7 +183,9 @@ class MainActivity : ComponentActivity() {
                     if (page == 0) {
                         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
                         RoomsPage(hot, ringed, locked, learnView) {
-                            if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) choosing = it
+                            if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
+                                if (Heat.heatable(it, store.progress)) choosing = it else pick(it, false)
+                            }
                         }
                     } else DataPage(
                         store.rooms, store.colors, store.lastAps, store.replyAps, store.guess, store.probability,

@@ -79,6 +79,10 @@ object Heat {
     const val NO = "nur Label"
 
     fun default(learning: Boolean) = !learning
+
+    val UNHEATED = setOf("flur", Defaults.NONE)
+
+    fun heatable(room: String, p: Progress?): Boolean = p?.heatable?.get(room) ?: (room !in UNHEATED)
 }
 
 object Prompt {
@@ -435,7 +439,7 @@ object Wake {
     fun settled(before: Mode, after: Mode) = before == Mode.MOVING && (after == Mode.SETTLING || after == Mode.STILL)
 }
 
-data class Progress(val target: Int, val counts: Map<String, Int>, val done: Boolean)
+data class Progress(val target: Int, val counts: Map<String, Int>, val done: Boolean, val heatable: Map<String, Boolean> = emptyMap())
 
 enum class LearnStep { STOP, DISCARD, WAIT, SCAN }
 
@@ -458,7 +462,8 @@ object Learn {
     fun parse(text: String?): Progress? = try {
         val o = JSONObject(text ?: "")
         val a = o.getJSONArray("rooms")
-        Progress(o.getInt("target"), (0 until a.length()).associate { a.getJSONObject(it).let { r -> r.getString("room") to r.getInt("n") } }, o.getBoolean("done"))
+        Progress(o.getInt("target"), (0 until a.length()).associate { a.getJSONObject(it).let { r -> r.getString("room") to r.getInt("n") } }, o.getBoolean("done"),
+            (0 until a.length()).mapNotNull { a.getJSONObject(it).let { r -> if (r.has("heatable")) r.getString("room") to r.getBoolean("heatable") else null } }.toMap())
     } catch (e: Exception) { null }
 
     fun step(startedAt: Long, now: Long, offBody: Boolean, done: Boolean, promptAt: Long, scanPending: Boolean, idleSince: Long): LearnStep = when {

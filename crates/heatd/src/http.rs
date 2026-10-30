@@ -641,10 +641,10 @@ fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<Strin
     let batches = crate::context::read_raw(state.sink.root(), Table::Labels, None)?;
     let ids = |batch: &arrow::record_batch::RecordBatch, name: &str| crate::context::text_column(batch, name).ok().map(|c| (0..batch.num_rows()).map(|i| (!c.is_null(i)).then(|| c.value(i).to_string())).collect::<Vec<_>>());
     let voided: std::collections::HashSet<String> = batches.iter().filter_map(|b| ids(b, "voided_label_id")).flatten().flatten().collect();
-    for batch in &batches {
+    for batch in batches.iter() {
         let own = ids(batch, "label_id");
-        let (from, to) = (crate::context::ts_column(&batch, "from_ts")?, crate::context::ts_column(&batch, "to_ts")?);
-        let (room, source) = (crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
+        let (from, to) = (crate::context::ts_column(batch, "from_ts")?, crate::context::ts_column(batch, "to_ts")?);
+        let (room, source) = (crate::context::text_column(batch, "room")?, crate::context::text_column(batch, "source")?);
         let retroactive = |i: usize| !from.is_null(i) && !to.is_null(i) && to.value(i) - from.value(i) > max_span_us;
         rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && !own.as_ref().and_then(|o| o[i].as_ref()).is_some_and(|id| voided.contains(id)) && !to.is_null(i) && to.value(i) >= since_us && !retroactive(i)).map(|i| (to.value(i), room.value(i).to_string())));
     }
@@ -665,7 +665,7 @@ async fn labels_progress(State(state): State<AppState>) -> ApiResult {
     let since_us = cfg.labels_since.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map_or(0, |t| t.timestamp_micros());
     let counts = label_counts(&state, since_us)?;
     let model_rooms = state.watchmatch.model_rooms();
-    let rooms: Vec<Value> = state.config.rooms.iter().filter(|r| !r.nodes.is_empty() || r.name == "flur" || model_rooms.contains(&r.name)).map(|r| json!({"room": r.name, "n": counts.get(&r.name).copied().unwrap_or(0)})).collect();
+    let rooms: Vec<Value> = state.config.rooms.iter().filter(|r| !r.nodes.is_empty() || r.name == "flur" || model_rooms.contains(&r.name)).map(|r| json!({"room": r.name, "n": counts.get(&r.name).copied().unwrap_or(0), "heatable": !r.nodes.is_empty()})).collect();
     let done = !rooms.is_empty() && rooms.iter().all(|r| r["n"].as_u64().unwrap_or(0) >= cfg.label_target as u64);
     Ok(Json(json!({"target": cfg.label_target, "since": cfg.labels_since, "rooms": rooms, "done": done})))
 }
@@ -1087,12 +1087,12 @@ label_target = 2
         let (status, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!((body["target"].clone(), body["since"].clone(), body["done"].clone()), (json!(2), json!(iso), json!(false)));
-        assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 0}, {"room": "bad", "n": 0}, {"room": "flur", "n": 0}]));
+        assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 0, "heatable": true}, {"room": "bad", "n": 0, "heatable": true}, {"room": "flur", "n": 0, "heatable": false}]));
         for (offset, room) in [(-60_000, "bad"), (1_000, "bad"), (2_000, "bad"), (50_000, "bad"), (1_000, "wohnzimmer"), (20_000, "flur"), (30_000, "diele")] {
             call(&h.state, "POST", "/watch/label", label_body("pixel-watch", since + offset - 1_000, since + offset + 1_000, room)).await;
         }
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
-        assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 1}, {"room": "bad", "n": 2}, {"room": "flur", "n": 1}]));
+        assert_eq!(body["rooms"], json!([{"room": "wohnzimmer", "n": 1, "heatable": true}, {"room": "bad", "n": 2, "heatable": true}, {"room": "flur", "n": 1, "heatable": false}]));
         assert_eq!(body["done"], json!(false));
         for (offset, room) in [(40_000, "wohnzimmer"), (60_000, "flur")] {
             call(&h.state, "POST", "/watch/label", label_body("pixel-watch", since + offset - 1_000, since + offset + 1_000, room)).await;
@@ -1166,7 +1166,7 @@ label_target = 2
         tap("flur", now - 800_000, 1_000).await;
         tap("flur", now - 7_200_000, 1_000).await;
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
-        assert_eq!(body["rooms"], json!([{"room": "bad", "n": 2}, {"room": "flur", "n": 1}]));
+        assert_eq!(body["rooms"], json!([{"room": "bad", "n": 2, "heatable": true}, {"room": "flur", "n": 1, "heatable": true}]));
     }
 
     #[tokio::test]
@@ -1941,7 +1941,7 @@ labels_since = '{iso}'
             for at in offsets {
                 call(&h.state, "POST", "/watch/label", label_body("pixel-watch", base + at - 1_000, base + at + 1_000, "bad")).await;
             }
-            assert_eq!(call(&h.state, "GET", "/api/labels/progress", None).await.1["rooms"], json!([{"room": "bad", "n": expected}]));
+            assert_eq!(call(&h.state, "GET", "/api/labels/progress", None).await.1["rooms"], json!([{"room": "bad", "n": expected, "heatable": true}]));
         }
     }
 

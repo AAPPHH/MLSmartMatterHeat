@@ -1657,6 +1657,19 @@ class CoreTest {
     private val progressText = """{"target":10,"since":null,"rooms":[{"room":"wohnzimmer","n":10},{"room":"schlafzimmer","n":3},{"room":"bad","n":3},{"room":"kueche","n":7},{"room":"flur","n":4}],"done":false}"""
 
     @Test
+    fun heatChoiceIsSkippedForRoomsWithoutRadiator() {
+        assertTrue(Heat.heatable("bad", null))
+        assertFalse(Heat.heatable("flur", null))
+        assertFalse(Heat.heatable(Defaults.NONE, null))
+        val p = Learn.parse("""{"target":10,"since":null,"rooms":[{"room":"bad","n":1,"heatable":false},{"room":"flur","n":1,"heatable":true},{"room":"kueche","n":1}],"done":false}""")!!
+        assertFalse(Heat.heatable("bad", p))
+        assertTrue(Heat.heatable("flur", p))
+        assertTrue(Heat.heatable("kueche", p))
+        assertFalse(Heat.heatable(Defaults.NONE, p))
+        assertEquals(emptyMap<String, Boolean>(), Learn.parse(progressText)!!.heatable)
+    }
+
+    @Test
     fun learnProgressParsing() {
         val p = Learn.parse(progressText)!!
         assertEquals(Progress(10, mapOf("wohnzimmer" to 10, "schlafzimmer" to 3, "bad" to 3, "kueche" to 7, "flur" to 4), false), p)
