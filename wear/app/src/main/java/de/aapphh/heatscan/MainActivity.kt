@@ -199,6 +199,22 @@ class MainActivity : ComponentActivity() {
                     fontSize = 9.sp, maxLines = 1, color = if (learning) INK else Color.White
                 )
             }
+            if (!prompt && view == null && choosing == null && pager.currentPage == 1) {
+                val holdUntil = version.let { store.wifiHoldUntil }
+                val holdOn = WifiHold.active(holdUntil, now)
+                LaunchedEffect(holdOn) {
+                    while (holdOn) {
+                        now = System.currentTimeMillis()
+                        delay(15_000)
+                    }
+                }
+                Text(
+                    WifiHold.chip(holdUntil, now),
+                    Modifier.align(Alignment.TopCenter).padding(top = 2.dp).clip(RoundedCornerShape(50)).background(if (holdOn) SELECTED else IDLE)
+                        .clickable { ScanService.instance?.toggleWifiHold() }.padding(horizontal = 10.dp, vertical = 2.dp),
+                    fontSize = 9.sp, maxLines = 1, color = if (holdOn) INK else Color.White
+                )
+            }
             choosing?.let { room ->
                 Column(Modifier.fillMaxSize().background(Color.Black).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
                     Text(Defaults.CAPTIONS.getValue(room), fontSize = 12.sp, color = Color.White, maxLines = 1)

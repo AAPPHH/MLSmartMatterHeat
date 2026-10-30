@@ -1730,4 +1730,35 @@ class CoreTest {
         assertFalse(Reuse.openScan(true, false))
         assertFalse(Reuse.openScan(false, true))
     }
+
+    @Test
+    fun wifiHoldParsesMinutes() {
+        assertEquals(5, WifiHold.minutes("""{"room":"x","wifi_hold_min":5}"""))
+        assertEquals(30, WifiHold.minutes("""{"wifi_hold_min":30}"""))
+        assertNull(WifiHold.minutes("""{"wifi_hold_min":0}"""))
+        assertNull(WifiHold.minutes("""{"wifi_hold_min":31}"""))
+        assertNull(WifiHold.minutes("""{"wifi_hold_min":2.5}"""))
+        assertNull(WifiHold.minutes("""{"wifi_hold_min":"5"}"""))
+        assertNull(WifiHold.minutes("""{"room":"x"}"""))
+        assertNull(WifiHold.minutes("[1]"))
+        assertNull(WifiHold.minutes(null))
+    }
+
+    @Test
+    fun wifiHoldTiming() {
+        val m = 60_000L
+        assertEquals(1_000_000L + 10 * m, WifiHold.toggle(0L, 1_000_000L))
+        assertEquals(0L, WifiHold.toggle(1_000_000L + m, 1_000_000L))
+        assertEquals(1_000_000L + 5 * m, WifiHold.extend(0L, 1_000_000L, 5))
+        assertEquals(1_000_000L + 10 * m, WifiHold.extend(1_000_000L + 10 * m, 1_000_000L, 5))
+        assertEquals(1_000_000L + 20 * m, WifiHold.extend(1_000_000L + 10 * m, 1_000_000L, 20))
+        assertEquals(1_000_000L + 3 * m, WifiHold.extend(500_000L, 1_000_000L, 3))
+        assertTrue(WifiHold.active(10L, 9L))
+        assertFalse(WifiHold.active(10L, 10L))
+        assertEquals(10, WifiHold.remainingMin(1_000_000L + 10 * m, 1_000_000L))
+        assertEquals(1, WifiHold.remainingMin(1_000_000L + 1, 1_000_000L))
+        assertEquals(0, WifiHold.remainingMin(1_000_000L, 1_000_000L))
+        assertEquals("WLAN 10 min", WifiHold.chip(0L, 5L))
+        assertEquals("WLAN 3 min", WifiHold.chip(5L + 3 * m, 5L))
+    }
 }

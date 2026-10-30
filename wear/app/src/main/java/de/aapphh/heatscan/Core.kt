@@ -1081,6 +1081,9 @@ class Store(private val ctx: Context) {
     var lastFreshAt: Long
         get() = sp.getLong("lastFreshAt", 0L)
         set(v) = sp.edit().putLong("lastFreshAt", v).apply()
+    var wifiHoldUntil: Long
+        get() = sp.getLong("wifiHoldUntil", 0L)
+        set(v) = sp.edit().putLong("wifiHoldUntil", v).apply()
     var learnAt: Long
         get() = sp.getLong("learnAt", 0L)
         set(v) = sp.edit().putLong("learnAt", v).apply()
@@ -1216,8 +1219,35 @@ class Store(private val ctx: Context) {
     }
 }
 
+object WifiHold {
+    const val MANUAL_MIN = 10
+    const val MAX_MIN = 30
+    private const val MIN_MS = 60_000L
+
+    fun minutes(text: String?): Int? = try {
+        (JSONObject(text ?: "").opt("wifi_hold_min") as? Number)?.toDouble()?.takeIf { it % 1.0 == 0.0 && it.toInt() in 1..MAX_MIN }?.toInt()
+    } catch (e: Exception) { null }
+
+    fun active(until: Long, now: Long) = until > now
+
+    fun extend(until: Long, now: Long, min: Int) = maxOf(if (active(until, now)) until else 0L, now + min * MIN_MS)
+
+    fun toggle(until: Long, now: Long) = if (active(until, now)) 0L else now + MANUAL_MIN * MIN_MS
+
+    fun remainingMin(until: Long, now: Long) = if (active(until, now)) ((until - now + MIN_MS - 1) / MIN_MS).toInt() else 0
+
+    fun chip(until: Long, now: Long) = if (active(until, now)) "WLAN ${remainingMin(until, now)} min" else "WLAN $MANUAL_MIN min"
+}
+
 object Poster {
     class Reply(val code: Int, val text: String)
+
+    @Volatile var onReply: ((String) -> Unit)? = null
+
+    private fun reply(code: Int, text: String): Reply {
+        if (code in 200..299) onReply?.invoke(text)
+        return Reply(code, text)
+    }
 
     fun send(server: String, path: String, body: String, network: Network?): Reply {
         val url = URL(server.trim().trimEnd('/') + path)
@@ -1231,7 +1261,7 @@ object Poster {
             conn.outputStream.use { it.write(body.toByteArray()) }
             val code = conn.responseCode
             val text = (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
-            return Reply(code, text)
+            return reply(code, text)
         } finally {
             conn.disconnect()
         }
@@ -1244,7 +1274,7 @@ object Poster {
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             val code = conn.responseCode
-            return Reply(code, (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: "")
+            return reply(code, (if (code < 400) conn.inputStream else conn.errorStream)?.bufferedReader()?.use { it.readText() } ?: "")
         } finally {
             conn.disconnect()
         }

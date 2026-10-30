@@ -123,6 +123,51 @@ class ScanService : Service() {
         }
     }
 
+    private val holdCallback = object : ConnectivityManager.NetworkCallback() {}
+    private var holding = false
+    private val holdRelease = Runnable { syncHold() }
+
+    private fun syncHold() {
+        val now = System.currentTimeMillis()
+        val until = store.wifiHoldUntil
+        handler.removeCallbacks(holdRelease)
+        if (active && WifiHold.active(until, now)) {
+            if (!holding) {
+                try {
+                    cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), holdCallback)
+                    holding = true
+                    Trace.i("wifi_hold", "on" to true, "until" to until)
+                } catch (e: Exception) {
+                    Trace.w("wifi_hold", e, "on" to true)
+                    store.wifiHoldUntil = 0L
+                }
+            }
+            if (holding) handler.postDelayed(holdRelease, until - now)
+        } else {
+            if (until != 0L) store.wifiHoldUntil = 0L
+            if (holding) {
+                holding = false
+                try { cm.unregisterNetworkCallback(holdCallback) } catch (e: Exception) { Log.w(TAG, "unregister hold", e) }
+                Trace.i("wifi_hold", "on" to false)
+            }
+        }
+    }
+
+    fun toggleWifiHold() {
+        handler.post {
+            store.wifiHoldUntil = WifiHold.toggle(store.wifiHoldUntil, System.currentTimeMillis())
+            syncHold()
+        }
+    }
+
+    private fun onReplyText(text: String) {
+        val min = WifiHold.minutes(text) ?: return
+        handler.post {
+            store.wifiHoldUntil = WifiHold.extend(store.wifiHoldUntil, System.currentTimeMillis(), min)
+            syncHold()
+        }
+    }
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             when (i.action) {
@@ -229,6 +274,8 @@ class ScanService : Service() {
                 it.inventory()?.let { inv -> enqueueMeta(inv) }
             }
             store.running = true
+            Poster.onReply = ::onReplyText
+            syncHold()
             Trace.i("service_started", "queue" to queue.size, "doze" to power.isDeviceIdleMode, "saver" to power.isPowerSaveMode, "bgLoc" to ScanStarter.bgLocation(this), "whitelist" to power.isIgnoringBatteryOptimizations(packageName))
             Trace.i("policy", "adaptive" to adaptive, "step" to (step != null), "wakeStep" to (wakeStep != null), "triggers" to triggers.size, "offBodySensor" to (offBodySensor != null))
             tick()
@@ -239,6 +286,13 @@ class ScanService : Service() {
 
     override fun onDestroy() {
         stopLearn("destroy")
+        Poster.onReply = null
+        handler.removeCallbacks(holdRelease)
+        if (holding) {
+            holding = false
+            try { cm.unregisterNetworkCallback(holdCallback) } catch (e: Exception) { Log.w(TAG, "unregister hold", e) }
+        }
+        store.wifiHoldUntil = 0L
         handler.removeCallbacks(tick)
         handler.removeCallbacks(beatTimeout)
         if (active) {
@@ -319,6 +373,7 @@ class ScanService : Service() {
 
     private fun tick() {
         val now = SystemClock.elapsedRealtime()
+        if (holding) syncHold()
         sampler?.closeIfDue()
         val before = policy.mode
         if (policy.onTick(now)) scan(policy.mode.sleeps || now - lastEnqueueAt >= ScanConfig.HEARTBEAT_MS)
