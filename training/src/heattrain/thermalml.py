@@ -1,6 +1,6 @@
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -15,7 +15,7 @@ from skl2onnx import convert_sklearn, update_registered_converter
 from skl2onnx.common.data_types import FloatTensorType
 from skl2onnx.common.shape_calculator import calculate_linear_regressor_output_shapes
 from xgboost import XGBRegressor
-from heattrain.thermal import build_rooms, fit_room, kalman, load_lake, read_arrows, step_terms
+from heattrain.thermal import build_rooms, fit, fit_room, kalman, load_lake, read_arrows, step_terms, valve_gain
 
 update_registered_converter(XGBRegressor, "XGBoostXGBRegressor", calculate_linear_regressor_output_shapes, convert_xgboost)
 
@@ -112,6 +112,10 @@ class RoomML:
     valid: bool
     offset: float = 0.0
     n_cold: int = 0
+    offset_tr: float = 0.0
+    doc_tr: dict = None
+    xs_tr: np.ndarray = None
+    lab_tr: np.ndarray = None
     xs: np.ndarray = None
     kair: np.ndarray = None
     pred1: np.ndarray = None
@@ -188,14 +192,14 @@ def decay_fit(m, y, cfg):
 
 
 def decay_labels(R, cfg):
-    d = R.d
+    d, test = R.d, R.test
     lab = np.full(d.n, np.nan)
     count = 0
     k = cfg["decay_lookback_min"]
     while k < d.n:
         if d.u[k] <= cfg["cold_valve"] and d.u[max(0, k - cfg["decay_lookback_min"]):k].max() > cfg["decay_valve_from"]:
             e = k
-            while e < d.n and e - k < cfg["decay_max_min"] and d.u[e] <= cfg["cold_valve"]:
+            while e < d.n and e - k < cfg["decay_max_min"] and d.u[e] <= cfg["cold_valve"] and test[e] == test[k]:
                 e += 1
             if e - k >= cfg["decay_min_min"]:
                 fit = decay_fit(np.arange(e - k, dtype=float), d.y[k:e], cfg)
@@ -209,11 +213,12 @@ def decay_labels(R, cfg):
     return lab, count
 
 
-def prepare_room(d, doc, cfg, tcfg, others, ambient):
+def prepare_room(d, doc, cfg, tcfg, others, ambient, test):
     span_h = d.n * d.dt / 3600
     p = doc["params"]
     ok = span_h >= cfg["min_valid_hours"] and all(np.isfinite(v) for v in p.values()) and doc["metrics"][doc["structure"]]["rmse_horizon"] is not None and d.u.std() >= tcfg["min_valve_std"]
     R = RoomML(d, doc, bool(ok))
+    R.test = test
     R.others, R.hour = others, local_hour(R.times(), tcfg["timezone"])
     R.amb = ambient_ctx(ambient, R.times(), cfg["ambient_stale_s"])
     R.yc = causal(d.y)
@@ -227,6 +232,15 @@ def prepare_room(d, doc, cfg, tcfg, others, ambient):
     cold = cold_mask(d.u, cfg)
     R.n_cold = int(cold.sum())
     R.offset = float(np.nanmedian(d.yi[cold] - R.kair[cold])) if R.n_cold else 0.0
+    cold_tr = cold & ~test
+    R.offset_tr = float(np.nanmedian(d.yi[cold_tr] - R.kair[cold_tr])) if cold_tr.any() else R.offset
+    dtr = replace(d, y=np.where(test, np.nan, d.y), yi=np.where(test, np.nan, d.yi))
+    try:
+        ftr, _ = fit(dtr, doc["structure"], tcfg)
+        R.doc_tr = dict(doc, params=ftr.p, valve_gain=valve_gain(dtr, tcfg))
+    except Exception:
+        R.doc_tr = doc
+    R.xs_tr = kalman(R.doc_tr["params"], d, doc["structure"], tcfg, collect=True)[3]
     return R
 
 
@@ -236,7 +250,7 @@ def fill_rows(R, cfg, names):
     R.ks = np.arange(lo, d.n - 1)
     if len(R.ks) < 1:
         R.F = np.zeros((0, len(names)), np.float32)
-        R.lab = R.tgt = np.zeros(0)
+        R.lab = R.lab_tr = R.tgt = np.zeros(0)
         return
     parts = []
     for a in range(0, len(R.ks), cfg["chunk"]):
@@ -245,28 +259,24 @@ def fill_rows(R, cfg, names):
                "others_heating": R.others[k], "phys_sensor_pred": R.pred1[k], "phys_air": R.kair[k], **{n: x[k] for n, x in R.amb.items()}}
         parts.append(feature_matrix(cfg, names, ctx, R.name))
     R.F = np.vstack(parts)
-    lab = np.full(d.n, np.nan)
     cold = cold_mask(d.u, cfg)
-    lab[cold] = d.yi[cold] - R.offset
     dl, cnt = decay_labels(R, cfg)
-    lab = np.where(np.isfinite(dl), dl - R.offset, lab)
-    R.lab = (lab[R.ks] - R.yc[R.ks])
+    def labels(offset):
+        lab = np.full(d.n, np.nan)
+        lab[cold] = d.yi[cold] - offset
+        return np.where(np.isfinite(dl), dl - offset, lab)[R.ks] - R.yc[R.ks]
+    R.lab, R.lab_tr = labels(R.offset), labels(R.offset_tr)
     R.tgt = d.yi[R.ks + 1] - R.pred1[R.ks]
     R.n_decay = cnt
 
 
-def split_masks(rooms, cfg):
-    days = sorted({int(t // 86400) for R in rooms for t in R.times()[::60]})
+def split_masks(rooms_data, cfg):
+    times = {d.room: grid_times(d) for d in rooms_data}
+    days = sorted({int(t // 86400) for x in times.values() for t in x[::60]})
     if len(days) >= cfg["min_split_days"]:
         test_days = set(days[-max(1, int(round(len(days) * cfg["holdout_frac"]))):])
-        kind = "days"
-        for R in rooms:
-            R.test = np.array([int(t // 86400) in test_days for t in R.times()])
-    else:
-        kind = "blocks"
-        for R in rooms:
-            R.test = (np.floor(R.times() / (cfg["block_min"] * 60)).astype(int) % 4) == 3
-    return kind
+        return "days", {n: np.array([int(t // 86400) in test_days for t in x]) for n, x in times.items()}
+    return "blocks", {n: (np.floor(x / (cfg["block_min"] * 60)).astype(int) % 4) == 3 for n, x in times.items()}
 
 
 class Net:
@@ -291,9 +301,10 @@ def fit_nets(cfg, rooms, names, lat_names, full):
         if not R.valid or len(R.ks) == 0:
             continue
         m = np.ones(len(R.ks), bool) if full else ~R.test[R.ks]
-        lm = m & np.isfinite(R.lab)
+        lab = R.lab if full else R.lab_tr
+        lm = m & np.isfinite(lab)
         Xl.append(R.F[lm][:, lat_cols])
-        yl.append(R.lab[lm])
+        yl.append(lab[lm])
         rm = m & np.isfinite(R.tgt) & (np.abs(R.tgt) < cfg["max_abs_target"]) & np.isfinite(R.F[:, 0])
         Xr.append(R.F[rm])
         yr.append(R.tgt[rm])
@@ -352,8 +363,8 @@ def tile_env(env, C):
     return {k: ({kd: (t(v[0]), t(v[1])) for kd, v in x.items()} if k == "nb" else {kd: t(v) for kd, v in x.items()} if k == "amb" else t(x)) for k, x in env.items()}
 
 
-def origin_state(cfg, R, ks):
-    return R.xs[ks], windows(R.yc, ks, cfg["history_min"] + 1, 0), windows(R.d.u, ks, cfg["boost_cap_min"] + 1, 1)
+def origin_state(cfg, R, ks, xs=None):
+    return (R.xs if xs is None else xs)[ks], windows(R.yc, ks, cfg["history_min"] + 1, 0), windows(R.d.u, ks, cfg["boost_cap_min"] + 1, 1)
 
 
 def recorded(R, ks):
@@ -435,7 +446,7 @@ def evaluate_cycles(cfg, tcfg, rooms, names, split_nets, final_nets):
         rows = []
         for s, e, tgt in cyc:
             seg = slice(s, e + 1)
-            rows.append({"start_ts": R.d.t0 + s * R.d.dt, "minutes": e - s, "target": tgt, "oos": bool(R.test[s]), "grey_box": cycle_metrics(R.kair[seg], R.d.u[seg], tgt, cfg),
+            rows.append({"start_ts": R.d.t0 + s * R.d.dt, "minutes": e - s, "target": tgt, "oos": bool(R.test[s:e + 1].all()), "grey_box": cycle_metrics(R.kair[seg], R.d.u[seg], tgt, cfg),
                          "residual": cycle_metrics(lat_final[seg], R.d.u[seg], tgt, cfg) if np.isfinite(lat_final[seg]).all() else None})
         oos = [i for i, r in enumerate(rows) if r["oos"]] if split_nets["residual"] is not None else []
         in_sample = not oos
@@ -445,18 +456,18 @@ def evaluate_cycles(cfg, tcfg, rooms, names, split_nets, final_nets):
         if use:
             sel = np.array([cyc[i][0] for i in use])
             Hc = max(cyc[i][1] - cyc[i][0] for i in use)
-            x0, S0, V0 = origin_state(cfg, R, sel)
+            x0, S0, V0 = origin_state(cfg, R, sel, R.xs_tr)
             env = env_from(R, sel, Hc)
             for key, ln, rn in (("grey_box", None, None), ("residual", nets["latent"], nets["residual"])):
                 if key == "residual" and rn is None:
                     continue
-                out = rollout(cfg, tcfg, R.doc, R.name, names, x0, S0, V0, env, recorded(R, sel), Hc, latent=ln, residual=rn)
+                out = rollout(cfg, tcfg, R.doc_tr, R.name, names, x0, S0, V0, env, recorded(R, sel), Hc, latent=ln, residual=rn)
                 es, ea = [], []
                 for j, i in enumerate(use):
                     s, e, _ = cyc[i]
                     L = e - s
                     es.append(out["sensor"][j, 1:L + 1] - R.d.yi[s + 1:s + L + 1])
-                    ea.append(out["air"][j, :L] - (R.kair if key == "grey_box" else lat_est)[s:s + L])
+                    ea.append(out["air"][j, :L] - (R.xs_tr[:, 1] if key == "grey_box" else lat_est)[s:s + L])
                 res[key], res[key + "_air"] = rmse(np.concatenate(es)), rmse(np.concatenate(ea))
         bt[R.name], table[R.name] = res, rows
     return bt, table
@@ -541,14 +552,15 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
     cfg, tcfg = config["thermalml"], config["thermal"]
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     others = others_heating(rooms_data, cfg)
+    split, tests = split_masks(rooms_data, cfg)
     rooms, warn = [], {}
     for d in rooms_data:
         try:
             doc = fit_room(d, tcfg)
-            R = prepare_room(d, doc, cfg, tcfg, others[d.room], ambient)
+            R = prepare_room(d, doc, cfg, tcfg, others[d.room], ambient, tests[d.room])
         except Exception as e:
             warn[d.room] = f"physics fit failed: {e}"
-            R = RoomML(d, None, False, others=others[d.room])
+            R = RoomML(d, None, False, others=others[d.room], test=tests[d.room])
             R.hour, R.yc = local_hour(R.times(), tcfg["timezone"]), causal(d.y)
         rooms.append(R)
     index = [R.name for R in rooms]
@@ -556,7 +568,6 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
     for R in rooms:
         if R.valid:
             fill_rows(R, cfg, names)
-    split = split_masks(rooms, cfg)
     for R in rooms:
         if R.valid and not len(R.ks):
             R.valid = False
@@ -583,8 +594,8 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
             lat["kalman_agreement_rmse_test"].append(la - R.kair[R.ks][t])
             hot = R.F[t][:, ci["valve_lag_0"]] > 0.5
             lat["kalman_agreement_rmse_hot_test"].append((la - R.kair[R.ks][t])[hot])
-            lm = np.isfinite(R.lab[t])
-            lat["label_rmse_test"].append(la[lm] - (R.lab[t][lm] + R.yc[R.ks][t][lm]))
+            lm = np.isfinite(R.lab_tr[t])
+            lat["label_rmse_test"].append(la[lm] - (R.lab_tr[t][lm] + R.yc[R.ks][t][lm]))
         metrics["latent"] = {k: rmse(np.concatenate(v)) if v else None for k, v in lat.items()}
     metrics["backtest"], table = evaluate_cycles(cfg, tcfg, rooms, names, nets_split, nets_final)
     out = Path(out_root) / version

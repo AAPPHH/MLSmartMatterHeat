@@ -2,11 +2,12 @@ import copy
 import json
 from pathlib import Path
 from dataclasses import replace
+from types import SimpleNamespace
 import numpy as np
 import onnxruntime as ort
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.thermalml import build_bundle, choose_t_off, env_from, feature_matrix, feature_names, load_ambient, optimum_start, origin_state, since_boost
+from heattrain.thermalml import build_bundle, choose_t_off, decay_labels, env_from, feature_matrix, feature_names, load_ambient, optimum_start, origin_state, since_boost
 from test_thermal import simulate
 
 CONF = copy.deepcopy(CONFIG)
@@ -123,3 +124,25 @@ def test_parity_fixture_in_repo():
         peaks = np.array(r["peaks"])
         assert r["t_off_min"] == choose_t_off(peaks, np.arange(len(peaks)), r["target"], r["overshoot_tol"]) and len(r["air"]) == r["horizon_min"]
     assert (root / "thermal_bundle" / b["latent"]["file"]).is_file()
+
+
+def test_grey_box_backtest_is_held_out(built):
+    b, ctx = built[1], built[2]
+    R = next(r for r in ctx["rooms"] if r.name == "a")
+    assert b["metrics"]["backtest"]["a"]["in_sample"] is False
+    assert R.doc_tr["params"] != R.doc["params"] and R.doc_tr["structure"] == R.doc["structure"]
+    assert R.test.any() and not R.test.all() and np.isfinite(R.offset_tr)
+
+
+def test_decay_labels_stop_at_split_edges():
+    cfg = CONF["thermalml"]
+    n = 200
+    u = np.zeros(n)
+    u[:30] = 1.0
+    t = np.arange(n, dtype=float)
+    y = 20.0 + 3.0 * np.exp(-np.maximum(t - 30, 0) / 20.0)
+    test = np.zeros(n, bool)
+    test[70:] = True
+    R = SimpleNamespace(d=SimpleNamespace(n=n, u=u, y=y), test=test)
+    lab, count = decay_labels(R, cfg)
+    assert count == 1 and np.isfinite(lab[30:70]).all() and np.isnan(lab[70:]).all()
