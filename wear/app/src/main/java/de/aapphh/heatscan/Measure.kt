@@ -107,7 +107,7 @@ object MeasureBatch {
         }
         return build(e.getString("device"), BatchId.scan(ts, e.optString("id").ifEmpty { null }), nowWall, offset, appVersion, samples).also { o ->
             if (e.has("id")) o.put("id", e.getString("id"))
-            listOf("motion", "power", "label").forEach { k -> if (!e.isNull(k) && e.has(k)) o.put(k, e.getString(k)) }
+            listOf("motion", "power", "label", "label_id").forEach { k -> if (!e.isNull(k) && e.has(k)) o.put(k, e.getString(k)) }
             if (e.has("away")) o.put("away", e.getBoolean("away"))
             if (e.has("bedtime") && !e.isNull("bedtime")) o.put("bedtime", e.getBoolean("bedtime"))
             if (e.has("heat") && !e.isNull("heat")) o.put("heat", e.getBoolean("heat"))

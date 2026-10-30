@@ -79,6 +79,16 @@ struct LabelBody {
     label: String,
     #[serde(default)]
     heat: Option<bool>,
+    #[serde(default)]
+    label_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VoidBody {
+    device: String,
+    label_id: String,
+    #[serde(default)]
+    ts: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -128,10 +138,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
         .route("/api/label", post(label))
+        .route("/api/label/void", post(label_void))
         .route("/api/labels/progress", get(labels_progress))
         .route("/watch/measurement", post(watch_measurement))
         .route("/watch/sensors", post(watch_sensors))
         .route("/watch/label", post(label))
+        .route("/watch/label/void", post(label_void))
         .route("/api/ambient", post(ambient))
         .route("/api/usage", get(usage))
         .with_state(state)
@@ -236,13 +248,13 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     }
     let heat = body.heat.unwrap_or(true);
     if let Some(label) = body.label.as_deref().filter(|l| !l.is_empty()) {
-        let row = Label { ts: body.ts * 1000, room: label.into(), source: "watch".into(), device: Some(body.device.clone()), heat: Some(heat), ..Default::default() };
+        let row = Label { ts: body.ts * 1000, room: label.into(), source: "watch".into(), device: Some(body.device.clone()), heat: Some(heat), label_id: body.label_id.clone(), ..Default::default() };
         if let Err(e) = state.sink.append(row) {
             eprintln!("labels: {e}");
         }
     }
     if heat && (!body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty())) {
-        state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref());
+        state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref(), body.label_id.as_deref());
     }
     let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "away": body.away, "bedtime": body.bedtime, "id": body.id});
     let mut state_event = Event::now(kind::WATCH_STATE, "watch").with_detail(detail);
@@ -305,6 +317,8 @@ struct LongBody {
     #[serde(default)]
     heat: Option<bool>,
     #[serde(default)]
+    label_id: Option<String>,
+    #[serde(default)]
     queued: Option<bool>,
 }
 
@@ -325,6 +339,7 @@ impl LongBody {
             away: self.away.unwrap_or(false),
             bedtime: self.bedtime,
             heat: self.heat,
+            label_id: self.label_id.clone(),
         })
     }
 }
@@ -623,11 +638,15 @@ fn label_counts(state: &AppState, since_us: i64) -> anyhow::Result<HashMap<Strin
     state.sink.flush()?;
     let max_span_us = 2 * state.config.watchmatch.label_tolerance_s * 1_000_000;
     let mut rows: Vec<(i64, String)> = Vec::new();
-    for batch in crate::context::read_raw(state.sink.root(), Table::Labels, None)? {
+    let batches = crate::context::read_raw(state.sink.root(), Table::Labels, None)?;
+    let ids = |batch: &arrow::record_batch::RecordBatch, name: &str| crate::context::text_column(batch, name).ok().map(|c| (0..batch.num_rows()).map(|i| (!c.is_null(i)).then(|| c.value(i).to_string())).collect::<Vec<_>>());
+    let voided: std::collections::HashSet<String> = batches.iter().filter_map(|b| ids(b, "voided_label_id")).flatten().flatten().collect();
+    for batch in &batches {
+        let own = ids(batch, "label_id");
         let (from, to) = (crate::context::ts_column(&batch, "from_ts")?, crate::context::ts_column(&batch, "to_ts")?);
         let (room, source) = (crate::context::text_column(&batch, "room")?, crate::context::text_column(&batch, "source")?);
         let retroactive = |i: usize| !from.is_null(i) && !to.is_null(i) && to.value(i) - from.value(i) > max_span_us;
-        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && !to.is_null(i) && to.value(i) >= since_us && !retroactive(i)).map(|i| (to.value(i), room.value(i).to_string())));
+        rows.extend((0..batch.num_rows()).filter(|&i| source.value(i) == "watch" && !own.as_ref().and_then(|o| o[i].as_ref()).is_some_and(|id| voided.contains(id)) && !to.is_null(i) && to.value(i) >= since_us && !retroactive(i)).map(|i| (to.value(i), room.value(i).to_string())));
     }
     rows.sort();
     let mut last: HashMap<String, i64> = HashMap::new();
@@ -662,13 +681,26 @@ async fn label(State(state): State<AppState>, Json(body): Json<LabelBody>) -> Ap
     let labelled = state.storage.relabel(&body.device, body.from, body.to, &body.label)?;
     let heat = body.heat.unwrap_or(true);
     if heat {
-        state.watchmatch.note_stay(&body.device, body.to.min(now_ms()), Some(&body.label));
+        state.watchmatch.note_stay(&body.device, body.to.min(now_ms()), Some(&body.label), body.label_id.as_deref());
     }
-    let row = Label { ts: lake::now_us(), from_ts: Some(body.from * 1000), to_ts: Some(body.to * 1000), room: body.label.clone(), source: "watch".into(), device: Some(body.device.clone()), heat: Some(heat), ..Default::default() };
+    let row = Label { ts: lake::now_us(), from_ts: Some(body.from * 1000), to_ts: Some(body.to * 1000), room: body.label.clone(), source: "watch".into(), device: Some(body.device.clone()), heat: Some(heat), label_id: body.label_id.clone(), ..Default::default() };
     if let Err(e) = state.sink.append(row) {
         eprintln!("labels: {e}");
     }
     Ok(Json(json!({"labelled": labelled})))
+}
+
+async fn label_void(State(state): State<AppState>, Json(body): Json<VoidBody>) -> ApiResult {
+    if body.label_id.is_empty() || body.label_id.len() > 64 {
+        return Err(ApiError::bad("label_id must be 1..64 characters"));
+    }
+    let ts = body.ts.unwrap_or_else(now_ms).min(now_ms()) * 1000;
+    let row = Label { ts, room: String::new(), source: "void".into(), device: Some(body.device.clone()), voided_label_id: Some(body.label_id.clone()), ..Default::default() };
+    if let Err(e) = state.sink.append(row) {
+        eprintln!("labels: {e}");
+    }
+    let cleared = state.watchmatch.void_stay(&body.device, &body.label_id);
+    Ok(Json(json!({"voided": body.label_id, "stay_cleared": cleared})))
 }
 
 #[derive(Deserialize)]
@@ -1067,6 +1099,47 @@ label_target = 2
         }
         let (_, body) = call(&h.state, "GET", "/api/labels/progress", None).await;
         assert_eq!(body["done"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn void_hides_label_from_progress_and_clears_only_its_own_stay() {
+        let since = now_ms() - 3_600_000;
+        let iso = chrono::DateTime::from_timestamp_millis(since).unwrap().to_rfc3339();
+        let h = harness_with(false, "away_guard_minutes = 0
+", &format!("[[rooms]]
+name = 'bad'
+nodes = [7]
+[watchmatch]
+labels_since = '{iso}'
+"));
+        let tap = |id: &str, at: i64| Some(json!({"device": "pixel-watch", "from": at - 1_000, "to": at + 1_000, "label": "bad", "label_id": id}).to_string());
+        let progress = || call(&h.state, "GET", "/api/labels/progress", None);
+        let stay = || h.state.watchmatch.stay().map(|s| s.1);
+        call(&h.state, "POST", "/watch/label", tap("a", since + 1_000)).await;
+        call(&h.state, "POST", "/watch/label", tap("b", since + 100_000)).await;
+        assert_eq!((progress().await.1["rooms"][0]["n"].clone(), stay()), (json!(2), Some("bad".to_string())));
+        let (status, body) = call(&h.state, "POST", "/watch/label/void", Some(json!({"device": "pixel-watch", "label_id": "a", "ts": since + 2_000}).to_string())).await;
+        assert_eq!((status, body["stay_cleared"].clone()), (StatusCode::OK, json!(false)));
+        assert_eq!((progress().await.1["rooms"][0]["n"].clone(), stay()), (json!(1), Some("bad".to_string())));
+        let (status, body) = call(&h.state, "POST", "/api/label/void", Some(json!({"device": "pixel-watch", "label_id": "b"}).to_string())).await;
+        assert_eq!((status, body["stay_cleared"].clone()), (StatusCode::OK, json!(true)));
+        assert_eq!((progress().await.1["rooms"][0]["n"].clone(), stay()), (json!(0), None));
+        let labels = lake_rows(&h, "labels");
+        assert_eq!(some(&column(&labels, "label_id")), ["a", "b", "-", "-"]);
+        assert_eq!(some(&column(&labels, "voided_label_id")), ["-", "-", "a", "b"]);
+        assert_eq!(some(&column(&labels, "source")), ["watch", "watch", "void", "void"]);
+        assert_eq!(call(&h.state, "POST", "/watch/label/void", Some(json!({"device": "pixel-watch", "label_id": ""}).to_string())).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn scan_embedded_label_id_is_stored_and_voidable() {
+        let h = harness_with(false, "", "");
+        let now = now_ms();
+        call(&h.state, "POST", "/api/scan", Some(json!({"ts": now, "device": "pixel-watch", "label": "bad", "label_id": "x", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]}).to_string())).await;
+        assert_eq!(h.state.watchmatch.stay().map(|s| s.1), Some("bad".to_string()));
+        call(&h.state, "POST", "/api/label/void", Some(json!({"device": "pixel-watch", "label_id": "x"}).to_string())).await;
+        assert!(h.state.watchmatch.stay().is_none());
+        assert_eq!(some(&column(&lake_rows(&h, "labels"), "label_id"))[0], "x");
     }
 
     #[tokio::test]

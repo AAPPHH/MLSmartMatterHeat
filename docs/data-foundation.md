@@ -23,9 +23,9 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 
 ## Schema metadata and versioning
 
-Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `2`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
+Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `4`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
 
-Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
+Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`; v4: `labels` columns `label_id`, `voided_label_id`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
 
 ## Hot path (raw Arrow IPC streams)
 
@@ -188,7 +188,7 @@ commit: dict<utf8>
 
 ### labels
 
-Producers: /watch/label and alias /api/label (source `watch`), manual entry (`manual`), rule core for overrides (`override`), room model (`model`). Partitioned by date.
+Producers: /watch/label and alias /api/label (source `watch`), /watch/label/void and alias /api/label/void (source `void`), manual entry (`manual`), rule core for overrides (`override`), room model (`model`). Partitioned by date.
 
 ```schema labels
 ts: timestamp[us,UTC]
@@ -201,9 +201,11 @@ confidence: f32?
 model_id: utf8?
 probs: utf8?
 heat: bool?
+label_id: utf8?
+voided_label_id: utf8?
 ```
 
-- `ts`: time the label was recorded; `from_ts`/`to_ts`: validity window of window labels from /api/label (null for point labels). `confidence` and `probs` (JSON object room to probability) are filled for `model`; `model_id` identifies the model. `device`: watch/device the label refers to, if any. `heat`: whether the label may drive occupancy and the setpoint (`/watch/label`, `/api/label` and scan-embedded labels accept `heat`, default true); `heat=false` labels (watch Lernmodus) are stored for training only. Null (rows from before the column existed, other sources) counts as true. A row with `to_ts - from_ts` of at most twice `label_tolerance_s` is a point label at its midpoint in training; longer retroactive intervals are ignored.
+- `ts`: time the label was recorded; `from_ts`/`to_ts`: validity window of window labels from /api/label (null for point labels). `confidence` and `probs` (JSON object room to probability) are filled for `model`; `model_id` identifies the model. `device`: watch/device the label refers to, if any. `heat`: whether the label may drive occupancy and the setpoint (`/watch/label`, `/api/label` and scan-embedded labels accept `heat`, default true); `heat=false` labels (watch Lernmodus) are stored for training only. Null (rows from before the column existed, other sources) counts as true. A row with `to_ts - from_ts` of at most twice `label_tolerance_s` is a point label at its midpoint in training; longer retroactive intervals are ignored. `label_id` (client UUID, optional in `/watch/label`, `/api/label` and scan bodies; null if absent) identifies one tap, shared by its range row and its scan-embedded row. A void request writes a row with source `void`, empty `room`, `device` and `voided_label_id` = the voided `label_id`; consumers drop every row whose `label_id` appears as a `voided_label_id` and ignore void rows themselves. A void of the label that set the current stay also clears that stay.
 
 ### watch_raw
 
