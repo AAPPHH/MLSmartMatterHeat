@@ -1,6 +1,6 @@
 # Boost / optimum start (offline reference)
 
-Reference implementation: `training/src/heattrain/thermalml.py` (`rollout`, `optimum_start`, `choose_t_off`). Parity data: `crates/heatd/testdata/thermal_ml_parity.json` plus `crates/heatd/testdata/thermal_bundle/`.
+Reference implementation: `training/src/heattrain/thermalml.py` (`rollout`, `optimum_start`, `choose_t_off`). heatd (`crates/heatd/src/thermal.rs`, `boost.rs`) implements the same rollout and the same `t_off` rule. Parity data: `crates/heatd/testdata/thermal_ml_parity.json` (physics, Kalman, feature vectors, ONNX outputs, rollout peaks for all 181 candidates, chosen `t_off`) plus the bundle `crates/heatd/testdata/thermal_bundle/<version>/`, both written by `training/tests/make_thermal_fixture.py` and asserted by Rust and Python tests. heatd refuses a bundle whose `dt_s`, `history_min` or `lag_step_min` differ from its constants (60, 60, 5).
 
 ## Idea
 
@@ -22,7 +22,7 @@ Predicted peak = `max_k air_k`, k = 0..H-1.
 
 ## Choosing t_off
 
-Candidates `T = 0..180` (1 min grid). Feasible: `peak <= target + 0.3`. Choose the feasible `T` with minimal `|peak - target|` (first on ties). If none is feasible, choose `argmin(peak)` (normally `T = 0`, i.e. no boost).
+Candidates `T = 0..180` (1 min grid, all rolled out in one batch, no bisection, horizon H = 300 for every candidate). The valve is fully open (`u = 1`) while `k < T`; the PI model is used only afterwards. Feasible: `peak <= target + 0.3`. Choose the feasible `T` with minimal `|peak - target|` (first on ties). If none is feasible, choose `argmin(peak)` (normally `T = 0`, i.e. no boost).
 
 ## Features (Rust computes by name)
 
@@ -36,7 +36,11 @@ Histories at 1 min resolution, index 0 = now: `sensor_lag_L = S[L]` (causal forw
 
 ## Backtest score (bundle.metrics.backtest)
 
-Per heat-up cycle (valve >= 50 % after >= 30 min below, window 240 min): roll out the variant from the cycle start with the recorded valve plan and weather, RMSE of predicted vs measured sensor (`grey_box`, `residual`); `*_air` = RMSE of predicted vs the variant's own air estimate. Out-of-sample (held-out days/blocks) when available, else `in_sample: true`.
+Per heat-up cycle (valve >= 50 % after >= 30 min below, window 240 min): roll out the variant from the cycle start with the recorded valve plan and weather, RMSE of predicted vs measured sensor (`grey_box`, `residual`); `*_air` = RMSE of predicted vs the variant's own air estimate. Only cycles whose whole window lies in the held-out days/blocks count. The grey-box physics and the sensor offset used for the backtest are fitted on the training days only (decay labels never span a train/test edge). If a room has no such cycle, all cycles are used and the entry carries `in_sample: true`; heatd ignores in-sample entries for the live gate (>= 3 out-of-sample cycles are required).
+
+## Live switch time
+
+On a live cycle the switch time is `applied = planned + offset` (minutes from cycle start), `offset` uniform in +-`explore_min`, drawn once per cycle. Replans move `planned` only while the elapsed time is below the last planned value; after that `applied` is fixed, and the setpoint is switched to the target as soon as `elapsed >= applied` (also for a positive offset).
 
 ## Cycle metrics
 

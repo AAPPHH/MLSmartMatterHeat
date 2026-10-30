@@ -708,6 +708,9 @@ async fn ambient(State(state): State<AppState>, Json(body): Json<AmbientBody>) -
             return Err(ApiError::bad("reading needs sensor ^[a-z0-9_]{1,16}$, unit 1..8 alphanumeric characters and a finite value"));
         }
     }
+    for r in body.readings.iter().filter(|r| crate::thermal::AMBIENT.contains(&r.sensor.as_str())) {
+        state.boost.note_ambient(&r.sensor, r.value);
+    }
     let rows: Vec<lake::Ambient> = body.readings.into_iter().map(|r| lake::Ambient { ts: body.ts * 1000, source: body.source.clone(), sensor: r.sensor, value: r.value, unit: r.unit }).collect();
     let stored = rows.len();
     state.sink.append_many(rows)?;
@@ -1996,6 +1999,7 @@ nodes = [5]
             assert!(call(&h.state, "POST", "/api/ambient", Some(b.clone())).await.0.is_client_error(), "{b}");
         }
         assert_eq!(lake_rows(&h, "ambient").iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+        assert_eq!((h.state.boost.ambient_value("nvme_c"), h.state.boost.ambient_value("pkg_w"), h.state.boost.ambient_value("die_c")), (Some(41.5), Some(3.25), None));
     }
 
     #[tokio::test]

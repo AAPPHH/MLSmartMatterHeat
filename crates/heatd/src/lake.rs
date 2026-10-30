@@ -931,7 +931,10 @@ pub struct TableRoll {
     pub status: RollStatus,
 }
 
+static ROLL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn roll_day(root: &Path, date: NaiveDate) -> Vec<TableRoll> {
+    let _guard = ROLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     Table::ALL
         .into_iter()
         .map(|table| match roll_table(root, table, date) {
