@@ -69,6 +69,10 @@ class ScanService : Service() {
     private var beatPending = false
     private var lastEnqueueAt = 0L
     private var lastScanRequestAt = Long.MIN_VALUE / 4
+    private var lastScanMs = 0L
+    private var lastScanTs = 0L
+    private var usedScanMs = 0L
+    private var screenOnAt = Reuse.NONE
     private var loggedMode: Mode? = null
     private val flusher = Flusher()
     private var sampler: SensorSampler? = null
@@ -125,6 +129,7 @@ class ScanService : Service() {
                 WifiManager.SCAN_RESULTS_AVAILABLE_ACTION -> collect(i.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, true), true)
                 Intent.ACTION_SCREEN_ON -> {
                     Trace.i("screen_on", "queue" to queue.size)
+                    screenOnAt = SystemClock.elapsedRealtime()
                     sampler?.flushFifo()
                     sampler?.burst()
                     flush("screen_on")
@@ -325,7 +330,7 @@ class ScanService : Service() {
         if (!active) return
         val now = SystemClock.elapsedRealtime()
         val freshAge = System.currentTimeMillis() - store.lastFreshAt
-        if (Wake.scanDue(now, lastScanRequestAt, idle) && freshAge !in 0 until Wake.FRESH_MS && policy.claimWake(now)) {
+        if (!suppressed() && Wake.scanDue(now, lastScanRequestAt, idle) && freshAge !in 0 until Wake.FRESH_MS && policy.claimWake(now)) {
             Trace.i("wake_scan", "reason" to reason)
             scan()
         }
@@ -398,7 +403,26 @@ class ScanService : Service() {
         }
     }
 
-    private fun scan(beat: Boolean = false) {
+    private fun suppressed() = Reuse.suppress(foregroundSince != Reuse.NONE, store.learnAt != 0L)
+
+    private fun usableScan(now: Long) = Reuse.usable(now, lastScanMs, foregroundSince, screenOnAt, usedScanMs)
+
+    fun onForeground() {
+        handler.post {
+            if (!active || foregroundSince == Reuse.NONE) return@post
+            val now = SystemClock.elapsedRealtime()
+            val open = Reuse.openScan(usableScan(now), store.learnAt != 0L)
+            Trace.i("foreground", "openScan" to open)
+            if (open && policy.claimWake(now)) scan(open = true)
+        }
+    }
+
+    private fun scan(beat: Boolean = false, open: Boolean = false) {
+        if (!open && suppressed()) {
+            policy.refund()
+            Trace.i("scan_suppressed", "beat" to beat)
+            return
+        }
         sampler?.burst()
         if (beat) {
             beatPending = true
@@ -574,6 +598,21 @@ class ScanService : Service() {
             if (manualPending || manualAwaiting) return@post
             if (!active) return@post failManual("Scan pausiert")
             val now = SystemClock.elapsedRealtime()
+            if (store.learnAt == 0L && usableScan(now)) {
+                usedScanMs = lastScanMs
+                manualRoom = room
+                manualHeat = heat
+                manualAwaiting = true
+                handler.postDelayed(ackTimeout, Tap.ACK_WAIT_MS)
+                Trace.i("manual_reuse", "ageMs" to now - lastScanMs)
+                try {
+                    val ts = lastScanTs
+                    io.execute { LabelRecorder.point(applicationContext, room, ts, heat) }
+                } catch (e: RejectedExecutionException) {
+                    failManual("Fehler beim Speichern")
+                }
+                return@post
+            }
             manualPending = true
             manualRoom = room
             manualHeat = heat
@@ -639,6 +678,10 @@ class ScanService : Service() {
             beatPending = false
             handler.removeCallbacks(beatTimeout)
             val ts = Capture.wallMs(System.currentTimeMillis(), now, newest)
+            if (!manual) {
+                lastScanMs = if (home) newest / 1000 else 0L
+                lastScanTs = ts
+            }
             enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual, newest * 1000, learn)
             if (learn) {
                 learnPending = false
@@ -795,6 +838,12 @@ class ScanService : Service() {
         private const val CHANNEL = "scan"
         @Volatile var running = false
         @Volatile var instance: ScanService? = null
+        @Volatile var foregroundSince = Reuse.NONE
+
+        fun setForeground(on: Boolean) {
+            foregroundSince = if (on) SystemClock.elapsedRealtime() else Reuse.NONE
+            if (on) instance?.onForeground()
+        }
 
         fun alarmIntent(c: Context): PendingIntent = PendingIntent.getBroadcast(
             c, 0, Intent(c, TickReceiver::class.java).setAction(ACTION_TICK),

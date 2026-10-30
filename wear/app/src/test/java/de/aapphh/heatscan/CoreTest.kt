@@ -1699,4 +1699,35 @@ class CoreTest {
         assertFalse(Learn.waiting(true, 1_000, 1_000 + Learn.PENDING_MS))
         assertFalse(Learn.waiting(false, 1_000, 1_001))
     }
+
+    @Test
+    fun reuseTapWithinWindowOfForegroundScan() {
+        assertTrue(Reuse.usable(100_000, 90_000, 80_000, Reuse.NONE, 0))
+        assertTrue(Reuse.usable(100_000, 80_000, 80_000, Reuse.NONE, 0))
+        assertFalse(Reuse.usable(100_001, 80_000, 80_000, Reuse.NONE, 0))
+        assertFalse(Reuse.usable(100_000, 70_000, 60_000, Reuse.NONE, 0))
+    }
+
+    @Test
+    fun reuseNeedsForegroundOrScreenOnScanNotUsedYet() {
+        assertFalse(Reuse.usable(100_000, 90_000, 95_000, Reuse.NONE, 0))
+        assertTrue(Reuse.usable(100_000, 90_000, 95_000, 85_000, 0))
+        assertFalse(Reuse.usable(100_000, 90_000, Reuse.NONE, Reuse.NONE, 0))
+        assertFalse(Reuse.usable(100_000, 90_000, 80_000, Reuse.NONE, 90_000))
+        assertFalse(Reuse.usable(100_000, 0, 0, 0, 0))
+    }
+
+    @Test
+    fun autoScanSuppressedInForegroundExceptLearn() {
+        assertTrue(Reuse.suppress(true, false))
+        assertFalse(Reuse.suppress(false, false))
+        assertFalse(Reuse.suppress(true, true))
+    }
+
+    @Test
+    fun openScanOnlyWithoutUsableScan() {
+        assertTrue(Reuse.openScan(false, false))
+        assertFalse(Reuse.openScan(true, false))
+        assertFalse(Reuse.openScan(false, true))
+    }
 }

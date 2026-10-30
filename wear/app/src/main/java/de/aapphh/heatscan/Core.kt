@@ -98,6 +98,18 @@ enum class TapKind { WAIT, OK, QUEUED, THROTTLED, FAILED }
 
 data class TapView(val kind: TapKind, val title: String, val sub: String = "")
 
+object Reuse {
+    const val MAX_AGE_MS = 20_000L
+    const val NONE = Long.MAX_VALUE
+
+    fun usable(nowMs: Long, scanMs: Long, foregroundSinceMs: Long, screenOnMs: Long, usedMs: Long): Boolean =
+        scanMs > 0 && scanMs != usedMs && nowMs - scanMs in 0..MAX_AGE_MS && (scanMs >= foregroundSinceMs || scanMs >= screenOnMs)
+
+    fun suppress(foreground: Boolean, learning: Boolean) = foreground && !learning
+
+    fun openScan(usable: Boolean, learning: Boolean) = !usable && !learning
+}
+
 object Tap {
     const val FALLBACK_WAIT_S = 30
     const val GAP_WAIT_S = 2
@@ -1277,6 +1289,7 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
     private var nextAt = start
     private var stillSince = Long.MIN_VALUE / 4
     private var lastScanAt = Long.MIN_VALUE / 4
+    private var prevScanAt = Long.MIN_VALUE / 4
     private val recent = ArrayDeque<Long>()
     private var misses = 0
     val away: Boolean get() = mode == Mode.AWAY || misses >= ScanConfig.AWAY_AFTER_MISSES
@@ -1349,8 +1362,15 @@ class ScanPolicy(private val adaptive: Boolean, start: Long) {
         while (recent.isNotEmpty() && now - recent.first() >= ScanConfig.SCAN_WINDOW_MS) recent.removeFirst()
         if (recent.size >= ScanConfig.SCAN_WINDOW_MAX) return false
         recent.addLast(now)
+        prevScanAt = lastScanAt
         lastScanAt = now
         return true
+    }
+
+    fun refund() {
+        if (recent.isEmpty()) return
+        recent.removeLast()
+        lastScanAt = prevScanAt
     }
 
     private fun retryAt(): Long = maxOf(

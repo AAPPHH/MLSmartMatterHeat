@@ -110,6 +110,12 @@ class MainActivity : ComponentActivity() {
             askedBackground = true
             backgroundPerms.launch(ScanStarter.missingBackground(this).toTypedArray())
         } else ScanStarter.start(this, "resume")
+        ScanService.setForeground(true)
+    }
+
+    override fun onPause() {
+        ScanService.setForeground(false)
+        super.onPause()
     }
 
     @Composable
