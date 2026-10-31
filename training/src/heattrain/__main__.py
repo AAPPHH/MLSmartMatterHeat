@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from heattrain.boiler import boiler
 from heattrain.thermal import thermal
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
@@ -40,6 +41,17 @@ CONFIG = {
         "horizon_min": 300, "toff_max": 180, "toff_step": 1, "overshoot_tol": 0.3, "boost_setpoint": 28.0,
         "parity_rows": 400, "parity_tol": 1e-4, "parity_nan_frac": 0.05,
     },
+    "boiler": {
+        "timezone": "Europe/Berlin", "dt_s": 60.0, "temp_valid": [0.0, 95.0], "max_gap_s": 900.0, "invalid_wants_k": 1.0, "night_hours": [21, 6],
+        "open_frac": 0.3, "full_open": 0.85, "warm_window_min": 20, "warm_rise_k": 1.0, "merge_gap_min": 10, "supply_hold_min": 15,
+        "nosupply_min": 30, "flat_k": 0.6, "wants_min_k": 0.5, "min_nights": 3, "min_days": 3.0,
+        "recovery_tol_k": 0.0, "recovery_max_min": 240,
+        "fit_max_min": 120, "fit_min_points": 4, "fit_min_rise_k": 3.0, "fall_k": 0.5, "tau_bounds": [2.0, 120.0], "max_extrapolation_k": 15.0, "plateau_k": 0.5, "plateau_gap_k": 1.5,
+        "sensor_coupling": 0.6, "coupling_range": [0.45, 0.8], "min_curve_events": 4, "min_verdict_events": 2, "min_curve_span_k": 3.0, "curve_slope_min": 0.3, "flow_high_k": 12.0, "flow_low_k": 10.0,
+        "curve_ref": {"indoor": 20.0, "design_out": -12.0, "flow": 70.0, "ret": 55.0, "n": 1.33},
+        "group_min": 120, "power_valve_min": 0.5, "power_min_minutes": 10, "power_rel": [0.6, 1.6], "delay_flag_min": 15.0, "invalid_warn": 0.1, "invalid_crit": 0.5,
+        "cycle_window_min": 60, "cycle_step_min": 30, "cycle_period_min": [5, 30], "cycle_trend_min": 31, "cycle_frac_min": 0.4, "cycle_sigma_min_k": 0.15, "cycle_min_crossings": 3, "cycle_min_windows": 3, "cycle_share_flag": 0.3,
+    },
 }
 
 
@@ -59,17 +71,22 @@ def run_thermal(config, src, models_dir):
     print(out)
 
 
+def run_boiler(config, src, out_dir):
+    doc, out = boiler(config, src, out_dir)
+    print(out, doc["belastbar"], len(doc["befunde"]))
+
+
 def run_thermalml(config, src, models_dir):
     out, bundle = thermalml(config, src, models_dir)
     print(out, {r: v["valid"] for r, v in bundle["rooms"].items()}, bundle["metrics"]["backtest"])
 
 
-COMMANDS = {"watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml}
+COMMANDS = {"watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
 
 
 def main(argv):
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir>")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir>")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 
