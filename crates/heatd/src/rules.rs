@@ -93,6 +93,8 @@ pub struct Commands {
     holds: HashMap<u64, Hold>,
     last_write: HashMap<u64, (i64, &'static str)>,
     deferred: HashMap<u64, f64>,
+    resets: HashMap<u64, i64>,
+    last_reset: HashMap<u64, i64>,
     occ: Occ,
 }
 
@@ -106,6 +108,7 @@ impl Commands {
         self.device.clear();
         self.last_write.clear();
         self.deferred.clear();
+        self.resets.clear();
     }
 
     #[cfg(test)]
@@ -213,14 +216,21 @@ pub fn base_setpoint(room: &Room, config: &Config, now: NaiveDateTime) -> f64 {
     scheduled(room, now).unwrap_or(config.default_setpoint)
 }
 
+fn in_sleep_hours(config: &Config, now: NaiveDateTime) -> bool {
+    let Ok((from, to)) = config.watchmatch.state.sleep_minutes() else { return false };
+    let minute = now.hour() * 60 + now.minute();
+    if from <= to { (from..to).contains(&minute) } else { minute >= from || minute < to }
+}
+
 pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
     let occupancy = presence.map_or(Occupancy::Unknown, |p| p.occupancy(config));
     let (source, sleeping) = presence.map_or(("", false), |p| (p.source, p.sleep));
+    let night = in_sleep_hours(config, now);
     config
         .rooms
         .iter()
         .flat_map(|room| {
-            let sleep_here = sleeping && config.sleep_room.as_deref() == Some(room.name.as_str());
+            let sleep_here = (sleeping || night) && config.sleep_room.as_deref() == Some(room.name.as_str());
             let (base, base_reason) = match (scheduled(room, now), room.home_setpoint) {
                 (Some(s), _) => (s, "schedule"),
                 (None, Some(h)) if !sleep_here && occupancy != Occupancy::Away => (h, "home"),
@@ -469,6 +479,61 @@ fn clamp_boost(readings: &[Reading], node: u64, setpoint: f64, cap: f64) -> f64 
     setpoint.clamp(setpoint_limits(readings, node).0, cap)
 }
 
+fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now_ms: i64, window_busy: &HashSet<String>, exploring: &HashMap<String, Experiment>) {
+    let cfg = &state.config.supply;
+    if !cfg.enabled {
+        return;
+    }
+    let no_supply = state.windows.lock().unwrap().no_supply_rooms();
+    let frost = state.config.frost_setpoint;
+    let reset_event = |want: &Desired, phase: &str, detail: serde_json::Value| {
+        let mut event = lake::Event::now(kind::PI_RESET, "heatd").with_detail(json!({"room": want.room, "state": phase, "detail": detail}));
+        event.node = Some(want.node);
+        log("pi reset event", state.sink.append(event));
+    };
+    for want in wants.iter_mut() {
+        let blocked = window_busy.contains(&want.room) || exploring.contains_key(&want.room) || matches!(want.reason, "window_open" | "away" | "boost" | "boost_off" | "exploration") || state.commanded.lock().unwrap().holding(&[want.node]);
+        let running = state.commanded.lock().unwrap().resets.get(&want.node).copied();
+        if let Some(until) = running {
+            if !blocked && now_ms < until {
+                want.setpoint = clamp_setpoint(readings, want.node, frost, state.failsafe.max_c());
+                want.reason = "pi_reset";
+                want.rule = "supply";
+                continue;
+            }
+            state.commanded.lock().unwrap().resets.remove(&want.node);
+            reset_event(want, "end", json!({"aborted": blocked}));
+        }
+        if blocked {
+            state.windows.lock().unwrap().clear_overshoot(want.node);
+            continue;
+        }
+        if no_supply.contains(&want.room) {
+            let Some(temp) = state.windows.lock().unwrap().local_temp(want.node) else { continue };
+            let cap = clamp_setpoint(readings, want.node, (((temp + cfg.cap_k) * 2.0).floor() / 2.0).max(frost), state.failsafe.max_c());
+            if want.setpoint > cap {
+                want.setpoint = cap;
+                want.reason = "no_supply";
+                want.rule = "supply";
+            }
+            continue;
+        }
+        let due = state.windows.lock().unwrap().overshoot_due(cfg, want.node, want.setpoint, now_ms);
+        let gap = (cfg.reset_gap_min * 60_000.0) as i64;
+        let Some((temp, valve)) = due.filter(|_| state.commanded.lock().unwrap().last_reset.get(&want.node).is_none_or(|t| now_ms - t >= gap)) else { continue };
+        {
+            let mut commands = state.commanded.lock().unwrap();
+            commands.resets.insert(want.node, now_ms + (cfg.reset_min * 60_000.0) as i64);
+            commands.last_reset.insert(want.node, now_ms);
+        }
+        state.windows.lock().unwrap().clear_overshoot(want.node);
+        reset_event(want, "start", json!({"temp": temp, "setpoint": want.setpoint, "valve": valve}));
+        want.setpoint = clamp_setpoint(readings, want.node, frost, state.failsafe.max_c());
+        want.reason = "pi_reset";
+        want.rule = "supply";
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now: NaiveDateTime, now_ms: i64, window_busy: &HashSet<String>, away: bool, exploring: &HashMap<String, Experiment>) {
     if !state.boost.enabled() {
@@ -569,6 +634,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let readings = state.latest.all();
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, &window_busy, away, &exploring);
+    supply_step(state, &mut wants, &readings, now_ms, &window_busy, &exploring);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
     };
@@ -598,7 +664,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                 continue;
             }
             let last_write = commands.last_write.get(&want.node).copied();
-            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off");
+            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off" | "no_supply" | "pi_reset");
             let bypass = hold_ended || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
             if !bypass && last_write.is_some_and(|(t, _)| now_ms - t < interval_ms) {
                 if commands.deferred.get(&want.node).is_none_or(|d| (d - want.setpoint).abs() >= DESIRED_EPS_C) {
@@ -625,7 +691,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                     commands.last_write.insert(want.node, (now_ms, want.reason));
                     commands.deferred.remove(&want.node);
                 }
-                if want.reason != "window_open" && old.is_some_and(|o| want.setpoint < o) {
+                if !matches!(want.reason, "window_open" | "no_supply" | "pi_reset") && old.is_some_and(|o| want.setpoint < o) {
                     state.windows.lock().unwrap().note_decrease(&want.room, now_ms);
                 }
                 log("setpoint row", state.storage.insert_setpoint(now_ms, want.node, &want.room, want.setpoint, want.reason));
@@ -758,6 +824,8 @@ days = ['Mon', 'Fri']
 from = '22:00'
 to = '06:00'
 setpoint = 19.0
+[watchmatch.state]
+sleep_hours = '3-3'
 ";
 
     fn at(day: u32, h: u32, m: u32) -> NaiveDateTime {
@@ -811,6 +879,32 @@ nodes = [8]
         let sleeping = Some(Presence { sleep: true, ..home().unwrap() });
         assert_eq!(get(sleeping.clone(), 6), (18.0, "sleep"));
         assert_eq!(get(sleeping, 5), (20.0, "home"));
+    }
+
+    #[test]
+    fn sleep_hours_fallback_keeps_the_bedroom_at_default_without_a_sleep_report() {
+        let config = Config::parse("default_setpoint = 18.0
+occupied_setpoint = 20.0
+sleep_room = \"schlafzimmer\"
+[[rooms]]
+name = \"wohnzimmer\"
+nodes = [5]
+home_setpoint = 20.0
+[[rooms]]
+name = \"schlafzimmer\"
+nodes = [6]
+home_setpoint = 20.0
+").unwrap();
+        let get = |now: NaiveDateTime, p: Option<Presence>, node: u64| raw(now, &config, p.as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == node).map(|d| (d.setpoint, d.reason)).unwrap();
+        let awake = || presence("flur", 1.0);
+        assert_eq!(get(at(30, 23, 45), awake(), 6), (18.0, "sleep"));
+        assert_eq!(get(at(31, 3, 0), None, 6), (18.0, "sleep"));
+        assert_eq!(get(at(31, 6, 59), awake(), 6), (18.0, "sleep"));
+        assert_eq!(get(at(31, 3, 0), presence("schlafzimmer", 1.0), 6), (18.0, "sleep"));
+        assert_eq!(get(at(31, 3, 0), awake(), 5), (20.0, "home"));
+        assert_eq!(get(at(31, 7, 0), awake(), 6), (20.0, "home"));
+        assert_eq!(get(at(30, 22, 59), awake(), 6), (20.0, "home"));
+        assert_eq!(get(at(30, 12, 0), presence("schlafzimmer", 1.0), 6), (20.0, "occupied"));
     }
 
     #[test]

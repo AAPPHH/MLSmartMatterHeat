@@ -415,3 +415,76 @@ fn manual_open_times_out() {
     assert_eq!(s.state(), "closed");
     assert_eq!(s.find("window_close").detail["reason"], "manual_timeout");
 }
+
+fn incident() -> Sim {
+    let mut s = Sim::new("");
+    s.run(flat(19.0, 5));
+    s.valve(100.0);
+    s.run(ramp(19.0, -0.0155, 120));
+    s
+}
+
+fn supply_events(s: &Sim) -> Vec<&WinEvent> {
+    s.events.iter().filter(|e| e.kind == "supply").collect()
+}
+
+#[test]
+fn valve_wide_open_without_temperature_rise_is_no_supply() {
+    let s = incident();
+    let ev = supply_events(&s);
+    assert_eq!(ev.len(), 1, "{:?}", s.events);
+    assert_eq!(ev[0].detail["state"], "start");
+    assert!(s.w.no_supply_rooms().contains("a"));
+    assert_eq!(s.w.view("a", s.t)["no_supply_since"].as_i64(), ev[0].detail["since_ms"].as_i64());
+}
+
+#[test]
+fn rising_radiator_with_wide_open_valve_is_normal_heating() {
+    let mut s = Sim::new("");
+    s.run(flat(19.0, 5));
+    s.valve(100.0);
+    s.run(ramp(19.0, 0.03, 120));
+    assert!(supply_events(&s).is_empty());
+}
+
+#[test]
+fn no_supply_ends_when_the_radiator_heats_up_again() {
+    let mut s = incident();
+    s.run(ramp(17.1, 0.1, 20));
+    let ev = supply_events(&s);
+    assert_eq!(ev.len(), 2, "{:?}", s.events);
+    assert_eq!(ev[1].detail["state"], "end");
+    assert!(ev[1].detail["duration_min"].as_f64().unwrap() > 100.0);
+    assert!(s.w.no_supply_rooms().is_empty());
+}
+
+#[test]
+fn fast_drop_during_no_supply_opens_the_window_despite_the_open_valve() {
+    let mut s = incident();
+    s.run(flat(17.1, 100));
+    s.run(ramp(17.1, -0.1, 45));
+    assert!(s.kinds().contains(&"window_open"), "{:?}", s.events);
+    assert_eq!(s.find("window_open").detail["radiator_warm"], false);
+}
+
+#[test]
+fn same_drop_with_supply_and_hot_radiator_is_not_a_window() {
+    let mut s = Sim::new("[supply]\nenabled = false");
+    s.run(flat(19.0, 5));
+    s.valve(100.0);
+    s.run(ramp(19.0, -0.0155, 120));
+    s.run(flat(17.1, 100));
+    s.run(ramp(17.1, -0.1, 45));
+    assert!(!s.kinds().contains(&"window_open"), "{:?}", s.events);
+}
+
+#[test]
+fn learned_supply_window_is_the_median_of_episodes() {
+    use chrono::{Local, TimeZone};
+    let ms = |d: u32, h: u32, m: u32| Local.with_ymd_and_hms(2026, 10, d, h, m, 0).unwrap().timestamp_millis();
+    let eps = vec![(ms(20, 23, 40), ms(21, 6, 40)), (ms(21, 23, 45), ms(22, 6, 45)), (ms(22, 23, 50), ms(23, 6, 50))];
+    let v = supply_window(&eps);
+    assert_eq!((v["from"].as_str(), v["to"].as_str()), (Some("23:45"), Some("06:45")));
+    assert!(v["label"].as_str().unwrap().contains("Kessel liefert nicht: ~23:45-06:45"));
+    assert!(supply_window(&eps[..1]).is_null());
+}

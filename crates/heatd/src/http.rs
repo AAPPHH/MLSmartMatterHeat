@@ -623,7 +623,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?, "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 async fn snapshot(State(state): State<AppState>) -> ApiResult {

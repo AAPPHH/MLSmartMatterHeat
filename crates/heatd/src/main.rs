@@ -34,6 +34,8 @@ mod watchmatch;
 mod watchmatch_tests;
 mod window;
 #[cfg(test)]
+mod supply_tests;
+#[cfg(test)]
 mod window_tests;
 
 use anyhow::{anyhow, bail, Context, Result};

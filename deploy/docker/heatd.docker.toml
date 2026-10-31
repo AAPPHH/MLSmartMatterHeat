@@ -151,6 +151,21 @@ probe_min = 10.0
 probe_drop_k = 0.5
 max_events_per_hour = 4
 
+[supply]
+enabled = true
+valve_pct = 90
+min_min = 45
+flat_k_per_h = 0.2
+recover_k_per_h = 1.0
+recover_window_min = 15
+cap_k = 0.5
+learn_days = 14
+overshoot_k = 1.0
+overshoot_valve_pct = 50
+overshoot_min = 15
+reset_min = 10
+reset_gap_min = 120
+
 [failsafe]
 setpoint = 18.0
 max_c = 22.0

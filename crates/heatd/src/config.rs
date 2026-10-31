@@ -357,6 +357,30 @@ impl Default for WindowSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct SupplySection {
+    pub enabled: bool,
+    pub valve_pct: f64,
+    pub min_min: f64,
+    pub flat_k_per_h: f64,
+    pub recover_k_per_h: f64,
+    pub recover_window_min: f64,
+    pub cap_k: f64,
+    pub learn_days: f64,
+    pub overshoot_k: f64,
+    pub overshoot_valve_pct: f64,
+    pub overshoot_min: f64,
+    pub reset_min: f64,
+    pub reset_gap_min: f64,
+}
+
+impl Default for SupplySection {
+    fn default() -> Self {
+        Self { enabled: true, valve_pct: 90.0, min_min: 45.0, flat_k_per_h: 0.2, recover_k_per_h: 1.0, recover_window_min: 15.0, cap_k: 0.5, learn_days: 14.0, overshoot_k: 1.0, overshoot_valve_pct: 50.0, overshoot_min: 15.0, reset_min: 10.0, reset_gap_min: 120.0 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -393,6 +417,7 @@ pub struct Config {
     pub poll_silence_s: u64,
     pub watchmatch: WatchMatchSection,
     pub window: WindowSection,
+    pub supply: SupplySection,
     pub boost: BoostSection,
     pub failsafe: FailsafeSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
@@ -436,6 +461,7 @@ impl Default for Config {
             poll_silence_s: 60,
             watchmatch: WatchMatchSection::default(),
             window: WindowSection::default(),
+            supply: SupplySection::default(),
             boost: BoostSection::default(),
             failsafe: FailsafeSection::default(),
             br_watchdog: Default::default(),

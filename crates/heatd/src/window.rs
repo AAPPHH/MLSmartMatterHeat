@@ -1,4 +1,5 @@
-use crate::config::{Config, WindowSection};
+use crate::config::{Config, SupplySection, WindowSection};
+use chrono::{Local, TimeZone, Timelike};
 use crate::lake::{self, Table};
 use arrow::array::{Array, Float64Array, Int64Array, TimestampMicrosecondArray, UInt32Array, UInt64Array};
 use serde_json::{json, Value};
@@ -39,6 +40,8 @@ struct NodeWin {
     valve_before: Option<f64>,
     cool_start: Option<(i64, f64, f64)>,
     samples: VecDeque<(i64, f64)>,
+    high_since: Option<i64>,
+    over_since: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +60,7 @@ struct RoomWin {
     suppressed: u64,
     nodes_seen: usize,
     learned: Vec<f64>,
+    supply: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +74,7 @@ pub struct WinEvent {
 pub struct Windows {
     rooms: BTreeMap<String, RoomWin>,
     nodes: HashMap<u64, NodeWin>,
+    episodes: Vec<(String, i64, i64)>,
 }
 
 struct Reading {
@@ -174,6 +179,12 @@ impl RoomWin {
         Some(Reading { drop_k: peak - temp, slope, temp, hit_drop: peak - temp >= cfg.open_drop_k * factor, hit_slope: points.len() >= 3 && slope <= cfg.open_slope_k_per_h * factor })
     }
 
+    fn trend(&self, from: i64, now: i64) -> Option<f64> {
+        let mut points = self.within(from, now, KEEP_MS);
+        points.push((now, self.samples().last()?.1));
+        (points[0].0 <= from + 5 * MIN_MS).then(|| slope_per_h(&points))
+    }
+
     fn close(&mut self, reason: &'static str, now: i64) {
         self.active = None;
         self.floor_ms = now;
@@ -183,14 +194,17 @@ impl RoomWin {
 }
 
 impl NodeWin {
-    fn set_valve(&mut self, cfg: &WindowSection, ts_ms: i64, value: f64) {
+    fn set_valve(&mut self, cfg: &WindowSection, high_pct: f64, ts_ms: i64, value: f64) {
         if !(0.0..=100.0).contains(&value) {
             self.valve = None;
+            self.high_since = None;
+            self.over_since = None;
             self.closed_ms = None;
             self.cool_start = None;
             return;
         }
         let prev = self.valve;
+        self.high_since = if value >= high_pct { self.high_since.or(Some(ts_ms)) } else { None };
         let low = value <= cfg.valve_low_pct;
         if low {
             if !prev.is_some_and(|p| p <= cfg.valve_low_pct) {
@@ -259,7 +273,7 @@ impl Windows {
                     entry.series.pop_front();
                 }
             }
-            PI_HEATING_DEMAND => n.set_valve(cfg, ts_ms, value),
+            PI_HEATING_DEMAND => n.set_valve(cfg, config.supply.valve_pct, ts_ms, value),
             _ => {}
         }
     }
@@ -273,8 +287,79 @@ impl Windows {
         rows.extend(raw_history(root, from, now_ms));
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(b.2)));
         rows.dedup_by(|a, b| (a.0, a.1, a.2) == (b.0, b.1, b.2));
-        rows.iter().for_each(|(ts, node, attribute, v)| self.observe(config, *node, attribute, *v, *ts));
+        for (ts, node, attribute, v) in &rows {
+            self.observe(config, *node, attribute, *v, *ts);
+            if *attribute == LOCAL_TEMPERATURE {
+                if let Some(room) = config.rooms.iter().find(|r| r.nodes.contains(node)) {
+                    self.supply_tick(config, &room.name, *ts);
+                }
+            }
+        }
         rows.len()
+    }
+
+    pub fn supply_tick(&mut self, config: &Config, room: &str, now: i64) -> Vec<WinEvent> {
+        let cfg = &config.supply;
+        let Some(nodes) = config.rooms.iter().find(|r| r.name == room).map(|r| r.nodes.clone()).filter(|n| cfg.enabled && !n.is_empty()) else { return Vec::new() };
+        let Some(mut w) = self.rooms.remove(room) else { return Vec::new() };
+        let mins = |m: f64| (m * MIN_MS as f64) as i64;
+        let event = |state: &str, since: i64, extra: Value| {
+            let mut detail = json!({"room": room, "state": state, "since_ms": since});
+            detail.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+            WinEvent { kind: lake::kind::SUPPLY, room: room.into(), detail }
+        };
+        let mut out = Vec::new();
+        match w.supply {
+            Some(since) if w.trend(now - mins(cfg.recover_window_min), now).is_some_and(|s| s >= cfg.recover_k_per_h) => {
+                w.supply = None;
+                self.episodes.push((room.into(), since, now));
+                nodes.iter().for_each(|id| self.nodes.entry(*id).or_default().high_since = Some(now));
+                out.push(event("end", since, json!({"duration_min": (now - since) as f64 / 60_000.0})));
+            }
+            Some(_) => {}
+            None => {
+                let highs: Option<Vec<i64>> = nodes.iter().map(|id| self.nodes.get(id).and_then(|n| n.high_since)).collect();
+                if let Some(since) = highs.and_then(|h| h.into_iter().max()).filter(|s| now - s >= mins(cfg.min_min)) {
+                    if w.trend(now - mins(cfg.min_min), now).is_some_and(|s| s <= cfg.flat_k_per_h) {
+                        w.supply = Some(since);
+                        out.push(event("start", since, json!({})));
+                    }
+                }
+            }
+        }
+        self.rooms.insert(room.into(), w);
+        out
+    }
+
+    pub fn no_supply_rooms(&self) -> HashSet<String> {
+        self.rooms.iter().filter(|(_, r)| r.supply.is_some()).map(|(n, _)| n.clone()).collect()
+    }
+
+    pub fn local_temp(&self, node: u64) -> Option<f64> {
+        self.nodes.get(&node).and_then(|n| n.temp)
+    }
+
+    pub fn overshoot_due(&mut self, cfg: &SupplySection, node: u64, setpoint: f64, now: i64) -> Option<(f64, f64)> {
+        let n = self.nodes.get_mut(&node)?;
+        let hit = n.temp.zip(n.valve).filter(|(t, v)| *t >= setpoint + cfg.overshoot_k && *v >= cfg.overshoot_valve_pct);
+        if hit.is_none() {
+            n.over_since = None;
+            return None;
+        }
+        let since = *n.over_since.get_or_insert(now);
+        hit.filter(|_| now - since >= (cfg.overshoot_min * MIN_MS as f64) as i64)
+    }
+
+    pub fn clear_overshoot(&mut self, node: u64) {
+        if let Some(n) = self.nodes.get_mut(&node) {
+            n.over_since = None;
+        }
+    }
+
+    pub fn supply_view(&self, config: &Config, now: i64) -> Value {
+        let horizon = now - (config.supply.learn_days * 86_400_000.0) as i64;
+        let episodes: Vec<(i64, i64)> = self.episodes.iter().filter(|e| e.2 >= horizon).map(|e| (e.1, e.2)).collect();
+        json!({"active": self.rooms.iter().filter_map(|(n, r)| r.supply.map(|s| json!({"room": n, "since_ms": s}))).collect::<Vec<_>>(), "learned": supply_window(&episodes)})
     }
 
     pub fn note_decrease(&mut self, room: &str, ts_ms: i64) {
@@ -336,10 +421,10 @@ impl Windows {
 
     pub fn step(&mut self, config: &Config, now: i64, outdoor: Option<(f64, Option<f64>)>) -> Vec<WinEvent> {
         let cfg = &config.window;
+        let mut events: Vec<WinEvent> = config.rooms.iter().flat_map(|r| self.supply_tick(config, &r.name, now)).collect();
         if !cfg.enabled {
-            return Vec::new();
+            return events;
         }
-        let mut events = Vec::new();
         for room in config.rooms.iter().filter(|r| !r.nodes.is_empty()) {
             let Some(mut w) = self.rooms.remove(&room.name) else { continue };
             let evs = self.room_step(cfg, &room.name, &room.nodes, &mut w, now, outdoor);
@@ -417,7 +502,7 @@ impl Windows {
         if !r.hit_drop && !sustained {
             return Vec::new();
         }
-        let warm = !nodes.iter().all(|id| self.nodes.get(id).is_some_and(|n| n.cold(cfg, now))) || w.decrease_ms.is_some_and(|d| now - d < mins(cfg.radiator_cold_min));
+        let warm = (w.supply.is_none() && !nodes.iter().all(|id| self.nodes.get(id).is_some_and(|n| n.cold(cfg, now)))) || w.decrease_ms.is_some_and(|d| now - d < mins(cfg.radiator_cold_min));
         let guard = self.typical(cfg, nodes) * cfg.expected_cooldown_factor;
         let drop_rate = r.drop_k / (cfg.open_window_min / 60.0);
         let by_drop = r.hit_drop && (!warm || drop_rate > guard);
@@ -478,6 +563,7 @@ impl Windows {
             "auto_opens": r.auto_opens,
             "reopens": r.reopens,
             "suppressed": r.suppressed,
+            "no_supply_since": r.supply,
         })
     }
 
@@ -498,4 +584,19 @@ impl Windows {
         }
         out
     }
+}
+
+fn local_minute(ms: i64) -> Option<i64> {
+    Local.timestamp_millis_opt(ms).single().map(|d| i64::from(d.hour() * 60 + d.minute()))
+}
+
+pub fn supply_window(episodes: &[(i64, i64)]) -> Value {
+    let long: Vec<(i64, i64)> = episodes.iter().filter_map(|(a, b)| (b - a >= 30 * MIN_MS).then_some(local_minute(*a)?).zip(local_minute(*b))).collect();
+    if long.len() < 2 {
+        return Value::Null;
+    }
+    let mid = |pick: fn(&(i64, i64)) -> i64| (median(long.iter().map(|e| ((pick(e) + 720) % 1440) as f64).collect()) as i64 + 720) % 1440;
+    let (from, to) = (mid(|e| e.0), mid(|e| e.1));
+    let clock = |m: i64| format!("{:02}:{:02}", m / 60, m % 60);
+    json!({"from": clock(from), "to": clock(to), "episodes": long.len(), "label": format!("Kessel liefert nicht: ~{}-{}", clock(from), clock(to))})
 }

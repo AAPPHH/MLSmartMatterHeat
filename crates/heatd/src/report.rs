@@ -394,6 +394,16 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
     }
 
+    match supply_section(root, date) {
+        Ok(section) => md.push_str(&section),
+        Err(e) => {
+            let _ = writeln!(md, "
+## Kesselversorgung
+
+Nicht verfuegbar: {e:#}");
+        }
+    }
+
     match usage_section(root, date) {
         Ok(section) => md.push_str(&section),
         Err(e) => {
@@ -597,6 +607,40 @@ pub fn usage_json(root: &Path, from: NaiveDate, to: NaiveDate) -> Result<Value> 
         "totals": {"rooms": rooms_json(totals.iter(), &house), "house": house.json(&house)},
         "note": "heat_proxy_kh = sum of valve fraction x max(sensor - outdoor, 0) x hours, a relative estimate and not measured energy; the current UTC day is included only after the 03:00 roll",
     }))
+}
+
+pub fn supply_section(root: &Path, date: NaiveDate) -> Result<String> {
+    let db = open_lake(root, date - chrono::Duration::days(14), date + chrono::Duration::days(1))?;
+    let events = rows(
+        &db.conn,
+        "SELECT CAST(epoch_us(ts) / 1000 AS BIGINT), json_extract_string(detail, '$.room'), json_extract_string(detail, '$.state'), CAST(json_extract(detail, '$.since_ms') AS BIGINT) FROM events WHERE kind = 'supply' ORDER BY ts",
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?)),
+    )?;
+    let mut md = String::from("
+## Kesselversorgung
+
+");
+    let (lo, hi) = (midnight_us(date) / 1000, midnight_us(date + chrono::Duration::days(1)) / 1000);
+    let today: Vec<_> = events.iter().filter(|e| (lo..hi).contains(&e.0)).collect();
+    if today.is_empty() {
+        md.push_str("Keine Phasen ohne Waermelieferung (Ventil >= 90 % ohne Temperaturanstieg).
+");
+    }
+    for (ms, room, state, since) in today {
+        let _ = writeln!(md, "- {} {} {}{}", hhmm(ms * 1000), room.as_deref().unwrap_or("-"), state.as_deref().unwrap_or("-"), since.map_or(String::new(), |s| format!(" (seit {})", hhmm(s * 1000))));
+    }
+    let episodes: Vec<(i64, i64)> = events.iter().filter(|e| e.2.as_deref() == Some("end")).filter_map(|e| Some((e.3?, e.0))).collect();
+    let learned = crate::window::supply_window(&episodes);
+    match learned["label"].as_str() {
+        Some(label) => {
+            let _ = writeln!(md, "
+{label} (Median ueber {} Phasen der letzten 14 Tage, Ortszeit).", learned["episodes"]);
+        }
+        None => md.push_str("
+Kein wiederkehrendes Muster gelernt.
+"),
+    }
+    Ok(md)
 }
 
 pub fn usage_section(root: &Path, date: NaiveDate) -> Result<String> {
