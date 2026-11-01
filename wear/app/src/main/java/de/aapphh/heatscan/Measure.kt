@@ -234,7 +234,7 @@ object Inventory {
 }
 
 object Special {
-    fun isSpecial(o: JSONObject) = LabelEvent.isLabel(o) || MeasureBatch.isMeasure(o) || Inventory.isSensors(o)
+    fun isSpecial(o: JSONObject) = LabelEvent.isLabel(o) || WindowEvent.isWindow(o) || MeasureBatch.isMeasure(o) || Inventory.isSensors(o)
 }
 
 class SensorSampler(
