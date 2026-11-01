@@ -14,4 +14,12 @@ menu "BR Watchdog"
             Built-in Matter controller side client (CASE + Interaction Model write over lwIP UDP, mbedTLS).
             With this off the watchdog runs dry_run only and refuses mode armed.
 
+    config BR_WATCHDOG_MATTER_RUST
+        bool "Use the Rust Matter client (firmware/br/matter_client) instead of the C one"
+        depends on BR_WATCHDOG_MATTER
+        default n
+        help
+            Needs the esp Rust toolchain (espup) and cargo on PATH. The C client stays the default
+            until on-device interop with the Rust client has passed.
+
 endmenu
