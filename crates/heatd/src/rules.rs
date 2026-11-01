@@ -635,6 +635,22 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, &window_busy, away, &exploring);
     supply_step(state, &mut wants, &readings, now_ms, &window_busy, &exploring);
+    let normal = desired(now, &state.config, presence.as_ref(), &step.held, &HashSet::new(), &exploring);
+    let contexts: Vec<(String, crate::window_v2::RoomCtx)> = state
+        .config
+        .rooms
+        .iter()
+        .map(|r| {
+            let ctx = crate::window_v2::RoomCtx {
+                target: normal.iter().find(|w| w.room == r.name).map(|w| w.setpoint),
+                hold: state.commanded.lock().unwrap().holding(&r.nodes),
+                boost: wants.iter().any(|w| w.room == r.name && matches!(w.reason, "boost" | "boost_off")),
+                away,
+            };
+            (r.name.clone(), ctx)
+        })
+        .collect();
+    state.windows.lock().unwrap().set_context(contexts);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
     };

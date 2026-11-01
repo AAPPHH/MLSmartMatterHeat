@@ -72,6 +72,18 @@ struct WindowBody {
 }
 
 #[derive(Deserialize)]
+struct WindowLabelBody {
+    device: String,
+    ts: i64,
+    room: String,
+    open: bool,
+    #[serde(default)]
+    prompt_id: Option<String>,
+    #[serde(default)]
+    label_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct LabelBody {
     device: String,
     from: i64,
@@ -144,6 +156,8 @@ pub fn router(state: AppState) -> Router {
         .route("/watch/measurement", post(watch_measurement))
         .route("/watch/sensors", post(watch_sensors))
         .route("/watch/label", post(label))
+        .route("/watch/window_label", post(window_label))
+        .route("/api/window_label", post(window_label))
         .route("/watch/label/void", post(label_void))
         .route("/api/ambient", post(ambient))
         .route("/api/usage", get(usage))
@@ -561,7 +575,15 @@ async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiR
     if let Some(alert) = state.status.br_alert() {
         response["alert"] = alert;
     }
+    if let Some(prompt) = window_prompt(&state, [&body]) {
+        response["window_prompt"] = prompt;
+    }
     Ok(Json(response))
+}
+
+fn window_prompt<'a>(state: &AppState, scans: impl IntoIterator<Item = &'a ScanBody>) -> Option<Value> {
+    let home = scans.into_iter().any(|s| !s.away && !s.queued && !state.watchmatch.is_anchor(&s.device));
+    home.then(|| state.windows.lock().unwrap().prompt(&state.config.window, now_ms())).flatten()
 }
 
 async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> ApiResult {
@@ -587,6 +609,9 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     }
     if let Some(alert) = state.status.br_alert() {
         response["alert"] = alert;
+    }
+    if let Some(prompt) = window_prompt(&state, &body.scans) {
+        response["window_prompt"] = prompt;
     }
     Ok(Json(response))
 }
@@ -707,7 +732,30 @@ async fn label_void(State(state): State<AppState>, Json(body): Json<VoidBody>) -
         eprintln!("labels: {e}");
     }
     let cleared = state.watchmatch.void_stay(&body.device, &body.label_id);
+    let reverted = state.windows.lock().unwrap().void_label(&body.label_id, now_ms());
+    reverted.into_iter().for_each(|e| crate::rules::window_event(&state, e));
     Ok(Json(json!({"voided": body.label_id, "stay_cleared": cleared})))
+}
+
+async fn window_label(State(state): State<AppState>, Json(body): Json<WindowLabelBody>) -> ApiResult {
+    if !state.config.rooms.iter().any(|r| r.name == body.room) {
+        return Err(ApiError::bad("room must be a configured room"));
+    }
+    if body.device.is_empty() || body.label_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 64) {
+        return Err(ApiError::bad("device must not be empty and label_id must be 1..64 characters"));
+    }
+    if let Some(id) = &body.label_id {
+        if !state.storage.claim_id(&body.device, &format!("window_label:{id}"))? {
+            return Ok(Json(json!({"stored": 0, "duplicate": true})));
+        }
+    }
+    let ts = body.ts.min(now_ms() + MAX_FUTURE_MS);
+    let row = Label { ts: ts * 1000, room: body.room.clone(), source: "window".into(), device: Some(body.device.clone()), heat: Some(false), label_id: body.label_id.clone(), window_open: Some(body.open), ..Default::default() };
+    state.sink.append(row)?;
+    let event = state.windows.lock().unwrap().label(&body.room, ts, body.open, body.prompt_id.as_deref(), body.label_id.as_deref(), now_ms());
+    event.into_iter().for_each(|e| crate::rules::window_event(&state, e));
+    let open = state.windows.lock().unwrap().open_rooms();
+    Ok(Json(json!({"stored": 1, "manual": body.prompt_id.is_none(), "window_open": open.iter().collect::<Vec<_>>()})))
 }
 
 #[derive(Deserialize)]

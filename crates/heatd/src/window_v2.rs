@@ -8,7 +8,7 @@ const LEAD_MS: i64 = 15 * MIN_MS;
 const MAX_TICK_MIN: f64 = 5.0;
 const CENTER_C: f64 = 20.0;
 const RIDGE_A: f64 = 60.0;
-const RIDGE_B: f64 = 2000.0;
+const RIDGE_B: f64 = 500.0;
 
 pub const V1: &str = "v1";
 pub const V2: &str = "v2";
@@ -244,12 +244,9 @@ impl Shadow {
         self.rooms.iter().filter(|(_, r)| r.open.is_some()).map(|(n, _)| n.clone()).collect()
     }
 
+    #[cfg(test)]
     pub fn lengths(&self, room: &str) -> Vec<f64> {
         self.rooms.get(room).map_or_else(Vec::new, |r| r.lengths.iter().copied().collect())
-    }
-
-    pub fn coefficients(&self, room: &str, c: &WindowV2Section) -> (f64, f64) {
-        self.rooms.get(room).map_or_else(|| Ar1::new(c).coefficients(), |r| r.base.predict(CENTER_C + 1.0, 1.0, false).min(0.0).max(f64::MIN).pipe_pair(r.base.predict(CENTER_C, 1.0, false)))
     }
 
     pub fn on_report(&mut self, cfg: &WindowSection, room: &str, ts: i64, x: f64, f: &Flags, ctx: &RoomCtx) -> Step2 {
@@ -361,20 +358,26 @@ pub fn parse_csv(text: &str) -> anyhow::Result<Vec<(i64, u64, String, f64)>> {
         .collect()
 }
 
-pub fn replay(config: &Config, rows: &[(i64, u64, String, f64)], outdoor: Option<(f64, Option<f64>)>) -> Value {
-    let mut config = config.clone();
-    config.window.enabled = true;
-    config.window.v2.enabled = true;
+pub fn replay(text: &str, rows: &[(i64, u64, String, f64)], outdoor: Option<(f64, Option<f64>)>) -> anyhow::Result<Value> {
+    let mut config = Config::parse(text)?;
     if config.rooms.is_empty() {
         let mut nodes: Vec<u64> = rows.iter().filter(|r| r.2 == LOCAL_TEMPERATURE || r.2 == PI_HEATING_DEMAND).map(|r| r.1).collect();
         nodes.sort_unstable();
         nodes.dedup();
-        config.rooms = nodes.iter().map(|n| crate::config::Room { name: format!("node{n}"), nodes: vec![*n], ..Default::default() }).collect();
+        let generated: String = nodes.iter().map(|n| format!("
+[[rooms]]
+name = 'node{n}'
+nodes = [{n}]
+")).collect();
+        config = Config::parse(&format!("{text}
+{generated}"))?;
     }
+    config.window.enabled = true;
+    config.window.v2.enabled = true;
     let mut w = Windows::default();
     let mut rows: Vec<&(i64, u64, String, f64)> = rows.iter().collect();
     rows.sort_by_key(|r| r.0);
-    let Some(first) = rows.first().map(|r| r.0) else { return json!({"episodes": [], "summary": {}}) };
+    let Some(first) = rows.first().map(|r| r.0) else { return Ok(json!({"episodes": [], "summary": {}})) };
     let end = rows.last().map_or(first, |r| r.0) + (config.window.label_grace_min as i64 + 1) * MIN_MS;
     let (mut t, mut i, mut outdoor) = (first - MIN_MS, 0, outdoor);
     let mut episodes: Vec<Value> = Vec::new();
@@ -402,5 +405,5 @@ pub fn replay(config: &Config, rows: &[(i64, u64, String, f64)], outdoor: Option
             (d.to_string(), json!({"episodes": mine.len(), "open_min": sum("duration_min"), "probes": sum("probe_count"), "probe_valve_min": sum("probe_valve_min"), "below_min": sum("below_min"), "label_yes": count("yes"), "label_no": count("no"), "label_none": count("none")}))
         })
         .collect();
-    json!({"episodes": episodes, "summary": summary})
+    Ok(json!({"episodes": episodes, "summary": summary}))
 }

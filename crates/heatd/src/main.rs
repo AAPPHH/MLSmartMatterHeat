@@ -37,6 +37,9 @@ mod window;
 mod supply_tests;
 #[cfg(test)]
 mod window_tests;
+mod window_v2;
+#[cfg(test)]
+mod window_v2_tests;
 
 use anyhow::{anyhow, bail, Context, Result};
 use config::{Config, ControllerKind};
@@ -46,7 +49,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | export --view step_responses|room_delta|room_delta_daily|radiator_summary|radiator_pairs [--room <room>] [--from <date>] [--to <date>] [--out <path>] | report [date] | thread form <serial-port> | thread dataset <serial-port>";
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | export --view step_responses|room_delta|room_delta_daily|radiator_summary|radiator_pairs [--room <room>] [--from <date>] [--to <date>] [--out <path>] | report [date] | window-replay <csv> | thread form <serial-port> | thread dataset <serial-port>";
 const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -333,6 +336,12 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         ["migrate"] => migrate::run(&config),
         ["export", rest @ ..] => export_command(&config, rest),
+        ["window-replay", path] => {
+            let text = std::fs::read_to_string(std::env::var("HEATD_CONFIG").unwrap_or_else(|_| "heatd.toml".into())).unwrap_or_default();
+            let rows = window_v2::parse_csv(&std::fs::read_to_string(path).with_context(|| format!("read {path}"))?)?;
+            println!("{}", window_v2::replay(&text, &rows, None)?);
+            Ok(())
+        }
         ["report"] => report::report_command(Path::new(&config.data_dir), None).map(|p| println!("{}", p.display())),
         ["report", date] => report::report_command(Path::new(&config.data_dir), Some(date)).map(|p| println!("{}", p.display())),
         ["commission" | "read" | "set" | "inventory", ..] => runtime()?.block_on(controller_command(config, &args)),

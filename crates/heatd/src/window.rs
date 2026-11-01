@@ -1,6 +1,7 @@
 use crate::config::{Config, SupplySection, WindowSection};
 use chrono::{Local, TimeZone, Timelike};
 use crate::lake::{self, Table};
+use crate::window_v2::{Episode, Flags, LabelRec, RoomCtx, Shadow, Tally, V1};
 use arrow::array::{Array, Float64Array, Int64Array, TimestampMicrosecondArray, UInt32Array, UInt64Array};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -62,6 +63,8 @@ struct RoomWin {
     nodes_seen: usize,
     learned: Vec<f64>,
     supply: Option<i64>,
+    tally: Option<Tally>,
+    done: Vec<Episode>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,11 +74,28 @@ pub struct WinEvent {
     pub detail: Value,
 }
 
+#[derive(Debug, Clone)]
+struct Prompt {
+    id: String,
+    room: String,
+    question: &'static str,
+    created_ms: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct Windows {
     rooms: BTreeMap<String, RoomWin>,
     nodes: HashMap<u64, NodeWin>,
     episodes: Vec<(String, i64, i64)>,
+    shadow: Shadow,
+    ctx: HashMap<String, RoomCtx>,
+    outdoor: Option<f64>,
+    finished: Vec<Episode>,
+    labels: VecDeque<LabelRec>,
+    prompt: Option<Prompt>,
+    prompts: VecDeque<Prompt>,
+    prompt_seq: u64,
+    prompt_at: HashMap<String, i64>,
 }
 
 struct Reading {
@@ -187,6 +207,10 @@ impl RoomWin {
     }
 
     fn close(&mut self, reason: &'static str, now: i64) {
+        if let Some(tally) = self.tally.take() {
+            let source = self.active.as_ref().map_or("auto", |a| a.source);
+            self.done.push(Episode { detector: V1, room: String::new(), end_ms: now, reason: reason.into(), source, onset_ms: None, tally });
+        }
         self.active = None;
         self.floor_ms = now;
         self.slope_since = None;
@@ -260,6 +284,7 @@ impl Windows {
         let cfg = &config.window;
         let entry = self.rooms.entry(room.name.clone()).or_default();
         let n = self.nodes.entry(node).or_default();
+        let mut report = None;
         match attribute {
             LOCAL_TEMPERATURE => {
                 n.temp = Some(value);
@@ -274,10 +299,104 @@ impl Windows {
                 while entry.series.front().is_some_and(|s| s.0 < ts_ms - KEEP_MS) {
                     entry.series.pop_front();
                 }
+                report = entry.series.back().map(|s| s.1);
             }
             PI_HEATING_DEMAND => n.set_valve(cfg, config.supply.valve_pct, ts_ms, value),
             _ => {}
         }
+        if let Some(x) = report.filter(|_| cfg.v2.enabled) {
+            self.shadow_report(config, &room.name, &room.nodes, ts_ms, x);
+        }
+    }
+
+    fn flags(&self, cfg: &WindowSection, name: &str, nodes: &[u64], ts: i64, x: f64) -> Flags {
+        let known = self.heating(nodes);
+        let heating = known == Some(true);
+        let closed_age = nodes.iter().filter_map(|id| self.nodes.get(id).and_then(|n| n.closed_ms)).map(|c| (ts - c) as f64 / MIN_MS as f64).min_by(f64::total_cmp);
+        let room = self.rooms.get(name);
+        Flags {
+            heating,
+            no_supply: room.is_some_and(|r| r.supply.is_some()),
+            rad_age_min: if heating || known.is_none() { Some(0.0) } else { closed_age },
+            typical_k_per_h: self.typical(cfg, nodes),
+            decrease_recent: room.and_then(|r| r.decrease_ms).is_some_and(|d| ts - d <= (cfg.setpoint_guard_min * MIN_MS as f64) as i64),
+            outdoor_blocked: self.outdoor.is_some_and(|o| x - o < cfg.min_outdoor_delta_k),
+        }
+    }
+
+    fn shadow_report(&mut self, config: &Config, name: &str, nodes: &[u64], ts: i64, x: f64) {
+        let cfg = &config.window;
+        let flags = self.flags(cfg, name, nodes, ts, x);
+        let ctx = self.ctx.get(name).cloned().unwrap_or_default();
+        let ctx = RoomCtx { target: ctx.target.or(Some(config.default_setpoint)), ..ctx };
+        let out = self.shadow.on_report(cfg, name, ts, x, &flags, &ctx);
+        self.finished.extend(out.done);
+        for t in out.transitions {
+            self.raise(cfg, &t.room, if t.open { "open" } else { "closed" }, t.ts);
+        }
+    }
+
+    pub fn set_context(&mut self, ctx: impl IntoIterator<Item = (String, RoomCtx)>) {
+        self.ctx = ctx.into_iter().collect();
+    }
+
+    fn raise(&mut self, cfg: &WindowSection, room: &str, question: &'static str, now: i64) {
+        if self.prompt_at.get(room).is_some_and(|t| now - t < (cfg.prompt_gap_min * MIN_MS as f64) as i64) {
+            return;
+        }
+        self.prompt_at.insert(room.into(), now);
+        self.prompt_seq += 1;
+        let prompt = Prompt { id: format!("w{now}-{}", self.prompt_seq), room: room.into(), question, created_ms: now };
+        self.prompts.push_back(prompt.clone());
+        while self.prompts.len() > 20 {
+            self.prompts.pop_front();
+        }
+        self.prompt = Some(prompt);
+    }
+
+    pub fn prompt(&self, cfg: &WindowSection, now: i64) -> Option<Value> {
+        self.prompt.as_ref().filter(|p| now - p.created_ms < (cfg.prompt_expire_min * MIN_MS as f64) as i64).map(|p| json!({"id": p.id, "room": p.room, "question": p.question}))
+    }
+
+    pub fn label(&mut self, room: &str, ts: i64, open: bool, prompt_id: Option<&str>, label_id: Option<&str>, now: i64) -> Option<WinEvent> {
+        let question = prompt_id.and_then(|id| self.prompts.iter().find(|p| p.id == id)).map(|p| p.question);
+        if prompt_id.is_some_and(|id| self.prompt.as_ref().is_some_and(|p| p.id == id)) {
+            self.prompt = None;
+        }
+        self.labels.push_back(LabelRec { label_id: label_id.map(Into::into), room: room.into(), ts, open, manual: prompt_id.is_none(), question });
+        while self.labels.front().is_some_and(|l| l.ts < now - 24 * 3_600_000) || self.labels.len() > 500 {
+            self.labels.pop_front();
+        }
+        if prompt_id.is_none() { self.manual(room, open, now) } else { None }
+    }
+
+    pub fn void_label(&mut self, label_id: &str, now: i64) -> Option<WinEvent> {
+        let (voided, kept): (VecDeque<LabelRec>, VecDeque<LabelRec>) = std::mem::take(&mut self.labels).into_iter().partition(|l| l.label_id.as_deref() == Some(label_id));
+        self.labels = kept;
+        let rec = voided.into_iter().find(|l| l.manual && l.open)?;
+        let manual_open = self.rooms.get(&rec.room).and_then(|r| r.active.as_ref()).is_some_and(|a| a.source == "manual");
+        if manual_open { self.manual(&rec.room, false, now) } else { None }
+    }
+
+    pub fn finish(&mut self, config: &Config, now: i64) -> Vec<WinEvent> {
+        self.finished.extend(self.shadow.finish(&config.window, now));
+        for (name, w) in self.rooms.iter_mut() {
+            if w.active.is_some() {
+                w.close("open_at_end", now);
+            }
+            let mut done = std::mem::take(&mut w.done);
+            done.iter_mut().for_each(|e| e.room = name.clone());
+            self.finished.extend(done);
+        }
+        self.emit_finished(&config.window, i64::MAX)
+    }
+
+    fn emit_finished(&mut self, cfg: &WindowSection, now: i64) -> Vec<WinEvent> {
+        let grace = (cfg.label_grace_min * MIN_MS as f64) as i64;
+        let (ready, waiting): (Vec<Episode>, Vec<Episode>) = std::mem::take(&mut self.finished).into_iter().partition(|e| now.saturating_sub(e.end_ms) >= grace);
+        self.finished = waiting;
+        let labels: Vec<LabelRec> = self.labels.iter().cloned().collect();
+        ready.into_iter().map(|e| WinEvent { kind: lake::kind::WINDOW_EPISODE, room: e.room.clone(), detail: e.detail(&labels, grace) }).collect()
     }
 
     pub fn rebuild(&mut self, config: &Config, root: &Path, now_ms: i64) -> usize {
@@ -297,6 +416,8 @@ impl Windows {
                 }
             }
         }
+        self.shadow.forget_open();
+        self.finished.clear();
         rows.len()
     }
 
@@ -389,6 +510,7 @@ impl Windows {
             }
             let first = r.active.as_ref().map_or(now, |a| a.first_ms);
             r.active = Some(Active { phase: Phase::Open, source: "manual", first_ms: first, since_ms: now, timeout_min: f64::MAX, rate: 0.0 });
+            r.tally.get_or_insert_with(|| Tally::new(now));
             r.min_temp = r.series.back().map(|s| s.1);
             return Some(WinEvent { kind: "window_open", room: room.into(), detail: json!({"room": room, "source": "manual"}) });
         }
@@ -416,6 +538,10 @@ impl Windows {
             .fold(None, |a: Option<f64>, v| Some(a.map_or(v, |a| a.max(v))))
     }
 
+    fn valve_frac(&self, nodes: &[u64]) -> f64 {
+        nodes.iter().filter_map(|id| self.nodes.get(id).and_then(|n| n.valve)).fold(0.0, f64::max) / 100.0
+    }
+
     fn heating(&self, nodes: &[u64]) -> Option<bool> {
         let known: Vec<f64> = nodes.iter().filter_map(|id| self.nodes.get(id).and_then(|n| n.valve)).collect();
         (!known.is_empty()).then(|| known.iter().any(|v| *v > 0.0))
@@ -423,14 +549,29 @@ impl Windows {
 
     pub fn step(&mut self, config: &Config, now: i64, outdoor: Option<(f64, Option<f64>)>) -> Vec<WinEvent> {
         let cfg = &config.window;
+        self.outdoor = outdoor.map(|o| o.0);
         let mut events: Vec<WinEvent> = config.rooms.iter().flat_map(|r| self.supply_tick(config, &r.name, now)).collect();
         if !cfg.enabled {
             return events;
         }
         for room in config.rooms.iter().filter(|r| !r.nodes.is_empty()) {
             let Some(mut w) = self.rooms.remove(&room.name) else { continue };
-            let evs = self.room_step(cfg, &room.name, &room.nodes, &mut w, now, outdoor);
+            let target = self.ctx.get(&room.name).and_then(|c| c.target).unwrap_or(config.default_setpoint);
+            let evs = self.room_step(cfg, &room.name, &room.nodes, &mut w, now, outdoor, target);
+            for e in &evs {
+                let question = match (e.kind, e.detail["source"].as_str(), e.detail["reason"].as_str()) {
+                    (lake::kind::WINDOW_OPEN, Some("auto"), _) | (lake::kind::WINDOW_REOPEN, ..) => Some("open"),
+                    (lake::kind::WINDOW_CLOSE, _, Some("recovery" | "timeout_probe")) => Some("closed"),
+                    _ => None,
+                };
+                if let Some(q) = question {
+                    self.raise(cfg, &room.name, q, now);
+                }
+            }
             events.extend(evs);
+            let mut done = std::mem::take(&mut w.done);
+            done.iter_mut().for_each(|e| e.room = room.name.clone());
+            self.finished.extend(done);
             for rate in std::mem::take(&mut w.learned) {
                 for id in &room.nodes {
                     self.nodes.entry(*id).or_default().push_sample(cfg, now, rate);
@@ -438,10 +579,12 @@ impl Windows {
             }
             self.rooms.insert(room.name.clone(), w);
         }
+        events.extend(self.emit_finished(cfg, now));
         events
     }
 
-    fn room_step(&self, cfg: &WindowSection, name: &str, nodes: &[u64], w: &mut RoomWin, now: i64, outdoor: Option<(f64, Option<f64>)>) -> Vec<WinEvent> {
+    #[allow(clippy::too_many_arguments)]
+    fn room_step(&self, cfg: &WindowSection, name: &str, nodes: &[u64], w: &mut RoomWin, now: i64, outdoor: Option<(f64, Option<f64>)>, target: f64) -> Vec<WinEvent> {
         let mins = |m: f64| (m * MIN_MS as f64) as i64;
         let age = mins(cfg.open_window_min);
         let event = |kind: &'static str, detail: Value| WinEvent { kind, room: name.into(), detail };
@@ -453,6 +596,9 @@ impl Windows {
         let seen: Vec<(i64, f64)> = w.samples().into_iter().filter(|s| s.0 >= since).collect();
         let low = seen.iter().map(|s| s.1).fold(cur, f64::min);
         w.min_temp = Some(w.min_temp.map_or(low, |m| m.min(low)));
+        if let Some(t) = w.tally.as_mut() {
+            t.tick(now, cur < target - cfg.below_k, (active.phase == Phase::Probe).then(|| self.valve_frac(nodes)));
+        }
         let closed = |reason: &'static str, w: &mut RoomWin| {
             let detail = json!({"room": name, "reason": reason, "open_minutes": (now - active.first_ms) as f64 / 60_000.0, "min_temp": w.min_temp});
             w.close(reason, now);
@@ -478,6 +624,9 @@ impl Windows {
                 }
                 if (now - since) as f64 >= active.timeout_min.max(cfg.min_open_hold_min) * MIN_MS as f64 {
                     w.active = Some(Active { phase: Phase::Probe, since_ms: now, ..active });
+                    if let Some(t) = w.tally.as_mut() {
+                        t.probe();
+                    }
                     w.slope_since = None;
                     w.recover_since = None;
                 }
@@ -537,6 +686,7 @@ impl Windows {
         let Some(why) = blocked else {
             let rate = if by_drop { drop_rate } else { -r.slope };
             w.active = Some(Active { phase: Phase::Open, source: "auto", first_ms: now, since_ms: now, timeout_min: cfg.max_open_min, rate });
+            w.tally = Some(Tally::new(now));
             w.opens.push_back(now);
             w.auto_opens += 1;
             w.slope_since = None;
