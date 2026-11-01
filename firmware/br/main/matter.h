@@ -101,6 +101,7 @@ void mc_wipe(void *p, size_t n);
 typedef int (*mc_rng_fn)(void *ctx, uint8_t *b, size_t n);
 
 int mc_ecdsa_sign(const uint8_t priv[32], const uint8_t *msg, size_t n, uint8_t sig[MC_SIG_LEN], mc_rng_fn rng, void *rctx);
+int mc_pub_from_priv(const uint8_t priv[32], uint8_t pub[MC_PUB_LEN], mc_rng_fn rng, void *rctx);
 int mc_ecdsa_verify(const uint8_t pub[MC_PUB_LEN], const uint8_t *msg, size_t n, const uint8_t sig[MC_SIG_LEN]);
 
 typedef struct {

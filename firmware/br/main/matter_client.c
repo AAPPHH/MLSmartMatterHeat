@@ -548,13 +548,13 @@ int mc_write_int16(const mc_io_t *io, const wd_creds_t *cr, uint64_t peer_node, 
     c->active_ms = mrp->active_ms;
     if (err_len) err[0] = '\0';
     mc_cert_t rcac, own;
-    uint8_t cf[8];
+    uint8_t cf[8], chk[MC_PUB_LEN];
     int rc;
     if (mc_cert_parse(cr->rcac, cr->rcac_len, &rcac) || !rcac.is_ca) {
         rc = fail(c, MC_E_CERT, "cert_rcac", 0);
     } else if (check_chain(c, &rcac, cr->icac_len ? cr->icac : NULL, cr->icac_len, cr->noc, cr->noc_len, &own, false)) {
         rc = MC_E_CERT;
-    } else if (cr->key[0] != 4 || !mc_ct_eq(cr->key, own.pub, MC_PUB_LEN)) {
+    } else if (cr->key[0] != 4 || !mc_ct_eq(cr->key, own.pub, MC_PUB_LEN) || mc_pub_from_priv(cr->key + MC_PUB_LEN, chk, rng_cb, c) || !mc_ct_eq(chk, own.pub, MC_PUB_LEN)) {
         rc = fail(c, MC_E_KEY, "key_mismatch", 0);
     } else if (mc_compressed_fabric_id(rcac.pub, cr->fabric_id, cf) || mc_ipk_operational(cr->ipk, cf, c->ipk)) {
         rc = fail(c, MC_E_CRYPTO, "crypto_ipk", 0);
@@ -567,5 +567,6 @@ int mc_write_int16(const mc_io_t *io, const wd_creds_t *cr, uint64_t peer_node, 
     }
     if (err_len && !err[0] && rc) snprintf(err, err_len, "error_%d", rc);
     mc_wipe(c, sizeof(*c));
+    mc_wipe(chk, sizeof(chk));
     return rc;
 }

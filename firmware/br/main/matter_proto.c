@@ -400,6 +400,25 @@ int mc_ecdsa_sign(const uint8_t priv[32], const uint8_t *msg, size_t n, uint8_t 
     return rc ? MC_E_CRYPTO : MC_OK;
 }
 
+int mc_pub_from_priv(const uint8_t priv[32], uint8_t pub[MC_PUB_LEN], mc_rng_fn rng, void *rctx)
+{
+    mbedtls_ecp_group g;
+    mbedtls_ecp_point q;
+    mbedtls_mpi d;
+    size_t ol;
+    mbedtls_ecp_group_init(&g);
+    mbedtls_ecp_point_init(&q);
+    mbedtls_mpi_init(&d);
+    int rc = mbedtls_ecp_group_load(&g, MBEDTLS_ECP_DP_SECP256R1);
+    if (rc == 0) rc = mbedtls_mpi_read_binary(&d, priv, 32);
+    if (rc == 0) rc = mbedtls_ecp_mul(&g, &q, &d, &g.G, rng, rctx);
+    if (rc == 0) rc = mbedtls_ecp_point_write_binary(&g, &q, MBEDTLS_ECP_PF_UNCOMPRESSED, &ol, pub, MC_PUB_LEN);
+    mbedtls_ecp_group_free(&g);
+    mbedtls_ecp_point_free(&q);
+    mbedtls_mpi_free(&d);
+    return rc ? MC_E_CRYPTO : MC_OK;
+}
+
 int mc_ecdsa_verify(const uint8_t pub[MC_PUB_LEN], const uint8_t *msg, size_t n, const uint8_t sig[MC_SIG_LEN])
 {
     mbedtls_ecp_group g;

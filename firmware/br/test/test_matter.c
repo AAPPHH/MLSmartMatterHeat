@@ -154,7 +154,12 @@ static void test_crypto(void)
     memcpy(priv, V_Node01_01_PrivateKey, 32);
     mc_cert_t c;
     CHECK(mc_cert_parse(V_Node01_01_Chip, sizeof(V_Node01_01_Chip), &c) == 0);
-    CHECK(mc_ecdsa_sign(priv, (const uint8_t *)"hello", 5, sig, test_rng, NULL) == 0);
+    uint8_t derived[65];
+    CHECK(mc_pub_from_priv(priv, derived, test_rng, NULL) == 0 && !memcmp(derived, c.pub, 65));
+    priv[3] ^= 1;
+    CHECK(mc_pub_from_priv(priv, derived, test_rng, NULL) == 0 && memcmp(derived, c.pub, 65));
+    priv[3] ^= 1;
+    CHECK(mc_ecdsa_sign(priv,(const uint8_t *)"hello", 5, sig, test_rng, NULL) == 0);
     CHECK(mc_ecdsa_verify(c.pub, (const uint8_t *)"hello", 5, sig) == 0);
     CHECK(mc_ecdsa_verify(c.pub, (const uint8_t *)"hellp", 5, sig) != 0);
 }
