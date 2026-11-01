@@ -197,6 +197,21 @@ fn timeout_probe_with_stable_temperature_closes() {
 }
 
 #[test]
+fn reopen_extends_the_probe_interval_to_at_least_the_probe_cooldown() {
+    let mut s = opened_with("[window]
+probe_cooldown_min = 50");
+    s.run(flat(19.4, 21));
+    s.valve(30.0);
+    s.run(ramp(19.4, -0.12, 6));
+    assert_eq!(s.find("window_reopen").detail["timeout_min"], 50.0);
+    s.valve(0.0);
+    s.run(flat(18.7, 45));
+    assert_eq!(s.state(), "open");
+    s.run(flat(18.7, 8));
+    assert_eq!(s.state(), "probe");
+}
+
+#[test]
 fn reopen_timeout_is_capped() {
     let mut s = opened();
     let mut level = 19.4;

@@ -86,7 +86,7 @@ impl Episode {
     pub fn detail(&self, labels: &[LabelRec], grace_ms: i64) -> Value {
         let start = self.tally.start_ms;
         let mine = |l: &&LabelRec| l.room == self.room && l.ts >= start - LEAD_MS && l.ts <= self.end_ms + grace_ms;
-        let seen = |l: &&LabelRec| !(l.question == Some("closed") && !l.open);
+        let seen = |l: &&LabelRec| if l.manual { l.open || l.ts <= start } else { !(l.question == Some("closed") && !l.open) };
         let confirm = labels.iter().filter(mine).filter(seen).max_by_key(|l| l.ts).map_or("none", |l| if l.open { "yes" } else { "no" });
         let latency = labels.iter().filter(mine).filter(|l| l.manual && l.open && l.ts <= self.end_ms).min_by_key(|l| l.ts).map(|l| (start - l.ts) as f64 / MIN_MS as f64);
         let close = labels.iter().filter(mine).filter(|l| l.question == Some("closed") && l.ts >= self.end_ms).max_by_key(|l| l.ts).map_or("none", |l| if l.open { "wrong" } else { "correct" });

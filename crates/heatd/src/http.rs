@@ -2204,6 +2204,15 @@ nodes = [5]
     }
 
     #[tokio::test]
+    async fn late_manual_window_label_is_stored_without_changing_the_window_state() {
+        let h = harness(false);
+        let late = json!({"device": "pixel-watch", "ts": now_ms() - 400_000, "room": "wohnzimmer", "open": true, "prompt_id": null, "label_id": "late"}).to_string();
+        let (status, body) = call(&h.state, "POST", "/watch/window_label", Some(late)).await;
+        assert_eq!((status, body["stored"].clone(), body["window_open"].clone()), (StatusCode::OK, json!(1), json!([])));
+        assert_eq!(lake_rows(&h, "labels").len(), 1);
+    }
+
+    #[tokio::test]
     async fn window_label_rejects_unknown_rooms_and_empty_devices() {
         let h = harness(false);
         for body in [json!({"device": "pixel-watch", "ts": 1, "room": "keller", "open": true}), json!({"device": "", "ts": 1, "room": "wohnzimmer", "open": true}), json!({"device": "w", "ts": 1, "room": "wohnzimmer", "open": true, "label_id": ""})] {

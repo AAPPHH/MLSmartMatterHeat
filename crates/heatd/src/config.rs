@@ -327,6 +327,8 @@ pub struct WindowSection {
     pub label_grace_min: f64,
     pub prompt_expire_min: f64,
     pub prompt_gap_min: f64,
+    pub prompt_global_gap_min: f64,
+    pub prompt_max_per_day: usize,
     pub below_k: f64,
     pub v2: WindowV2Section,
 }
@@ -419,6 +421,8 @@ impl Default for WindowSection {
             label_grace_min: 25.0,
             prompt_expire_min: 20.0,
             prompt_gap_min: 10.0,
+            prompt_global_gap_min: 30.0,
+            prompt_max_per_day: 6,
             below_k: 0.5,
             v2: WindowV2Section::default(),
         }

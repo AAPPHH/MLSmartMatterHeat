@@ -3,6 +3,8 @@ use crate::window::*;
 use crate::window_v2::*;
 use serde_json::Value;
 
+const MIN: i64 = 60_000;
+
 struct H {
     w: Windows,
     c: Config,
@@ -217,8 +219,87 @@ fn labels_confirm_episodes_and_manual_entries_give_latency() {
     let v1 = h.episodes("v1");
     assert_eq!(v1.len(), 1);
     assert_eq!(v1[0]["end_reason"], "manual");
-    assert_eq!(v1[0]["label"], "no", "{:?}", v1[0]);
+    assert_eq!(v1[0]["source"], "manual");
+    assert_eq!(v1[0]["label"], "yes", "{:?}", v1[0]);
     assert_eq!(v1[0]["latency_min"].as_f64(), Some(0.0));
+}
+
+#[test]
+fn manual_close_at_the_end_of_a_detected_opening_is_not_a_no() {
+    let mut h = H::new("", "enabled = false");
+    drop_after_calm(&mut h);
+    h.run(flat(19.4, 8));
+    h.w.label("a", h.t, false, None, Some("m1"), h.t);
+    h.run(flat(19.4, 30));
+    let v1 = h.episodes("v1");
+    assert_eq!((v1[0]["source"].as_str(), v1[0]["end_reason"].as_str(), v1[0]["label"].as_str()), (Some("auto"), Some("manual"), Some("none")), "{:?}", v1[0]);
+}
+
+#[test]
+fn manual_close_before_the_detector_opened_contradicts_it() {
+    let mut h = H::new("", "enabled = false");
+    h.run(flat(21.0, 30));
+    h.w.label("a", h.t, false, None, Some("m1"), h.t);
+    h.run(ramp(21.0, -0.4, 5));
+    h.run(flat(19.4, 30));
+    let v1 = h.episodes("v1");
+    assert_eq!(v1[0]["label"], "no", "{:?}", v1[0]);
+}
+
+#[test]
+fn late_manual_entries_are_stored_but_do_not_change_the_window_state() {
+    let mut h = H::new("", "enabled = false");
+    h.run(flat(21.0, 20));
+    assert!(h.w.label("a", h.t - 301_000, true, None, Some("m1"), h.t).is_none());
+    assert!(h.w.open_rooms().is_empty());
+    assert!(h.w.label("a", h.t - 299_000, true, None, Some("m2"), h.t).is_some());
+    assert!(h.w.open_rooms().contains("a"));
+}
+
+#[test]
+fn void_only_reverts_the_manual_open_its_own_label_caused() {
+    let mut h = H::new("", "enabled = false");
+    h.run(flat(21.0, 5));
+    h.w.label("a", h.t, true, None, Some("m1"), h.t);
+    h.w.manual("a", false, h.t);
+    h.w.label("a", h.t, true, None, Some("m2"), h.t);
+    assert!(h.w.void_label("m1", h.t).is_none());
+    assert!(h.w.open_rooms().contains("a"));
+    assert!(h.w.void_label("m2", h.t).is_some());
+    assert!(h.w.open_rooms().is_empty());
+}
+
+#[test]
+fn live_v1_transition_prompts_and_global_gap_and_daily_cap_apply() {
+    let mut h = H::new("prompt_gap_min = 1
+prompt_global_gap_min = 30
+prompt_max_per_day = 3", "");
+    let cfg = h.c.window.clone();
+    drop_after_calm(&mut h);
+    let first = h.w.prompt(&cfg, h.t).expect("v1 transition prompts")["id"].clone();
+    let base = h.t + 100 * MIN;
+    let mut last = first;
+    let mut shown = Vec::new();
+    for dt in [0, 10, 40, 70] {
+        h.w.test_prompt(&cfg, "a", "open", base + dt * MIN);
+        let id = h.w.prompt(&cfg, base + dt * MIN).map_or(Value::Null, |p| p["id"].clone());
+        shown.push(!id.is_null() && id != last);
+        if !id.is_null() {
+            last = id;
+        }
+    }
+    assert_eq!(shown, vec![true, false, true, false]);
+}
+
+#[test]
+fn disabled_window_section_neither_accumulates_v2_episodes_nor_prompts() {
+    let mut h = H::new("enabled = false", "");
+    let cfg = h.c.window.clone();
+    h.run(flat(21.0, 30));
+    h.run(ramp(21.0, -0.4, 8));
+    h.run(flat(18.0, 60));
+    assert!(h.w.prompt(&cfg, h.t).is_none());
+    assert!(h.episodes("v2").is_empty());
 }
 
 #[test]

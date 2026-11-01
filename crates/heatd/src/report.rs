@@ -399,7 +399,7 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         &format!(
             "SELECT json_extract_string(detail, '$.detector') AS d, count(*), coalesce(sum(json_extract(detail, '$.duration_min')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.probe_count')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.probe_valve_min')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.below_min')::DOUBLE), 0),
                     count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'yes'), count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'no'), count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'none'),
-                    avg(json_extract(detail, '$.latency_min')::DOUBLE) FROM events WHERE kind = 'window_episode' AND {day} GROUP BY d ORDER BY d"
+                    avg(json_extract(detail, '$.latency_min')::DOUBLE) FROM events WHERE kind = 'window_episode' AND coalesce(json_extract_string(detail, '$.source'), 'auto') <> 'manual' AND {day} GROUP BY d ORDER BY d"
         ),
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?, r.get::<_, f64>(4)?, r.get::<_, f64>(5)?, r.get::<_, i64>(6)?, r.get::<_, i64>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<f64>>(9)?)),
     )?;

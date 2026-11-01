@@ -157,6 +157,8 @@ close_debounce_min = 3.0
 label_grace_min = 25.0
 prompt_expire_min = 20.0
 prompt_gap_min = 10.0
+prompt_global_gap_min = 30.0
+prompt_max_per_day = 6
 
 [window.v2]
 enabled = true
