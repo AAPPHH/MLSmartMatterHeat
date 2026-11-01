@@ -8,10 +8,18 @@ menu "BR Watchdog"
             Put the real value in sdkconfig.<variant>.local, never in the repo.
 
     config BR_WATCHDOG_MATTER
-        bool "Armed path: Matter controller write on the border router"
+        bool "Armed path: minimal Matter CASE client on the border router"
+        default y
+        help
+            Built-in Matter controller side client (CASE + Interaction Model write over lwIP UDP, mbedTLS).
+            With this off the watchdog runs dry_run only and refuses mode armed.
+
+    config BR_WATCHDOG_MATTER_RUST
+        bool "Use the Rust Matter client (firmware/br/matter_client) instead of the C one"
+        depends on BR_WATCHDOG_MATTER
         default n
         help
-            Needs the esp-matter controller component, which is not integrated.
-            With this off the watchdog runs dry_run only and refuses mode armed.
+            Needs the esp Rust toolchain (espup) and cargo on PATH. The C client stays the default
+            until on-device interop with the Rust client has passed.
 
 endmenu
