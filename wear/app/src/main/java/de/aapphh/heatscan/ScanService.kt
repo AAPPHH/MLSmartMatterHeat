@@ -792,7 +792,11 @@ class ScanService : Service() {
     private fun send(server: String, path: String, body: String, net: Network?): Int = try {
         val reply = Poster.send(server, path, body, net)
         if (reply.code in 200..299) store.setReply(ReplyJson.parse(reply.text), ReplyJson.postedAps(body))
-        if (reply.code in 200..299) ReplyJson.parse(reply.text).alert?.let { Alerter.show(this, store, it) }
+        if (reply.code in 200..299) ReplyJson.parse(reply.text).let { r ->
+            r.alert?.let { Alerter.show(this, store, it) }
+            val now = System.currentTimeMillis()
+            store.admitWindow(WindowEvent.parse(r.window, now), now)?.let { WindowPrompter.show(this, it) }
+        }
         if (reply.code in 200..299) Poster.room(reply.text).let { if (it.isNotEmpty()) lastRoom = it; (if (it in Defaults.ROOMS) it else null).let { g -> if (store.guess != g) store.guess = g } }
         if (reply.code in 200..299 && ReplyJson.postedAps(body)) onReplyGuess(body, reply.text)
         reply.code
@@ -833,6 +837,7 @@ class ScanService : Service() {
     }
 
     private fun sendMeta(server: String, e: JSONObject, net: Network?): Int {
+        if (WindowEvent.isWindow(e)) return plain(server, WindowEvent.PATH, WindowEvent.body(e), net).let { if (it == 405) 404 else it }
         val c = if (MeasureBatch.isMeasure(e)) plain(server, Measure.PATH, MeasureBatch.body(e), net) else plain(server, Measure.PATH_SENSORS, Inventory.body(e), net)
         return if (c == 405) 404 else c
     }
@@ -933,6 +938,77 @@ object Alerter {
             Trace.w("alert_failed", e)
         }
     }
+}
+
+object WindowPrompter {
+    private const val CHANNEL = "window"
+    private const val ID = 5
+
+    private fun nm(c: Context): NotificationManager = c.getSystemService(NotificationManager::class.java).also {
+        it.createNotificationChannel(NotificationChannel(CHANNEL, "Fenster", NotificationManager.IMPORTANCE_HIGH).apply { enableVibration(true) })
+    }
+
+    fun show(c: Context, a: WindowAsk) {
+        try {
+            val open = PendingIntent.getActivity(
+                c, 2, Intent(c, MainActivity::class.java).putExtra("window", true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            nm(c).notify(ID, Notification.Builder(c, CHANNEL)
+                .setContentTitle(WindowEvent.title(a))
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setTimeoutAfter(WindowEvent.EXPIRY_MS)
+                .setContentIntent(open)
+                .setFullScreenIntent(open, true)
+                .setPriority(Notification.PRIORITY_HIGH)
+                .build())
+        } catch (e: Exception) {
+            Trace.w("window_prompt_failed", e)
+        }
+    }
+
+    fun cancel(c: Context) = nm(c).cancel(ID)
+
+    fun answer(c: Context, a: WindowAsk?, room: String, open: Boolean, done: (String) -> Unit = {}) {
+        val app = c.applicationContext
+        try {
+            io.execute {
+                val store = Store(app)
+                val now = System.currentTimeMillis()
+                val id = LabelEvent.newId()
+                ScanQueue.get(app).add(WindowEvent.entry(store.device, now, room, open, a?.id, id), now)
+                if (a != null && store.windowPending?.id == a.id) store.windowPending = null
+                cancel(app)
+                Trace.i("window_label", "room" to room, "open" to open, "prompt" to (a?.id ?: "-"))
+                ScanService.instance?.flush("window")
+                done(id)
+            }
+        } catch (e: RejectedExecutionException) {
+            Trace.i("window_label_rejected")
+        }
+    }
+
+    fun dismiss(c: Context, a: WindowAsk) {
+        val store = Store(c)
+        if (store.windowPending?.id == a.id) store.windowPending = null
+        cancel(c)
+    }
+
+    fun void(c: Context, id: String) {
+        val app = c.applicationContext
+        try {
+            io.execute {
+                val now = System.currentTimeMillis()
+                ScanQueue.get(app).add(LabelEvent.voidEntry(Store(app).device, id, now), now)
+                Trace.i("window_void", "id" to id)
+                ScanService.instance?.flush("window")
+            }
+        } catch (e: RejectedExecutionException) {
+            Trace.i("window_label_rejected")
+        }
+    }
+
+    private val io = Executors.newSingleThreadExecutor()
 }
 
 object Prompter {

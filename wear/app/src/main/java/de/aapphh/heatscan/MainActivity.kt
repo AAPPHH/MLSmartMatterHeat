@@ -85,11 +85,12 @@ class MainActivity : ComponentActivity() {
         ScanStarter.start(this, "permissions")
     }
     private val prompt get() = intent.getBooleanExtra("prompt", false)
+    private val windowIntent get() = intent.getBooleanExtra("window", false)
     private val learnPrompt get() = prompt && intent.getBooleanExtra("learn", false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (prompt) {
+        if (prompt || windowIntent) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
         }
@@ -98,6 +99,15 @@ class MainActivity : ComponentActivity() {
         intent.getStringExtra("device")?.let { store.device = it }
         intent.getStringExtra("home")?.let { store.home = it }
         setContent { MaterialTheme { Screen(store) } }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (windowIntent) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
     }
 
     override fun onResume() {
@@ -136,6 +146,9 @@ class MainActivity : ComponentActivity() {
         val view = tapped?.let { Tap.view(state, it, until, now) }
         val kind = view?.kind
         val haptic = LocalHapticFeedback.current
+        var windowManual by remember { mutableStateOf<String?>(null) }
+        var windowUndo by remember { mutableStateOf<String?>(null) }
+        val windowAsk = version.let { WindowEvent.live(store.windowPending, now) }
         val learning = version.let { store.learnAt != 0L }
         val progress = version.let { store.progress }
         val learnView = Learn.view(learning, progress)
@@ -153,8 +166,18 @@ class MainActivity : ComponentActivity() {
                 pick(room, Heat.default(store.learnAt != 0L))
             }
         }
-        LaunchedEffect(locked, tapped) {
-            while (locked || tapped != null) {
+        LaunchedEffect(windowAsk?.id) {
+            if (windowAsk != null) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+        LaunchedEffect(windowUndo) {
+            if (windowUndo != null) {
+                delay(WindowEvent.UNDO_MS)
+                windowUndo = null
+                if (windowIntent) finish()
+            }
+        }
+        LaunchedEffect(locked, tapped, windowAsk?.id) {
+            while (locked || tapped != null || windowAsk != null) {
                 now = System.currentTimeMillis()
                 delay(500)
             }
@@ -210,12 +233,19 @@ class MainActivity : ComponentActivity() {
                         delay(15_000)
                     }
                 }
-                Text(
-                    WifiHold.chip(holdUntil, now),
-                    Modifier.align(Alignment.TopCenter).padding(top = 2.dp).clip(RoundedCornerShape(50)).background(if (holdOn) SELECTED else IDLE)
-                        .clickable { ScanService.instance?.toggleWifiHold() }.padding(horizontal = 10.dp, vertical = 2.dp),
-                    fontSize = 9.sp, maxLines = 1, color = if (holdOn) INK else Color.White
-                )
+                Row(Modifier.align(Alignment.TopCenter).padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        WifiHold.chip(holdUntil, now),
+                        Modifier.clip(RoundedCornerShape(50)).background(if (holdOn) SELECTED else IDLE)
+                            .clickable { ScanService.instance?.toggleWifiHold() }.padding(horizontal = 10.dp, vertical = 2.dp),
+                        fontSize = 9.sp, maxLines = 1, color = if (holdOn) INK else Color.White
+                    )
+                    Text(
+                        WindowEvent.CHIP,
+                        Modifier.clip(RoundedCornerShape(50)).background(IDLE).clickable { windowManual = "" }.padding(horizontal = 10.dp, vertical = 2.dp),
+                        fontSize = 9.sp, maxLines = 1, color = Color.White
+                    )
+                }
             }
             choosing?.let { room ->
                 Column(Modifier.fillMaxSize().background(Color.Black).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
@@ -243,10 +273,72 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+            WindowOverlay(
+                windowAsk, windowManual, windowUndo, store.progress,
+                onAnswer = { ask, room, open ->
+                    windowManual = null
+                    WindowPrompter.answer(this@MainActivity, ask, room, open) { id -> runOnUiThread { windowUndo = id } }
+                },
+                onDismiss = { ask ->
+                    WindowPrompter.dismiss(this@MainActivity, ask)
+                    if (windowIntent) finish()
+                },
+                onPick = { windowManual = it },
+                onCancel = { windowManual = null },
+                onUndo = { id ->
+                    WindowPrompter.void(this@MainActivity, id)
+                    windowUndo = null
+                    if (windowIntent) finish()
+                }
+            )
             Row(Modifier.align(Alignment.BottomCenter).padding(bottom = 3.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 repeat(2) {
                     Box(Modifier.size(4.dp).clip(CircleShape).background(if (pager.currentPage == it) Color.White else Color.DarkGray))
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WindowPill(text: String, fill: Color, ink: Color, size: Int, onClick: () -> Unit) {
+    Text(
+        text,
+        Modifier.padding(top = 5.dp).fillMaxWidth().clip(RoundedCornerShape(50)).background(fill).clickable { onClick() }.padding(vertical = if (size > 12) 10.dp else 5.dp),
+        fontSize = size.sp, fontWeight = FontWeight.Bold, color = ink, textAlign = TextAlign.Center, maxLines = 1
+    )
+}
+
+@Composable
+private fun WindowOverlay(
+    ask: WindowAsk?, manual: String?, undo: String?, progress: Progress?,
+    onAnswer: (WindowAsk?, String, Boolean) -> Unit, onDismiss: (WindowAsk) -> Unit, onPick: (String) -> Unit, onCancel: () -> Unit, onUndo: (String) -> Unit
+) {
+    if (ask == null && manual == null && undo == null) return
+    Column(
+        Modifier.fillMaxSize().background(Color.Black).pointerInput(Unit) { detectTapGestures { } }.padding(horizontal = 28.dp),
+        Arrangement.Center, Alignment.CenterHorizontally
+    ) {
+        when {
+            undo != null -> {
+                Text("Gespeichert", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                WindowPill(Tap.UNDO, IDLE, Color.White, 12) { onUndo(undo) }
+            }
+            ask != null -> {
+                Text(WindowEvent.title(ask), fontSize = 15.sp, lineHeight = 18.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                WindowPill(WindowEvent.YES, SELECTED, INK, 16) { onAnswer(ask, ask.room, true) }
+                WindowPill(WindowEvent.NO, IDLE, Color.White, 16) { onAnswer(ask, ask.room, false) }
+                WindowPill(WindowEvent.DISMISS, Color.Black, CAPTION, 10) { onDismiss(ask) }
+            }
+            manual == "" -> {
+                WindowEvent.rooms(progress).forEach { room -> WindowPill(Defaults.CAPTIONS.getValue(room), IDLE, Color.White, 12) { onPick(room) } }
+                WindowPill("Abbrechen", Color.Black, CAPTION, 10) { onCancel() }
+            }
+            manual != null -> {
+                Text("Fenster ${Defaults.CAPTIONS[manual] ?: manual}", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
+                WindowPill(WindowEvent.OPEN, SELECTED, INK, 16) { onAnswer(null, manual, true) }
+                WindowPill(WindowEvent.CLOSED, IDLE, Color.White, 16) { onAnswer(null, manual, false) }
+                WindowPill("Abbrechen", Color.Black, CAPTION, 10) { onCancel() }
             }
         }
     }

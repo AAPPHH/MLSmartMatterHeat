@@ -1834,4 +1834,64 @@ class CoreTest {
         assertEquals("WLAN 10 min", WifiHold.chip(0L, 5L))
         assertEquals("WLAN 3 min", WifiHold.chip(5L + 3 * m, 5L))
     }
+
+    @Test
+    fun windowPromptParse() {
+        val r = ReplyJson.parse("""{"probability":0.5,"window_prompt":{"id":"w1","room":"wohnzimmer","question":"open"}}""")
+        assertEquals(WindowAsk("w1", "wohnzimmer", true, 7L), WindowEvent.parse(r.window, 7L))
+        assertEquals(false, WindowEvent.parse(JSONObject("""{"id":"w2","room":"bad","question":"closed"}"""), 7L)!!.open)
+        assertNull(WindowEvent.parse(ReplyJson.parse("""{"probability":0.5}""").window, 7L))
+        assertNull(WindowEvent.parse(JSONObject("""{"id":"w1","room":"garage","question":"open"}"""), 7L))
+        assertNull(WindowEvent.parse(JSONObject("""{"id":"w1","room":"bad","question":"maybe"}"""), 7L))
+        assertNull(WindowEvent.parse(JSONObject("""{"room":"bad","question":"open"}"""), 7L))
+        assertNull(WindowEvent.parse(null, 7L))
+        assertEquals("Fenster im Wohnen offen?", WindowEvent.title(WindowAsk("w1", "wohnzimmer", true)))
+    }
+
+    @Test
+    fun windowPromptDedupeAndExpiry() {
+        val a = WindowAsk("w1", "bad", true)
+        val (p1, seen1) = WindowEvent.admit(null, emptyList(), a, 1_000L)
+        assertEquals(WindowAsk("w1", "bad", true, 1_000L), p1)
+        assertEquals(listOf("w1"), seen1)
+        val (p2, seen2) = WindowEvent.admit(p1, seen1, a, 5_000L)
+        assertEquals(p1, p2)
+        assertEquals(seen1, seen2)
+        val (p3, _) = WindowEvent.admit(null, seen1, a, 5_000L)
+        assertNull(p3)
+        val (p4, seen4) = WindowEvent.admit(p1, seen1, WindowAsk("w2", "bad", false), 6_000L)
+        assertEquals("w2", p4!!.id)
+        assertEquals(listOf("w1", "w2"), seen4)
+        val (p5, _) = WindowEvent.admit(p1, seen1, null, 1_000L + WindowEvent.EXPIRY_MS)
+        assertNull(p5)
+        val (p6, _) = WindowEvent.admit(p1, seen1, null, 1_000L + WindowEvent.EXPIRY_MS - 1)
+        assertEquals(p1, p6)
+        assertNull(WindowEvent.live(p1, 999L))
+        val many = (1..30).fold(Pair<WindowAsk?, List<String>>(null, emptyList())) { acc, n -> WindowEvent.admit(acc.first, acc.second, WindowAsk("i$n", "bad", true), n.toLong()) }
+        assertEquals(20, many.second.size)
+        assertEquals("i30", many.second.last())
+    }
+
+    @Test
+    fun windowBodyAndQueue() {
+        val e = WindowEvent.entry("watch", 123L, "bad", true, "w1", "id-1")
+        assertTrue(WindowEvent.isWindow(e))
+        assertTrue(Special.isSpecial(e))
+        assertFalse(LabelEvent.isLabel(e))
+        val b = JSONObject(WindowEvent.body(e))
+        assertEquals("watch", b.getString("device"))
+        assertEquals(123L, b.getLong("ts"))
+        assertEquals("bad", b.getString("room"))
+        assertTrue(b.getBoolean("open"))
+        assertEquals("w1", b.getString("prompt_id"))
+        assertEquals("id-1", b.getString("label_id"))
+        val m = JSONObject(WindowEvent.body(WindowEvent.entry("watch", 1L, "kueche", false, null, "id-2")))
+        assertTrue(m.isNull("prompt_id"))
+        assertFalse(m.getBoolean("open"))
+        val back = JSONObject(e.toString())
+        assertEquals(WindowEvent.body(e), WindowEvent.body(back))
+        assertEquals(WindowAsk("w1", "bad", true, 9L), WindowEvent.fromJson(WindowEvent.json(WindowAsk("w1", "bad", true, 9L))))
+        assertNull(WindowEvent.fromJson("garbage"))
+        assertEquals(listOf("wohnzimmer", "schlafzimmer", "bad", "kueche"), WindowEvent.rooms(null))
+    }
 }
