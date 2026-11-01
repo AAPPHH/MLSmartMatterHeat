@@ -394,6 +394,28 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
     }
 
+    let episodes = rows(
+        c,
+        &format!(
+            "SELECT json_extract_string(detail, '$.detector') AS d, count(*), coalesce(sum(json_extract(detail, '$.duration_min')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.probe_count')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.probe_valve_min')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.below_min')::DOUBLE), 0),
+                    count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'yes'), count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'no'), count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'none'),
+                    avg(json_extract(detail, '$.latency_min')::DOUBLE) FROM events WHERE kind = 'window_episode' AND {day} GROUP BY d ORDER BY d"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?, r.get::<_, f64>(4)?, r.get::<_, f64>(5)?, r.get::<_, i64>(6)?, r.get::<_, i64>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<f64>>(9)?)),
+    )?;
+    if !episodes.is_empty() {
+        md.push_str("
+Detektor-Vergleich (v1 live, v2 Shadow ohne Schreibzugriff; Episoden werden 25 min nach Ende gemeldet, Label = Antwort auf die Fensterfrage der Uhr):
+
+| Detektor | Episoden | offene Minuten | Proben | Proben-Ventilminuten | Minuten unter Soll-0.5 | Label ja | nein | keins | Latenz vs. manuell (min) |
+|---|---|---|---|---|---|---|---|---|---|
+");
+        for (detector, count, minutes, probes, valve, below, yes, no, none, latency) in episodes {
+            let latency = latency.map_or_else(|| "-".to_string(), |l| format!("{l:.1}"));
+            let _ = writeln!(md, "| {detector} | {count} | {minutes:.0} | {probes:.0} | {valve:.1} | {below:.0} | {yes} | {no} | {none} | {latency} |");
+        }
+    }
+
     match supply_section(root, date) {
         Ok(section) => md.push_str(&section),
         Err(e) => {

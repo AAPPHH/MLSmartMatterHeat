@@ -2144,4 +2144,72 @@ nodes = [5]
         assert_eq!((body["from"].clone(), body["days"].clone()), (json!("2026-10-19"), json!([])));
         assert_eq!(body["totals"]["house"]["valve_hours"], json!(0.0));
     }
+
+    fn raise_prompt(h: &Harness, question: &'static str) {
+        let cfg = h.state.config.window.clone();
+        h.state.windows.lock().unwrap().test_prompt(&cfg, "wohnzimmer", question, now_ms());
+    }
+
+    #[tokio::test]
+    async fn window_prompt_rides_scan_replies_only_while_a_watch_is_home() {
+        let h = harness_with(false, "away_guard_minutes = 0\n[watchmatch]\nanchor_devices = ['minix-anchor']\n", "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n");
+        let now = now_ms();
+        assert!(call(&h.state, "POST", "/api/scan", Some(scan_at(now, json!({})))).await.1.get("window_prompt").is_none());
+        raise_prompt(&h, "open");
+        let (_, body) = call(&h.state, "POST", "/api/scan", Some(scan_at(now + 1_000, json!({})))).await;
+        assert_eq!((body["window_prompt"]["room"].as_str(), body["window_prompt"]["question"].as_str()), (Some("wohnzimmer"), Some("open")));
+        assert!(body["window_prompt"]["id"].as_str().is_some_and(|id| !id.is_empty()));
+        for hidden in [json!({"away": true}), json!({"queued": true}), json!({"device": "minix-anchor"})] {
+            let (_, body) = call(&h.state, "POST", "/api/scan", Some(scan_at(now + 2_000, hidden))).await;
+            assert!(body.get("window_prompt").is_none(), "{body}");
+        }
+        let batch = json!({"scans": [serde_json::from_str::<Value>(&scan_at(now + 3_000, json!({}))).unwrap()]}).to_string();
+        let (_, body) = call(&h.state, "POST", "/api/scans", Some(batch)).await;
+        assert_eq!(body["window_prompt"]["question"], "open");
+    }
+
+    #[tokio::test]
+    async fn window_label_answers_a_prompt_without_touching_the_window_state() {
+        let h = harness(false);
+        raise_prompt(&h, "closed");
+        let id = h.state.windows.lock().unwrap().prompt(&h.state.config.window, now_ms()).unwrap()["id"].as_str().unwrap().to_string();
+        let answer = json!({"device": "pixel-watch", "ts": now_ms(), "room": "wohnzimmer", "open": true, "prompt_id": id, "label_id": "l1"}).to_string();
+        let (status, body) = call(&h.state, "POST", "/watch/window_label", Some(answer.clone())).await;
+        assert_eq!((status, body["stored"].clone(), body["manual"].clone()), (StatusCode::OK, json!(1), json!(false)));
+        assert!(h.state.windows.lock().unwrap().open_rooms().is_empty());
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", Some(answer)).await.1, json!({"stored": 0, "duplicate": true}));
+        let labels = lake_rows(&h, "labels");
+        let (_, scan) = call(&h.state, "POST", "/api/scan", Some(scan_at(now_ms(), json!({})))).await;
+        assert!(scan.get("window_prompt").is_none(), "answered prompt is gone");
+        assert_eq!(some(&column(&labels, "source")), ["window"]);
+        assert_eq!((some(&column(&labels, "window_open")), some(&column(&labels, "room")), some(&column(&labels, "heat")), some(&column(&labels, "label_id"))), (vec!["true".to_string()], vec!["wohnzimmer".to_string()], vec!["false".to_string()], vec!["l1".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn manual_window_label_drives_the_window_state_and_void_reverts_it() {
+        let h = harness(false);
+        let manual = |open: bool, id: &str| Some(json!({"device": "pixel-watch", "ts": now_ms(), "room": "wohnzimmer", "open": open, "prompt_id": null, "label_id": id}).to_string());
+        let (status, body) = call(&h.state, "POST", "/watch/window_label", manual(true, "m1")).await;
+        assert_eq!((status, body["manual"].clone(), body["window_open"].clone()), (StatusCode::OK, json!(true), json!(["wohnzimmer"])));
+        let noon = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        let frost = control_step(&h.state, noon, 1_000).await.unwrap();
+        assert_eq!(frost[0].reason, "window_open");
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", manual(false, "m2")).await.1["window_open"], json!([]));
+        call(&h.state, "POST", "/watch/window_label", manual(true, "m3")).await;
+        assert_eq!(h.state.windows.lock().unwrap().open_rooms().len(), 1);
+        let (status, _) = call(&h.state, "POST", "/watch/label/void", Some(json!({"device": "pixel-watch", "label_id": "m3"}).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(h.state.windows.lock().unwrap().open_rooms().is_empty());
+        assert_eq!(some(&column(&lake_rows(&h, "labels"), "source")), ["window", "window", "window", "void"]);
+    }
+
+    #[tokio::test]
+    async fn window_label_rejects_unknown_rooms_and_empty_devices() {
+        let h = harness(false);
+        for body in [json!({"device": "pixel-watch", "ts": 1, "room": "keller", "open": true}), json!({"device": "", "ts": 1, "room": "wohnzimmer", "open": true}), json!({"device": "w", "ts": 1, "room": "wohnzimmer", "open": true, "label_id": ""})] {
+            assert_eq!(call(&h.state, "POST", "/watch/window_label", Some(body.to_string())).await.0, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", Some(json!({"device": "w", "ts": 1}).to_string())).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(lake_rows(&h, "labels").is_empty());
+    }
 }

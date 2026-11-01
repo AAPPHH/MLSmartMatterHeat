@@ -354,6 +354,11 @@ impl Windows {
         self.prompt = Some(prompt);
     }
 
+    #[cfg(test)]
+    pub fn test_prompt(&mut self, cfg: &WindowSection, room: &str, question: &'static str, now: i64) {
+        self.raise(cfg, room, question, now);
+    }
+
     pub fn prompt(&self, cfg: &WindowSection, now: i64) -> Option<Value> {
         self.prompt.as_ref().filter(|p| now - p.created_ms < (cfg.prompt_expire_min * MIN_MS as f64) as i64).map(|p| json!({"id": p.id, "room": p.room, "question": p.question}))
     }
@@ -725,6 +730,7 @@ impl Windows {
             "reopens": r.reopens,
             "suppressed": r.suppressed,
             "no_supply_since": r.supply,
+            "v2_open": self.shadow.open_rooms().iter().any(|n| n == room),
         })
     }
 

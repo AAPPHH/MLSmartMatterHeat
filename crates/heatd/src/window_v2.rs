@@ -244,11 +244,6 @@ impl Shadow {
         self.rooms.iter().filter(|(_, r)| r.open.is_some()).map(|(n, _)| n.clone()).collect()
     }
 
-    #[cfg(test)]
-    pub fn lengths(&self, room: &str) -> Vec<f64> {
-        self.rooms.get(room).map_or_else(Vec::new, |r| r.lengths.iter().copied().collect())
-    }
-
     pub fn on_report(&mut self, cfg: &WindowSection, room: &str, ts: i64, x: f64, f: &Flags, ctx: &RoomCtx) -> Step2 {
         let c = &cfg.v2;
         let mins = |m: f64| (m * MIN_MS as f64) as i64;
@@ -400,7 +395,7 @@ nodes = [{n}]
         .iter()
         .map(|d| {
             let mine: Vec<&Value> = episodes.iter().filter(|e| e["detector"] == *d).collect();
-            let sum = |k: &str| mine.iter().filter_map(|e| e[k].as_f64()).sum::<f64>();
+            let sum = |k: &str| mine.iter().filter_map(|e| e[k].as_f64()).fold(0.0, |a, b| a + b);
             let count = |l: &str| mine.iter().filter(|e| e["label"] == l).count();
             (d.to_string(), json!({"episodes": mine.len(), "open_min": sum("duration_min"), "probes": sum("probe_count"), "probe_valve_min": sum("probe_valve_min"), "below_min": sum("below_min"), "label_yes": count("yes"), "label_no": count("no"), "label_none": count("none")}))
         })
