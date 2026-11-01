@@ -8,10 +8,10 @@ menu "BR Watchdog"
             Put the real value in sdkconfig.<variant>.local, never in the repo.
 
     config BR_WATCHDOG_MATTER
-        bool "Armed path: Matter controller write on the border router"
-        default n
+        bool "Armed path: minimal Matter CASE client on the border router"
+        default y
         help
-            Needs the esp-matter controller component, which is not integrated.
+            Built-in Matter controller side client (CASE + Interaction Model write over lwIP UDP, mbedTLS).
             With this off the watchdog runs dry_run only and refuses mode armed.
 
 endmenu

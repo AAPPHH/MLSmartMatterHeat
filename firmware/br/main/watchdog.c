@@ -32,6 +32,7 @@
 #define CFG_MAGIC 0x57443031u
 #define BODY_MAX 4096
 #define STATUS_MAX 2048
+#define WD_TASK_STACK 14336
 #define OTA_CHUNK 4096
 #define OTA_VALIDATE_GOOD_S 60
 #define OTA_VALIDATE_DEADLINE_S 600
@@ -49,6 +50,7 @@ static SemaphoreHandle_t s_lock;
 static temperature_sensor_handle_t s_tsens;
 static httpd_handle_t s_httpd;
 static volatile uint32_t s_ticks;
+static volatile uint32_t s_stack_free_min = WD_TASK_STACK;
 
 static uint32_t uptime_s(void)
 {
@@ -253,8 +255,8 @@ static esp_err_t ambient_handler(httpd_req_t *req)
 
 static esp_err_t heap_handler(httpd_req_t *req)
 {
-    char out[128];
-    snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u}", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    char out[192];
+    snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u,\"wd_stack_size\":%u,\"wd_stack_free_min\":%u}", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), (unsigned)WD_TASK_STACK, (unsigned)s_stack_free_min);
     return send_json(req, "200 OK", out);
 }
 
@@ -413,6 +415,8 @@ static void watchdog_task(void *arg)
             r = wd_matter_write_setpoint(cr, snap.cfg.nodes[act.node_idx], snap.cfg.endpoint, snap.cfg.setpoint_cc, err, sizeof(err));
             memset(cr, 0, sizeof(*cr));
             free(cr);
+            uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+            if (hw < s_stack_free_min) s_stack_free_min = hw;
         } else {
             strlcpy(err, "no_credentials", sizeof(err));
         }
@@ -436,7 +440,7 @@ void br_watchdog_start(void)
     }
     if (strlen(CONFIG_BR_WATCHDOG_TOKEN) == 0) ESP_LOGE(TAG, "BR_WATCHDOG_TOKEN empty: all watchdog writes are rejected");
     start_http();
-    xTaskCreate(watchdog_task, "br_watchdog", 6144, NULL, 4, NULL);
+    xTaskCreate(watchdog_task, "br_watchdog", WD_TASK_STACK, NULL, 4, NULL);
     xTaskCreate(validate_task, "ota_validate", 3072, NULL, 3, NULL);
     ESP_LOGI(TAG, "started: mode %s, timeout %us, creds %s", cfg.armed ? "armed" : "dry_run", (unsigned)cfg.timeout_s, s_have_creds ? "present" : "absent");
 }
