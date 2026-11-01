@@ -1,35 +1,9 @@
 mod common;
 use common::*;
 use matter_client::client::*;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
 
 static PORT: AtomicU16 = AtomicU16::new(47600);
-
-pub fn test_dir() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../test")).canonicalize().unwrap()
-}
-
-pub fn spawn_responder(port: u16, scenario: &str, result: &std::path::Path, extra: &[(&str, String)]) -> Child {
-    let dir = test_dir();
-    let mut cmd = Command::new(std::env::var("PYTHON").unwrap_or_else(|_| "python".into()));
-    cmd.current_dir(&dir)
-        .args(["-I", "ref_responder.py"])
-        .env("RESP_PORT", port.to_string())
-        .env("RESP_SCENARIO", scenario)
-        .env("RESP_RESULT", result)
-        .env("RESP_VECTORS", dir.join("vectors.h"))
-        .env("RESP_STRICT", "1")
-        .stdout(Stdio::null());
-    for (k, v) in extra {
-        cmd.env(k, v);
-    }
-    let c = cmd.spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(1200));
-    c
-}
 
 struct Case {
     scenario: &'static str,

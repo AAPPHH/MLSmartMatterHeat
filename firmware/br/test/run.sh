@@ -50,3 +50,6 @@ lb bad_sig sig_sigma2
 lb write_fail write_status_87
 lb ok key_mismatch DEDEDEDE00010002 LB_BAD_KEY=1
 lb silent timeout_sigma1
+CL="$TMP/matter_loopback"
+if command -v cygpath >/dev/null 2>&1; then CL=$(cygpath -w "$CL.exe"); fi
+(cd ../matter_client && C_LOOPBACK="$CL" cargo test --release)

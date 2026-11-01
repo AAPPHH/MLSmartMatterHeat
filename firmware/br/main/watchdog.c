@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "mbedtls/platform_util.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 #include "watchdog_core.h"
@@ -78,6 +79,10 @@ static void load_nvs(wd_config_t *cfg)
     }
     len = sizeof(s_creds);
     s_have_creds = nvs_get_blob(h, NVS_KEY_CREDS, &s_creds, &len) == ESP_OK && len == sizeof(s_creds);
+    if (s_have_creds && (s_creds.rcac_len == 0 || s_creds.rcac_len > WD_CERT_MAX || s_creds.icac_len > WD_CERT_MAX || s_creds.noc_len == 0 || s_creds.noc_len > WD_CERT_MAX)) {
+        mbedtls_platform_zeroize(&s_creds, sizeof(s_creds));
+        s_have_creds = false;
+    }
     nvs_close(h);
     if (!WD_MATTER_BUILT) cfg->armed = 0;
 }
@@ -218,7 +223,7 @@ static esp_err_t credentials_handler(httpd_req_t *req)
         return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"err\":\"oom\"}");
     }
     wd_err_t e = wd_parse_credentials(body, cr);
-    memset(body, 0, req->content_len);
+    mbedtls_platform_zeroize(body, req->content_len);
     free(body);
     if (e != WD_OK) {
         free(cr);
@@ -237,7 +242,7 @@ static esp_err_t credentials_handler(httpd_req_t *req)
         s_have_creds = true;
         xSemaphoreGive(s_lock);
     }
-    memset(cr, 0, sizeof(*cr));
+    mbedtls_platform_zeroize(cr, sizeof(*cr));
     free(cr);
     if (r != ESP_OK) return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"err\":\"nvs\"}");
     ESP_LOGI(TAG, "operational credentials stored");
@@ -413,7 +418,7 @@ static void watchdog_task(void *arg)
         esp_err_t r = ESP_ERR_INVALID_STATE;
         if (cr) {
             r = wd_matter_write_setpoint(cr, snap.cfg.nodes[act.node_idx], snap.cfg.endpoint, snap.cfg.setpoint_cc, err, sizeof(err));
-            memset(cr, 0, sizeof(*cr));
+            mbedtls_platform_zeroize(cr, sizeof(*cr));
             free(cr);
             uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
             if (hw < s_stack_free_min) s_stack_free_min = hw;

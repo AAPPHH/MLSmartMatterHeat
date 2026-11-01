@@ -570,3 +570,11 @@ int mc_write_int16(const mc_io_t *io, const wd_creds_t *cr, uint64_t peer_node, 
     mc_wipe(chk, sizeof(chk));
     return rc;
 }
+
+int mc_creds_cfid(const wd_creds_t *cr, uint8_t cf[8])
+{
+    mc_cert_t rcac;
+    if (cr->rcac_len > WD_CERT_MAX || cr->icac_len > WD_CERT_MAX || cr->noc_len > WD_CERT_MAX) return MC_E_CERT;
+    if (mc_cert_parse(cr->rcac, cr->rcac_len, &rcac) || mc_compressed_fabric_id(rcac.pub, cr->fabric_id, cf)) return MC_E_CERT;
+    return MC_OK;
+}

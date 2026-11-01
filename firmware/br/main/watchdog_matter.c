@@ -56,7 +56,7 @@ typedef struct {
 static int net_send(void *ctx, const uint8_t *b, size_t n)
 {
     net_t *s = ctx;
-    return sendto(s->fd, b, n, 0, (struct sockaddr *)&s->peer, sizeof(s->peer));
+    return send(s->fd, b, n, 0);
 }
 
 static int net_recv(void *ctx, uint8_t *b, size_t max, uint32_t ms)
@@ -64,7 +64,7 @@ static int net_recv(void *ctx, uint8_t *b, size_t max, uint32_t ms)
     net_t *s = ctx;
     struct timeval tv = {.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
     setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    int r = recvfrom(s->fd, b, max, 0, NULL, NULL);
+    int r = recv(s->fd, b, max, 0);
     return r < 0 ? 0 : r;
 }
 
@@ -183,6 +183,11 @@ static esp_err_t try_peer(const wd_creds_t *cr, uint64_t node, const peer_t *p, 
     n.peer.sin6_len = sizeof(n.peer);
     n.peer.sin6_port = htons(p->port ? p->port : MATTER_PORT_FALLBACK);
     memcpy(&n.peer.sin6_addr, p->addr[idx], 16);
+    if (connect(n.fd, (struct sockaddr *)&n.peer, sizeof(n.peer)) != 0) {
+        close(n.fd);
+        strlcpy(err, "socket", err_len);
+        return ESP_FAIL;
+    }
     mc_io_t io = {&n, net_send, net_recv, net_now, net_rng};
     mc_mrp_t mrp;
     mc_mrp_from_txt(&mrp, p->sii_ms, p->sai_ms);
@@ -193,7 +198,6 @@ static esp_err_t try_peer(const wd_creds_t *cr, uint64_t node, const peer_t *p, 
 
 esp_err_t wd_matter_write_setpoint(const wd_creds_t *creds, uint64_t node, uint8_t endpoint, int32_t centi_c, char *err, size_t err_len)
 {
-    mc_cert_t rcac;
     uint8_t cf[8];
     char label[40];
     peer_t p;
@@ -202,7 +206,7 @@ esp_err_t wd_matter_write_setpoint(const wd_creds_t *creds, uint64_t node, uint8
         strlcpy(err, "range", err_len);
         return ESP_ERR_INVALID_ARG;
     }
-    if (mc_cert_parse(creds->rcac, creds->rcac_len, &rcac) || mc_compressed_fabric_id(rcac.pub, creds->fabric_id, cf)) {
+    if (mc_creds_cfid(creds, cf)) {
         strlcpy(err, "cert_rcac", err_len);
         return ESP_FAIL;
     }

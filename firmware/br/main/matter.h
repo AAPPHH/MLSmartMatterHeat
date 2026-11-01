@@ -147,6 +147,7 @@ typedef struct {
 
 enum { MC_OK = 0, MC_E_ARG = -1, MC_E_TIMEOUT = -2, MC_E_PROTO = -3, MC_E_CERT = -4, MC_E_CRYPTO = -5, MC_E_PEER = -6, MC_E_STATUS = -7, MC_E_KEY = -8 };
 
+int mc_creds_cfid(const wd_creds_t *cr, uint8_t cf[8]);
 void mc_mrp_from_txt(mc_mrp_t *m, uint32_t sii_ms, uint32_t sai_ms);
 uint32_t mc_backoff_ms(uint32_t base_ms, uint8_t send_count, uint32_t max_ms, uint32_t rnd);
 

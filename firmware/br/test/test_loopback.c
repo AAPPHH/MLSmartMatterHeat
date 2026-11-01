@@ -51,7 +51,9 @@ static uint32_t net_now(void *ctx)
 static void net_rng(void *ctx, uint8_t *b, size_t n)
 {
     (void)ctx;
-    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)(rand() >> 3);
+    static int fixed = -1;
+    if (fixed < 0) fixed = getenv("LB_FIXED_RNG") != NULL;
+    for (size_t i = 0; i < n; i++) b[i] = fixed ? 0x5a : (uint8_t)(rand() >> 3);
 }
 
 int main(int argc, char **argv)
