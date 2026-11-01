@@ -24,6 +24,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.draw.alpha
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
@@ -301,10 +302,10 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun WindowPill(text: String, fill: Color, ink: Color, size: Int, onClick: () -> Unit) {
+private fun WindowPill(text: String, fill: Color, ink: Color, size: Int, enabled: Boolean = true, onClick: () -> Unit) {
     Text(
         text,
-        Modifier.padding(top = 5.dp).fillMaxWidth().clip(RoundedCornerShape(50)).background(fill).clickable { onClick() }.padding(vertical = if (size > 12) 10.dp else 5.dp),
+        Modifier.padding(top = 5.dp).fillMaxWidth().alpha(if (enabled) 1f else 0.35f).clip(RoundedCornerShape(50)).background(fill).clickable(enabled = enabled) { onClick() }.padding(vertical = if (size > 12) 10.dp else 5.dp),
         fontSize = size.sp, fontWeight = FontWeight.Bold, color = ink, textAlign = TextAlign.Center, maxLines = 1
     )
 }
@@ -315,6 +316,9 @@ private fun WindowOverlay(
     onAnswer: (WindowAsk?, String, Boolean) -> Unit, onDismiss: (WindowAsk) -> Unit, onPick: (String) -> Unit, onCancel: () -> Unit, onUndo: (String) -> Unit
 ) {
     if (ask == null && manual == null && undo == null) return
+    val shot = remember(ask?.id, manual, undo) { OneShot() }
+    var spent by remember(ask?.id, manual, undo) { mutableStateOf(false) }
+    val once: (() -> Unit) -> Unit = { f -> if (shot.take()) { spent = true; f() } }
     Column(
         Modifier.fillMaxSize().background(Color.Black).pointerInput(Unit) { detectTapGestures { } }.padding(horizontal = 28.dp),
         Arrangement.Center, Alignment.CenterHorizontally
@@ -322,13 +326,13 @@ private fun WindowOverlay(
         when {
             undo != null -> {
                 Text("Gespeichert", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
-                WindowPill(Tap.UNDO, IDLE, Color.White, 12) { onUndo(undo) }
+                WindowPill(Tap.UNDO, IDLE, Color.White, 12, !spent) { once { onUndo(undo) } }
             }
             ask != null -> {
                 Text(WindowEvent.title(ask), fontSize = 15.sp, lineHeight = 18.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
-                WindowPill(WindowEvent.YES, SELECTED, INK, 16) { onAnswer(ask, ask.room, true) }
-                WindowPill(WindowEvent.NO, IDLE, Color.White, 16) { onAnswer(ask, ask.room, false) }
-                WindowPill(WindowEvent.DISMISS, Color.Black, CAPTION, 10) { onDismiss(ask) }
+                WindowPill(WindowEvent.YES, SELECTED, INK, 16, !spent) { once { onAnswer(ask, ask.room, true) } }
+                WindowPill(WindowEvent.NO, IDLE, Color.White, 16, !spent) { once { onAnswer(ask, ask.room, false) } }
+                WindowPill(WindowEvent.DISMISS, Color.Black, CAPTION, 10, !spent) { once { onDismiss(ask) } }
             }
             manual == "" -> {
                 WindowEvent.rooms(progress).forEach { room -> WindowPill(Defaults.CAPTIONS.getValue(room), IDLE, Color.White, 12) { onPick(room) } }
@@ -336,8 +340,8 @@ private fun WindowOverlay(
             }
             manual != null -> {
                 Text("Fenster ${Defaults.CAPTIONS[manual] ?: manual}", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center)
-                WindowPill(WindowEvent.OPEN, SELECTED, INK, 16) { onAnswer(null, manual, true) }
-                WindowPill(WindowEvent.CLOSED, IDLE, Color.White, 16) { onAnswer(null, manual, false) }
+                WindowPill(WindowEvent.OPEN, SELECTED, INK, 16, !spent) { once { onAnswer(null, manual, true) } }
+                WindowPill(WindowEvent.CLOSED, IDLE, Color.White, 16, !spent) { once { onAnswer(null, manual, false) } }
                 WindowPill("Abbrechen", Color.Black, CAPTION, 10) { onCancel() }
             }
         }

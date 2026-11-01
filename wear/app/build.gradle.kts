@@ -18,8 +18,8 @@ android {
         applicationId = "de.aapphh.heatscan"
         minSdk = 30
         targetSdk = 37
-        versionCode = 27
-        versionName = "3.7"
+        versionCode = 28
+        versionName = "3.8"
     }
     signingConfigs {
         if (!keystoreProps.isEmpty) {

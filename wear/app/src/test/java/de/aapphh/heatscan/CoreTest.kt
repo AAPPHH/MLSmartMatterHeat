@@ -1845,7 +1845,18 @@ class CoreTest {
         assertNull(WindowEvent.parse(JSONObject("""{"id":"w1","room":"bad","question":"maybe"}"""), 7L))
         assertNull(WindowEvent.parse(JSONObject("""{"room":"bad","question":"open"}"""), 7L))
         assertNull(WindowEvent.parse(null, 7L))
-        assertEquals("Fenster im Wohnen offen?", WindowEvent.title(WindowAsk("w1", "wohnzimmer", true)))
+        assertEquals("Ist das Fenster im Wohnzimmer offen?", WindowEvent.title(WindowAsk("w1", "wohnzimmer", true)))
+        assertEquals("Ist das Fenster im Schlafzimmer offen?", WindowEvent.title(WindowAsk("w1", "schlafzimmer", true)))
+        assertEquals("Ist das Fenster im Bad offen?", WindowEvent.title(WindowAsk("w1", "bad", false)))
+        assertEquals("Ist das Fenster in der Küche offen?", WindowEvent.title(WindowAsk("w1", "kueche", true)))
+    }
+
+    @Test
+    fun oneShotAllowsExactlyOneTap() {
+        val gate = OneShot()
+        assertEquals(true, gate.take())
+        assertEquals(false, gate.take())
+        assertEquals(false, gate.take())
     }
 
     @Test

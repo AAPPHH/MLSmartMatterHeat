@@ -73,6 +73,16 @@ object LabelEvent {
     fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("from", o.getLong("from")).put("to", o.getLong("to")).put("label", o.getString("label")).put("heat", o.optBoolean("heat", true)).let { withId(it, o) }
 }
 
+class OneShot {
+    private var used = false
+
+    fun take(): Boolean {
+        if (used) return false
+        used = true
+        return true
+    }
+}
+
 data class WindowAsk(val id: String, val room: String, val open: Boolean, val at: Long = 0L)
 
 object WindowEvent {
@@ -90,7 +100,9 @@ object WindowEvent {
 
     fun rooms(p: Progress?): List<String> = Defaults.ROOMS.filter { Heat.heatable(it, p) }
 
-    fun title(a: WindowAsk) = "Fenster im ${Defaults.CAPTIONS[a.room] ?: a.room} offen?"
+    private val PLACES = mapOf("wohnzimmer" to "im Wohnzimmer", "schlafzimmer" to "im Schlafzimmer", "bad" to "im Bad", "kueche" to "in der Küche", "flur" to "im Flur")
+
+    fun title(a: WindowAsk) = "Ist das Fenster ${PLACES[a.room] ?: "im ${Defaults.CAPTIONS[a.room] ?: a.room}"} offen?"
 
     fun parse(o: JSONObject?, now: Long): WindowAsk? = try {
         o?.let {
