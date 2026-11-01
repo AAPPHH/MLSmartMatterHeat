@@ -60,9 +60,9 @@ impl Mrp {
 pub fn backoff_ms(base_ms: u32, send_count: u8, max_ms: u32, rnd: u32) -> u32 {
     let mut i = base_ms as u64 * 1127 / 1024;
     for _ in 1..send_count {
-        i = i * 16 / 10;
+        i = i.saturating_mul(16) / 10;
     }
-    i = i * (1024 + (rnd & 255) as u64) / 1024;
+    i = i.saturating_mul(1024 + (rnd & 255) as u64) / 1024;
     if i > max_ms as u64 {
         max_ms
     } else {
@@ -587,7 +587,7 @@ impl<'a, I: Io> Client<'a, I> {
         };
         self.psid = psid;
         if sai != 0 {
-            self.active_ms = sai.clamp(self.active_ms, 10000);
+            self.active_ms = sai.max(self.active_ms).min(10000);
         }
         sx.salt[..16].copy_from_slice(&self.ipk);
         sx.salt[16..48].copy_from_slice(&rrand);
