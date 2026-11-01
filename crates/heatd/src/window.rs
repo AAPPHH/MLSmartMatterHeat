@@ -50,6 +50,7 @@ struct RoomWin {
     series: VecDeque<(i64, f64)>,
     floor_ms: i64,
     slope_since: Option<i64>,
+    recover_since: Option<i64>,
     opens: VecDeque<i64>,
     decrease_ms: Option<i64>,
     logged: HashMap<&'static str, i64>,
@@ -189,6 +190,7 @@ impl RoomWin {
         self.active = None;
         self.floor_ms = now;
         self.slope_since = None;
+        self.recover_since = None;
         self.last_close = Some((reason, now));
     }
 }
@@ -461,17 +463,23 @@ impl Windows {
         }
         match active.phase {
             Phase::Open => {
-                if now - since >= mins(cfg.min_open_min) {
+                if now - since >= mins(cfg.min_open_min.max(cfg.min_open_hold_min)) {
                     let from = (now - mins(cfg.close_window_min)).max(since);
                     let recent: Vec<f64> = w.within(from, now, age).iter().map(|s| s.1).collect();
                     let rise = cur - recent.iter().copied().fold(cur, f64::min);
                     if rise >= cfg.close_rise_k && self.heating(nodes) != Some(true) {
-                        return closed("recovery", w);
+                        let held = *w.recover_since.get_or_insert(now);
+                        if now - held >= mins(cfg.close_debounce_min) {
+                            return closed("recovery", w);
+                        }
+                    } else {
+                        w.recover_since = None;
                     }
                 }
-                if (now - since) as f64 >= active.timeout_min * MIN_MS as f64 {
+                if (now - since) as f64 >= active.timeout_min.max(cfg.min_open_hold_min) * MIN_MS as f64 {
                     w.active = Some(Active { phase: Phase::Probe, since_ms: now, ..active });
                     w.slope_since = None;
+                    w.recover_since = None;
                 }
                 Vec::new()
             }
@@ -510,10 +518,13 @@ impl Windows {
         while w.opens.front().is_some_and(|t| now - t >= 3_600_000) {
             w.opens.pop_front();
         }
+        let rearm = w.last_close.filter(|c| c.0 != "manual").is_some_and(|(reason, at)| now - at < mins(if reason == "timeout_probe" { cfg.probe_cooldown_min.max(cfg.rearm_min) } else { cfg.rearm_min }));
         let blocked = if w.decrease_ms.is_some_and(|d| now - d <= mins(cfg.setpoint_guard_min)) {
             Some("setpoint")
         } else if outdoor.is_some_and(|o| r.temp - o.0 < cfg.min_outdoor_delta_k) {
             Some("outdoor")
+        } else if rearm {
+            Some("rearm")
         } else if !by_drop && !by_slope {
             Some("cooldown")
         } else if w.opens.len() >= cfg.max_events_per_hour {

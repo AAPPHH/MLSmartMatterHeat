@@ -320,6 +320,67 @@ pub struct WindowSection {
     pub valve_low_pct: f64,
     pub radiator_cold_min: f64,
     pub manual_max_min: f64,
+    pub min_open_hold_min: f64,
+    pub rearm_min: f64,
+    pub probe_cooldown_min: f64,
+    pub close_debounce_min: f64,
+    pub label_grace_min: f64,
+    pub prompt_expire_min: f64,
+    pub prompt_gap_min: f64,
+    pub below_k: f64,
+    pub v2: WindowV2Section,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WindowV2Section {
+    pub enabled: bool,
+    pub open_h_k: f64,
+    pub close_h_k: f64,
+    pub slack_k_per_min: f64,
+    pub close_slack_k_per_min: f64,
+    pub max_gap_min: f64,
+    pub prior_cool_per_min: f64,
+    pub prior_floor_c: f64,
+    pub prior_heat_k_per_min: f64,
+    pub forget: f64,
+    pub radiator_tau_min: f64,
+    pub max_episode_min: f64,
+    pub energy_cost_per_valve_min: f64,
+    pub comfort_cost_per_min_below: f64,
+    pub probe_horizon_min: f64,
+    pub probe_gap_min: f64,
+    pub probe_valve_pct: f64,
+    pub prior_min_n: usize,
+    pub prior_keep: usize,
+    pub default_episode_min: Vec<f64>,
+}
+
+impl Default for WindowV2Section {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            open_h_k: 1.0,
+            close_h_k: 0.6,
+            slack_k_per_min: 0.03,
+            close_slack_k_per_min: 0.01,
+            max_gap_min: 10.0,
+            prior_cool_per_min: 0.003,
+            prior_floor_c: 16.0,
+            prior_heat_k_per_min: 0.05,
+            forget: 0.998,
+            radiator_tau_min: 10.0,
+            max_episode_min: 120.0,
+            energy_cost_per_valve_min: 1.0,
+            comfort_cost_per_min_below: 0.6,
+            probe_horizon_min: 10.0,
+            probe_gap_min: 15.0,
+            probe_valve_pct: 50.0,
+            prior_min_n: 3,
+            prior_keep: 50,
+            default_episode_min: vec![10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0],
+        }
+    }
 }
 
 impl Default for WindowSection {
@@ -351,6 +412,15 @@ impl Default for WindowSection {
             valve_low_pct: 10.0,
             radiator_cold_min: 45.0,
             manual_max_min: 720.0,
+            min_open_hold_min: 15.0,
+            rearm_min: 20.0,
+            probe_cooldown_min: 30.0,
+            close_debounce_min: 3.0,
+            label_grace_min: 25.0,
+            prompt_expire_min: 20.0,
+            prompt_gap_min: 10.0,
+            below_k: 0.5,
+            v2: WindowV2Section::default(),
         }
     }
 }

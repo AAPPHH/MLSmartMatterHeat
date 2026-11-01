@@ -53,7 +53,11 @@ impl Sim {
 }
 
 fn opened() -> Sim {
-    let mut s = Sim::new("");
+    opened_with("")
+}
+
+fn opened_with(extra: &str) -> Sim {
+    let mut s = Sim::new(extra);
     s.run(flat(21.0, 15));
     s.run(ramp(21.0, -0.4, 4));
     s
@@ -66,19 +70,21 @@ fn sharp_drop_with_cold_outside_opens_and_recovery_closes() {
     let d = &s.find("window_open").detail;
     assert!(d["drop_k"].as_f64().unwrap() >= 1.0 && d["source"] == "auto" && d["outdoor"] == 2.0 && d["valve_before"] == 0.0 && d["room"] == "a", "{d}");
     assert_eq!(s.w.open_rooms().len(), 1);
-    s.run(flat(19.4, 6));
+    s.run(flat(19.4, 13));
     assert_eq!(s.state(), "open");
-    s.run(ramp(19.4, 0.2, 3));
+    s.run(ramp(19.4, 0.2, 6));
     assert_eq!(s.kinds(), vec!["window_open", "window_close"]);
     let d = &s.find("window_close").detail;
     assert_eq!(d["reason"], "recovery");
-    assert!((d["min_temp"].as_f64().unwrap() - 19.4).abs() < 1e-9 && d["open_minutes"].as_f64().unwrap() >= 5.0, "{d}");
+    assert!((d["min_temp"].as_f64().unwrap() - 19.4).abs() < 1e-9 && d["open_minutes"].as_f64().unwrap() >= 15.0, "{d}");
     assert!(s.w.open_rooms().is_empty());
 }
 
 #[test]
 fn recovery_waits_for_minimum_open_time_and_for_heating_off() {
-    let mut s = opened();
+    let mut s = opened_with("[window]
+min_open_hold_min = 0.0
+close_debounce_min = 0.0");
     s.run(vec![19.4, 19.8, 20.0]);
     assert_eq!(s.state(), "open");
     s.valve(40.0);
@@ -487,4 +493,89 @@ fn learned_supply_window_is_the_median_of_episodes() {
     assert_eq!((v["from"].as_str(), v["to"].as_str()), (Some("23:45"), Some("06:45")));
     assert!(v["label"].as_str().unwrap().contains("Kessel liefert nicht: ~23:45-06:45"));
     assert!(supply_window(&eps[..1]).is_null());
+}
+
+#[test]
+fn recovery_needs_the_hold_time_and_a_debounced_rise() {
+    let mut s = opened_with("[window]
+max_open_min = 60.0");
+    s.run(flat(19.4, 8));
+    s.run(ramp(19.4, 0.2, 3));
+    assert_eq!(s.state(), "open", "rise inside the 15 min hold must not close");
+    s.run(flat(19.4, 8));
+    s.run(vec![19.8, 19.4]);
+    s.run(vec![19.8]);
+    s.run(flat(19.8, 2));
+    assert_eq!(s.state(), "open", "a rise that has not held for the debounce does not close");
+    s.run(flat(19.8, 1));
+    assert_eq!(s.state(), "closed");
+}
+
+#[test]
+fn closed_window_is_not_rearmed_for_twenty_minutes_and_probe_close_waits_thirty() {
+    let mut s = opened_with("[window]
+min_open_hold_min = 0.0
+close_debounce_min = 0.0");
+    s.run(flat(19.4, 6));
+    s.run(ramp(19.4, 0.2, 3));
+    assert_eq!(s.state(), "closed");
+    s.run(flat(20.0, 2));
+    s.run(ramp(20.0, -0.4, 4));
+    assert_eq!(s.state(), "closed");
+    assert_eq!(s.find("window_suppressed").detail["reason"], "rearm");
+    let mut p = opened();
+    p.run(flat(19.4, 20));
+    p.run(flat(19.4, 10));
+    assert_eq!(p.find("window_close").detail["reason"], "timeout_probe");
+    p.run(flat(21.0, 2));
+    p.run(ramp(21.0, -0.4, 4));
+    assert_eq!(p.state(), "closed");
+    p.run(flat(19.4, 20));
+    p.run(flat(21.0, 2));
+    p.run(ramp(21.0, -0.4, 4));
+    assert_eq!(p.state(), "open");
+}
+
+const NO_HYSTERESIS: &str = "[window]
+min_open_hold_min = 0.0
+rearm_min = 0.0
+probe_cooldown_min = 0.0
+close_debounce_min = 0.0";
+
+fn flapping_shape(extra: &str) -> (Sim, usize, Vec<(usize, bool)>) {
+    let mut s = Sim::new(extra);
+    s.run(flat(21.0, 15));
+    let mut toggles = Vec::new();
+    let mut frozen = false;
+    let mut minute = 0;
+    let mut feed = |s: &mut Sim, temps: Vec<f64>| {
+        for t in temps {
+            s.run(vec![t]);
+            minute += 1;
+            let now = s.w.open_rooms().contains("a");
+            if now != frozen {
+                frozen = now;
+                toggles.push((minute, now));
+            }
+        }
+    };
+    feed(&mut s, ramp(21.0, -0.4, 4));
+    feed(&mut s, flat(19.5, 14));
+    for _ in 0..3 {
+        feed(&mut s, vec![20.0]);
+        feed(&mut s, ramp(20.0, -0.4, 4));
+        feed(&mut s, flat(18.5, 4));
+    }
+    feed(&mut s, flat(18.5, 10));
+    let opens = s.events.iter().filter(|e| e.kind == "window_open").count();
+    (s, opens, toggles)
+}
+
+#[test]
+fn recovery_bounce_shape_of_2026_10_31_opens_once_without_setpoint_toggling() {
+    let (_, old_opens, old_toggles) = flapping_shape(NO_HYSTERESIS);
+    assert!(old_opens >= 3 && old_toggles.len() >= 5, "baseline must flap: {old_opens} {old_toggles:?}");
+    let (s, opens, toggles) = flapping_shape("");
+    assert_eq!(opens, 1, "{:?}", s.events);
+    assert!(toggles.len() <= 2, "{toggles:?}");
 }

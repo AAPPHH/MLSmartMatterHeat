@@ -150,6 +150,10 @@ max_timeout_min = 60.0
 probe_min = 10.0
 probe_drop_k = 0.5
 max_events_per_hour = 4
+min_open_hold_min = 15.0
+rearm_min = 20.0
+probe_cooldown_min = 30.0
+close_debounce_min = 3.0
 
 [supply]
 enabled = true
