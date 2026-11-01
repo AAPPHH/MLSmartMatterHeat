@@ -721,6 +721,10 @@ impl<'a, I: Io> Client<'a, I> {
         if r != OK {
             return r;
         }
+        if self.pend_ack && self.rph.proto == IM_PROTO {
+            self.send_msg(SC_PROTO, OP_ACK, &[], false);
+            self.pend_ack = false;
+        }
         if self.rph.proto != IM_PROTO {
             return self.fail(E_PROTO, format_args!("proto_write"));
         }
@@ -729,10 +733,6 @@ impl<'a, I: Io> Client<'a, I> {
             WriteRsp::Proto(m) => return self.fail(E_PROTO, format_args!("{}", m)),
             WriteRsp::Status(s) => return self.fail(E_STATUS, format_args!("write_status_{:02x}", s)),
             WriteRsp::Ok => {}
-        }
-        if self.pend_ack {
-            self.send_msg(SC_PROTO, OP_ACK, &[], false);
-            self.pend_ack = false;
         }
         OK
     }
