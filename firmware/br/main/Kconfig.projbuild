@@ -17,9 +17,9 @@ menu "BR Watchdog"
     config BR_WATCHDOG_MATTER_RUST
         bool "Use the Rust Matter client (firmware/br/matter_client) instead of the C one"
         depends on BR_WATCHDOG_MATTER
-        default n
+        default y
         help
-            Needs the esp Rust toolchain (espup) and cargo on PATH. The C client stays the default
-            until on-device interop with the Rust client has passed.
+            Needs the esp Rust toolchain (espup) and cargo on PATH. The C client is a fallback only;
+            the watchdog stays dry_run until on-device interop with the Rust client has passed.
 
 endmenu
