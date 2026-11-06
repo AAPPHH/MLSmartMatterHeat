@@ -8,6 +8,7 @@
 #include "esp_cpu_utils.h"
 #include "esp_debug_helpers.h"
 #include "esp_memory_utils.h"
+#include "esp_private/esp_clk.h"
 #include "esp_private/panic_internal.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
@@ -126,15 +127,16 @@ void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info)
     memset(&s_panic, 0, sizeof(s_panic));
     s_panic.count = prev + 1;
     s_panic.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
-    s_panic.exception = (uint8_t)info->exception;
+    s_panic.exception = (uint8_t)(g_panic_abort ? PANIC_EXCEPTION_ABORT : info->exception);
     s_panic.core = (uint8_t)info->core;
     s_panic.pc = (uint32_t)info->addr;
     const XtExcFrame *f = info->frame;
     if (f) {
         s_panic.cause = f->exccause;
         s_panic.excvaddr = f->excvaddr;
+        s_panic.a0 = f->a0;
         esp_backtrace_frame_t bt = {.pc = f->pc, .sp = f->a1, .next_pc = f->a0, .exc_frame = f};
-        bool ok = esp_stack_ptr_is_sane(bt.sp) && esp_ptr_executable((void *)esp_cpu_process_stack_pc(bt.pc));
+        bool ok = esp_stack_ptr_is_sane(bt.sp) && (esp_ptr_executable((void *)esp_cpu_process_stack_pc(bt.pc)) || f->exccause == EXCCAUSE_INSTR_PROHIBITED);
         for (int i = 0; ok && i < WD_BT_FRAMES; i++) {
             s_panic.bt[i] = esp_cpu_process_stack_pc(bt.pc);
             if (bt.next_pc == 0 || !esp_backtrace_get_next_frame(&bt)) break;
@@ -142,7 +144,7 @@ void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info)
     }
     TaskHandle_t th = xTaskGetCurrentTaskHandleForCore(info->core);
     wd_append_clean(s_panic.task, sizeof(s_panic.task), th ? pcTaskGetName(th) : "");
-    wd_append_clean(s_panic.reason, sizeof(s_panic.reason), info->reason);
+    wd_append_clean(s_panic.reason, sizeof(s_panic.reason), g_panic_abort ? "" : info->reason);
     wd_append_clean(s_panic.details, sizeof(s_panic.details), g_panic_abort ? g_panic_abort_details : "");
     wd_append_clean(s_panic.twdt, sizeof(s_panic.twdt), s_twdt);
     wd_panic_seal(&s_panic);
@@ -504,10 +506,15 @@ static void log_dry_run(const wd_state_t *st)
     ESP_LOGW(TAG, "no heartbeat for %us: would send %.1f to nodes %s (dry_run)", (unsigned)st->cfg.timeout_s, st->cfg.setpoint_cc / 100.0, nodes);
 }
 
+static uint32_t wall_s(void)
+{
+    return (uint32_t)(esp_clk_rtc_time() / 1000000);
+}
+
 static void rtc_store_locked(uint32_t now)
 {
     wd_rtc_t r;
-    wd_rtc_pack(&r, &s_state, now, &s_conn, s_wifi_restarts, s_disc_reason);
+    wd_rtc_pack(&r, &s_state, now, wall_s(), &s_conn, s_wifi_restarts, s_disc_reason);
     s_rtc = r;
 }
 
@@ -581,7 +588,7 @@ static const char *reset_name(esp_reset_reason_t r)
 
 static bool reset_crashed(esp_reset_reason_t r)
 {
-    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT || r == ESP_RST_BROWNOUT || r == ESP_RST_CPU_LOCKUP;
 }
 
 static bool rtc_load(void)
@@ -670,7 +677,7 @@ void br_watchdog_start(void)
     load_nvs(&cfg);
     wd_state_init(&s_state, &cfg);
     uint32_t boot_s = uptime_s();
-    if (rtc_load()) wd_state_restore(&s_state, &s_rtc, boot_s, reset_crashed(esp_reset_reason()));
+    if (rtc_load()) wd_state_restore(&s_state, &s_rtc, boot_s, wall_s(), reset_crashed(esp_reset_reason()));
     wd_conn_init(&s_conn, s_rtc.conn_level < WD_CONN_LEVELS ? s_rtc.conn_level : 0, boot_s);
     s_last_tick_s = boot_s;
 #if CONFIG_EXAMPLE_CONNECT_WIFI
