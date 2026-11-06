@@ -1375,6 +1375,38 @@ class CoreTest {
     }
 
     @Test
+    fun noQuestionUnlessHomePositivelyKnown() {
+        val now = 10_000_000L
+        val uni = Home.isHome(listOf("eduroam", "UniGuest"), listOf("FritzBox"))
+        assertFalse(uni)
+        assertFalse(Presence.known(uni, now - 1_000, now))
+        assertFalse(Presence.known(null, 0L, now))
+        assertFalse(Presence.known(true, 0L, now))
+        assertFalse(Presence.known(true, now - Presence.FRESH_MS - 1, now))
+        assertFalse(Presence.known(true, now + 5_000, now))
+        assertTrue(Presence.known(true, now - 60_000, now))
+    }
+
+    @Test
+    fun promptsBlockedWhenHomeUnknownOrForeign() {
+        val now = 10_000_000L
+        assertFalse(Wake.promptAllowed(false, false, now - 1_000, now, null, true, true))
+        assertFalse(Wake.promptAllowed(false, null, 0L, now, null, true, true))
+        assertFalse(Wake.promptAllowed(false, true, now - Presence.FRESH_MS - 1, now, null, false, true))
+        assertFalse(Wake.promptAllowed(true, true, now - 1_000, now, null, false, true))
+        assertTrue(Wake.promptAllowed(false, true, now - 1_000, now, null, true, true))
+    }
+
+    @Test
+    fun learnDoesNotScanOrAskAwayFromHome() {
+        val t0 = 1_000_000L
+        assertEquals(LearnStep.SCAN, Learn.step(t0, t0 + 10_000, false, false, 0L, false, 0L, true))
+        assertEquals(LearnStep.WAIT, Learn.step(t0, t0 + 10_000, false, false, 0L, false, 0L, false))
+        assertEquals(LearnStep.DISCARD, Learn.step(t0, t0 + 80_000, false, false, t0 + 20_000, false, 0L, false))
+        assertEquals(LearnStep.STOP, Learn.step(t0, t0 + 10_000, true, false, 0L, false, 0L, false))
+    }
+
+    @Test
     fun settleAndWakePromptWithoutFreshScan() {
         val t = StayTracker()
         val d = t.promptWithoutScan(t0, "bad", false)
