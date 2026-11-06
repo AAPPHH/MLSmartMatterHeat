@@ -1,6 +1,8 @@
 #include "watchdog_core.h"
 #include <math.h>
 #include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
@@ -202,18 +204,30 @@ wd_err_t wd_parse_credentials(const char *body, wd_creds_t *out)
     return WD_OK;
 }
 
+static uint32_t sat_add(uint32_t a, uint32_t b)
+{
+    return a > UINT32_MAX - b ? UINT32_MAX : a + b;
+}
+
 uint32_t wd_age_s(const wd_state_t *st, uint32_t now_s)
 {
-    return now_s >= st->last_hb_s ? now_s - st->last_hb_s : 0;
+    return sat_add(now_s >= st->last_hb_s ? now_s - st->last_hb_s : 0, st->hb_carry_s);
+}
+
+uint32_t wd_since_trigger_s(const wd_state_t *st, uint32_t now_s)
+{
+    return sat_add(now_s >= st->triggered_at_s ? now_s - st->triggered_at_s : 0, st->trig_carry_s);
 }
 
 bool wd_on_heartbeat(wd_state_t *st, uint32_t now_s)
 {
     bool rearmed = st->triggered;
     st->last_hb_s = now_s;
+    st->hb_carry_s = 0;
     if (rearmed) {
         st->triggered = false;
         st->triggered_at_s = 0;
+        st->trig_carry_s = 0;
         reset_nodes(st);
     }
     return rearmed;
@@ -225,6 +239,7 @@ void wd_set_armed(wd_state_t *st, bool armed, uint32_t now_s)
     st->cfg.armed = armed;
     if (armed && !was && st->triggered) {
         st->triggered_at_s = now_s;
+        st->trig_carry_s = 0;
         reset_nodes(st);
     }
 }
@@ -236,6 +251,7 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s)
         if (wd_age_s(st, now_s) < st->cfg.timeout_s) return act;
         st->triggered = true;
         st->triggered_at_s = now_s;
+        st->trig_carry_s = 0;
         reset_nodes(st);
         act.kind = WD_ACT_TRIGGERED;
         return act;
@@ -243,7 +259,7 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s)
     if (!st->cfg.armed) return act;
     for (int i = 0; i < st->cfg.node_count; i++) {
         if (st->node_state[i] != WD_NODE_PENDING || st->node_due_s[i] > now_s) continue;
-        if (now_s - st->triggered_at_s > WD_RETRY_WINDOW_S) {
+        if (wd_since_trigger_s(st, now_s) > WD_RETRY_WINDOW_S) {
             st->node_state[i] = WD_NODE_GAVE_UP;
             continue;
         }
@@ -288,7 +304,7 @@ size_t wd_heartbeat_json(const wd_state_t *st, uint32_t age_s, char *buf, size_t
         if (w_ > 0) o += (size_t)w_;                                \
     } while (0)
 
-size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, double die_c, const char *fw, bool armed_capable, char *buf, size_t n)
+size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, double die_c, const char *fw, bool armed_capable, const wd_diag_t *dg, char *buf, size_t n)
 {
     size_t o = 0;
     APPEND("{\"mode\":\"%s\",\"armed_capable\":%s,\"last_heartbeat_age_s\":%u,\"timeout_s\":%u,\"setpoint_c\":%.2f,\"endpoint\":%u,\"triggered\":%s,\"triggered_at_uptime_s\":",
@@ -309,7 +325,105 @@ size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, doub
     APPEND("],\"die_temperature_c\":");
     if (have_temp) APPEND("%.1f", die_c);
     else APPEND("null");
-    APPEND(",\"uptime_s\":%u,\"fw\":\"%s\"}", (unsigned)now_s, fw ? fw : "");
+    APPEND(",\"uptime_s\":%u,\"fw\":\"%s\"", (unsigned)now_s, fw ? fw : "");
+    if (dg) {
+        APPEND(",\"reset_reason\":\"%s\",\"reset_reason_code\":%d,\"state_restored\":%s,\"conn_reboots\":%u,\"conn_level\":%u,\"wifi_ip\":%s,\"noip_s\":%u,\"wifi_disc_reason\":",
+               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->conn_reboots, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s);
+        if (dg->disc_reason > 0) APPEND("%d", dg->disc_reason);
+        else APPEND("null");
+    }
+    APPEND("}");
     if (n) buf[o < n ? o : n - 1] = '\0';
     return o;
+}
+
+static uint32_t rtc_sum(const wd_rtc_t *r)
+{
+    const uint8_t *p = (const uint8_t *)r;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < offsetof(wd_rtc_t, sum); i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+}
+
+void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t conn_reboots, uint32_t disc_reason, bool conn_pending)
+{
+    memset(r, 0, sizeof(*r));
+    r->magic = WD_RTC_MAGIC;
+    r->hb_age_s = wd_age_s(st, now_s);
+    r->triggered = st->triggered;
+    r->trig_age_s = st->triggered ? wd_since_trigger_s(st, now_s) : 0;
+    r->conn_reboots = conn_reboots;
+    r->disc_reason = disc_reason;
+    r->conn_level = c->level;
+    r->conn_pending = conn_pending;
+    r->sum = rtc_sum(r);
+}
+
+bool wd_rtc_valid(const wd_rtc_t *r)
+{
+    return r->magic == WD_RTC_MAGIC && r->sum == rtc_sum(r);
+}
+
+void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s)
+{
+    st->last_hb_s = now_s;
+    st->hb_carry_s = sat_add(r->hb_age_s, WD_REBOOT_GAP_S);
+    if (!r->triggered) return;
+    st->triggered = true;
+    st->triggered_at_s = now_s;
+    st->trig_carry_s = sat_add(r->trig_age_s, WD_REBOOT_GAP_S);
+    reset_nodes(st);
+}
+
+void wd_conn_init(wd_conn_t *c, uint8_t level, uint32_t now_s)
+{
+    c->level = level;
+    c->has_ip = false;
+    c->since_s = now_s;
+}
+
+void wd_conn_update(wd_conn_t *c, bool has_ip, uint32_t now_s)
+{
+    if (has_ip != c->has_ip) {
+        c->has_ip = has_ip;
+        c->since_s = now_s;
+    } else if (has_ip && now_s - c->since_s >= WD_CONN_STABLE_S) {
+        c->level = 0;
+    }
+}
+
+uint32_t wd_conn_limit_s(uint8_t level, uint32_t base_s)
+{
+    static const uint32_t mult[WD_CONN_LEVELS] = {1, 4, 24};
+    return base_s * mult[level < WD_CONN_LEVELS ? level : WD_CONN_LEVELS - 1];
+}
+
+bool wd_conn_due(const wd_conn_t *c, uint32_t now_s, uint32_t base_s)
+{
+    return !c->has_ip && now_s - c->since_s >= wd_conn_limit_s(c->level, base_s);
+}
+
+bool wd_failsafe_busy(const wd_state_t *st, uint32_t now_s)
+{
+    if (!st->cfg.armed) return false;
+    if (!st->triggered) return st->cfg.timeout_s <= WD_REBOOT_GUARD_S || wd_age_s(st, now_s) >= st->cfg.timeout_s - WD_REBOOT_GUARD_S;
+    if (wd_since_trigger_s(st, now_s) > WD_RETRY_WINDOW_S) return false;
+    for (int i = 0; i < st->cfg.node_count; i++) {
+        if (st->node_state[i] == WD_NODE_PENDING) return true;
+    }
+    return false;
+}
+
+bool wd_conn_reboot_ok(const wd_conn_t *c, const wd_state_t *st, uint32_t now_s, uint32_t base_s, bool ota_pending)
+{
+    return base_s > 0 && !ota_pending && wd_conn_due(c, now_s, base_s) && !wd_failsafe_busy(st, now_s);
+}
+
+bool wd_feed_ok(uint32_t now_s, uint32_t last_tick_s, bool send_active, uint32_t send_since_s, bool ot_seen)
+{
+    if (!ot_seen && now_s > WD_OT_BOOT_S) return false;
+    if (send_active) return now_s - send_since_s <= WD_SEND_MAX_S;
+    return now_s - last_tick_s <= WD_STALL_S;
 }

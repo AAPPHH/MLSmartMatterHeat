@@ -147,7 +147,7 @@ static void test_armed_sends_each_node_once_then_rearm(void)
     CHECK(wd_tick(&st, 602).kind == WD_ACT_NONE);
     CHECK(wd_tick(&st, 5000).kind == WD_ACT_NONE);
     char buf[512];
-    wd_status_json(&st, 5000, true, 41.5, "v1", true, buf, sizeof(buf));
+    wd_status_json(&st, 5000, true, 41.5, "v1", true, NULL, buf, sizeof(buf));
     CHECK(strstr(buf, "\"triggered\":true") && strstr(buf, "\"node\":5,\"ok\":true,\"err\":null"));
     CHECK(wd_on_heartbeat(&st, 5001));
     CHECK(!st.triggered);
@@ -179,7 +179,7 @@ static void test_retry_backoff_and_giveup(void)
     CHECK(last <= 600 + WD_RETRY_WINDOW_S);
     CHECK(st.node_state[0] == WD_NODE_GAVE_UP);
     char buf[512];
-    wd_status_json(&st, t, false, 0, "v1", true, buf, sizeof(buf));
+    wd_status_json(&st, t, false, 0, "v1", true, NULL, buf, sizeof(buf));
     CHECK(strstr(buf, "\"ok\":false,\"err\":\"timeout__no_resp\"") && strstr(buf, "\"die_temperature_c\":null"));
 }
 
@@ -212,15 +212,209 @@ static void test_status_json_shape(void)
 {
     wd_state_t st = fresh(false);
     char buf[512];
-    size_t n = wd_status_json(&st, 12, true, 38.46, "fw1", false, buf, sizeof(buf));
+    size_t n = wd_status_json(&st, 12, true, 38.46, "fw1", false, NULL, buf, sizeof(buf));
     CHECK(n == strlen(buf));
     CHECK(strstr(buf, "\"mode\":\"dry_run\"") && strstr(buf, "\"triggered\":false") && strstr(buf, "\"triggered_at_uptime_s\":null"));
     CHECK(strstr(buf, "\"results\":[]") && strstr(buf, "\"die_temperature_c\":38.5") && strstr(buf, "\"uptime_s\":12") && strstr(buf, "\"fw\":\"fw1\"") && strstr(buf, "\"timeout_s\":600"));
     char small[16];
-    wd_status_json(&st, 12, true, 38.46, "fw1", false, small, sizeof(small));
+    wd_status_json(&st, 12, true, 38.46, "fw1", false, NULL, small, sizeof(small));
     CHECK(strlen(small) == 15);
     n = wd_heartbeat_json(&st, 30, buf, sizeof(buf));
     CHECK(n == strlen(buf) && strcmp(buf, "{\"ok\":true,\"mode\":\"dry_run\",\"age_s\":30}") == 0);
+}
+
+static void test_status_json_diag(void)
+{
+    wd_state_t st = fresh(true);
+    st.triggered = true;
+    for (int i = 0; i < st.cfg.node_count; i++) st.node_tried[i] = 1;
+    wd_diag_t dg = {"task_wdt", 6, 3, 2, 8, true, 77, true};
+    char buf[2048];
+    size_t n = wd_status_json(&st, 900, true, 40.0, "fw1-long-version-string-0123456789", true, &dg, buf, sizeof(buf));
+    CHECK(n == strlen(buf) && n < 1200);
+    CHECK(strstr(buf, "\"reset_reason\":\"task_wdt\"") && strstr(buf, "\"reset_reason_code\":6") && strstr(buf, "\"conn_reboots\":3") && strstr(buf, "\"wifi_disc_reason\":8"));
+    CHECK(strstr(buf, "\"state_restored\":true") && strstr(buf, "\"wifi_ip\":true") && strstr(buf, "\"noip_s\":77") && strstr(buf, "\"conn_level\":2"));
+    dg.disc_reason = 0;
+    wd_status_json(&st, 900, false, 0, "fw1", true, &dg, buf, sizeof(buf));
+    CHECK(strstr(buf, "\"wifi_disc_reason\":null") && strstr(buf, "\"die_temperature_c\":null"));
+}
+
+static void test_restore_keeps_timer_across_reboots(void)
+{
+    wd_state_t st = fresh(true);
+    wd_conn_t c;
+    wd_conn_init(&c, 0, 0);
+    wd_on_heartbeat(&st, 10);
+    wd_rtc_t r;
+    wd_rtc_pack(&r, &st, 400, &c, 0, 0, false);
+    CHECK(wd_rtc_valid(&r) && r.hb_age_s == 390 && !r.triggered);
+    wd_state_t st2 = fresh(true);
+    wd_state_restore(&st2, &r, 15);
+    CHECK(wd_age_s(&st2, 15) == 390 + WD_REBOOT_GAP_S);
+    CHECK(wd_tick(&st2, 15).kind == WD_ACT_NONE);
+    CHECK(wd_tick(&st2, 15 + 600 - 390 - WD_REBOOT_GAP_S).kind == WD_ACT_TRIGGERED);
+    wd_state_t cur = fresh(true);
+    wd_state_restore(&cur, &r, 15);
+    for (int k = 0; k < 40 && wd_age_s(&cur, 35) < 600; k++) {
+        wd_rtc_pack(&r, &cur, 35, &c, 0, 0, false);
+        cur = fresh(true);
+        wd_state_restore(&cur, &r, 15);
+    }
+    CHECK(wd_age_s(&cur, 35) >= 600);
+    CHECK(wd_tick(&cur, 35).kind == WD_ACT_TRIGGERED);
+    wd_on_heartbeat(&cur, 40);
+    CHECK(wd_age_s(&cur, 40) == 0 && cur.hb_carry_s == 0);
+}
+
+static void test_restore_triggered_resumes_window(void)
+{
+    wd_state_t st = fresh(true);
+    wd_conn_t c;
+    wd_conn_init(&c, 0, 0);
+    wd_tick(&st, 600);
+    wd_action_t a = wd_tick(&st, 600);
+    CHECK(a.kind == WD_ACT_SEND);
+    wd_report(&st, a.node_idx, false, "timeout", 600);
+    wd_rtc_t r;
+    wd_rtc_pack(&r, &st, 1500, &c, 1, 8, false);
+    CHECK(r.triggered && r.trig_age_s == 900 && r.disc_reason == 8 && r.conn_reboots == 1);
+    wd_state_t st2 = fresh(true);
+    wd_state_restore(&st2, &r, 20);
+    CHECK(st2.triggered && wd_since_trigger_s(&st2, 20) == 900 + WD_REBOOT_GAP_S);
+    CHECK(wd_tick(&st2, 20).kind == WD_ACT_SEND);
+    CHECK(wd_tick(&st2, 20 + WD_RETRY_WINDOW_S - 900 - WD_REBOOT_GAP_S + 1).kind == WD_ACT_NONE);
+    CHECK(st2.node_state[0] == WD_NODE_GAVE_UP);
+    wd_on_heartbeat(&st2, 5000);
+    CHECK(!st2.triggered && st2.trig_carry_s == 0 && st2.node_state[0] == WD_NODE_PENDING);
+}
+
+static void test_rtc_validation(void)
+{
+    wd_state_t st = fresh(false);
+    wd_conn_t c;
+    wd_conn_init(&c, 1, 0);
+    wd_rtc_t r;
+    wd_rtc_pack(&r, &st, 50, &c, 2, 0, true);
+    CHECK(wd_rtc_valid(&r) && r.conn_level == 1 && r.conn_pending);
+    r.hb_age_s ^= 1;
+    CHECK(!wd_rtc_valid(&r));
+    wd_rtc_t z;
+    memset(&z, 0, sizeof(z));
+    CHECK(!wd_rtc_valid(&z));
+    memset(&z, 0xA5, sizeof(z));
+    CHECK(!wd_rtc_valid(&z));
+}
+
+static void test_conn_backoff(void)
+{
+    wd_conn_t c;
+    uint32_t base = 900;
+    CHECK(wd_conn_limit_s(0, base) == 900 && wd_conn_limit_s(1, base) == 3600 && wd_conn_limit_s(2, base) == 21600 && wd_conn_limit_s(200, base) == 21600);
+    wd_conn_init(&c, 0, 100);
+    CHECK(!wd_conn_due(&c, 100 + 899, base) && wd_conn_due(&c, 100 + 900, base));
+    wd_conn_update(&c, false, 500);
+    CHECK(c.since_s == 100);
+    wd_conn_init(&c, 1, 5);
+    CHECK(!wd_conn_due(&c, 5 + 3599, base) && wd_conn_due(&c, 5 + 3600, base));
+    wd_conn_init(&c, 2, 5);
+    CHECK(!wd_conn_due(&c, 5 + 21599, base) && wd_conn_due(&c, 5 + 21600, base));
+    wd_conn_update(&c, true, 1000);
+    CHECK(c.has_ip && !wd_conn_due(&c, 1000000, base) && c.level == 2);
+    wd_conn_update(&c, true, 1000 + WD_CONN_STABLE_S - 1);
+    CHECK(c.level == 2);
+    wd_conn_update(&c, true, 1000 + WD_CONN_STABLE_S);
+    CHECK(c.level == 0);
+    wd_conn_init(&c, 2, 0);
+    wd_conn_update(&c, true, 100);
+    wd_conn_update(&c, false, 200);
+    CHECK(c.level == 2 && c.since_s == 200 && !wd_conn_due(&c, 200 + 900, base));
+}
+
+static void test_long_outage_no_reboot_loop(void)
+{
+    wd_state_t st = fresh(false);
+    wd_conn_t c;
+    uint32_t base = 900, boots = 0, up = 0, total = 0, horizon = 48 * 3600, first[3] = {0, 0, 0};
+    wd_conn_init(&c, 0, 0);
+    while (total < horizon) {
+        total++;
+        up++;
+        if (!wd_conn_reboot_ok(&c, &st, up, base, false)) continue;
+        if (boots < 3) first[boots] = total;
+        boots++;
+        wd_conn_init(&c, c.level + 1, 0);
+        up = 0;
+    }
+    CHECK(first[0] == 900 && first[1] == 900 + 3600 && first[2] == 900 + 3600 + 21600);
+    CHECK(boots == 2 + (horizon - 900 - 3600) / 21600);
+}
+
+static void test_failsafe_blocks_conn_reboot(void)
+{
+    wd_state_t st = fresh(true);
+    wd_conn_t c;
+    uint32_t base = 900;
+    wd_conn_init(&c, 0, 0);
+    wd_on_heartbeat(&st, 0);
+    CHECK(!wd_failsafe_busy(&st, 299) && wd_failsafe_busy(&st, 300) && wd_failsafe_busy(&st, 599));
+    CHECK(!wd_conn_reboot_ok(&c, &st, 1000, base, true));
+    wd_state_t idle = fresh(false);
+    CHECK(wd_conn_reboot_ok(&c, &idle, 1000, base, false));
+    CHECK(!wd_conn_reboot_ok(&c, &idle, 1000, base, true));
+    CHECK(!wd_conn_reboot_ok(&c, &idle, 1000, 0, false));
+    wd_state_t dry = fresh(false);
+    wd_tick(&dry, 5000);
+    CHECK(dry.triggered && !wd_failsafe_busy(&dry, 5100));
+    wd_state_t arm = fresh(true);
+    wd_conn_t late;
+    wd_conn_init(&late, 0, 0);
+    CHECK(wd_tick(&arm, 600).kind == WD_ACT_TRIGGERED);
+    CHECK(wd_failsafe_busy(&arm, 600) && !wd_conn_reboot_ok(&late, &arm, 1000, base, false));
+    for (int i = 0; i < arm.cfg.node_count; i++) {
+        wd_action_t a = wd_tick(&arm, 700);
+        CHECK(a.kind == WD_ACT_SEND);
+        wd_report(&arm, a.node_idx, true, NULL, 700);
+    }
+    CHECK(!wd_failsafe_busy(&arm, 710) && wd_conn_reboot_ok(&late, &arm, 1000, base, false));
+    wd_state_t gu = fresh(true);
+    wd_tick(&gu, 600);
+    CHECK(wd_failsafe_busy(&gu, 600 + WD_RETRY_WINDOW_S));
+    CHECK(!wd_failsafe_busy(&gu, 600 + WD_RETRY_WINDOW_S + 1));
+    wd_state_t big = fresh(true);
+    big.hb_carry_s = UINT32_MAX;
+    CHECK(wd_failsafe_busy(&big, 100) && wd_age_s(&big, 100) == UINT32_MAX);
+}
+
+static void test_armed_trigger_survives_reboot_loop(void)
+{
+    wd_state_t st = fresh(true);
+    wd_conn_t c;
+    wd_rtc_t r;
+    wd_conn_init(&c, 0, 0);
+    wd_on_heartbeat(&st, 0);
+    uint32_t sent = 0;
+    for (int boot = 0; boot < 60 && !sent; boot++) {
+        wd_rtc_pack(&r, &st, 60, &c, 0, 0, false);
+        st = fresh(true);
+        wd_state_restore(&st, &r, 20);
+        for (uint32_t t = 20; t < 80 && !sent; t++) {
+            wd_action_t a = wd_tick(&st, t);
+            if (a.kind == WD_ACT_SEND) sent = 1;
+        }
+    }
+    CHECK(sent);
+}
+
+static void test_feed_ok(void)
+{
+    CHECK(wd_feed_ok(100, 99, false, 0, true));
+    CHECK(wd_feed_ok(130, 100, false, 0, true));
+    CHECK(!wd_feed_ok(131, 100, false, 0, true));
+    CHECK(wd_feed_ok(1000, 100, true, 100, true));
+    CHECK(wd_feed_ok(100 + WD_SEND_MAX_S, 100, true, 100, true));
+    CHECK(!wd_feed_ok(101 + WD_SEND_MAX_S, 100, true, 100, true));
+    CHECK(wd_feed_ok(WD_OT_BOOT_S, WD_OT_BOOT_S, false, 0, false));
+    CHECK(!wd_feed_ok(WD_OT_BOOT_S + 1, WD_OT_BOOT_S + 1, false, 0, false));
 }
 
 int main(void)
@@ -236,6 +430,15 @@ int main(void)
     test_retry_stops_on_heartbeat();
     test_dry_to_armed_during_outage();
     test_status_json_shape();
+    test_status_json_diag();
+    test_restore_keeps_timer_across_reboots();
+    test_restore_triggered_resumes_window();
+    test_rtc_validation();
+    test_conn_backoff();
+    test_long_outage_no_reboot_loop();
+    test_failsafe_blocks_conn_reboot();
+    test_armed_trigger_survives_reboot_loop();
+    test_feed_ok();
     printf("%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }
