@@ -121,3 +121,9 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 # OTA
 #
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+#
+# Hang protection: task WDT panics (panic reboots at once), 30 s leaves room for CASE crypto and flash writes
+#
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
