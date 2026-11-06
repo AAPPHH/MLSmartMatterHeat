@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../main/watchdog_core.h"
+#include "cJSON.h"
 
 static int failures;
 static int checks;
@@ -525,8 +526,59 @@ static void test_crash_only_counts_active_send(void)
     CHECK(!wd_rtc_valid(&r));
 }
 
+static void test_blackbox(void)
+{
+    wd_trace_t t;
+    memset(&t, 0xA5, sizeof(t));
+    CHECK(!wd_trace_valid(&t));
+    wd_trace_mark(&t, WD_ST_TX, 5, 100);
+    CHECK(!wd_trace_valid(&t));
+    wd_trace_begin(&t, 8, 1000);
+    CHECK(wd_trace_valid(&t) && t.seq == 1 && t.stage == WD_ST_START);
+    wd_trace_mark(&t, WD_ST_LOOKUP, 1010, 9000);
+    wd_trace_mark(&t, WD_ST_TX, 1500, 4000);
+    wd_trace_mark(&t, WD_ST_RXWAIT, 1501, 8000);
+    wd_trace_mark(&t, WD_ST_CRYPTO, 1900, 3000);
+    wd_trace_mark(&t, WD_ST_TX, 2400, 5000);
+    CHECK(wd_trace_valid(&t) && t.tx == 2 && t.rx == 1 && t.stack_min == 3000 && t.stage_ms[WD_ST_TX] == 1400);
+    wd_panic_t p;
+    memset(&p, 0, sizeof(p));
+    CHECK(!wd_panic_valid(&p));
+    p.count = 2;
+    p.exception = 4;
+    p.cause = 28;
+    p.pc = 0x42009555;
+    p.bt[0] = 0x42009555;
+    p.bt[1] = 0x4200aaaa;
+    wd_append_clean(p.task, sizeof(p.task), "br_watch");
+    wd_append_clean(p.task, sizeof(p.task), "dog\"x\n-and-more-than-fifteen");
+    wd_append_clean(p.twdt, sizeof(p.twdt), "\n - br_supervisor (CPU 0)");
+    CHECK(!strcmp(p.task, "br_watchdog_x_-"));
+    wd_panic_seal(&p);
+    char buf[1024];
+    size_t n = wd_blackbox_json(&p, &t, buf, sizeof(buf));
+    CHECK(n < sizeof(buf) && strstr(buf, "\"exception\":\"fault\"") && strstr(buf, "\"pc\":\"0x42009555\"") && strstr(buf, "\"backtrace\":[\"0x42009555\",\"0x4200aaaa\"]"));
+    CHECK(strstr(buf, "\"stage\":\"tx\"") && strstr(buf, "\"tx\":2,\"rx\":1,\"stack_min\":3000") && strstr(buf, "\"lookup\":10") && strstr(buf, "\"twdt\":\"_ - br_supervisor (CPU 0)\""));
+    char full[1100];
+    snprintf(full, sizeof(full), "{%s}", buf);
+    cJSON *j = cJSON_Parse(full);
+    CHECK(j && cJSON_GetObjectItem(cJSON_GetObjectItem(j, "last_send"), "seq")->valueint == 1);
+    cJSON_Delete(j);
+    p.pc ^= 1;
+    CHECK(!wd_panic_valid(&p));
+    wd_blackbox_json(&p, NULL, buf, sizeof(buf));
+    CHECK(!strcmp(buf, "\"last_panic\":null,\"last_send\":null"));
+    char small[20];
+    wd_panic_seal(&p);
+    n = wd_blackbox_json(&p, &t, small, sizeof(small));
+    CHECK(n > sizeof(small) && strlen(small) == sizeof(small) - 1);
+    wd_trace_begin(&t, 9, 5000);
+    CHECK(t.seq == 2 && t.tx == 0 && t.stack_min == 0);
+}
+
 int main(void)
 {
+    test_blackbox();
     test_send_crash_guard();
     test_crash_only_counts_active_send();
     test_u64_str();

@@ -375,13 +375,51 @@ static uint32_t nodes_hash(const wd_config_t *cfg)
 
 static uint32_t rtc_sum(const wd_rtc_t *r)
 {
-    const uint8_t *p = (const uint8_t *)r;
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < offsetof(wd_rtc_t, sum); i++) {
-        h = (h ^ p[i]) * 16777619u;
-    }
-    return h;
+    return wd_fnv(r, offsetof(wd_rtc_t, sum));
 }
+
+bool wd_panic_valid(const wd_panic_t *p)
+{
+    return p->magic == WD_PANIC_MAGIC && p->sum == wd_fnv(p, offsetof(wd_panic_t, sum));
+}
+
+static void trace_seal(wd_trace_t *t)
+{
+    t->magic = WD_TRACE_MAGIC;
+    t->sum = wd_fnv(t, offsetof(wd_trace_t, sum));
+}
+
+bool wd_trace_valid(const wd_trace_t *t)
+{
+    return t->magic == WD_TRACE_MAGIC && t->stage < WD_ST_COUNT && t->sum == wd_fnv(t, offsetof(wd_trace_t, sum));
+}
+
+void wd_trace_begin(wd_trace_t *t, uint64_t node, uint32_t now_ms)
+{
+    uint32_t seq = wd_trace_valid(t) ? t->seq + 1 : 1;
+    memset(t, 0, sizeof(*t));
+    t->seq = seq;
+    t->start_ms = now_ms;
+    t->node_lo = (uint32_t)node;
+    t->stage = WD_ST_START;
+    t->seen = 1u << WD_ST_START;
+    trace_seal(t);
+}
+
+void wd_trace_mark(wd_trace_t *t, wd_stage_t stage, uint32_t now_ms, uint32_t stack_free)
+{
+    if (!wd_trace_valid(t) || stage >= WD_ST_COUNT) return;
+    t->stage = (uint8_t)stage;
+    t->stage_ms[stage] = now_ms - t->start_ms;
+    t->seen |= (uint16_t)(1u << stage);
+    if (stage == WD_ST_TX) t->tx++;
+    if (stage == WD_ST_CRYPTO) t->rx++;
+    if (stack_free && (!t->stack_min || stack_free < t->stack_min)) t->stack_min = stack_free;
+    trace_seal(t);
+}
+
+static const char *const stage_names[WD_ST_COUNT] = {"idle", "start", "creds", "lookup", "connect", "tx", "rx_wait", "crypto", "done"};
+static const char *const exception_names[] = {"debug", "iwdt", "twdt", "abort", "fault"};
 
 void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason)
 {
@@ -473,4 +511,35 @@ bool wd_feed_ok(uint32_t now_s, uint32_t last_tick_s, bool send_active, uint32_t
     if (!ot_seen && now_s > WD_OT_BOOT_S) return false;
     if (send_active) return now_s - send_since_s <= WD_SEND_MAX_S;
     return now_s - last_tick_s <= WD_STALL_S;
+}
+
+size_t wd_blackbox_json(const wd_panic_t *p, const wd_trace_t *t, char *buf, size_t n)
+{
+    size_t o = 0;
+    APPEND("\"last_panic\":");
+    if (p && wd_panic_valid(p)) {
+        APPEND("{\"count\":%u,\"uptime_s\":%u,\"exception\":\"%s\",\"cause\":%u,\"pc\":\"0x%08x\",\"excvaddr\":\"0x%08x\",\"core\":%u,\"task\":\"%.15s\",\"reason\":\"%.31s\",\"details\":\"%.47s\",\"twdt\":\"%.111s\",\"backtrace\":[",
+               (unsigned)p->count, (unsigned)p->uptime_s, p->exception < sizeof(exception_names) / sizeof(exception_names[0]) ? exception_names[p->exception] : "unknown", (unsigned)p->cause, (unsigned)p->pc, (unsigned)p->excvaddr, (unsigned)p->core, p->task, p->reason, p->details, p->twdt);
+        for (int i = 0; i < WD_BT_FRAMES && p->bt[i]; i++) {
+            APPEND("%s\"0x%08x\"", i ? "," : "", (unsigned)p->bt[i]);
+        }
+        APPEND("]}");
+    } else {
+        APPEND("null");
+    }
+    APPEND(",\"last_send\":");
+    if (t && wd_trace_valid(t)) {
+        APPEND("{\"seq\":%u,\"node\":%u,\"stage\":\"%s\",\"tx\":%u,\"rx\":%u,\"stack_min\":%u,\"start_ms\":%u,\"stage_ms\":{", (unsigned)t->seq, (unsigned)t->node_lo, stage_names[t->stage], (unsigned)t->tx, (unsigned)t->rx, (unsigned)t->stack_min, (unsigned)t->start_ms);
+        bool first = true;
+        for (int i = 0; i < WD_ST_COUNT; i++) {
+            if (!(t->seen & (1u << i))) continue;
+            APPEND("%s\"%s\":%u", first ? "" : ",", stage_names[i], (unsigned)t->stage_ms[i]);
+            first = false;
+        }
+        APPEND("}}");
+    } else {
+        APPEND("null");
+    }
+    if (n) buf[o < n ? o : n - 1] = '\0';
+    return o;
 }

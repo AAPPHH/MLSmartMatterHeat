@@ -19,6 +19,9 @@
 #define WD_OT_BOOT_S 600
 #define WD_CRASH_MAX 2
 #define WD_CRASH_BACKOFF_S 120
+#define WD_BT_FRAMES 8
+#define WD_TRACE_MAGIC 0x57445443u
+#define WD_PANIC_MAGIC 0x57445041u
 #define WD_RTC_MAGIC 0x57445255u
 
 typedef enum { WD_OK = 0, WD_E_JSON, WD_E_FIELD, WD_E_RANGE } wd_err_t;
@@ -71,6 +74,41 @@ typedef struct {
     uint32_t sum;
 } wd_rtc_t;
 
+typedef enum { WD_ST_IDLE = 0, WD_ST_START, WD_ST_CREDS, WD_ST_LOOKUP, WD_ST_CONNECT, WD_ST_TX, WD_ST_RXWAIT, WD_ST_CRYPTO, WD_ST_DONE, WD_ST_COUNT } wd_stage_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t seq;
+    uint32_t start_ms;
+    uint32_t node_lo;
+    uint32_t stack_min;
+    uint32_t stage_ms[WD_ST_COUNT];
+    uint16_t seen;
+    uint16_t tx;
+    uint16_t rx;
+    uint8_t stage;
+    uint8_t pad;
+    uint32_t sum;
+} wd_trace_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t count;
+    uint32_t uptime_s;
+    uint32_t pc;
+    uint32_t excvaddr;
+    uint32_t cause;
+    uint32_t bt[WD_BT_FRAMES];
+    uint8_t exception;
+    uint8_t core;
+    uint8_t pad[2];
+    char task[16];
+    char reason[32];
+    char details[48];
+    char twdt[112];
+    uint32_t sum;
+} wd_panic_t;
+
 typedef struct {
     uint8_t level;
     bool has_ip;
@@ -102,6 +140,36 @@ typedef struct {
 } wd_creds_t;
 
 size_t wd_u64_str(uint64_t v, char *buf, size_t n);
+
+#define WD_INLINE static inline __attribute__((always_inline))
+
+WD_INLINE uint32_t wd_fnv(const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ b[i]) * 16777619u;
+    }
+    return h;
+}
+
+WD_INLINE void wd_append_clean(char *dst, size_t n, const char *src)
+{
+    size_t o = 0;
+    while (o + 1 < n && dst[o]) o++;
+    for (size_t i = 0; src && src[i] && o + 1 < n; i++) {
+        char c = src[i];
+        dst[o++] = c >= 32 && c < 127 && c != '"' && c != '\\' ? c : '_';
+    }
+    if (n) dst[o] = '\0';
+}
+
+WD_INLINE void wd_panic_seal(wd_panic_t *p)
+{
+    p->magic = WD_PANIC_MAGIC;
+    p->sum = wd_fnv(p, offsetof(wd_panic_t, sum));
+}
+
 void wd_config_defaults(wd_config_t *cfg);
 bool wd_config_valid(const wd_config_t *cfg);
 bool wd_config_equal(const wd_config_t *a, const wd_config_t *b);
@@ -127,4 +195,9 @@ uint32_t wd_conn_limit_s(uint8_t level, uint32_t base_s);
 bool wd_conn_due(const wd_conn_t *c, uint32_t now_s, uint32_t base_s);
 bool wd_wifi_restart_ok(const wd_conn_t *c, const wd_state_t *st, uint32_t now_s, uint32_t base_s);
 bool wd_feed_ok(uint32_t now_s, uint32_t last_tick_s, bool send_active, uint32_t send_since_s, bool ot_seen);
+bool wd_panic_valid(const wd_panic_t *p);
+bool wd_trace_valid(const wd_trace_t *t);
+void wd_trace_begin(wd_trace_t *t, uint64_t node, uint32_t now_ms);
+void wd_trace_mark(wd_trace_t *t, wd_stage_t stage, uint32_t now_ms, uint32_t stack_free);
+size_t wd_blackbox_json(const wd_panic_t *p, const wd_trace_t *t, char *buf, size_t n);
 size_t wd_heartbeat_json(const wd_state_t *st, uint32_t age_s, char *buf, size_t n);
