@@ -11,7 +11,7 @@
 #define WD_KEY_LEN 97
 #define WD_IPK_LEN 16
 #define WD_REBOOT_GAP_S 30
-#define WD_REBOOT_GUARD_S 300
+#define WD_HB_VETO_S 300
 #define WD_CONN_STABLE_S 600
 #define WD_CONN_LEVELS 3
 #define WD_SEND_MAX_S 2400
@@ -55,11 +55,12 @@ typedef struct {
     uint32_t magic;
     uint32_t hb_age_s;
     uint32_t trig_age_s;
-    uint32_t conn_reboots;
+    uint32_t wifi_restarts;
     uint32_t disc_reason;
+    uint32_t nodes_hash;
     uint8_t triggered;
     uint8_t conn_level;
-    uint8_t conn_pending;
+    uint8_t node_ok;
     uint8_t pad;
     uint32_t sum;
 } wd_rtc_t;
@@ -73,7 +74,7 @@ typedef struct {
 typedef struct {
     const char *reset_name;
     int reset_code;
-    uint32_t conn_reboots;
+    uint32_t wifi_restarts;
     uint32_t conn_level;
     int disc_reason;
     bool has_ip;
@@ -110,14 +111,13 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s);
 void wd_report(wd_state_t *st, int node_idx, bool ok, const char *err, uint32_t now_s);
 size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, double die_c, const char *fw, bool armed_capable, const wd_diag_t *dg, char *buf, size_t n);
 uint32_t wd_since_trigger_s(const wd_state_t *st, uint32_t now_s);
-void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t conn_reboots, uint32_t disc_reason, bool conn_pending);
+void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason);
 bool wd_rtc_valid(const wd_rtc_t *r);
 void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s);
 void wd_conn_init(wd_conn_t *c, uint8_t level, uint32_t now_s);
 void wd_conn_update(wd_conn_t *c, bool has_ip, uint32_t now_s);
 uint32_t wd_conn_limit_s(uint8_t level, uint32_t base_s);
 bool wd_conn_due(const wd_conn_t *c, uint32_t now_s, uint32_t base_s);
-bool wd_failsafe_busy(const wd_state_t *st, uint32_t now_s);
-bool wd_conn_reboot_ok(const wd_conn_t *c, const wd_state_t *st, uint32_t now_s, uint32_t base_s, bool ota_pending);
+bool wd_wifi_restart_ok(const wd_conn_t *c, const wd_state_t *st, uint32_t now_s, uint32_t base_s);
 bool wd_feed_ok(uint32_t now_s, uint32_t last_tick_s, bool send_active, uint32_t send_since_s, bool ot_seen);
 size_t wd_heartbeat_json(const wd_state_t *st, uint32_t age_s, char *buf, size_t n);

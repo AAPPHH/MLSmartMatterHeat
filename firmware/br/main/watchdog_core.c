@@ -327,14 +327,25 @@ size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, doub
     else APPEND("null");
     APPEND(",\"uptime_s\":%u,\"fw\":\"%s\"", (unsigned)now_s, fw ? fw : "");
     if (dg) {
-        APPEND(",\"reset_reason\":\"%s\",\"reset_reason_code\":%d,\"state_restored\":%s,\"conn_reboots\":%u,\"conn_level\":%u,\"wifi_ip\":%s,\"noip_s\":%u,\"wifi_disc_reason\":",
-               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->conn_reboots, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s);
+        APPEND(",\"reset_reason\":\"%s\",\"reset_reason_code\":%d,\"state_restored\":%s,\"wifi_restarts\":%u,\"conn_level\":%u,\"wifi_ip\":%s,\"noip_s\":%u,\"wifi_disc_reason\":",
+               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->wifi_restarts, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s);
         if (dg->disc_reason > 0) APPEND("%d", dg->disc_reason);
         else APPEND("null");
     }
     APPEND("}");
     if (n) buf[o < n ? o : n - 1] = '\0';
     return o;
+}
+
+static uint32_t nodes_hash(const wd_config_t *cfg)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < cfg->node_count; i++) {
+        for (int k = 0; k < 8; k++) {
+            h = (h ^ (uint8_t)(cfg->nodes[i] >> (8 * k))) * 16777619u;
+        }
+    }
+    return h;
 }
 
 static uint32_t rtc_sum(const wd_rtc_t *r)
@@ -347,17 +358,20 @@ static uint32_t rtc_sum(const wd_rtc_t *r)
     return h;
 }
 
-void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t conn_reboots, uint32_t disc_reason, bool conn_pending)
+void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason)
 {
     memset(r, 0, sizeof(*r));
     r->magic = WD_RTC_MAGIC;
     r->hb_age_s = wd_age_s(st, now_s);
     r->triggered = st->triggered;
     r->trig_age_s = st->triggered ? wd_since_trigger_s(st, now_s) : 0;
-    r->conn_reboots = conn_reboots;
+    r->wifi_restarts = wifi_restarts;
     r->disc_reason = disc_reason;
     r->conn_level = c->level;
-    r->conn_pending = conn_pending;
+    r->nodes_hash = nodes_hash(&st->cfg);
+    for (int i = 0; st->triggered && i < st->cfg.node_count; i++) {
+        if (st->node_state[i] == WD_NODE_OK) r->node_ok |= (uint8_t)(1u << i);
+    }
     r->sum = rtc_sum(r);
 }
 
@@ -375,6 +389,13 @@ void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s)
     st->triggered_at_s = now_s;
     st->trig_carry_s = sat_add(r->trig_age_s, WD_REBOOT_GAP_S);
     reset_nodes(st);
+    if (r->nodes_hash != nodes_hash(&st->cfg)) return;
+    for (int i = 0; i < st->cfg.node_count; i++) {
+        if (!(r->node_ok & (1u << i))) continue;
+        st->node_state[i] = WD_NODE_OK;
+        st->node_tried[i] = 1;
+        st->node_attempts[i] = 1;
+    }
 }
 
 void wd_conn_init(wd_conn_t *c, uint8_t level, uint32_t now_s)
@@ -405,20 +426,9 @@ bool wd_conn_due(const wd_conn_t *c, uint32_t now_s, uint32_t base_s)
     return !c->has_ip && now_s - c->since_s >= wd_conn_limit_s(c->level, base_s);
 }
 
-bool wd_failsafe_busy(const wd_state_t *st, uint32_t now_s)
+bool wd_wifi_restart_ok(const wd_conn_t *c, const wd_state_t *st, uint32_t now_s, uint32_t base_s)
 {
-    if (!st->cfg.armed) return false;
-    if (!st->triggered) return st->cfg.timeout_s <= WD_REBOOT_GUARD_S || wd_age_s(st, now_s) >= st->cfg.timeout_s - WD_REBOOT_GUARD_S;
-    if (wd_since_trigger_s(st, now_s) > WD_RETRY_WINDOW_S) return false;
-    for (int i = 0; i < st->cfg.node_count; i++) {
-        if (st->node_state[i] == WD_NODE_PENDING) return true;
-    }
-    return false;
-}
-
-bool wd_conn_reboot_ok(const wd_conn_t *c, const wd_state_t *st, uint32_t now_s, uint32_t base_s, bool ota_pending)
-{
-    return base_s > 0 && !ota_pending && wd_conn_due(c, now_s, base_s) && !wd_failsafe_busy(st, now_s);
+    return base_s > 0 && wd_conn_due(c, now_s, base_s) && wd_age_s(st, now_s) >= WD_HB_VETO_S;
 }
 
 bool wd_feed_ok(uint32_t now_s, uint32_t last_tick_s, bool send_active, uint32_t send_since_s, bool ot_seen)
