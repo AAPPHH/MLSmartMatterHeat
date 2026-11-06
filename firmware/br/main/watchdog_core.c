@@ -55,6 +55,17 @@ bool wd_config_equal(const wd_config_t *a, const wd_config_t *b)
     return memcmp(a->nodes, b->nodes, sizeof(uint64_t) * a->node_count) == 0;
 }
 
+static void clear_crashes(wd_state_t *st)
+{
+    memset(st->node_crashes, 0, sizeof(st->node_crashes));
+    st->sending = 0;
+    st->last_node = WD_NO_NODE;
+    st->last_send_s = 0;
+    st->send_carry_s = 0;
+    st->global_crashes = 0;
+    st->global_due_s = 0;
+}
+
 static void reset_nodes(wd_state_t *st)
 {
     memset(st->node_state, 0, sizeof(st->node_state));
@@ -62,12 +73,14 @@ static void reset_nodes(wd_state_t *st)
     memset(st->node_due_s, 0, sizeof(st->node_due_s));
     memset(st->node_attempts, 0, sizeof(st->node_attempts));
     memset(st->node_err, 0, sizeof(st->node_err));
+    clear_crashes(st);
 }
 
 void wd_state_init(wd_state_t *st, const wd_config_t *cfg)
 {
     memset(st, 0, sizeof(*st));
     st->cfg = *cfg;
+    st->last_node = WD_NO_NODE;
 }
 
 bool wd_token_ok(const char *expected, const char *provided)
@@ -237,8 +250,7 @@ uint32_t wd_since_trigger_s(const wd_state_t *st, uint32_t now_s)
 bool wd_on_heartbeat(wd_state_t *st, uint32_t now_s)
 {
     bool rearmed = st->triggered;
-    st->sending = 0;
-    st->send_crashes = 0;
+    clear_crashes(st);
     st->last_hb_s = now_s;
     st->hb_carry_s = 0;
     if (rearmed) {
@@ -254,10 +266,7 @@ void wd_set_armed(wd_state_t *st, bool armed, uint32_t now_s)
 {
     bool was = st->cfg.armed;
     st->cfg.armed = armed;
-    if (armed != was) {
-        st->sending = 0;
-        st->send_crashes = 0;
-    }
+    if (armed != was) clear_crashes(st);
     if (armed && !was && st->triggered) {
         st->triggered_at_s = now_s;
         st->trig_carry_s = 0;
@@ -278,16 +287,23 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s)
         return act;
     }
     if (!st->cfg.armed) return act;
+    int best = -1;
     for (int i = 0; i < st->cfg.node_count; i++) {
         if (st->node_state[i] != WD_NODE_PENDING || st->node_due_s[i] > now_s) continue;
         if (wd_since_trigger_s(st, now_s) > WD_RETRY_WINDOW_S) {
             st->node_state[i] = WD_NODE_GAVE_UP;
             continue;
         }
+        if (st->global_due_s > now_s) continue;
+        if (best < 0 || st->node_attempts[i] + st->node_crashes[i] < st->node_attempts[best] + st->node_crashes[best]) best = i;
+    }
+    if (best >= 0) {
         st->sending = 1;
+        st->last_node = (uint8_t)best;
+        st->last_send_s = now_s;
+        st->send_carry_s = 0;
         act.kind = WD_ACT_SEND;
-        act.node_idx = i;
-        return act;
+        act.node_idx = best;
     }
     return act;
 }
@@ -298,7 +314,9 @@ void wd_report(wd_state_t *st, int i, bool ok, const char *err, uint32_t now_s)
     if (!st->triggered || i < 0 || i >= st->cfg.node_count) return;
     st->node_tried[i] = 1;
     st->node_attempts[i]++;
+    st->node_crashes[i] = 0;
     if (ok) {
+        st->global_crashes = 0;
         st->node_state[i] = WD_NODE_OK;
         st->node_err[i][0] = '\0';
         return;
@@ -330,6 +348,8 @@ size_t wd_heartbeat_json(const wd_state_t *st, uint32_t age_s, char *buf, size_t
 size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, double die_c, const char *fw, bool armed_capable, const wd_diag_t *dg, char *buf, size_t n)
 {
     size_t o = 0;
+    unsigned crashes = 0;
+    for (int i = 0; i < WD_MAX_NODES; i++) crashes += st->node_crashes[i];
     APPEND("{\"mode\":\"%s\",\"armed_capable\":%s,\"last_heartbeat_age_s\":%u,\"timeout_s\":%u,\"setpoint_c\":%.2f,\"endpoint\":%u,\"triggered\":%s,\"triggered_at_uptime_s\":",
            st->cfg.armed ? "armed" : "dry_run", armed_capable ? "true" : "false", (unsigned)wd_age_s(st, now_s), (unsigned)st->cfg.timeout_s,
            st->cfg.setpoint_cc / 100.0, (unsigned)st->cfg.endpoint, st->triggered ? "true" : "false");
@@ -353,7 +373,7 @@ size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, doub
     APPEND(",\"uptime_s\":%u,\"fw\":\"%s\"", (unsigned)now_s, fw ? fw : "");
     if (dg) {
         APPEND(",\"reset_reason\":\"%s\",\"reset_reason_code\":%d,\"state_restored\":%s,\"wifi_restarts\":%u,\"conn_level\":%u,\"wifi_ip\":%s,\"noip_s\":%u,\"send_crashes\":%u,\"wifi_disc_reason\":",
-               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->wifi_restarts, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s, (unsigned)st->send_crashes);
+               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->wifi_restarts, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s, (unsigned)crashes);
         if (dg->disc_reason > 0) APPEND("%d", dg->disc_reason);
         else APPEND("null");
     }
@@ -421,14 +441,28 @@ void wd_trace_mark(wd_trace_t *t, wd_stage_t stage, uint32_t now_ms, uint32_t st
 static const char *const stage_names[WD_ST_COUNT] = {"idle", "start", "creds", "lookup", "connect", "tx", "rx_wait", "crypto", "done"};
 static const char *const exception_names[] = {"debug", "iwdt", "twdt", "abort", "fault"};
 
-void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason)
+static uint32_t remaining_s(uint32_t due_s, uint32_t now_s)
+{
+    return due_s > now_s ? due_s - now_s : 0;
+}
+
+static uint32_t minus_s(uint32_t v, uint32_t d)
+{
+    return v > d ? v - d : 0;
+}
+
+void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, uint32_t wall_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason)
 {
     memset(r, 0, sizeof(*r));
     r->magic = WD_RTC_MAGIC;
+    r->wall_s = wall_s;
     r->hb_age_s = wd_age_s(st, now_s);
     r->triggered = st->triggered;
     r->sending = st->triggered && st->sending;
-    r->send_crashes = st->triggered ? st->send_crashes : 0;
+    r->last_node = st->triggered ? st->last_node : WD_NO_NODE;
+    r->since_send_s = st->triggered && st->last_node != WD_NO_NODE ? sat_add(now_s >= st->last_send_s ? now_s - st->last_send_s : 0, st->send_carry_s) : UINT32_MAX;
+    r->global_crashes = st->triggered ? st->global_crashes : 0;
+    r->global_wait_s = st->triggered ? remaining_s(st->global_due_s, now_s) : 0;
     r->trig_age_s = st->triggered ? wd_since_trigger_s(st, now_s) : 0;
     r->wifi_restarts = wifi_restarts;
     r->disc_reason = disc_reason;
@@ -436,6 +470,8 @@ void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_con
     r->nodes_hash = nodes_hash(&st->cfg);
     for (int i = 0; st->triggered && i < st->cfg.node_count; i++) {
         if (st->node_state[i] == WD_NODE_OK) r->node_ok |= (uint8_t)(1u << i);
+        r->node_crashes[i] = st->node_crashes[i];
+        r->node_wait_s[i] = remaining_s(st->node_due_s[i], now_s);
     }
     r->sum = rtc_sum(r);
 }
@@ -445,32 +481,54 @@ bool wd_rtc_valid(const wd_rtc_t *r)
     return r->magic == WD_RTC_MAGIC && r->sum == rtc_sum(r);
 }
 
-void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s, bool crashed)
+static void mark_crash(wd_state_t *st, int i)
 {
+    st->node_tried[i] = 1;
+    snprintf(st->node_err[i], WD_ERR_LEN, "send_crash");
+    if (st->node_crashes[i] >= WD_CRASH_MAX) st->node_state[i] = WD_NODE_GAVE_UP;
+}
+
+void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s, uint32_t wall_s, bool abnormal)
+{
+    bool known = wall_s != WD_NO_WALL && r->wall_s != WD_NO_WALL && wall_s >= r->wall_s;
+    uint32_t gap = known ? wall_s - r->wall_s : WD_REBOOT_GAP_S;
+    uint32_t wait_gap = known ? gap : 0;
     st->last_hb_s = now_s;
-    st->hb_carry_s = sat_add(r->hb_age_s, WD_REBOOT_GAP_S);
+    st->hb_carry_s = sat_add(r->hb_age_s, gap);
     if (!r->triggered) return;
     st->triggered = true;
     st->triggered_at_s = now_s;
-    st->trig_carry_s = sat_add(r->trig_age_s, WD_REBOOT_GAP_S);
+    st->trig_carry_s = sat_add(r->trig_age_s, gap);
     reset_nodes(st);
     bool same = r->nodes_hash == nodes_hash(&st->cfg);
     for (int i = 0; same && i < st->cfg.node_count; i++) {
-        if (!(r->node_ok & (1u << i))) continue;
-        st->node_state[i] = WD_NODE_OK;
-        st->node_tried[i] = 1;
-        st->node_attempts[i] = 1;
+        if (r->node_ok & (1u << i)) {
+            st->node_state[i] = WD_NODE_OK;
+            st->node_tried[i] = 1;
+            st->node_attempts[i] = 1;
+            continue;
+        }
+        st->node_crashes[i] = r->node_crashes[i] > WD_CRASH_MAX ? WD_CRASH_MAX : r->node_crashes[i];
+        st->node_due_s[i] = now_s + minus_s(r->node_wait_s[i], wait_gap);
+        if (st->node_crashes[i]) mark_crash(st, i);
     }
-    unsigned crashes = r->send_crashes + (crashed && r->sending ? 1u : 0u);
-    st->send_crashes = (uint8_t)(crashes > WD_CRASH_MAX ? WD_CRASH_MAX : crashes);
-    for (int i = 0; st->send_crashes && i < st->cfg.node_count; i++) {
-        if (st->node_state[i] == WD_NODE_OK) continue;
-        st->node_tried[i] = 1;
-        st->node_attempts[i] = st->send_crashes;
-        st->node_due_s[i] = now_s + WD_CRASH_BACKOFF_S * st->send_crashes;
-        if (st->send_crashes >= WD_CRASH_MAX) st->node_state[i] = WD_NODE_GAVE_UP;
-        snprintf(st->node_err[i], WD_ERR_LEN, "send_crash");
+    if (same) {
+        st->global_crashes = r->global_crashes;
+        st->global_due_s = now_s + minus_s(r->global_wait_s, wait_gap);
+        st->last_node = r->last_node < st->cfg.node_count ? r->last_node : WD_NO_NODE;
+        st->last_send_s = now_s;
+        st->send_carry_s = sat_add(r->since_send_s, gap);
     }
+    if (!abnormal || !st->cfg.armed) return;
+    int n = st->last_node != WD_NO_NODE && (r->sending || st->send_carry_s <= WD_ATTRIB_S) ? st->last_node : -1;
+    if (n >= 0 && st->node_state[n] == WD_NODE_PENDING) {
+        st->node_crashes[n]++;
+        st->node_due_s[n] = now_s + WD_CRASH_BACKOFF_S;
+        mark_crash(st, n);
+    }
+    if (st->global_crashes < UINT8_MAX) st->global_crashes++;
+    if (st->global_crashes >= WD_GLOBAL_CRASH_MAX && st->global_due_s <= now_s) st->global_due_s = now_s + WD_GLOBAL_BACKOFF_S;
+    st->sending = 0;
 }
 
 void wd_conn_init(wd_conn_t *c, uint8_t level, uint32_t now_s)
@@ -518,8 +576,8 @@ size_t wd_blackbox_json(const wd_panic_t *p, const wd_trace_t *t, char *buf, siz
     size_t o = 0;
     APPEND("\"last_panic\":");
     if (p && wd_panic_valid(p)) {
-        APPEND("{\"count\":%u,\"uptime_s\":%u,\"exception\":\"%s\",\"cause\":%u,\"pc\":\"0x%08x\",\"excvaddr\":\"0x%08x\",\"core\":%u,\"task\":\"%.15s\",\"reason\":\"%.31s\",\"details\":\"%.47s\",\"twdt\":\"%.111s\",\"backtrace\":[",
-               (unsigned)p->count, (unsigned)p->uptime_s, p->exception < sizeof(exception_names) / sizeof(exception_names[0]) ? exception_names[p->exception] : "unknown", (unsigned)p->cause, (unsigned)p->pc, (unsigned)p->excvaddr, (unsigned)p->core, p->task, p->reason, p->details, p->twdt);
+        APPEND("{\"count\":%u,\"uptime_s\":%u,\"exception\":\"%s\",\"cause\":%u,\"a0\":\"0x%08x\",\"pc\":\"0x%08x\",\"excvaddr\":\"0x%08x\",\"core\":%u,\"task\":\"%.15s\",\"reason\":\"%.31s\",\"details\":\"%.47s\",\"twdt\":\"%.111s\",\"backtrace\":[",
+               (unsigned)p->count, (unsigned)p->uptime_s, p->exception < sizeof(exception_names) / sizeof(exception_names[0]) ? exception_names[p->exception] : "unknown", (unsigned)p->cause, (unsigned)p->a0, (unsigned)p->pc, (unsigned)p->excvaddr, (unsigned)p->core, p->task, p->reason, p->details, p->twdt);
         for (int i = 0; i < WD_BT_FRAMES && p->bt[i]; i++) {
             APPEND("%s\"0x%08x\"", i ? "," : "", (unsigned)p->bt[i]);
         }

@@ -247,19 +247,19 @@ static void test_restore_keeps_timer_across_reboots(void)
     wd_conn_init(&c, 0, 0);
     wd_on_heartbeat(&st, 10);
     wd_rtc_t r;
-    wd_rtc_pack(&r, &st, 400, &c, 0, 0);
+    wd_rtc_pack(&r, &st, 400, WD_NO_WALL, &c, 0, 0);
     CHECK(wd_rtc_valid(&r) && r.hb_age_s == 390 && !r.triggered);
     wd_state_t st2 = fresh(true);
-    wd_state_restore(&st2, &r, 15, false);
+    wd_state_restore(&st2, &r, 15, WD_NO_WALL, false);
     CHECK(wd_age_s(&st2, 15) == 390 + WD_REBOOT_GAP_S);
     CHECK(wd_tick(&st2, 15).kind == WD_ACT_NONE);
     CHECK(wd_tick(&st2, 15 + 600 - 390 - WD_REBOOT_GAP_S).kind == WD_ACT_TRIGGERED);
     wd_state_t cur = fresh(true);
-    wd_state_restore(&cur, &r, 15, false);
+    wd_state_restore(&cur, &r, 15, WD_NO_WALL, false);
     for (int k = 0; k < 40 && wd_age_s(&cur, 35) < 600; k++) {
-        wd_rtc_pack(&r, &cur, 35, &c, 0, 0);
+        wd_rtc_pack(&r, &cur, 35, WD_NO_WALL, &c, 0, 0);
         cur = fresh(true);
-        wd_state_restore(&cur, &r, 15, false);
+        wd_state_restore(&cur, &r, 15, WD_NO_WALL, false);
     }
     CHECK(wd_age_s(&cur, 35) >= 600);
     CHECK(wd_tick(&cur, 35).kind == WD_ACT_TRIGGERED);
@@ -277,10 +277,10 @@ static void test_restore_triggered_resumes_window(void)
     CHECK(a.kind == WD_ACT_SEND);
     wd_report(&st, a.node_idx, false, "timeout", 600);
     wd_rtc_t r;
-    wd_rtc_pack(&r, &st, 1500, &c, 1, 8);
+    wd_rtc_pack(&r, &st, 1500, WD_NO_WALL, &c, 1, 8);
     CHECK(r.triggered && r.trig_age_s == 900 && r.disc_reason == 8 && r.wifi_restarts == 1);
     wd_state_t st2 = fresh(true);
-    wd_state_restore(&st2, &r, 20, false);
+    wd_state_restore(&st2, &r, 20, WD_NO_WALL, false);
     CHECK(st2.triggered && wd_since_trigger_s(&st2, 20) == 900 + WD_REBOOT_GAP_S);
     CHECK(wd_tick(&st2, 20).kind == WD_ACT_SEND);
     CHECK(wd_tick(&st2, 20 + WD_RETRY_WINDOW_S - 900 - WD_REBOOT_GAP_S + 1).kind == WD_ACT_NONE);
@@ -295,7 +295,7 @@ static void test_rtc_validation(void)
     wd_conn_t c;
     wd_conn_init(&c, 1, 0);
     wd_rtc_t r;
-    wd_rtc_pack(&r, &st, 50, &c, 2, 0);
+    wd_rtc_pack(&r, &st, 50, WD_NO_WALL, &c, 2, 0);
     CHECK(wd_rtc_valid(&r) && r.conn_level == 1);
     r.hb_age_s ^= 1;
     CHECK(!wd_rtc_valid(&r));
@@ -382,10 +382,10 @@ static void test_restore_keeps_ok_nodes(void)
     }
     wd_report(&st, 2, false, "timeout", 600);
     wd_rtc_t r;
-    wd_rtc_pack(&r, &st, 700, &c, 0, 0);
+    wd_rtc_pack(&r, &st, 700, WD_NO_WALL, &c, 0, 0);
     CHECK(r.node_ok == 3);
     wd_state_t st2 = fresh(true);
-    wd_state_restore(&st2, &r, 10, false);
+    wd_state_restore(&st2, &r, 10, WD_NO_WALL, false);
     CHECK(st2.node_state[0] == WD_NODE_OK && st2.node_state[1] == WD_NODE_OK && st2.node_state[2] == WD_NODE_PENDING && st2.node_state[3] == WD_NODE_PENDING);
     wd_action_t a = wd_tick(&st2, 10);
     CHECK(a.kind == WD_ACT_SEND && a.node_idx == 2);
@@ -396,10 +396,10 @@ static void test_restore_keeps_ok_nodes(void)
     CHECK(wd_tick(&st2, 11).kind == WD_ACT_NONE);
     wd_state_t st3 = fresh(true);
     st3.cfg.nodes[0] = 99;
-    wd_state_restore(&st3, &r, 10, false);
+    wd_state_restore(&st3, &r, 10, WD_NO_WALL, false);
     CHECK(st3.node_state[0] == WD_NODE_PENDING && st3.node_state[1] == WD_NODE_PENDING);
     wd_state_t quiet = fresh(true);
-    wd_rtc_pack(&r, &quiet, 50, &c, 0, 0);
+    wd_rtc_pack(&r, &quiet, 50, WD_NO_WALL, &c, 0, 0);
     CHECK(r.node_ok == 0 && !r.triggered);
 }
 
@@ -412,9 +412,9 @@ static void test_armed_trigger_survives_reboot_loop(void)
     wd_on_heartbeat(&st, 0);
     uint32_t sent = 0;
     for (int boot = 0; boot < 60 && !sent; boot++) {
-        wd_rtc_pack(&r, &st, 60, &c, 0, 0);
+        wd_rtc_pack(&r, &st, 60, WD_NO_WALL, &c, 0, 0);
         st = fresh(true);
-        wd_state_restore(&st, &r, 20, false);
+        wd_state_restore(&st, &r, 20, WD_NO_WALL, false);
         for (uint32_t t = 20; t < 80 && !sent; t++) {
             wd_action_t a = wd_tick(&st, t);
             if (a.kind == WD_ACT_SEND) sent = 1;
@@ -451,79 +451,165 @@ static void test_u64_str(void)
     CHECK(strstr(buf, "{\"node\":9007199254740991,\"ok\":false,\"err\":\"timeout\"}"));
 }
 
-static void crash_cycle(wd_state_t *st, wd_conn_t *c, uint32_t now, bool *sent)
+static void reboot(wd_state_t *st, const wd_conn_t *c, uint32_t up, uint32_t wall, uint32_t down_s, bool armed, bool abnormal)
 {
     wd_rtc_t r;
-    wd_rtc_pack(&r, st, now, c, 0, 0);
-    *st = fresh(true);
-    wd_state_restore(st, &r, 5, true);
-    *sent = false;
-    for (uint32_t t = 5; t < 5 + WD_CRASH_BACKOFF_S - 1; t++) {
-        if (wd_tick(st, t).kind == WD_ACT_SEND) *sent = true;
-    }
+    wd_rtc_pack(&r, st, up, wall, c, 0, 0);
+    CHECK(wd_rtc_valid(&r));
+    *st = fresh(armed);
+    wd_state_restore(st, &r, 5, wall + down_s, abnormal);
 }
 
-static void test_send_crash_guard(void)
+static wd_state_t triggered_sending(wd_conn_t *c, int *node)
 {
     wd_state_t st = fresh(true);
-    wd_conn_t c;
-    wd_conn_init(&c, 0, 0);
+    wd_conn_init(c, 0, 0);
     wd_tick(&st, 600);
     wd_action_t a = wd_tick(&st, 600);
     CHECK(a.kind == WD_ACT_SEND && st.sending);
-    bool sent;
-    crash_cycle(&st, &c, 660, &sent);
-    CHECK(st.send_crashes == 1 && !sent && st.node_state[0] == WD_NODE_PENDING && !strcmp(st.node_err[0], "send_crash"));
-    CHECK(wd_tick(&st, 5 + WD_CRASH_BACKOFF_S).kind == WD_ACT_SEND && st.sending);
-    crash_cycle(&st, &c, 120, &sent);
-    CHECK(st.send_crashes == WD_CRASH_MAX && !sent);
-    for (int i = 0; i < 4; i++) CHECK(st.node_state[i] == WD_NODE_GAVE_UP);
+    *node = a.node_idx;
+    return st;
+}
+
+static void test_crash_isolates_node(void)
+{
+    wd_conn_t c;
+    int n;
+    wd_state_t st = triggered_sending(&c, &n);
+    CHECK(n == 0);
+    reboot(&st, &c, 610, 1000, 3, true, true);
+    CHECK(st.node_crashes[0] == 1 && st.node_state[0] == WD_NODE_PENDING && !strcmp(st.node_err[0], "send_crash"));
+    bool seen[4] = {false, false, false, false};
+    for (uint32_t t = 5; t < 9; t++) {
+        wd_action_t a = wd_tick(&st, t);
+        if (a.kind == WD_ACT_SEND) {
+            seen[a.node_idx] = true;
+            wd_report(&st, a.node_idx, true, NULL, t);
+        }
+    }
+    CHECK(!seen[0] && seen[1] && seen[2] && seen[3]);
+    reboot(&st, &c, 8, 2000, 3, true, false);
+    CHECK(st.node_crashes[0] == 1 && st.node_state[1] == WD_NODE_OK && st.node_state[3] == WD_NODE_OK);
+    CHECK(wd_tick(&st, 5 + 113).kind == WD_ACT_NONE);
+    wd_action_t a = wd_tick(&st, 5 + 114);
+    CHECK(a.kind == WD_ACT_SEND && a.node_idx == 0);
+    reboot(&st, &c, 119, 3000, 3, true, true);
+    CHECK(st.node_crashes[0] == WD_CRASH_MAX && st.node_state[0] == WD_NODE_GAVE_UP && !strcmp(st.node_err[0], "send_crash"));
+    for (int i = 1; i < 4; i++) CHECK(st.node_state[i] == WD_NODE_OK);
     CHECK(wd_tick(&st, 10000).kind == WD_ACT_NONE);
     char buf[1024];
     wd_diag_t dg = {"panic", 4, 0, 0, 0, false, 0, true};
     wd_status_json(&st, 30, false, 0, "v", true, &dg, buf, sizeof(buf));
     CHECK(strstr(buf, "\"err\":\"send_crash\"") && strstr(buf, "\"send_crashes\":2") && strstr(buf, "\"ok\":false"));
-    wd_rtc_t r;
-    wd_rtc_pack(&r, &st, 30, &c, 0, 0);
-    wd_state_t again = fresh(true);
-    wd_state_restore(&again, &r, 5, false);
-    CHECK(again.send_crashes == WD_CRASH_MAX && again.node_state[0] == WD_NODE_GAVE_UP && wd_tick(&again, 5000).kind == WD_ACT_NONE);
-    wd_on_heartbeat(&again, 6000);
-    CHECK(again.send_crashes == 0 && !again.triggered);
-    wd_tick(&again, 6000 + 600);
-    CHECK(wd_tick(&again, 6000 + 600).kind == WD_ACT_SEND);
-    wd_state_t mode = fresh(true);
-    wd_rtc_pack(&r, &st, 30, &c, 0, 0);
-    wd_state_restore(&mode, &r, 5, false);
-    wd_set_armed(&mode, false, 100);
-    wd_set_armed(&mode, true, 200);
-    CHECK(mode.send_crashes == 0 && mode.node_state[0] == WD_NODE_PENDING && wd_tick(&mode, 200).kind == WD_ACT_SEND);
+    wd_on_heartbeat(&st, 6000);
+    CHECK(!st.triggered && st.node_crashes[0] == 0 && st.global_crashes == 0);
 }
 
-static void test_crash_only_counts_active_send(void)
+static void test_crash_count_decays_after_report(void)
 {
-    wd_state_t st = fresh(true);
     wd_conn_t c;
+    int n;
+    wd_state_t st = triggered_sending(&c, &n);
+    reboot(&st, &c, 610, 1000, 3, true, true);
+    CHECK(st.node_crashes[0] == 1);
+    for (int i = 1; i < 4; i++) wd_report(&st, i, true, NULL, 5);
+    wd_action_t a = wd_tick(&st, 5 + WD_CRASH_BACKOFF_S);
+    CHECK(a.kind == WD_ACT_SEND && a.node_idx == 0);
+    wd_report(&st, 0, false, "timeout", 5 + WD_CRASH_BACKOFF_S);
+    CHECK(st.node_crashes[0] == 0);
+    reboot(&st, &c, 200, 2000, 3, true, true);
+    CHECK(st.node_crashes[0] == 1 && st.node_state[0] == WD_NODE_PENDING);
+}
+
+static void test_crash_attribution_window(void)
+{
+    wd_conn_t c;
+    int n;
+    wd_state_t st = fresh(true);
     wd_conn_init(&c, 0, 0);
     wd_tick(&st, 600);
-    wd_rtc_t r;
-    wd_rtc_pack(&r, &st, 610, &c, 0, 0);
-    CHECK(!r.sending && r.send_crashes == 0);
-    wd_state_t a = fresh(true);
-    wd_state_restore(&a, &r, 5, true);
-    CHECK(a.send_crashes == 0 && wd_tick(&a, 5).kind == WD_ACT_SEND);
-    wd_tick(&st, 620);
-    wd_rtc_pack(&r, &st, 620, &c, 0, 0);
-    CHECK(r.sending);
-    wd_state_t b = fresh(true);
-    wd_state_restore(&b, &r, 5, false);
-    CHECK(b.send_crashes == 0 && wd_tick(&b, 5).kind == WD_ACT_SEND);
-    wd_report(&st, 0, true, NULL, 625);
-    wd_rtc_pack(&r, &st, 626, &c, 0, 0);
-    CHECK(!r.sending);
-    wd_rtc_pack(&r, &st, 626, &c, 0, 0);
-    r.magic = 0x57445254u;
-    CHECK(!wd_rtc_valid(&r));
+    reboot(&st, &c, 610, 1000, 3, true, true);
+    CHECK(st.global_crashes == 1);
+    for (int i = 0; i < 4; i++) CHECK(st.node_crashes[i] == 0);
+    CHECK(wd_tick(&st, 5).kind == WD_ACT_SEND);
+    st = triggered_sending(&c, &n);
+    wd_report(&st, 0, false, "timeout", 605);
+    reboot(&st, &c, 620, 1000, 3, true, true);
+    CHECK(st.node_crashes[0] == 1 && st.global_crashes == 1);
+    st = triggered_sending(&c, &n);
+    wd_report(&st, 0, false, "timeout", 605);
+    reboot(&st, &c, 605 + WD_ATTRIB_S + 1, 1000, 3, true, true);
+    CHECK(st.node_crashes[0] == 0 && st.global_crashes == 1);
+}
+
+static void test_normal_reboot_adds_no_count(void)
+{
+    wd_conn_t c;
+    int n;
+    wd_state_t st = triggered_sending(&c, &n);
+    reboot(&st, &c, 610, 1000, 3, true, false);
+    CHECK(st.global_crashes == 0 && st.node_crashes[0] == 0 && st.node_state[0] == WD_NODE_PENDING);
+    CHECK(wd_tick(&st, 5).kind == WD_ACT_SEND);
+    reboot(&st, &c, 20, 1100, 3, true, false);
+    CHECK(st.global_crashes == 0 && st.node_crashes[0] == 0 && wd_tick(&st, 5).kind == WD_ACT_SEND);
+}
+
+static void test_global_crash_backoff_persists(void)
+{
+    wd_conn_t c;
+    wd_conn_init(&c, 0, 0);
+    wd_state_t st = fresh(true);
+    wd_tick(&st, 600);
+    uint32_t wall = 1000;
+    for (int i = 0; i < WD_GLOBAL_CRASH_MAX; i++) {
+        reboot(&st, &c, 5, wall, 3, true, true);
+        wall += 8;
+    }
+    CHECK(st.global_crashes == WD_GLOBAL_CRASH_MAX);
+    CHECK(wd_tick(&st, 5).kind == WD_ACT_NONE);
+    reboot(&st, &c, 5, wall, 3, true, false);
+    wall += 8;
+    CHECK(wd_tick(&st, 5).kind == WD_ACT_NONE && wd_tick(&st, 5 + WD_GLOBAL_BACKOFF_S - 30).kind == WD_ACT_NONE);
+    wd_action_t a = wd_tick(&st, 5 + WD_GLOBAL_BACKOFF_S);
+    CHECK(a.kind == WD_ACT_SEND);
+    wd_report(&st, a.node_idx, true, NULL, 5 + WD_GLOBAL_BACKOFF_S);
+    CHECK(st.global_crashes == 0 && wd_tick(&st, 5 + WD_GLOBAL_BACKOFF_S).kind == WD_ACT_SEND);
+}
+
+static void test_boot_loop_post_send_bounded(void)
+{
+    wd_conn_t c;
+    wd_conn_init(&c, 0, 0);
+    wd_state_t st = fresh(true);
+    uint32_t base = 0;
+    int sends = 0;
+    wd_tick(&st, 600);
+    for (uint32_t t = 600; t < 600 + WD_RETRY_WINDOW_S + 200; t++) {
+        uint32_t u = t - base;
+        wd_action_t a = wd_tick(&st, u);
+        if (a.kind != WD_ACT_SEND) continue;
+        sends++;
+        wd_report(&st, a.node_idx, false, "timeout", u);
+        wd_rtc_t r;
+        wd_rtc_pack(&r, &st, u + 1, t + 1, &c, 0, 0);
+        st = fresh(true);
+        wd_state_restore(&st, &r, 5, t + 5, true);
+        base = t + 5 - 5;
+        t += 4;
+    }
+    CHECK(sends >= 5 && sends <= WD_GLOBAL_CRASH_MAX + WD_RETRY_WINDOW_S / WD_GLOBAL_BACKOFF_S + 1);
+}
+
+static void test_dry_run_never_sends_after_restore(void)
+{
+    wd_conn_t c;
+    int n;
+    wd_state_t st = triggered_sending(&c, &n);
+    for (int k = 0; k < 6; k++) {
+        reboot(&st, &c, 10, 1000 + 20 * k, 3, false, true);
+        CHECK(st.global_crashes == 0 && st.node_crashes[0] == 0);
+        for (uint32_t t = 5; t < 5 + 3 * WD_RETRY_WINDOW_S; t += 50) CHECK(wd_tick(&st, t).kind == WD_ACT_NONE);
+    }
 }
 
 static void test_blackbox(void)
@@ -548,6 +634,7 @@ static void test_blackbox(void)
     p.exception = 4;
     p.cause = 28;
     p.pc = 0x42009555;
+    p.a0 = 0x4200bbbb;
     p.bt[0] = 0x42009555;
     p.bt[1] = 0x4200aaaa;
     wd_append_clean(p.task, sizeof(p.task), "br_watch");
@@ -557,7 +644,7 @@ static void test_blackbox(void)
     wd_panic_seal(&p);
     char buf[1024];
     size_t n = wd_blackbox_json(&p, &t, buf, sizeof(buf));
-    CHECK(n < sizeof(buf) && strstr(buf, "\"exception\":\"fault\"") && strstr(buf, "\"pc\":\"0x42009555\"") && strstr(buf, "\"backtrace\":[\"0x42009555\",\"0x4200aaaa\"]"));
+    CHECK(n < sizeof(buf) && strstr(buf, "\"exception\":\"fault\"") && strstr(buf, "\"pc\":\"0x42009555\"") && strstr(buf, "\"a0\":\"0x4200bbbb\"") && strstr(buf, "\"backtrace\":[\"0x42009555\",\"0x4200aaaa\"]"));
     CHECK(strstr(buf, "\"stage\":\"tx\"") && strstr(buf, "\"tx\":2,\"rx\":1,\"stack_min\":3000") && strstr(buf, "\"lookup\":10") && strstr(buf, "\"twdt\":\"_ - br_supervisor (CPU 0)\""));
     char full[1100];
     snprintf(full, sizeof(full), "{%s}", buf);
@@ -579,8 +666,13 @@ static void test_blackbox(void)
 int main(void)
 {
     test_blackbox();
-    test_send_crash_guard();
-    test_crash_only_counts_active_send();
+    test_crash_isolates_node();
+    test_crash_count_decays_after_report();
+    test_crash_attribution_window();
+    test_normal_reboot_adds_no_count();
+    test_global_crash_backoff_persists();
+    test_boot_loop_post_send_bounded();
+    test_dry_run_never_sends_after_restore();
     test_u64_str();
     test_defaults_and_token();
     test_parse_heartbeat();

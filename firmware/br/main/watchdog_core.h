@@ -20,9 +20,14 @@
 #define WD_CRASH_MAX 2
 #define WD_CRASH_BACKOFF_S 120
 #define WD_BT_FRAMES 8
+#define WD_ATTRIB_S 300
+#define WD_GLOBAL_CRASH_MAX 4
+#define WD_GLOBAL_BACKOFF_S 600
+#define WD_NO_WALL UINT32_MAX
+#define WD_NO_NODE 0xFF
 #define WD_TRACE_MAGIC 0x57445443u
-#define WD_PANIC_MAGIC 0x57445041u
-#define WD_RTC_MAGIC 0x57445255u
+#define WD_PANIC_MAGIC 0x57445042u
+#define WD_RTC_MAGIC 0x57445256u
 
 typedef enum { WD_OK = 0, WD_E_JSON, WD_E_FIELD, WD_E_RANGE } wd_err_t;
 typedef enum { WD_ACT_NONE = 0, WD_ACT_TRIGGERED, WD_ACT_SEND } wd_action_kind_t;
@@ -47,7 +52,12 @@ typedef struct {
     uint8_t node_state[WD_MAX_NODES];
     uint8_t node_tried[WD_MAX_NODES];
     uint8_t sending;
-    uint8_t send_crashes;
+    uint8_t last_node;
+    uint32_t last_send_s;
+    uint32_t send_carry_s;
+    uint8_t node_crashes[WD_MAX_NODES];
+    uint8_t global_crashes;
+    uint32_t global_due_s;
     uint32_t node_due_s[WD_MAX_NODES];
     uint8_t node_attempts[WD_MAX_NODES];
     char node_err[WD_MAX_NODES][WD_ERR_LEN];
@@ -65,12 +75,18 @@ typedef struct {
     uint32_t wifi_restarts;
     uint32_t disc_reason;
     uint32_t nodes_hash;
+    uint32_t wall_s;
+    uint32_t since_send_s;
+    uint32_t global_wait_s;
+    uint32_t node_wait_s[WD_MAX_NODES];
+    uint8_t node_crashes[WD_MAX_NODES];
     uint8_t triggered;
     uint8_t conn_level;
     uint8_t node_ok;
     uint8_t sending;
-    uint8_t send_crashes;
-    uint16_t pad;
+    uint8_t last_node;
+    uint8_t global_crashes;
+    uint8_t pad[2];
     uint32_t sum;
 } wd_rtc_t;
 
@@ -98,6 +114,7 @@ typedef struct {
     uint32_t pc;
     uint32_t excvaddr;
     uint32_t cause;
+    uint32_t a0;
     uint32_t bt[WD_BT_FRAMES];
     uint8_t exception;
     uint8_t core;
@@ -186,9 +203,9 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s);
 void wd_report(wd_state_t *st, int node_idx, bool ok, const char *err, uint32_t now_s);
 size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, double die_c, const char *fw, bool armed_capable, const wd_diag_t *dg, char *buf, size_t n);
 uint32_t wd_since_trigger_s(const wd_state_t *st, uint32_t now_s);
-void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason);
+void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, uint32_t wall_s, const wd_conn_t *c, uint32_t wifi_restarts, uint32_t disc_reason);
 bool wd_rtc_valid(const wd_rtc_t *r);
-void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s, bool crashed);
+void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s, uint32_t wall_s, bool abnormal);
 void wd_conn_init(wd_conn_t *c, uint8_t level, uint32_t now_s);
 void wd_conn_update(wd_conn_t *c, bool has_ip, uint32_t now_s);
 uint32_t wd_conn_limit_s(uint8_t level, uint32_t base_s);
