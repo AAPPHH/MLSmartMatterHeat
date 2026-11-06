@@ -155,10 +155,18 @@ impl ChipToolConfig {
     }
 
     fn wildcard_line(&self, command: &str, node: NodeId) -> String {
+        self.wildcard_line_keeping(command, node, 1)
+    }
+
+    fn wildcard_line_keeping(&self, command: &str, node: NodeId, keep: u8) -> String {
         format!(
-            "any {command} {WILDCARD} {WILDCARD} {} {} {node} {WILDCARD_ENDPOINT} --keepSubscriptions 1 --auto-resubscribe 1",
+            "any {command} {WILDCARD} {WILDCARD} {} {} {node} {WILDCARD_ENDPOINT} --keepSubscriptions {keep} --auto-resubscribe 1",
             self.subscribe_min_s, self.subscribe_max_s
         )
+    }
+
+    pub fn resubscribe_lines(&self, node: NodeId) -> Vec<String> {
+        vec![self.wildcard_line_keeping("subscribe-by-id", node, 0), self.wildcard_line_keeping("subscribe-event-by-id", node, 0)]
     }
 
     pub fn subscribe_lines(&self, node: NodeId) -> Vec<String> {
@@ -645,6 +653,15 @@ impl Session {
         Ok(())
     }
 
+    async fn resubscribe(&self, node: NodeId) -> Result<()> {
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
+        for line in self.config.resubscribe_lines(node) {
+            Self::send(stdin, &line).await?;
+        }
+        Ok(())
+    }
+
     async fn subscribe(&self, node: NodeId) -> Result<Receiver<AttributeReport>> {
         let (tx, rx) = channel(64);
         let mut guard = self.stdin.lock().await;
@@ -900,6 +917,13 @@ impl MatterController for ChipToolController {
         }
     }
 
+    async fn resubscribe(&self, node: NodeId) -> Result<()> {
+        match &self.session {
+            Some(session) => session.resubscribe(node).await,
+            None => Err(Error::Command("resubscribe needs a serving controller".into())),
+        }
+    }
+
     async fn inventory(&self, node: NodeId) -> Result<Inventory> {
         let limit = self.config.inventory_limit_s();
         let run = |args: Vec<String>| async move {
@@ -966,6 +990,7 @@ mod tests {
     #[test]
     fn builds_wildcard_subscribe_and_poll_lines() {
         let c = config();
+        assert!(c.resubscribe_lines(5).iter().all(|l| l.contains("--keepSubscriptions 0 --auto-resubscribe 1")));
         assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
         assert_eq!(
             c.subscribe_lines(5),

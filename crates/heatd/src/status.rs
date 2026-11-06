@@ -34,6 +34,7 @@ pub struct NodeStatus {
     pub since_us: i64,
     pub last_report_us: Option<i64>,
     pub reports: u64,
+    pub last_subscription_us: Option<i64>,
 }
 
 const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
@@ -108,6 +109,16 @@ impl Status {
         let n = inner.nodes.entry(node).or_default();
         n.last_report_us = Some(n.last_report_us.map_or(ts_us, |t| t.max(ts_us)));
         n.reports += 1;
+    }
+
+    pub fn subscription_report(&self, node: u64, ts_us: i64) {
+        let mut inner = self.0.lock().unwrap();
+        let n = inner.nodes.entry(node).or_default();
+        n.last_subscription_us = Some(n.last_subscription_us.map_or(ts_us, |t| t.max(ts_us)));
+    }
+
+    pub fn lost_for_us(&self, node: u64, now_us: i64) -> Option<i64> {
+        self.0.lock().unwrap().nodes.get(&node).filter(|n| n.state == SubState::Lost).map(|n| now_us - n.since_us)
     }
 
     pub fn subscription(&self, node: u64, state: SubState, ts_us: i64) {
@@ -214,7 +225,7 @@ impl Status {
             .nodes
             .iter()
             .map(|(id, n)| {
-                let mut node = json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "reports": n.reports});
+                let mut node = json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "last_subscription_report_age_s": age(n.last_subscription_us), "polling_only": n.state == SubState::Lost && n.last_report_us.is_some_and(|t| n.last_subscription_us.is_none_or(|s| t > s)), "reports": n.reports});
                 if let Some(limit) = inner.stale_us {
                     node["stale"] = json!(n.last_report_us.is_none_or(|t| now_us - t > limit));
                 }

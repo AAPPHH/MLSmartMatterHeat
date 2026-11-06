@@ -457,11 +457,13 @@ impl Default for SupplySection {
 #[serde(default)]
 pub struct StaleSection {
     pub after_s: u64,
+    pub resubscribe_after_s: u64,
+    pub resubscribe_gap_s: u64,
 }
 
 impl Default for StaleSection {
     fn default() -> Self {
-        Self { after_s: 900 }
+        Self { after_s: 900, resubscribe_after_s: 600, resubscribe_gap_s: 900 }
     }
 }
 

@@ -258,6 +258,7 @@ fn apply(state: &AppState, node: u64, busy: &Arc<AtomicBool>, timing: Timing, ou
         Out::Attribute(row) => {
             state.status.node_report(node, row.ts);
             if row.source == SOURCE_SUBSCRIPTION {
+                state.status.subscription_report(node, row.ts);
                 state.status.subscription(node, SubState::Subscribed, row.ts);
             }
             log_error(state.sink.append(row));
@@ -301,6 +302,8 @@ async fn capture_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing:
 async fn poll_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing: Timing) {
     let mut failures = 0u32;
     let silence_us = state.config.poll_silence_s as i64 * 1_000_000;
+    let (lost_us, gap_us) = (state.config.stale.resubscribe_after_s as i64 * 1_000_000, state.config.stale.resubscribe_gap_s as i64 * 1_000_000);
+    let mut asked_us: Option<i64> = None;
     loop {
         sleep(poll_delay(timing.poll, failures)).await;
         let silent = state.status.last_report_us(node).is_none_or(|t| lake::now_us() - t >= silence_us);
@@ -308,7 +311,17 @@ async fn poll_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing: Ti
             continue;
         }
         match state.controller.poll(node).await {
-            Ok(_) => failures = 0,
+            Ok(_) => {
+                failures = 0;
+                let now = lake::now_us();
+                if state.status.lost_for_us(node, now).is_some_and(|d| d >= lost_us) && asked_us.is_none_or(|t| now - t >= gap_us) {
+                    asked_us = Some(now);
+                    match state.controller.resubscribe(node).await {
+                        Ok(()) => eprintln!("node {node}: subscription lost while polls succeed, subscribing again"),
+                        Err(e) => eprintln!("resubscribe node {node}: {e}"),
+                    }
+                }
+            }
             Err(e) => {
                 failures += 1;
                 let detail = json!({"error": e.to_string(), "consecutive": failures, "next_poll_s": poll_delay(timing.poll, failures).as_secs()});
@@ -434,7 +447,11 @@ pub(crate) mod tests {
 
     pub(crate) fn state(dir: &std::path::Path, mock: Arc<MockController>) -> AppState {
         let toml = format!("poll_silence_s = 0
-inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_str().unwrap().replace('\\', "/"));
+inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]
+[stale]
+resubscribe_after_s = 0
+resubscribe_gap_s = 3600
+", dir.to_str().unwrap().replace('\\', "/"));
         let config = Config::parse(&toml).unwrap();
         let sink = lake::Sink::open(lake::LakeConfig::new(dir.join("lake"))).unwrap();
         let status = crate::status::Status::new(lake::now_us());
@@ -512,5 +529,28 @@ inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]\n", dir.to_s
         assert!(lake_rows(dir.path(), "attribute_reports") > 10);
         mock.write_heating_setpoint(5, 22.0).await.unwrap();
         until("setpoint report", || state.latest.get(5, "occupied_heating_setpoint") == Some(22.0)).await;
+    }
+
+    #[tokio::test]
+    async fn a_node_lost_while_polls_keep_arriving_is_labelled_polling_only_and_subscribed_again_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockController::new(1));
+        mock.add_node(5, 19.0, 19.0);
+        let state = state(dir.path(), mock.clone());
+        state.status.register_nodes([5]);
+        let timing = Timing { poll: Duration::from_millis(20), settle: Duration::from_millis(5), retry: Duration::from_millis(5), reconnect_start: Duration::from_millis(5), reconnect_max: Duration::from_millis(10) };
+        spawn(state.clone(), timing);
+        let sub = |s: &AppState| s.status.health(lake::now_us())["nodes"][0]["subscription"].as_str().unwrap().to_string();
+        until("subscribed", || sub(&state) == "subscribed").await;
+        mock.push_capture(5, CaptureItem::SubscriptionLost { node: Some(5), reason: "gone".into(), backoff_s: None });
+        until("lost", || sub(&state) == "lost").await;
+        until("resubscribe request", || !mock.resubscribes().is_empty()).await;
+        until("subscribed again", || sub(&state) == "subscribed").await;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(mock.resubscribes(), vec![5]);
+        state.status.subscription(5, SubState::Lost, lake::now_us());
+        state.status.node_report(5, lake::now_us());
+        let node = state.status.health(lake::now_us())["nodes"][0].clone();
+        assert_eq!((node["polling_only"].as_bool(), node["subscription"].as_str()), (Some(true), Some("lost")));
     }
 }
