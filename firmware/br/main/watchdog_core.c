@@ -237,6 +237,8 @@ uint32_t wd_since_trigger_s(const wd_state_t *st, uint32_t now_s)
 bool wd_on_heartbeat(wd_state_t *st, uint32_t now_s)
 {
     bool rearmed = st->triggered;
+    st->sending = 0;
+    st->send_crashes = 0;
     st->last_hb_s = now_s;
     st->hb_carry_s = 0;
     if (rearmed) {
@@ -252,6 +254,10 @@ void wd_set_armed(wd_state_t *st, bool armed, uint32_t now_s)
 {
     bool was = st->cfg.armed;
     st->cfg.armed = armed;
+    if (armed != was) {
+        st->sending = 0;
+        st->send_crashes = 0;
+    }
     if (armed && !was && st->triggered) {
         st->triggered_at_s = now_s;
         st->trig_carry_s = 0;
@@ -278,6 +284,7 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s)
             st->node_state[i] = WD_NODE_GAVE_UP;
             continue;
         }
+        st->sending = 1;
         act.kind = WD_ACT_SEND;
         act.node_idx = i;
         return act;
@@ -287,6 +294,7 @@ wd_action_t wd_tick(wd_state_t *st, uint32_t now_s)
 
 void wd_report(wd_state_t *st, int i, bool ok, const char *err, uint32_t now_s)
 {
+    st->sending = 0;
     if (!st->triggered || i < 0 || i >= st->cfg.node_count) return;
     st->node_tried[i] = 1;
     st->node_attempts[i]++;
@@ -344,8 +352,8 @@ size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, doub
     else APPEND("null");
     APPEND(",\"uptime_s\":%u,\"fw\":\"%s\"", (unsigned)now_s, fw ? fw : "");
     if (dg) {
-        APPEND(",\"reset_reason\":\"%s\",\"reset_reason_code\":%d,\"state_restored\":%s,\"wifi_restarts\":%u,\"conn_level\":%u,\"wifi_ip\":%s,\"noip_s\":%u,\"wifi_disc_reason\":",
-               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->wifi_restarts, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s);
+        APPEND(",\"reset_reason\":\"%s\",\"reset_reason_code\":%d,\"state_restored\":%s,\"wifi_restarts\":%u,\"conn_level\":%u,\"wifi_ip\":%s,\"noip_s\":%u,\"send_crashes\":%u,\"wifi_disc_reason\":",
+               dg->reset_name ? dg->reset_name : "unknown", dg->reset_code, dg->restored ? "true" : "false", (unsigned)dg->wifi_restarts, (unsigned)dg->conn_level, dg->has_ip ? "true" : "false", (unsigned)dg->noip_s, (unsigned)st->send_crashes);
         if (dg->disc_reason > 0) APPEND("%d", dg->disc_reason);
         else APPEND("null");
     }
@@ -381,6 +389,8 @@ void wd_rtc_pack(wd_rtc_t *r, const wd_state_t *st, uint32_t now_s, const wd_con
     r->magic = WD_RTC_MAGIC;
     r->hb_age_s = wd_age_s(st, now_s);
     r->triggered = st->triggered;
+    r->sending = st->triggered && st->sending;
+    r->send_crashes = st->triggered ? st->send_crashes : 0;
     r->trig_age_s = st->triggered ? wd_since_trigger_s(st, now_s) : 0;
     r->wifi_restarts = wifi_restarts;
     r->disc_reason = disc_reason;
@@ -397,7 +407,7 @@ bool wd_rtc_valid(const wd_rtc_t *r)
     return r->magic == WD_RTC_MAGIC && r->sum == rtc_sum(r);
 }
 
-void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s)
+void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s, bool crashed)
 {
     st->last_hb_s = now_s;
     st->hb_carry_s = sat_add(r->hb_age_s, WD_REBOOT_GAP_S);
@@ -406,12 +416,22 @@ void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s)
     st->triggered_at_s = now_s;
     st->trig_carry_s = sat_add(r->trig_age_s, WD_REBOOT_GAP_S);
     reset_nodes(st);
-    if (r->nodes_hash != nodes_hash(&st->cfg)) return;
-    for (int i = 0; i < st->cfg.node_count; i++) {
+    bool same = r->nodes_hash == nodes_hash(&st->cfg);
+    for (int i = 0; same && i < st->cfg.node_count; i++) {
         if (!(r->node_ok & (1u << i))) continue;
         st->node_state[i] = WD_NODE_OK;
         st->node_tried[i] = 1;
         st->node_attempts[i] = 1;
+    }
+    unsigned crashes = r->send_crashes + (crashed && r->sending ? 1u : 0u);
+    st->send_crashes = (uint8_t)(crashes > WD_CRASH_MAX ? WD_CRASH_MAX : crashes);
+    for (int i = 0; st->send_crashes && i < st->cfg.node_count; i++) {
+        if (st->node_state[i] == WD_NODE_OK) continue;
+        st->node_tried[i] = 1;
+        st->node_attempts[i] = st->send_crashes;
+        st->node_due_s[i] = now_s + WD_CRASH_BACKOFF_S * st->send_crashes;
+        if (st->send_crashes >= WD_CRASH_MAX) st->node_state[i] = WD_NODE_GAVE_UP;
+        snprintf(st->node_err[i], WD_ERR_LEN, "send_crash");
     }
 }
 

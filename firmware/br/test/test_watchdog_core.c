@@ -249,16 +249,16 @@ static void test_restore_keeps_timer_across_reboots(void)
     wd_rtc_pack(&r, &st, 400, &c, 0, 0);
     CHECK(wd_rtc_valid(&r) && r.hb_age_s == 390 && !r.triggered);
     wd_state_t st2 = fresh(true);
-    wd_state_restore(&st2, &r, 15);
+    wd_state_restore(&st2, &r, 15, false);
     CHECK(wd_age_s(&st2, 15) == 390 + WD_REBOOT_GAP_S);
     CHECK(wd_tick(&st2, 15).kind == WD_ACT_NONE);
     CHECK(wd_tick(&st2, 15 + 600 - 390 - WD_REBOOT_GAP_S).kind == WD_ACT_TRIGGERED);
     wd_state_t cur = fresh(true);
-    wd_state_restore(&cur, &r, 15);
+    wd_state_restore(&cur, &r, 15, false);
     for (int k = 0; k < 40 && wd_age_s(&cur, 35) < 600; k++) {
         wd_rtc_pack(&r, &cur, 35, &c, 0, 0);
         cur = fresh(true);
-        wd_state_restore(&cur, &r, 15);
+        wd_state_restore(&cur, &r, 15, false);
     }
     CHECK(wd_age_s(&cur, 35) >= 600);
     CHECK(wd_tick(&cur, 35).kind == WD_ACT_TRIGGERED);
@@ -279,7 +279,7 @@ static void test_restore_triggered_resumes_window(void)
     wd_rtc_pack(&r, &st, 1500, &c, 1, 8);
     CHECK(r.triggered && r.trig_age_s == 900 && r.disc_reason == 8 && r.wifi_restarts == 1);
     wd_state_t st2 = fresh(true);
-    wd_state_restore(&st2, &r, 20);
+    wd_state_restore(&st2, &r, 20, false);
     CHECK(st2.triggered && wd_since_trigger_s(&st2, 20) == 900 + WD_REBOOT_GAP_S);
     CHECK(wd_tick(&st2, 20).kind == WD_ACT_SEND);
     CHECK(wd_tick(&st2, 20 + WD_RETRY_WINDOW_S - 900 - WD_REBOOT_GAP_S + 1).kind == WD_ACT_NONE);
@@ -384,7 +384,7 @@ static void test_restore_keeps_ok_nodes(void)
     wd_rtc_pack(&r, &st, 700, &c, 0, 0);
     CHECK(r.node_ok == 3);
     wd_state_t st2 = fresh(true);
-    wd_state_restore(&st2, &r, 10);
+    wd_state_restore(&st2, &r, 10, false);
     CHECK(st2.node_state[0] == WD_NODE_OK && st2.node_state[1] == WD_NODE_OK && st2.node_state[2] == WD_NODE_PENDING && st2.node_state[3] == WD_NODE_PENDING);
     wd_action_t a = wd_tick(&st2, 10);
     CHECK(a.kind == WD_ACT_SEND && a.node_idx == 2);
@@ -395,7 +395,7 @@ static void test_restore_keeps_ok_nodes(void)
     CHECK(wd_tick(&st2, 11).kind == WD_ACT_NONE);
     wd_state_t st3 = fresh(true);
     st3.cfg.nodes[0] = 99;
-    wd_state_restore(&st3, &r, 10);
+    wd_state_restore(&st3, &r, 10, false);
     CHECK(st3.node_state[0] == WD_NODE_PENDING && st3.node_state[1] == WD_NODE_PENDING);
     wd_state_t quiet = fresh(true);
     wd_rtc_pack(&r, &quiet, 50, &c, 0, 0);
@@ -413,7 +413,7 @@ static void test_armed_trigger_survives_reboot_loop(void)
     for (int boot = 0; boot < 60 && !sent; boot++) {
         wd_rtc_pack(&r, &st, 60, &c, 0, 0);
         st = fresh(true);
-        wd_state_restore(&st, &r, 20);
+        wd_state_restore(&st, &r, 20, false);
         for (uint32_t t = 20; t < 80 && !sent; t++) {
             wd_action_t a = wd_tick(&st, t);
             if (a.kind == WD_ACT_SEND) sent = 1;
@@ -450,8 +450,85 @@ static void test_u64_str(void)
     CHECK(strstr(buf, "{\"node\":9007199254740991,\"ok\":false,\"err\":\"timeout\"}"));
 }
 
+static void crash_cycle(wd_state_t *st, wd_conn_t *c, uint32_t now, bool *sent)
+{
+    wd_rtc_t r;
+    wd_rtc_pack(&r, st, now, c, 0, 0);
+    *st = fresh(true);
+    wd_state_restore(st, &r, 5, true);
+    *sent = false;
+    for (uint32_t t = 5; t < 5 + WD_CRASH_BACKOFF_S - 1; t++) {
+        if (wd_tick(st, t).kind == WD_ACT_SEND) *sent = true;
+    }
+}
+
+static void test_send_crash_guard(void)
+{
+    wd_state_t st = fresh(true);
+    wd_conn_t c;
+    wd_conn_init(&c, 0, 0);
+    wd_tick(&st, 600);
+    wd_action_t a = wd_tick(&st, 600);
+    CHECK(a.kind == WD_ACT_SEND && st.sending);
+    bool sent;
+    crash_cycle(&st, &c, 660, &sent);
+    CHECK(st.send_crashes == 1 && !sent && st.node_state[0] == WD_NODE_PENDING && !strcmp(st.node_err[0], "send_crash"));
+    CHECK(wd_tick(&st, 5 + WD_CRASH_BACKOFF_S).kind == WD_ACT_SEND && st.sending);
+    crash_cycle(&st, &c, 120, &sent);
+    CHECK(st.send_crashes == WD_CRASH_MAX && !sent);
+    for (int i = 0; i < 4; i++) CHECK(st.node_state[i] == WD_NODE_GAVE_UP);
+    CHECK(wd_tick(&st, 10000).kind == WD_ACT_NONE);
+    char buf[1024];
+    wd_diag_t dg = {"panic", 4, 0, 0, 0, false, 0, true};
+    wd_status_json(&st, 30, false, 0, "v", true, &dg, buf, sizeof(buf));
+    CHECK(strstr(buf, "\"err\":\"send_crash\"") && strstr(buf, "\"send_crashes\":2") && strstr(buf, "\"ok\":false"));
+    wd_rtc_t r;
+    wd_rtc_pack(&r, &st, 30, &c, 0, 0);
+    wd_state_t again = fresh(true);
+    wd_state_restore(&again, &r, 5, false);
+    CHECK(again.send_crashes == WD_CRASH_MAX && again.node_state[0] == WD_NODE_GAVE_UP && wd_tick(&again, 5000).kind == WD_ACT_NONE);
+    wd_on_heartbeat(&again, 6000);
+    CHECK(again.send_crashes == 0 && !again.triggered);
+    wd_tick(&again, 6000 + 600);
+    CHECK(wd_tick(&again, 6000 + 600).kind == WD_ACT_SEND);
+    wd_state_t mode = fresh(true);
+    wd_rtc_pack(&r, &st, 30, &c, 0, 0);
+    wd_state_restore(&mode, &r, 5, false);
+    wd_set_armed(&mode, false, 100);
+    wd_set_armed(&mode, true, 200);
+    CHECK(mode.send_crashes == 0 && mode.node_state[0] == WD_NODE_PENDING && wd_tick(&mode, 200).kind == WD_ACT_SEND);
+}
+
+static void test_crash_only_counts_active_send(void)
+{
+    wd_state_t st = fresh(true);
+    wd_conn_t c;
+    wd_conn_init(&c, 0, 0);
+    wd_tick(&st, 600);
+    wd_rtc_t r;
+    wd_rtc_pack(&r, &st, 610, &c, 0, 0);
+    CHECK(!r.sending && r.send_crashes == 0);
+    wd_state_t a = fresh(true);
+    wd_state_restore(&a, &r, 5, true);
+    CHECK(a.send_crashes == 0 && wd_tick(&a, 5).kind == WD_ACT_SEND);
+    wd_tick(&st, 620);
+    wd_rtc_pack(&r, &st, 620, &c, 0, 0);
+    CHECK(r.sending);
+    wd_state_t b = fresh(true);
+    wd_state_restore(&b, &r, 5, false);
+    CHECK(b.send_crashes == 0 && wd_tick(&b, 5).kind == WD_ACT_SEND);
+    wd_report(&st, 0, true, NULL, 625);
+    wd_rtc_pack(&r, &st, 626, &c, 0, 0);
+    CHECK(!r.sending);
+    wd_rtc_pack(&r, &st, 626, &c, 0, 0);
+    r.magic = 0x57445254u;
+    CHECK(!wd_rtc_valid(&r));
+}
+
 int main(void)
 {
+    test_send_crash_guard();
+    test_crash_only_counts_active_send();
     test_u64_str();
     test_defaults_and_token();
     test_parse_heartbeat();
