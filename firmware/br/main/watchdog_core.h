@@ -95,6 +95,7 @@ typedef struct {
     uint8_t noc[WD_CERT_MAX];
 } wd_creds_t;
 
+size_t wd_u64_str(uint64_t v, char *buf, size_t n);
 void wd_config_defaults(wd_config_t *cfg);
 bool wd_config_valid(const wd_config_t *cfg);
 bool wd_config_equal(const wd_config_t *a, const wd_config_t *b);

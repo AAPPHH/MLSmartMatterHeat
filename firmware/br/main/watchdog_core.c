@@ -9,6 +9,21 @@
 
 #define MAX_NODE_ID 9007199254740991.0
 
+size_t wd_u64_str(uint64_t v, char *buf, size_t n)
+{
+    char t[21];
+    size_t k = 0, i = 0;
+    do {
+        t[k++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    for (; i < k && i + 1 < n; i++) {
+        buf[i] = t[k - 1 - i];
+    }
+    if (n) buf[i] = '\0';
+    return k;
+}
+
 void wd_config_defaults(wd_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -316,7 +331,9 @@ size_t wd_status_json(const wd_state_t *st, uint32_t now_s, bool have_temp, doub
     bool first = true;
     for (int i = 0; st->triggered && i < st->cfg.node_count; i++) {
         if (!st->node_tried[i] && st->node_state[i] != WD_NODE_GAVE_UP) continue;
-        APPEND("%s{\"node\":%llu,\"ok\":%s,\"err\":", first ? "" : ",", (unsigned long long)st->cfg.nodes[i], st->node_state[i] == WD_NODE_OK ? "true" : "false");
+        char nb[24];
+        wd_u64_str(st->cfg.nodes[i], nb, sizeof(nb));
+        APPEND("%s{\"node\":%s,\"ok\":%s,\"err\":", first ? "" : ",", nb, st->node_state[i] == WD_NODE_OK ? "true" : "false");
         if (st->node_err[i][0]) APPEND("\"%s\"", st->node_err[i]);
         else APPEND("null");
         APPEND("}");

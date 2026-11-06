@@ -434,8 +434,25 @@ static void test_feed_ok(void)
     CHECK(!wd_feed_ok(WD_OT_BOOT_S + 1, WD_OT_BOOT_S + 1, false, 0, false));
 }
 
+static void test_u64_str(void)
+{
+    char b[24];
+    CHECK(wd_u64_str(0, b, sizeof(b)) == 1 && !strcmp(b, "0"));
+    CHECK(wd_u64_str(8, b, sizeof(b)) == 1 && !strcmp(b, "8"));
+    CHECK(wd_u64_str(UINT64_MAX, b, sizeof(b)) == 20 && !strcmp(b, "18446744073709551615"));
+    CHECK(wd_u64_str(9007199254740991ull, b, 6) == 16 && !strcmp(b, "90071"));
+    wd_state_t st = fresh(true);
+    st.cfg.nodes[0] = 9007199254740991ull;
+    wd_tick(&st, 600);
+    wd_report(&st, 0, false, "timeout", 600);
+    char buf[512];
+    wd_status_json(&st, 601, false, 0, "v", true, NULL, buf, sizeof(buf));
+    CHECK(strstr(buf, "{\"node\":9007199254740991,\"ok\":false,\"err\":\"timeout\"}"));
+}
+
 int main(void)
 {
+    test_u64_str();
     test_defaults_and_token();
     test_parse_heartbeat();
     test_parse_mode_and_hex();

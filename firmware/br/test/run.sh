@@ -12,6 +12,7 @@ mkdir -p "$MBLIB"
 for f in $MBFILES; do
     [ "$MBLIB/$f.o" -nt "$MBED/library/$f.c" ] || $CC $MBFLAGS -c "$MBED/library/$f.c" -o "$MBLIB/$f.o"
 done
+! grep -nE '%[-0-9.]*(ll|j)|PRI[a-zA-Z]*64' ../main/watchdog*.c ../main/esp_ot_br.c || { echo "64-bit printf format in firmware sources (newlib nano cannot format them)"; exit 1; }
 $CC -std=c11 -Wall -Wextra -Werror -I"$IDF/components/json/cJSON" ../main/watchdog_core.c "$IDF/components/json/cJSON/cJSON.c" test_watchdog_core.c -lm -o "$TMP/wd_core_test"
 "$TMP/wd_core_test"
 MATTER_SRC="../main/matter_proto.c ../main/matter_client.c"

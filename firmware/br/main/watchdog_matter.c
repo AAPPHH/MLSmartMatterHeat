@@ -22,6 +22,7 @@ esp_err_t wd_matter_write_setpoint(const wd_creds_t *creds, uint64_t node, uint8
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "openthread/dns.h"
+#include "openthread/instance.h"
 #include "openthread/ip6.h"
 #include "openthread/srp_server.h"
 #include "matter.h"
@@ -104,8 +105,8 @@ static bool srp_lookup(const char *label, peer_t *p)
 {
     bool found = false;
     memset(p, 0, sizeof(*p));
-    esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *inst = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(inst) || !esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) return false;
     for (const otSrpServerHost *h = otSrpServerGetNextHost(inst, NULL); h && !found; h = otSrpServerGetNextHost(inst, h)) {
         if (otSrpServerHostIsDeleted(h)) continue;
         for (const otSrpServerService *s = otSrpServerHostGetNextService(h, NULL); s; s = otSrpServerHostGetNextService(h, s)) {
@@ -210,7 +211,7 @@ esp_err_t wd_matter_write_setpoint(const wd_creds_t *creds, uint64_t node, uint8
         strlcpy(err, "cert_rcac", err_len);
         return ESP_FAIL;
     }
-    snprintf(label, sizeof(label), "%02X%02X%02X%02X%02X%02X%02X%02X-%016llX", cf[0], cf[1], cf[2], cf[3], cf[4], cf[5], cf[6], cf[7], (unsigned long long)node);
+    snprintf(label, sizeof(label), "%02X%02X%02X%02X%02X%02X%02X%02X-%08lX%08lX", cf[0], cf[1], cf[2], cf[3], cf[4], cf[5], cf[6], cf[7], (unsigned long)(node >> 32), (unsigned long)(uint32_t)node);
     if (srp_lookup(label, &p)) {
         cache_save(node, &p);
     } else if (!cache_load(node, &p)) {
@@ -224,7 +225,9 @@ esp_err_t wd_matter_write_setpoint(const wd_creds_t *creds, uint64_t node, uint8
         err[0] = '\0';
     }
     if (r == ESP_ERR_TIMEOUT && !err[0]) strlcpy(err, "timeout", err_len);
-    ESP_LOGI(TAG, "node %llu: %s, heap min %u", (unsigned long long)node, r == ESP_OK ? "written" : err, (unsigned)esp_get_minimum_free_heap_size());
+    char nb[24];
+    wd_u64_str(node, nb, sizeof(nb));
+    ESP_LOGI(TAG, "node %s: %s, heap min %u", nb, r == ESP_OK ? "written" : err, (unsigned)esp_get_minimum_free_heap_size());
     return r;
 }
 #endif

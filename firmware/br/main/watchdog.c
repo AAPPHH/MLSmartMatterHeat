@@ -426,7 +426,9 @@ static void log_dry_run(const wd_state_t *st)
     char nodes[64] = "";
     size_t o = 0;
     for (int i = 0; i < st->cfg.node_count && o < sizeof(nodes) - 12; i++) {
-        o += snprintf(nodes + o, sizeof(nodes) - o, "%s%llu", i ? "," : "", (unsigned long long)st->cfg.nodes[i]);
+        char nb[24];
+        wd_u64_str(st->cfg.nodes[i], nb, sizeof(nb));
+        o += snprintf(nodes + o, sizeof(nodes) - o, "%s%s", i ? "," : "", nb);
     }
     ESP_LOGW(TAG, "no heartbeat for %us: would send %.1f to nodes %s (dry_run)", (unsigned)st->cfg.timeout_s, st->cfg.setpoint_cc / 100.0, nodes);
 }
@@ -470,7 +472,9 @@ static void watchdog_task(void *arg)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         wd_report(&s_state, act.node_idx, r == ESP_OK, err, uptime_s());
         xSemaphoreGive(s_lock);
-        ESP_LOGW(TAG, "node %llu write %s %s", (unsigned long long)snap.cfg.nodes[act.node_idx], r == ESP_OK ? "ok" : "failed", err);
+        char nb[24];
+        wd_u64_str(snap.cfg.nodes[act.node_idx], nb, sizeof(nb));
+        ESP_LOGW(TAG, "node %s write %s %s", nb, r == ESP_OK ? "ok" : "failed", err);
     }
 }
 
