@@ -71,7 +71,7 @@ import sys
 raw = open(sys.argv[1], "rb").read()
 assert len(raw) == 97 and raw[0] == 4, "ExampleOpCredsICAKey is not a 97 byte serialized P256 keypair"
 pub, priv = raw[:65], raw[65:]
-print((bytes.fromhex("30770201010420") + priv + bytes.fromhex("a00a06082a8648ce3d030107a144034200") + pub).hex())
+sys.stdout.write((bytes.fromhex("30770201010420") + priv + bytes.fromhex("a00a06082a8648ce3d030107a144034200") + pub).hex())
 PY
 }
 
