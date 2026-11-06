@@ -172,7 +172,13 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics()))
+    let now = now_ms();
+    let mut ages = String::from("# HELP heatd_reading_age_seconds age of the last value per node and attribute
+# TYPE heatd_reading_age_seconds gauge
+");
+    state.latest.all().iter().for_each(|r| ages.push_str(&format!("heatd_reading_age_seconds{{node=\"{}\",attribute=\"{}\"}} {}
+", r.node, r.attribute, ((now - r.ts) as f64 / 1000.0).max(0.0))));
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{ages}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics()))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -618,6 +624,7 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
 
 async fn api_state(State(state): State<AppState>) -> ApiResult {
     let readings = state.latest.all();
+    let (now, now_us) = (now_ms(), crate::lake::now_us());
     let setpoints = state.storage.last_setpoints()?;
     let windows = state.windows.lock().unwrap();
     let open = windows.open_rooms();
@@ -632,12 +639,21 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                 .iter()
                 .map(|&node| {
                     let reading = |name: &str| readings.iter().find(|r| r.node == node && r.attribute == name).map(|r| r.value);
+                    let age = |name: &str| readings.iter().find(|r| r.node == node && r.attribute == name).map(|r| ((now - r.ts) as f64 / 1000.0).max(0.0));
+                    let report_age = readings.iter().filter(|r| r.node == node).map(|r| r.ts * 1000).chain(state.status.last_report_us(node)).max().map(|t| ((now_us - t) as f64 / 1e6).max(0.0));
                     let setpoint = setpoints.iter().find(|s| s.node == node);
                     json!({
                         "node": node,
                         "local_temperature": reading("local_temperature"),
+                        "local_temperature_age_s": age("local_temperature"),
                         "occupied_heating_setpoint": reading("occupied_heating_setpoint"),
+                        "occupied_heating_setpoint_age_s": age("occupied_heating_setpoint"),
                         "system_mode": reading("system_mode"),
+                        "system_mode_age_s": age("system_mode"),
+                        "pi_heating_demand": reading("pi_heating_demand"),
+                        "pi_heating_demand_age_s": age("pi_heating_demand"),
+                        "last_report_age_s": report_age,
+                        "stale": report_age.is_none_or(|a| a > state.config.stale.after_s as f64),
                         "commanded_setpoint": commands.target(node),
                         "manual_hold": commands.hold(node).map(|h| json!({"value": h.value, "since_ts": h.since_ms})),
                         "reason": setpoint.map(|s| s.reason.clone()),
@@ -1012,6 +1028,30 @@ nodes = [5]
         assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
         let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(text.contains("heatd_node_subscription{node=\"5\",state=\"subscribed\"} 1") && text.contains("heatd_node_reports_total{node=\"5\"} 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn state_and_health_mark_old_values_stale_but_keep_them_visible() {
+        let h = harness(false);
+        h.state.status.set_stale_after(h.state.config.stale.after_s);
+        h.state.status.register_nodes([5]);
+        let (now, hour) = (now_ms(), 3_600_000);
+        h.state.latest.update(5, "local_temperature", 19.5, now - 13 * hour);
+        h.state.latest.update(5, "occupied_heating_setpoint", 20.0, now - 13 * hour);
+        h.state.status.node_report(5, (now - 13 * hour) * 1000);
+        let (_, state) = call(&h.state, "GET", "/api/state", None).await;
+        let node = &state["rooms"][0]["nodes"][0];
+        assert_eq!((node["local_temperature"].as_f64(), node["occupied_heating_setpoint"].as_f64(), node["stale"].as_bool()), (Some(19.5), Some(20.0), Some(true)));
+        assert!((node["local_temperature_age_s"].as_f64().unwrap() - 46_800.0).abs() < 5.0);
+        assert!(node["occupied_heating_setpoint_age_s"].as_f64().unwrap() > 46_000.0 && node["system_mode_age_s"].is_null());
+        let (_, health) = call(&h.state, "GET", "/health", None).await;
+        assert_eq!(health["nodes"][0]["stale"].as_bool(), Some(true));
+        let text = String::from_utf8(router(h.state.clone()).oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap().into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(text.contains("heatd_node_stale{node=\"5\"} 1") && text.contains("heatd_reading_age_seconds{node=\"5\",attribute=\"local_temperature\"} 4"), "{text}");
+        h.state.latest.update(5, "local_temperature", 20.1, now_ms());
+        let (_, state) = call(&h.state, "GET", "/api/state", None).await;
+        let node = &state["rooms"][0]["nodes"][0];
+        assert_eq!((node["stale"].as_bool(), node["local_temperature"].as_f64()), (Some(false), Some(20.1)));
     }
 
     #[tokio::test]
@@ -1699,6 +1739,51 @@ max_c = 25.0
         assert_eq!(extras(&h, "rate_limited"), 1);
         control_step(&h.state, at(15), t0 + 15 * 60_000).await.unwrap();
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0)]);
+    }
+
+    #[tokio::test]
+    async fn a_setpoint_changed_behind_heatds_back_is_rewritten_once_the_node_reports_it() {
+        for subscription_after_outage in [false, true] {
+            let h = harness_with(false, "away_guard_minutes = 0
+[br_watchdog]
+setpoint_c = 16.0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+            let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+            let t0 = 1_700_000_000_000;
+            crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - 1_000);
+            control_step(&h.state, at(0), t0).await.unwrap();
+            assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0)]);
+            let later = t0 + 3_600_000;
+            h.mock.write_heating_setpoint(5, 16.0).await.unwrap();
+            crate::rules::on_report(&h.state, &setpoint_report(16.0), !subscription_after_outage, later);
+            assert!(!h.state.commanded.lock().unwrap().holding(&[5]), "{subscription_after_outage}");
+            control_step(&h.state, at(30), later + 60_000).await.unwrap();
+            assert_eq!(h.mock.setpoint_writes().last(), Some(&(5, 18.0)), "{subscription_after_outage}");
+            assert_eq!(device_setpoint(&h).await, 18.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failsafe_sized_value_without_a_reporting_gap_is_still_a_manual_change() {
+        let h = harness_with(false, "away_guard_minutes = 0
+[br_watchdog]
+setpoint_c = 16.0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+        let t0 = 1_700_000_000_000;
+        crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - 1_000);
+        control_step(&h.state, at(0), t0).await.unwrap();
+        for m in 1..=5 {
+            crate::rules::on_report(&h.state, &setpoint_report(18.0), true, t0 + m * 60_000);
+        }
+        crate::rules::on_report(&h.state, &setpoint_report(16.0), false, t0 + 6 * 60_000);
+        assert!(h.state.commanded.lock().unwrap().holding(&[5]));
     }
 
     #[tokio::test]

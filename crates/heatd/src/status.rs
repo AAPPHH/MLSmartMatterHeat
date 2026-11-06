@@ -34,6 +34,7 @@ pub struct NodeStatus {
     pub since_us: i64,
     pub last_report_us: Option<i64>,
     pub reports: u64,
+    pub last_subscription_us: Option<i64>,
 }
 
 const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
@@ -78,6 +79,7 @@ struct Inner {
     last_roll: Option<(i64, bool)>,
     control_us: Option<i64>,
     br: Option<crate::br_watchdog::BrSnapshot>,
+    stale_us: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,6 +90,10 @@ impl Status {
         let status = Self::default();
         status.0.lock().unwrap().started_us = started_us;
         status
+    }
+
+    pub fn set_stale_after(&self, after_s: u64) {
+        self.0.lock().unwrap().stale_us = Some(after_s as i64 * 1_000_000);
     }
 
     pub fn register_nodes(&self, nodes: impl IntoIterator<Item = u64>) {
@@ -103,6 +109,16 @@ impl Status {
         let n = inner.nodes.entry(node).or_default();
         n.last_report_us = Some(n.last_report_us.map_or(ts_us, |t| t.max(ts_us)));
         n.reports += 1;
+    }
+
+    pub fn subscription_report(&self, node: u64, ts_us: i64) {
+        let mut inner = self.0.lock().unwrap();
+        let n = inner.nodes.entry(node).or_default();
+        n.last_subscription_us = Some(n.last_subscription_us.map_or(ts_us, |t| t.max(ts_us)));
+    }
+
+    pub fn lost_for_us(&self, node: u64, now_us: i64) -> Option<i64> {
+        self.0.lock().unwrap().nodes.get(&node).filter(|n| n.state == SubState::Lost).map(|n| now_us - n.since_us)
     }
 
     pub fn subscription(&self, node: u64, state: SubState, ts_us: i64) {
@@ -208,7 +224,13 @@ impl Status {
         let nodes: Vec<Value> = inner
             .nodes
             .iter()
-            .map(|(id, n)| json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "reports": n.reports}))
+            .map(|(id, n)| {
+                let mut node = json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "last_subscription_report_age_s": age(n.last_subscription_us), "polling_only": n.state == SubState::Lost && n.last_report_us.is_some_and(|t| n.last_subscription_us.is_none_or(|s| t > s)), "reports": n.reports});
+                if let Some(limit) = inner.stale_us {
+                    node["stale"] = json!(n.last_report_us.is_none_or(|t| now_us - t > limit));
+                }
+                node
+            })
             .collect();
         let degraded = inner.nodes.values().any(|n| matches!(n.state, SubState::Lost | SubState::Resubscribing));
         json!({
@@ -246,6 +268,12 @@ impl Status {
                 let _ = writeln!(out, "heatd_node_last_report_age_seconds{{node=\"{id}\"}} {}", age(t));
             }
         });
+        if let Some(limit) = inner.stale_us {
+            family(&mut out, "heatd_node_stale", "1 if the node has not reported for longer than the stale threshold", "gauge");
+            inner.nodes.iter().for_each(|(id, n)| {
+                let _ = writeln!(out, "heatd_node_stale{{node=\"{id}\"}} {}", u8::from(n.last_report_us.is_none_or(|t| now_us - t > limit)));
+            });
+        }
         family(&mut out, "heatd_node_reports_total", "attribute reports seen per node since start", "counter");
         inner.nodes.iter().for_each(|(id, n)| {
             let _ = writeln!(out, "heatd_node_reports_total{{node=\"{id}\"}} {}", n.reports);
