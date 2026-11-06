@@ -1,4 +1,9 @@
-# Interop check of the BR Matter client (to be run once after flashing; nothing here was run)
+# Interop check of the BR Matter client
+
+## Result 2026-11-06, section 2 on node 8
+
+fw v0.1.1-232-gb9ecf6a, Rust client (`CONFIG_BR_WATCHDOG_MATTER_RUST=y`), 19.0 C: `results[{node:8,ok:true}]` about 11 s after the trigger, confirmed by heatd's subscription (node 8 setpoint 19.0, booked as a 60 min manual hold). `wd_stack_free_min` 4312 of 14336, no panic. The first attempt on fw v0.1.1-224 panicked and looped: newlib nano printf has no 64-bit formats. To hold heatd's heartbeats off: `iptables -I OUTPUT -d <BR> -p tcp --dport 80 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset`, test curls as root. Afterwards unblock first and wait one heatd tick before setting `dry_run`.
+
 
 The client (`firmware/br/main/matter_client.c`, `matter_proto.c`) is verified on the host against the Matter SDK test vectors and an independent Python CASE responder (`firmware/br/test/run.sh`). What no host test can prove is that a real Matter stack accepts it. These steps do that, cheapest first. Do not run them against the production thermostats before step 2 passed.
 
