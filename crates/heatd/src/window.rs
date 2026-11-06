@@ -37,6 +37,7 @@ struct Active {
 #[derive(Debug, Default)]
 struct NodeWin {
     seen_ms: Option<i64>,
+    gap_ms: Option<i64>,
     temp: Option<f64>,
     valve: Option<f64>,
     closed_ms: Option<i64>,
@@ -291,6 +292,7 @@ impl Windows {
         if !gap {
             return;
         }
+        n.gap_ms = Some(ts_ms);
         n.over_since = None;
         n.high_since = None;
         if let Some(room) = config.rooms.iter().find(|r| r.nodes.contains(&node)) {
@@ -299,6 +301,10 @@ impl Windows {
             entry.slope_since = None;
             entry.recover_since = None;
         }
+    }
+
+    pub fn reconnected(&self, node: u64, now: i64, within_ms: i64) -> bool {
+        self.nodes.get(&node).and_then(|n| n.gap_ms).is_some_and(|g| now - g <= within_ms)
     }
 
     fn fresh(&self, node: u64, now: i64, stale_ms: i64) -> bool {

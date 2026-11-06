@@ -1742,6 +1742,51 @@ max_c = 25.0
     }
 
     #[tokio::test]
+    async fn a_setpoint_changed_behind_heatds_back_is_rewritten_once_the_node_reports_it() {
+        for subscription_after_outage in [false, true] {
+            let h = harness_with(false, "away_guard_minutes = 0
+[br_watchdog]
+setpoint_c = 16.0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+            let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+            let t0 = 1_700_000_000_000;
+            crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - 1_000);
+            control_step(&h.state, at(0), t0).await.unwrap();
+            assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0)]);
+            let later = t0 + 3_600_000;
+            h.mock.write_heating_setpoint(5, 16.0).await.unwrap();
+            crate::rules::on_report(&h.state, &setpoint_report(16.0), !subscription_after_outage, later);
+            assert!(!h.state.commanded.lock().unwrap().holding(&[5]), "{subscription_after_outage}");
+            control_step(&h.state, at(30), later + 60_000).await.unwrap();
+            assert_eq!(h.mock.setpoint_writes().last(), Some(&(5, 18.0)), "{subscription_after_outage}");
+            assert_eq!(device_setpoint(&h).await, 18.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failsafe_sized_value_without_a_reporting_gap_is_still_a_manual_change() {
+        let h = harness_with(false, "away_guard_minutes = 0
+[br_watchdog]
+setpoint_c = 16.0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+        let t0 = 1_700_000_000_000;
+        crate::rules::on_report(&h.state, &setpoint_report(19.0), false, t0 - 1_000);
+        control_step(&h.state, at(0), t0).await.unwrap();
+        for m in 1..=5 {
+            crate::rules::on_report(&h.state, &setpoint_report(18.0), true, t0 + m * 60_000);
+        }
+        crate::rules::on_report(&h.state, &setpoint_report(16.0), false, t0 + 6 * 60_000);
+        assert!(h.state.commanded.lock().unwrap().holding(&[5]));
+    }
+
+    #[tokio::test]
     async fn changes_below_the_deadband_are_not_written() {
         let h = harness_with(false, "", "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms.schedules]]\ndays = ['weekdays']\nfrom = '12:05'\nto = '23:00'\nsetpoint = 18.5\n");
         let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();

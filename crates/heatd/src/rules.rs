@@ -90,6 +90,7 @@ impl Occ {
 pub struct Commands {
     sent: HashMap<u64, Sent>,
     device: HashMap<u64, f64>,
+    device_ms: HashMap<u64, i64>,
     holds: HashMap<u64, Hold>,
     last_write: HashMap<u64, (i64, &'static str)>,
     deferred: HashMap<u64, f64>,
@@ -106,6 +107,7 @@ impl Commands {
     pub fn forget_desired_writes(&mut self) {
         self.sent.clear();
         self.device.clear();
+        self.device_ms.clear();
         self.last_write.clear();
         self.deferred.clear();
         self.resets.clear();
@@ -118,6 +120,12 @@ impl Commands {
 
     pub fn holding(&self, nodes: &[u64]) -> bool {
         nodes.iter().any(|n| self.holds.contains_key(n))
+    }
+
+    fn drifted(&self, node: u64, grace_ms: i64) -> bool {
+        let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
+        let (Some(device), Some(at), Some(sent)) = (self.device.get(&node), self.device_ms.get(&node), self.sent.get(&node)) else { return false };
+        at - sent.written_ms >= grace_ms && !self.holds.contains_key(&node) && !near(*device, sent.target) && !sent.acked.is_some_and(|a| near(a, *device))
     }
 
     pub fn hold(&self, node: u64) -> Option<&Hold> {
@@ -674,6 +682,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         }
     }
     let interval_ms = minutes(state.config.min_write_interval_min);
+    let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
     for want in wants {
         let (old, prior) = {
             let mut commands = state.commanded.lock().unwrap();
@@ -682,13 +691,14 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
             };
             let last = commands.target(want.node);
             let old = current(&commands, want.node);
-            if last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C) || old.is_some_and(|o| (o - want.setpoint).abs() < state.config.setpoint_deadband) {
+            let drifted = commands.drifted(want.node, grace_ms);
+            if (!drifted && last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C)) || old.is_some_and(|o| (o - want.setpoint).abs() < state.config.setpoint_deadband) {
                 commands.deferred.remove(&want.node);
                 continue;
             }
             let last_write = commands.last_write.get(&want.node).copied();
             let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off" | "no_supply" | "pi_reset");
-            let bypass = hold_ended || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
+            let bypass = hold_ended || drifted || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
             if !bypass && last_write.is_some_and(|(t, _)| now_ms - t < interval_ms) {
                 if commands.deferred.get(&want.node).is_none_or(|d| (d - want.setpoint).abs() >= DESIRED_EPS_C) {
                     commands.deferred.insert(want.node, want.setpoint);
@@ -733,11 +743,12 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     Ok(written)
 }
 
-fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) -> Option<f64> {
+fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64, reconnected: bool) -> Option<f64> {
     let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
     let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
     let mut commands = state.commanded.lock().unwrap();
     commands.device.insert(report.node, report.value);
+    commands.device_ms.insert(report.node, now_ms);
     let Some(sent) = commands.sent.get_mut(&report.node) else {
         commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None });
         return None;
@@ -751,7 +762,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
         }
         return None;
     }
-    if poll {
+    if poll || (reconnected && near(report.value, state.config.br_watchdog.setpoint_c)) {
         return None;
     }
     let previous = sent.acked.unwrap_or(sent.target);
@@ -770,7 +781,8 @@ pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     if report.attribute != OCCUPIED_HEATING_SETPOINT.snake {
         return;
     }
-    let Some(previous) = manual_change(state, report, poll, now_ms) else { return };
+    let reconnected = state.windows.lock().unwrap().reconnected(report.node, now_ms, GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000);
+    let Some(previous) = manual_change(state, report, poll, now_ms, reconnected) else { return };
     let Some(room) = state.config.rooms.iter().find(|r| r.nodes.contains(&report.node)) else { return };
     if report.value < previous {
         state.windows.lock().unwrap().note_decrease(&room.name, now_ms);
