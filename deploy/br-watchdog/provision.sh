@@ -166,7 +166,7 @@ def parse(text):
             cont[k] = int(val) if re.fullmatch(r"-?\d+", val) else val
     return root, text
 def main():
-    text = sys.stdin.read()
+    text = re.sub(r"\x1b\[[0-9;]*m", "", sys.stdin.read())
     root, _ = parse(text)
     acl = root.get("ACL")
     n = re.search(r"ACL:\s*(\d+) entries", text)
