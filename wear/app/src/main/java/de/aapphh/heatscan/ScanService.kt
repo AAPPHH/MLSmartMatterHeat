@@ -395,7 +395,7 @@ class ScanService : Service() {
     private fun promptNoScan(reason: String, wake: Boolean) {
         val away = policy.away
         val off = offBody == true
-        if (!Wake.promptAllowed(away, offBody, wake, power.isInteractive)) return
+        if (!Wake.promptAllowed(away, store.atHome, store.homeAt, System.currentTimeMillis(), offBody, wake, power.isInteractive)) return
         try {
             io.execute {
                 val d = store.stay { it.promptWithoutScan(System.currentTimeMillis(), store.guess, wake) }
@@ -510,7 +510,7 @@ class ScanService : Service() {
                 Trace.i("learn_pending_timeout")
                 learnPending = false
             }
-            val step = Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt).let { if (!learnReady && it != LearnStep.STOP) LearnStep.WAIT else it }
+            val step = Learn.step(store.learnAt, now, offBody == true, store.progress?.done == true, store.learnPromptAt, learnPending, learnIdleAt, store.homeKnown(now)).let { if (!learnReady && it != LearnStep.STOP) LearnStep.WAIT else it }
             when (step) {
                 LearnStep.STOP -> stopLearn("auto")
                 LearnStep.DISCARD -> {
@@ -726,6 +726,7 @@ class ScanService : Service() {
             Trace.i("scan_result", "count" to results.size, "home" to home)
             if (store.atHome != home) Trace.i("home_change", "home" to home)
             store.atHome = home
+            if (home) store.homeAt = System.currentTimeMillis() else Prompter.cancel(applicationContext)
             val before = policy.mode
             val now = SystemClock.elapsedRealtime()
             policy.onScan(home, now)
@@ -743,7 +744,7 @@ class ScanService : Service() {
                 if (home && store.learnAt != 0L) {
                     store.learnScanAt = ts
                     store.learnPromptAt = System.currentTimeMillis()
-                    Prompter.askLearn(this)
+                    Prompter.askLearn(this, store)
                 }
             }
         } catch (e: Exception) {
@@ -1052,7 +1053,7 @@ object Prompter {
     }
 
     fun ask(c: Context, store: Store, away: Boolean, offBody: Boolean, d: Decision) {
-        if (store.learnAt != 0L) return
+        if (store.learnAt != 0L || away || !store.homeKnown()) return
         try {
             val now = System.currentTimeMillis()
             val loud = Prompt.alert(now, store.lastPromptAlertAt, away, offBody, java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY))
@@ -1065,7 +1066,8 @@ object Prompter {
         }
     }
 
-    fun askLearn(c: Context) {
+    fun askLearn(c: Context, store: Store) {
+        if (!store.homeKnown()) return
         try {
             post(c, null, false, true, true, true)
         } catch (e: Exception) {
@@ -1074,7 +1076,7 @@ object Prompter {
     }
 
     fun refresh(c: Context, store: Store) {
-        if (store.learnAt != 0L) return
+        if (store.learnAt != 0L || !store.homeKnown()) return
         try {
             val (guess, change, loud) = store.stay { Triple(it.askGuess, it.askChange, it.askLoud) }
             post(c, guess, change, loud, false)

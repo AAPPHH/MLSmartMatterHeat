@@ -492,6 +492,12 @@ class StayTracker {
     }
 }
 
+object Presence {
+    const val FRESH_MS = 1_800_000L
+
+    fun known(atHome: Boolean?, homeAt: Long, now: Long) = atHome == true && Span.ms(now, homeAt) in 0..FRESH_MS
+}
+
 object Wake {
     const val GAP_MS = 20_000L
 
@@ -500,6 +506,9 @@ object Wake {
     fun scanDue(now: Long, lastRequestAt: Long, idle: Boolean) = !idle && now - lastRequestAt >= GAP_MS
 
     fun promptAllowed(away: Boolean, offBody: Boolean?, wake: Boolean, interactive: Boolean) = !away && offBody != true && (!wake || interactive)
+
+    fun promptAllowed(policyAway: Boolean, atHome: Boolean?, homeAt: Long, now: Long, offBody: Boolean?, wake: Boolean, interactive: Boolean) =
+        promptAllowed(policyAway || !Presence.known(atHome, homeAt, now), offBody, wake, interactive)
 
     fun settled(before: Mode, after: Mode) = before == Mode.MOVING && (after == Mode.SETTLING || after == Mode.STILL)
 }
@@ -531,11 +540,11 @@ object Learn {
             (0 until a.length()).mapNotNull { a.getJSONObject(it).let { r -> if (r.has("heatable")) r.getString("room") to r.getBoolean("heatable") else null } }.toMap())
     } catch (e: Exception) { null }
 
-    fun step(startedAt: Long, now: Long, offBody: Boolean, done: Boolean, promptAt: Long, scanPending: Boolean, idleSince: Long): LearnStep = when {
+    fun step(startedAt: Long, now: Long, offBody: Boolean, done: Boolean, promptAt: Long, scanPending: Boolean, idleSince: Long, home: Boolean = true): LearnStep = when {
         startedAt == 0L -> LearnStep.WAIT
         offBody || done || Span.ms(now, startedAt) >= MAX_MS -> LearnStep.STOP
         promptAt != 0L -> if (Span.ms(now, promptAt) >= ANSWER_MS) LearnStep.DISCARD else LearnStep.WAIT
-        scanPending || Span.ms(now, idleSince) < GAP_MS -> LearnStep.WAIT
+        !home || scanPending || Span.ms(now, idleSince) < GAP_MS -> LearnStep.WAIT
         else -> LearnStep.SCAN
     }
 
@@ -1223,7 +1232,9 @@ class Store(private val ctx: Context) {
     var windowSeen: List<String>
         get() = (sp.getString("windowSeen", "") ?: "").split(",").filter { it.isNotEmpty() }
         set(v) = sp.edit().putString("windowSeen", v.joinToString(",")).apply()
+    fun homeKnown(now: Long = System.currentTimeMillis()) = Presence.known(atHome, homeAt, now)
     fun admitWindow(incoming: WindowAsk?, now: Long): WindowAsk? = synchronized(Store::class.java) {
+        if (!homeKnown(now)) return null
         val before = windowPending
         val (p, seen) = WindowEvent.admit(before, windowSeen, incoming, now)
         if (seen != windowSeen) windowSeen = seen
@@ -1260,6 +1271,9 @@ class Store(private val ctx: Context) {
     var atHome: Boolean?
         get() = if (sp.contains("atHome")) sp.getBoolean("atHome", true) else null
         set(v) = sp.edit().also { if (v == null) it.remove("atHome") else it.putBoolean("atHome", v) }.apply()
+    var homeAt: Long
+        get() = sp.getLong("homeAt", 0L)
+        set(v) = sp.edit().putLong("homeAt", v).apply()
     val homeList: List<String> get() = Home.parse(home)
     var nonce: Long
         get() = sp.getLong("nonce", 0L)
