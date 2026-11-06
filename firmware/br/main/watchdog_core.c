@@ -525,6 +525,7 @@ void wd_state_restore(wd_state_t *st, const wd_rtc_t *r, uint32_t now_s, uint32_
         st->node_crashes[n]++;
         st->node_due_s[n] = now_s + WD_CRASH_BACKOFF_S;
         mark_crash(st, n);
+        st->last_node = WD_NO_NODE;
     }
     if (st->global_crashes < UINT8_MAX) st->global_crashes++;
     if (st->global_crashes >= WD_GLOBAL_CRASH_MAX && st->global_due_s <= now_s) st->global_due_s = now_s + WD_GLOBAL_BACKOFF_S;

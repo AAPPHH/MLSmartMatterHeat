@@ -542,6 +542,18 @@ static void test_crash_attribution_window(void)
     CHECK(st.node_crashes[0] == 0 && st.global_crashes == 1);
 }
 
+static void test_one_send_charged_once(void)
+{
+    wd_conn_t c;
+    int n;
+    wd_state_t st = triggered_sending(&c, &n);
+    wd_report(&st, 0, false, "no_address", 605);
+    reboot(&st, &c, 630, 1000, 3, true, true);
+    CHECK(st.node_crashes[0] == 1 && st.node_state[0] == WD_NODE_PENDING);
+    reboot(&st, &c, 30, 1100, 3, true, true);
+    CHECK(st.node_crashes[0] == 1 && st.node_state[0] == WD_NODE_PENDING && st.global_crashes == 2);
+}
+
 static void test_normal_reboot_adds_no_count(void)
 {
     wd_conn_t c;
@@ -669,6 +681,7 @@ int main(void)
     test_crash_isolates_node();
     test_crash_count_decays_after_report();
     test_crash_attribution_window();
+    test_one_send_charged_once();
     test_normal_reboot_adds_no_count();
     test_global_crash_backoff_persists();
     test_boot_loop_post_send_bounded();
