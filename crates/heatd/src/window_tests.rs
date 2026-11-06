@@ -39,6 +39,14 @@ impl Sim {
         }
     }
 
+    fn idle(&mut self, minutes: usize) {
+        for _ in 0..minutes {
+            self.t += 60_000;
+            let found = self.w.step(&self.c, self.t, self.out);
+            self.events.extend(found);
+        }
+    }
+
     fn kinds(&self) -> Vec<&'static str> {
         self.events.iter().map(|e| e.kind).collect()
     }
@@ -593,4 +601,53 @@ fn recovery_bounce_shape_of_2026_10_31_opens_once_without_setpoint_toggling() {
     let (s, opens, toggles) = flapping_shape("");
     assert_eq!(opens, 1, "{:?}", s.events);
     assert!(toggles.len() <= 2, "{toggles:?}");
+}
+
+#[test]
+fn a_silent_node_holds_an_open_window_instead_of_timing_it_out() {
+    let mut s = opened();
+    assert_eq!(s.state(), "open");
+    let before = s.events.len();
+    s.idle(600);
+    assert_eq!((s.state().as_str(), s.events.len()), ("open", before));
+}
+
+#[test]
+fn a_flat_stale_temperature_never_starts_no_supply_and_the_jump_after_reconnect_is_no_drop() {
+    let mut s = Sim::new("");
+    s.run(flat(19.0, 5));
+    s.valve(100.0);
+    s.run(flat(19.0, 10));
+    s.idle(120);
+    assert!(supply_events(&s).is_empty() && s.w.no_supply_rooms().is_empty(), "{:?}", s.events);
+    s.run(vec![17.0]);
+    s.run(flat(17.0, 3));
+    assert!(s.kinds().is_empty(), "{:?}", s.events);
+}
+
+#[test]
+fn reconnect_after_a_gap_forgets_the_old_series_for_detection() {
+    let mut s = Sim::new("");
+    s.run(flat(21.0, 20));
+    s.t += 20 * 60_000;
+    s.run(vec![19.0]);
+    s.run(flat(19.0, 4));
+    assert!(s.kinds().is_empty(), "{:?}", s.events);
+}
+
+#[test]
+fn stale_node_data_never_triggers_a_pi_reset() {
+    let s = Sim::new("");
+    let mut w = Windows::default();
+    let t = s.t;
+    w.observe(&s.c, 5, LOCAL_TEMPERATURE, 22.0, t);
+    w.observe(&s.c, 5, PI_HEATING_DEMAND, 100.0, t);
+    assert!(w.overshoot_due(&s.c.supply, 5, 20.0, t, 900_000).is_none());
+    assert!(w.overshoot_due(&s.c.supply, 5, 20.0, t + 16 * 60_000, 36_000_000).is_some());
+    let mut w = Windows::default();
+    w.observe(&s.c, 5, LOCAL_TEMPERATURE, 22.0, t);
+    w.observe(&s.c, 5, PI_HEATING_DEMAND, 100.0, t);
+    w.overshoot_due(&s.c.supply, 5, 20.0, t, 900_000);
+    assert!(w.overshoot_due(&s.c.supply, 5, 20.0, t + 16 * 60_000, 900_000).is_none());
+    assert!(w.local_temp(5, t + 16 * 60_000, 900_000).is_none() && w.local_temp(5, t + 60_000, 900_000) == Some(22.0));
 }

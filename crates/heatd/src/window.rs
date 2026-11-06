@@ -36,6 +36,8 @@ struct Active {
 
 #[derive(Debug, Default)]
 struct NodeWin {
+    seen_ms: Option<i64>,
+    gap_ms: Option<i64>,
     temp: Option<f64>,
     valve: Option<f64>,
     closed_ms: Option<i64>,
@@ -283,8 +285,35 @@ impl NodeWin {
 }
 
 impl Windows {
+    pub fn touch(&mut self, config: &Config, node: u64, ts_ms: i64) {
+        let n = self.nodes.entry(node).or_default();
+        let gap = n.seen_ms.is_some_and(|s| ts_ms - s > config.stale.after_ms());
+        n.seen_ms = Some(n.seen_ms.map_or(ts_ms, |s| s.max(ts_ms)));
+        if !gap {
+            return;
+        }
+        n.gap_ms = Some(ts_ms);
+        n.over_since = None;
+        n.high_since = None;
+        if let Some(room) = config.rooms.iter().find(|r| r.nodes.contains(&node)) {
+            let entry = self.rooms.entry(room.name.clone()).or_default();
+            entry.floor_ms = ts_ms - 1;
+            entry.slope_since = None;
+            entry.recover_since = None;
+        }
+    }
+
+    pub fn reconnected(&self, node: u64, now: i64, within_ms: i64) -> bool {
+        self.nodes.get(&node).and_then(|n| n.gap_ms).is_some_and(|g| now - g <= within_ms)
+    }
+
+    fn fresh(&self, node: u64, now: i64, stale_ms: i64) -> bool {
+        self.nodes.get(&node).and_then(|n| n.seen_ms).is_some_and(|s| now - s <= stale_ms)
+    }
+
     pub fn observe(&mut self, config: &Config, node: u64, attribute: &str, value: f64, ts_ms: i64) {
         let Some(room) = config.rooms.iter().find(|r| r.nodes.contains(&node)) else { return };
+        self.touch(config, node, ts_ms);
         let cfg = &config.window;
         let entry = self.rooms.entry(room.name.clone()).or_default();
         let n = self.nodes.entry(node).or_default();
@@ -293,7 +322,8 @@ impl Windows {
             LOCAL_TEMPERATURE => {
                 n.temp = Some(value);
                 n.track_cooldown(cfg, ts_ms, value);
-                let temps: Vec<f64> = room.nodes.iter().filter_map(|id| self.nodes.get(id).and_then(|n| n.temp)).collect();
+                let stale_ms = config.stale.after_ms();
+                let temps: Vec<f64> = room.nodes.iter().filter_map(|id| self.nodes.get(id)).filter(|n| n.seen_ms.is_some_and(|s| ts_ms - s <= stale_ms)).filter_map(|n| n.temp).collect();
                 if entry.nodes_seen != temps.len() {
                     entry.nodes_seen = temps.len();
                     entry.series.clear();
@@ -447,6 +477,9 @@ impl Windows {
     pub fn supply_tick(&mut self, config: &Config, room: &str, now: i64) -> Vec<WinEvent> {
         let cfg = &config.supply;
         let Some(nodes) = config.rooms.iter().find(|r| r.name == room).map(|r| r.nodes.clone()).filter(|n| cfg.enabled && !n.is_empty()) else { return Vec::new() };
+        if !nodes.iter().all(|id| self.fresh(*id, now, config.stale.after_ms())) {
+            return Vec::new();
+        }
         let Some(mut w) = self.rooms.remove(room) else { return Vec::new() };
         let mins = |m: f64| (m * MIN_MS as f64) as i64;
         let event = |state: &str, since: i64, extra: Value| {
@@ -481,12 +514,17 @@ impl Windows {
         self.rooms.iter().filter(|(_, r)| r.supply.is_some()).map(|(n, _)| n.clone()).collect()
     }
 
-    pub fn local_temp(&self, node: u64) -> Option<f64> {
-        self.nodes.get(&node).and_then(|n| n.temp)
+    pub fn local_temp(&self, node: u64, now: i64, stale_ms: i64) -> Option<f64> {
+        self.nodes.get(&node).filter(|_| self.fresh(node, now, stale_ms)).and_then(|n| n.temp)
     }
 
-    pub fn overshoot_due(&mut self, cfg: &SupplySection, node: u64, setpoint: f64, now: i64) -> Option<(f64, f64)> {
+    pub fn overshoot_due(&mut self, cfg: &SupplySection, node: u64, setpoint: f64, now: i64, stale_ms: i64) -> Option<(f64, f64)> {
+        let fresh = self.fresh(node, now, stale_ms);
         let n = self.nodes.get_mut(&node)?;
+        if !fresh {
+            n.over_since = None;
+            return None;
+        }
         let hit = n.temp.zip(n.valve).filter(|(t, v)| *t >= setpoint + cfg.overshoot_k && *v >= cfg.overshoot_valve_pct);
         if hit.is_none() {
             n.over_since = None;
@@ -581,7 +619,7 @@ impl Windows {
         for room in config.rooms.iter().filter(|r| !r.nodes.is_empty()) {
             let Some(mut w) = self.rooms.remove(&room.name) else { continue };
             let target = self.ctx.get(&room.name).and_then(|c| c.target).unwrap_or(config.default_setpoint);
-            let evs = self.room_step(cfg, &room.name, &room.nodes, &mut w, now, outdoor, target);
+            let evs = self.room_step(cfg, &room.name, &room.nodes, &mut w, now, outdoor, target, config.stale.after_ms());
             for e in &evs {
                 let question = match (e.kind, e.detail["source"].as_str(), e.detail["reason"].as_str()) {
                     (lake::kind::WINDOW_OPEN, Some("auto"), _) | (lake::kind::WINDOW_REOPEN, ..) => Some("open"),
@@ -608,11 +646,14 @@ impl Windows {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn room_step(&self, cfg: &WindowSection, name: &str, nodes: &[u64], w: &mut RoomWin, now: i64, outdoor: Option<(f64, Option<f64>)>, target: f64) -> Vec<WinEvent> {
+    fn room_step(&self, cfg: &WindowSection, name: &str, nodes: &[u64], w: &mut RoomWin, now: i64, outdoor: Option<(f64, Option<f64>)>, target: f64, stale_ms: i64) -> Vec<WinEvent> {
         let mins = |m: f64| (m * MIN_MS as f64) as i64;
         let age = mins(cfg.open_window_min);
         let event = |kind: &'static str, detail: Value| WinEvent { kind, room: name.into(), detail };
         let Some(cur) = w.series.back().map(|s| s.1) else { return Vec::new() };
+        if !nodes.iter().any(|id| self.fresh(*id, now, stale_ms)) && w.active.as_ref().is_none_or(|a| a.source != "manual") {
+            return Vec::new();
+        }
         let Some(active) = w.active.clone() else {
             return self.detect(cfg, name, nodes, w, now, outdoor);
         };

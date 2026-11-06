@@ -455,6 +455,26 @@ impl Default for SupplySection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct StaleSection {
+    pub after_s: u64,
+    pub resubscribe_after_s: u64,
+    pub resubscribe_gap_s: u64,
+}
+
+impl Default for StaleSection {
+    fn default() -> Self {
+        Self { after_s: 900, resubscribe_after_s: 600, resubscribe_gap_s: 900 }
+    }
+}
+
+impl StaleSection {
+    pub fn after_ms(&self) -> i64 {
+        self.after_s as i64 * 1000
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -494,6 +514,7 @@ pub struct Config {
     pub supply: SupplySection,
     pub boost: BoostSection,
     pub failsafe: FailsafeSection,
+    pub stale: StaleSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
 }
 
@@ -538,6 +559,7 @@ impl Default for Config {
             supply: SupplySection::default(),
             boost: BoostSection::default(),
             failsafe: FailsafeSection::default(),
+            stale: StaleSection::default(),
             br_watchdog: Default::default(),
         }
     }
@@ -662,7 +684,7 @@ mod tests {
         assert_eq!((docker.window.min_open_hold_min, docker.window.rearm_min, docker.window.probe_cooldown_min, docker.window.v2.enabled), (15.0, 20.0, 30.0, true));
         assert_eq!((docker.occupied_setpoint, docker.frost_setpoint, docker.watchmatch.label_target), (20.0, 8.0, 10));
         assert_eq!(docker.watchmatch.labels_since.as_deref(), Some("2026-10-29T20:28:00+01:00"));
-        assert_eq!((docker.br_watchdog.enabled, docker.br_watchdog.token_file.as_str(), docker.br_watchdog.interval_s, docker.br_watchdog.timeout_s), (false, "/secrets/br_watchdog_token", 30, 600));
+        assert_eq!((docker.br_watchdog.enabled, docker.br_watchdog.token_file.as_str(), docker.br_watchdog.interval_s, docker.br_watchdog.timeout_s), (true, "/secrets/br_watchdog_token", 30, 600));
         assert!(!Config::default().br_watchdog.enabled);
         assert!(docker.rooms.iter().all(|r| r.schedules.is_empty()));
         let example = Config::parse(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../heatd.example.toml")).unwrap()).unwrap();

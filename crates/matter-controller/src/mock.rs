@@ -27,6 +27,7 @@ struct Inner {
     limit_writes: Vec<(NodeId, f64)>,
     write_log: Vec<(&'static str, NodeId, f64)>,
     limit_rejecting: bool,
+    resubscribes: Vec<NodeId>,
 }
 
 pub struct MockController {
@@ -45,6 +46,10 @@ impl MockController {
 
     pub fn push_capture(&self, node: NodeId, item: CaptureItem) {
         Self::send_capture(&self.inner.lock().unwrap(), node, item);
+    }
+
+    pub fn resubscribes(&self) -> Vec<NodeId> {
+        self.inner.lock().unwrap().resubscribes.clone()
     }
 
     pub fn set_poll_failing(&self, failing: bool) {
@@ -223,6 +228,16 @@ impl MatterController for MockController {
         inner.captures.retain(|(n, _)| *n != node);
         inner.captures.push((node, tx));
         Ok(rx)
+    }
+
+    async fn resubscribe(&self, node: NodeId) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.nodes.contains_key(&node) {
+            return Err(Error::UnknownNode(node));
+        }
+        inner.resubscribes.push(node);
+        Self::send_capture(&inner, node, CaptureItem::Subscribed { node: Some(node) });
+        Ok(())
     }
 
     async fn poll(&self, node: NodeId) -> Result<usize> {
