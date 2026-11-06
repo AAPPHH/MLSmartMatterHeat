@@ -1,0 +1,10 @@
+[Unit]
+Description=heatd network guard, repairs wlo1 IPv4 and the Thread IPv6 route when they vanish
+After=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/aapphh/MLSmartMatterHeat/deploy/netguard/heatd-netguard.sh
+TimeoutStartSec=120
+Nice=10
+IOSchedulingClass=idle
