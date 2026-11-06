@@ -6,6 +6,7 @@ idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "."
                        EMBED_TXTFILES ${project_dir}/server_certs/ca_cert.pem
                        )
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
 if(CONFIG_BR_WATCHDOG_MATTER_RUST)
     get_filename_component(rs_dir "${CMAKE_CURRENT_LIST_DIR}/../matter_client" ABSOLUTE)
     set(rs_target_dir "${CMAKE_CURRENT_BINARY_DIR}/matter_rs")

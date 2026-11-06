@@ -5,6 +5,10 @@
 #include "driver/temperature_sensor.h"
 #include "esp_attr.h"
 #include "esp_app_desc.h"
+#include "esp_cpu_utils.h"
+#include "esp_debug_helpers.h"
+#include "esp_memory_utils.h"
+#include "esp_private/panic_internal.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
@@ -23,6 +27,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/platform_util.h"
+#include "xtensa_context.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 #include "watchdog_core.h"
@@ -39,6 +44,7 @@
 #define CFG_MAGIC 0x57443031u
 #define BODY_MAX 4096
 #define STATUS_MAX 2048
+#define HEAP_MAX 1536
 #define WD_TASK_STACK 14336
 #define OTA_CHUNK 4096
 #define OTA_VALIDATE_GOOD_S 60
@@ -63,6 +69,9 @@ static httpd_handle_t s_httpd;
 static volatile uint32_t s_ticks;
 static volatile uint32_t s_stack_free_min = WD_TASK_STACK;
 static RTC_NOINIT_ATTR wd_rtc_t s_rtc;
+static RTC_NOINIT_ATTR wd_panic_t s_panic;
+static RTC_NOINIT_ATTR wd_trace_t s_trace;
+static DRAM_ATTR char s_twdt[sizeof(((wd_panic_t *)0)->twdt)];
 static wd_conn_t s_conn;
 static wd_diag_t s_diag;
 static uint32_t s_wifi_restarts;
@@ -78,9 +87,66 @@ static volatile uint32_t s_disc_reason;
 typedef void (*ot_task_t)(void *);
 esp_err_t esp_openthread_task_queue_post(ot_task_t task, void *arg);
 
+extern void __real_esp_panic_handler(panic_info_t *info);
+
 static uint32_t uptime_s(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000000);
+}
+
+void br_watchdog_stage(wd_stage_t stage)
+{
+    uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    if (hw < s_stack_free_min) s_stack_free_min = hw;
+    wd_trace_mark(&s_trace, stage, (uint32_t)(esp_timer_get_time() / 1000), hw);
+}
+
+static void IRAM_ATTR twdt_collect(void *opaque, const char *msg)
+{
+    if (strncmp(msg, "Task watchdog got", 17) == 0) return;
+    if (msg[0] == '\n') wd_append_clean(s_twdt, sizeof(s_twdt), s_twdt[0] ? "," : "");
+    else wd_append_clean(s_twdt, sizeof(s_twdt), msg);
+}
+
+void IRAM_ATTR esp_task_wdt_isr_user_handler(void)
+{
+    s_twdt[0] = '\0';
+    esp_task_wdt_print_triggered_tasks(twdt_collect, NULL, NULL);
+    wd_append_clean(s_twdt, sizeof(s_twdt), " | running:");
+    for (int c = 0; c < CONFIG_FREERTOS_NUMBER_OF_CORES; c++) {
+        TaskHandle_t t = xTaskGetCurrentTaskHandleForCore(c);
+        wd_append_clean(s_twdt, sizeof(s_twdt), " ");
+        wd_append_clean(s_twdt, sizeof(s_twdt), t ? pcTaskGetName(t) : "");
+    }
+}
+
+void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info)
+{
+    uint32_t prev = s_panic.magic == WD_PANIC_MAGIC && s_panic.sum == wd_fnv(&s_panic, offsetof(wd_panic_t, sum)) ? s_panic.count : 0;
+    memset(&s_panic, 0, sizeof(s_panic));
+    s_panic.count = prev + 1;
+    s_panic.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    s_panic.exception = (uint8_t)info->exception;
+    s_panic.core = (uint8_t)info->core;
+    s_panic.pc = (uint32_t)info->addr;
+    const XtExcFrame *f = info->frame;
+    if (f) {
+        s_panic.cause = f->exccause;
+        s_panic.excvaddr = f->excvaddr;
+        esp_backtrace_frame_t bt = {.pc = f->pc, .sp = f->a1, .next_pc = f->a0, .exc_frame = f};
+        bool ok = esp_stack_ptr_is_sane(bt.sp) && esp_ptr_executable((void *)esp_cpu_process_stack_pc(bt.pc));
+        for (int i = 0; ok && i < WD_BT_FRAMES; i++) {
+            s_panic.bt[i] = esp_cpu_process_stack_pc(bt.pc);
+            if (bt.next_pc == 0 || !esp_backtrace_get_next_frame(&bt)) break;
+        }
+    }
+    TaskHandle_t th = xTaskGetCurrentTaskHandleForCore(info->core);
+    wd_append_clean(s_panic.task, sizeof(s_panic.task), th ? pcTaskGetName(th) : "");
+    wd_append_clean(s_panic.reason, sizeof(s_panic.reason), info->reason);
+    wd_append_clean(s_panic.details, sizeof(s_panic.details), g_panic_abort ? g_panic_abort_details : "");
+    wd_append_clean(s_panic.twdt, sizeof(s_panic.twdt), s_twdt);
+    wd_panic_seal(&s_panic);
+    __real_esp_panic_handler(info);
 }
 
 static void cfg_save(const wd_config_t *cfg)
@@ -291,9 +357,14 @@ static esp_err_t ambient_handler(httpd_req_t *req)
 
 static esp_err_t heap_handler(httpd_req_t *req)
 {
-    char out[256];
+    char out[HEAP_MAX];
     unsigned sup = s_sup_task ? (unsigned)uxTaskGetStackHighWaterMark(s_sup_task) * sizeof(StackType_t) : 0;
-    snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u,\"wd_stack_size\":%u,\"wd_stack_free_min\":%u,\"sup_stack_size\":%u,\"sup_stack_free_min\":%u}", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), (unsigned)WD_TASK_STACK, (unsigned)s_stack_free_min, (unsigned)SUP_TASK_STACK, sup);
+    wd_panic_t pn = s_panic;
+    wd_trace_t tr = s_trace;
+    int n = snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u,\"wd_stack_size\":%u,\"wd_stack_free_min\":%u,\"sup_stack_size\":%u,\"sup_stack_free_min\":%u,", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), (unsigned)WD_TASK_STACK, (unsigned)s_stack_free_min, (unsigned)SUP_TASK_STACK, sup);
+    n += (int)wd_blackbox_json(&pn, &tr, out + n, sizeof(out) - (size_t)n);
+    if (n + 2 > (int)sizeof(out)) return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"err\":\"heap_size\"}");
+    strcpy(out + n, "}");
     return send_json(req, "200 OK", out);
 }
 
@@ -433,6 +504,13 @@ static void log_dry_run(const wd_state_t *st)
     ESP_LOGW(TAG, "no heartbeat for %us: would send %.1f to nodes %s (dry_run)", (unsigned)st->cfg.timeout_s, st->cfg.setpoint_cc / 100.0, nodes);
 }
 
+static void rtc_store_locked(uint32_t now)
+{
+    wd_rtc_t r;
+    wd_rtc_pack(&r, &s_state, now, &s_conn, s_wifi_restarts, s_disc_reason);
+    s_rtc = r;
+}
+
 static void watchdog_task(void *arg)
 {
     for (;;) {
@@ -441,6 +519,7 @@ static void watchdog_task(void *arg)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         uint32_t now = uptime_s();
         wd_action_t act = wd_tick(&s_state, now);
+        if (act.kind == WD_ACT_SEND) rtc_store_locked(now);
         wd_state_t snap = s_state;
         if (act.kind == WD_ACT_SEND && s_have_creds) {
             cr = malloc(sizeof(*cr));
@@ -457,6 +536,7 @@ static void watchdog_task(void *arg)
         char err[WD_ERR_LEN] = "";
         esp_err_t r = ESP_ERR_INVALID_STATE;
         if (cr) {
+            wd_trace_begin(&s_trace, snap.cfg.nodes[act.node_idx], (uint32_t)(esp_timer_get_time() / 1000));
             s_send_since_s = uptime_s();
             s_send_active = true;
             r = wd_matter_write_setpoint(cr, snap.cfg.nodes[act.node_idx], snap.cfg.endpoint, snap.cfg.setpoint_cc, err, sizeof(err));
@@ -464,13 +544,13 @@ static void watchdog_task(void *arg)
             s_last_tick_s = uptime_s();
             mbedtls_platform_zeroize(cr, sizeof(*cr));
             free(cr);
-            uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
-            if (hw < s_stack_free_min) s_stack_free_min = hw;
+            br_watchdog_stage(WD_ST_DONE);
         } else {
             strlcpy(err, "no_credentials", sizeof(err));
         }
         xSemaphoreTake(s_lock, portMAX_DELAY);
         wd_report(&s_state, act.node_idx, r == ESP_OK, err, uptime_s());
+        rtc_store_locked(uptime_s());
         xSemaphoreGive(s_lock);
         char nb[24];
         wd_u64_str(snap.cfg.nodes[act.node_idx], nb, sizeof(nb));
@@ -499,6 +579,11 @@ static const char *reset_name(esp_reset_reason_t r)
     }
 }
 
+static bool reset_crashed(esp_reset_reason_t r)
+{
+    return r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+}
+
 static bool rtc_load(void)
 {
     esp_reset_reason_t rr = esp_reset_reason();
@@ -506,6 +591,10 @@ static bool rtc_load(void)
     s_diag.reset_name = reset_name(rr);
     bool ok = rr != ESP_RST_POWERON && wd_rtc_valid(&s_rtc);
     if (!ok) memset(&s_rtc, 0, sizeof(s_rtc));
+    if (rr == ESP_RST_POWERON) {
+        memset(&s_panic, 0, sizeof(s_panic));
+        memset(&s_trace, 0, sizeof(s_trace));
+    }
     s_diag.restored = ok;
     s_wifi_restarts = s_rtc.wifi_restarts;
     s_disc_reason = s_rtc.disc_reason;
@@ -565,10 +654,8 @@ static void supervisor_task(void *arg)
             s_conn.since_s = now;
             s_wifi_restarts++;
         }
-        wd_rtc_t r;
-        wd_rtc_pack(&r, &s_state, now, &s_conn, s_wifi_restarts, s_disc_reason);
+        rtc_store_locked(now);
         xSemaphoreGive(s_lock);
-        s_rtc = r;
         if (go) {
             ESP_LOGW(TAG, "no IP (wifi reason %u): WiFi restart #%u, Thread keeps running", (unsigned)s_disc_reason, (unsigned)s_wifi_restarts);
             wifi_restart();
@@ -583,7 +670,7 @@ void br_watchdog_start(void)
     load_nvs(&cfg);
     wd_state_init(&s_state, &cfg);
     uint32_t boot_s = uptime_s();
-    if (rtc_load()) wd_state_restore(&s_state, &s_rtc, boot_s);
+    if (rtc_load()) wd_state_restore(&s_state, &s_rtc, boot_s, reset_crashed(esp_reset_reason()));
     wd_conn_init(&s_conn, s_rtc.conn_level < WD_CONN_LEVELS ? s_rtc.conn_level : 0, boot_s);
     s_last_tick_s = boot_s;
 #if CONFIG_EXAMPLE_CONNECT_WIFI

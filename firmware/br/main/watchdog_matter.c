@@ -57,6 +57,7 @@ typedef struct {
 static int net_send(void *ctx, const uint8_t *b, size_t n)
 {
     net_t *s = ctx;
+    br_watchdog_stage(WD_ST_TX);
     return send(s->fd, b, n, 0);
 }
 
@@ -64,8 +65,10 @@ static int net_recv(void *ctx, uint8_t *b, size_t max, uint32_t ms)
 {
     net_t *s = ctx;
     struct timeval tv = {.tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000};
+    br_watchdog_stage(WD_ST_RXWAIT);
     setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     int r = recv(s->fd, b, max, 0);
+    if (r > 0) br_watchdog_stage(WD_ST_CRYPTO);
     return r < 0 ? 0 : r;
 }
 
@@ -175,6 +178,7 @@ static bool cache_load(uint64_t node, peer_t *p)
 static esp_err_t try_peer(const wd_creds_t *cr, uint64_t node, const peer_t *p, int idx, int16_t value, uint8_t ep, char *err, size_t err_len)
 {
     net_t n = {0};
+    br_watchdog_stage(WD_ST_CONNECT);
     n.fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
     if (n.fd < 0) {
         strlcpy(err, "socket", err_len);
@@ -207,11 +211,13 @@ esp_err_t wd_matter_write_setpoint(const wd_creds_t *creds, uint64_t node, uint8
         strlcpy(err, "range", err_len);
         return ESP_ERR_INVALID_ARG;
     }
+    br_watchdog_stage(WD_ST_CREDS);
     if (mc_creds_cfid(creds, cf)) {
         strlcpy(err, "cert_rcac", err_len);
         return ESP_FAIL;
     }
     snprintf(label, sizeof(label), "%02X%02X%02X%02X%02X%02X%02X%02X-%08lX%08lX", cf[0], cf[1], cf[2], cf[3], cf[4], cf[5], cf[6], cf[7], (unsigned long)(node >> 32), (unsigned long)(uint32_t)node);
+    br_watchdog_stage(WD_ST_LOOKUP);
     if (srp_lookup(label, &p)) {
         cache_save(node, &p);
     } else if (!cache_load(node, &p)) {
