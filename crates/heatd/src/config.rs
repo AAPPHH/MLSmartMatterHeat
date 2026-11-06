@@ -682,7 +682,7 @@ mod tests {
         assert_eq!((docker.window.min_open_hold_min, docker.window.rearm_min, docker.window.probe_cooldown_min, docker.window.v2.enabled), (15.0, 20.0, 30.0, true));
         assert_eq!((docker.occupied_setpoint, docker.frost_setpoint, docker.watchmatch.label_target), (20.0, 8.0, 10));
         assert_eq!(docker.watchmatch.labels_since.as_deref(), Some("2026-10-29T20:28:00+01:00"));
-        assert_eq!((docker.br_watchdog.enabled, docker.br_watchdog.token_file.as_str(), docker.br_watchdog.interval_s, docker.br_watchdog.timeout_s), (false, "/secrets/br_watchdog_token", 30, 600));
+        assert_eq!((docker.br_watchdog.enabled, docker.br_watchdog.token_file.as_str(), docker.br_watchdog.interval_s, docker.br_watchdog.timeout_s), (true, "/secrets/br_watchdog_token", 30, 600));
         assert!(!Config::default().br_watchdog.enabled);
         assert!(docker.rooms.iter().all(|r| r.schedules.is_empty()));
         let example = Config::parse(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../heatd.example.toml")).unwrap()).unwrap();

@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 const OTHERS_VALVE: f64 = 0.05;
 const AMBIENT_STALE_MS: i64 = 900_000;
 const KEEP_MS: i64 = 5 * 3_600_000;
-const STALE_MS: i64 = 30 * 60_000;
 const GAP_RESET_MIN: i64 = 360;
 const OFF_EPS_MIN: f64 = 1.0;
 const GATE_REFRESH_MIN: u64 = 60;
@@ -78,6 +77,7 @@ struct RoomState {
     cycle: Option<Cycle>,
     last_desired: Option<f64>,
     dirty: bool,
+    gap: bool,
     air: HashMap<&'static str, f64>,
 }
 
@@ -119,6 +119,7 @@ struct Inner {
     gate_days: HashMap<String, usize>,
     env: Env,
     hour: Option<f64>,
+    stale_ms: i64,
 }
 
 #[derive(Clone)]
@@ -160,10 +161,10 @@ fn pick_live(inner: &Inner, room: &str, forced: bool) -> Option<(String, String)
 impl Boost {
     pub fn new(config: &Config) -> Self {
         let cfg = config.boost.clone();
-        let rooms = config.rooms.iter().map(|r| RoomState { name: r.name.clone(), nodes: r.nodes.clone(), sensor: VecDeque::new(), valve: VecDeque::new(), est: None, cycle: None, last_desired: None, dirty: false, air: HashMap::new() }).collect();
+        let rooms = config.rooms.iter().map(|r| RoomState { name: r.name.clone(), nodes: r.nodes.clone(), sensor: VecDeque::new(), valve: VecDeque::new(), est: None, cycle: None, last_desired: None, dirty: false, gap: false, air: HashMap::new() }).collect();
         let links = config.neighbours.iter().map(|n| (n.a.clone(), n.b.clone(), n.kind.clone())).collect();
         let seed = cfg.seed.or(config.exploration_seed).unwrap_or_else(|| crate::lake::now_us() as u64);
-        let boost = Self(Arc::new(Mutex::new(Inner { cfg, rooms, links, bundle: None, dir_name: None, ambient: HashMap::new(), rng: Rng::new(seed ^ 0xB005), live: HashMap::new(), gate_days: HashMap::new(), env: Env::default(), hour: None })));
+        let boost = Self(Arc::new(Mutex::new(Inner { cfg, rooms, links, bundle: None, dir_name: None, ambient: HashMap::new(), rng: Rng::new(seed ^ 0xB005), live: HashMap::new(), gate_days: HashMap::new(), env: Env::default(), hour: None, stale_ms: config.stale.after_ms() })));
         if config.boost.enabled {
             if let Err(e) = boost.reload() {
                 eprintln!("boost: no thermal bundle loaded, shadow off until one appears: {e:#}");
@@ -211,7 +212,9 @@ impl Boost {
         let Some(idx) = inner.rooms.iter().position(|r| r.nodes.first() == Some(&node)) else { return };
         match attribute {
             crate::window::LOCAL_TEMPERATURE if value.is_finite() => {
+                let stale_ms = inner.stale_ms;
                 let rs = &mut inner.rooms[idx];
+                rs.gap |= rs.cycle.is_some() && rs.sensor.back().is_some_and(|s| ts_ms - s.0 > stale_ms);
                 rs.sensor.push_back((ts_ms, value));
                 rs.dirty = true;
                 inner.update_estimate(idx, value, ts_ms);
@@ -380,8 +383,8 @@ impl Inner {
         }
     }
 
-    fn others_heating(&self, room: &str) -> usize {
-        self.rooms.iter().filter(|o| o.name != room).filter(|o| o.valve.back().is_some_and(|v| v.1 > OTHERS_VALVE)).count()
+    fn others_heating(&self, room: &str, now_ms: i64) -> usize {
+        self.rooms.iter().filter(|o| o.name != room).filter(|o| o.valve.back().is_some_and(|v| v.1 > OTHERS_VALVE && now_ms - v.0 <= self.stale_ms)).count()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -397,7 +400,7 @@ impl Inner {
             target,
             sensor: grid(&rs.sensor, now_ms, SENSOR_HISTORY_MIN),
             valve: grid(&rs.valve, now_ms, VALVE_HISTORY_MIN),
-            others: self.others_heating(&rs.name) as f64,
+            others: self.others_heating(&rs.name, now_ms) as f64,
             ambient: AMBIENT.map(|s| self.ambient.get(s).filter(|a| now_ms - a.1 <= AMBIENT_STALE_MS).map_or(f64::NAN, |a| a.0)),
             h: 1.0 / 60.0,
         })
@@ -408,8 +411,16 @@ impl Inner {
         let name = want.room.clone();
         let sensor_now = self.rooms[idx].sensor.back().copied();
         if let (Some(bundle), Some(key), Some((t, v))) = (self.bundle.clone(), room_key(self, &name), sensor_now) {
-            if bundle.rooms[&key].valid && now_ms - t < STALE_MS && self.rooms[idx].est.as_ref().is_some_and(|e| now_ms.div_euclid(60_000) > e.min) {
+            if bundle.rooms[&key].valid && now_ms - t < self.stale_ms && self.rooms[idx].est.as_ref().is_some_and(|e| now_ms.div_euclid(60_000) > e.min) {
                 self.advance_estimate(idx, v, now_ms, false);
+            }
+        }
+        if self.rooms[idx].cycle.is_some() && (self.rooms[idx].gap || sensor_now.is_none_or(|s| now_ms - s.0 > self.stale_ms)) {
+            let boosting = self.rooms[idx].cycle.as_ref().is_some_and(|c| c.live.is_some() && c.phase == Phase::Boosting);
+            self.rooms[idx].gap = false;
+            self.finish(idx, now_ms, "sensor_stale", out);
+            if boosting && want.blocked.is_none() {
+                out.directives.insert(name.clone(), Directive::Switch);
             }
         }
         let rise = self.rooms[idx].last_desired.map(|d| want.setpoint - d);
@@ -483,10 +494,10 @@ impl Inner {
         let Some(key) = room_key(self, &name) else { return };
         let rs = &self.rooms[idx];
         let Some(&(t, temp)) = rs.sensor.back() else { return };
-        if !bundle.rooms[&key].valid || rs.est.is_none() || input.now_ms - t > STALE_MS || temp >= want.setpoint - REACH_C {
+        if !bundle.rooms[&key].valid || rs.est.is_none() || input.now_ms - t > self.stale_ms || temp >= want.setpoint - REACH_C {
             return;
         }
-        let others = self.others_heating(&name) as i64;
+        let others = self.others_heating(&name, input.now_ms) as i64;
         let offset_min = if self.live.contains_key(&name) { (self.rng.unit() * 2.0 - 1.0) * self.cfg.explore_min } else { 0.0 };
         let live = self.live.get(&name).and_then(|l| VARIANTS.into_iter().find(|v| *v == l.0)).filter(|v| self.available(v, &name));
         self.rooms[idx].cycle = Some(Cycle {

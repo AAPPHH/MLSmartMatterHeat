@@ -375,3 +375,13 @@ fn replay_of_the_bounce_shape_yields_one_live_episode() {
     let out = replay("", &rows_of(&temps), Some((2.0, None))).unwrap();
     assert_eq!(out["summary"]["v1"]["episodes"], 1, "{out}");
 }
+
+#[test]
+fn shadow_ignores_the_jump_across_a_reporting_gap() {
+    let mut h = H::new("", "");
+    h.run(flat(21.0, 30));
+    h.t += 90 * 60_000;
+    h.run(vec![17.0]);
+    h.run(flat(17.0, 5));
+    assert!(h.episodes("v2").is_empty() && h.v1_kinds().is_empty(), "{:?}", h.events);
+}

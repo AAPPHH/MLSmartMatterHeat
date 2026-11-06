@@ -509,7 +509,14 @@ fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], no
             continue;
         }
         if no_supply.contains(&want.room) {
-            let Some(temp) = state.windows.lock().unwrap().local_temp(want.node) else { continue };
+            let Some(temp) = state.windows.lock().unwrap().local_temp(want.node, now_ms, state.config.stale.after_ms()) else {
+                if let Some(held) = state.commanded.lock().unwrap().target(want.node).filter(|h| want.setpoint > *h) {
+                    want.setpoint = held;
+                    want.reason = "no_supply";
+                    want.rule = "supply";
+                }
+                continue;
+            };
             let cap = clamp_setpoint(readings, want.node, (((temp + cfg.cap_k) * 2.0).floor() / 2.0).max(frost), state.failsafe.max_c());
             if want.setpoint > cap {
                 want.setpoint = cap;
@@ -518,7 +525,7 @@ fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], no
             }
             continue;
         }
-        let due = state.windows.lock().unwrap().overshoot_due(cfg, want.node, want.setpoint, now_ms);
+        let due = state.windows.lock().unwrap().overshoot_due(cfg, want.node, want.setpoint, now_ms, state.config.stale.after_ms());
         let gap = (cfg.reset_gap_min * 60_000.0) as i64;
         let Some((temp, valve)) = due.filter(|_| state.commanded.lock().unwrap().last_reset.get(&want.node).is_none_or(|t| now_ms - t >= gap)) else { continue };
         {
@@ -754,6 +761,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
 }
 
 pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
+    state.windows.lock().unwrap().touch(&state.config, report.node, now_ms);
     if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND].contains(&report.attribute.as_str()) {
         state.windows.lock().unwrap().observe(&state.config, report.node, &report.attribute, report.value, now_ms);
         state.boost.observe(report.node, &report.attribute, report.value, now_ms);

@@ -82,7 +82,7 @@ async fn night() -> Env {
 async fn night_without_supply_caps_the_setpoint_near_the_measured_temperature() {
     let e = night().await;
     assert!(e.no_supply());
-    let temp = e.state.windows.lock().unwrap().local_temp(5).unwrap();
+    let temp = e.state.windows.lock().unwrap().local_temp(5, 0, i64::MAX).unwrap();
     let target = e.target().unwrap();
     assert!(target <= temp + 0.5 && target > temp, "target {target} temp {temp}");
     assert_eq!(e.mock.setpoint_writes().last().map(|w| w.1), Some(target));
@@ -130,4 +130,17 @@ async fn overshoot_reset_skips_small_overshoot_and_manual_hold() {
     e.state.commanded.lock().unwrap().test_hold(5, 20.0);
     e.run(vec![21.5; 30]).await;
     assert_eq!(e.target(), Some(20.0));
+}
+
+#[tokio::test]
+async fn stale_data_keeps_the_no_supply_cap_instead_of_lifting_it() {
+    let mut e = night().await;
+    let cap = e.target().unwrap();
+    let writes = e.mock.setpoint_writes().len();
+    let noon = NaiveDate::from_ymd_opt(2026, 10, 31).unwrap().and_hms_opt(12, 0, 0).unwrap();
+    for m in 1..=120 {
+        crate::rules::control_step(&e.state, noon, e.t + m * MIN).await.unwrap();
+    }
+    e.t += 120 * MIN;
+    assert_eq!((e.target(), e.mock.setpoint_writes().len(), e.no_supply()), (Some(cap), writes, true));
 }

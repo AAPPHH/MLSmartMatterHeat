@@ -515,3 +515,24 @@ fn serve_features_use_forward_filled_history_long_valve_history_and_the_others_t
     let ctx = inner.ctx(&inner.rooms[0], inner.bundle.as_ref().unwrap(), ROOM, (20.0, 20.0), 21.0, 7.0, 299 * 60_000).unwrap();
     assert_eq!((ctx.sensor[60], ctx.sensor[51], ctx.sensor[50]), (22.0, 22.0, 21.0), "causal forward fill, no interpolation");
 }
+
+#[test]
+fn live_boost_ends_and_switches_off_when_the_sensor_goes_silent_or_gaps() {
+    for gap_reconnect in [false, true] {
+        let boost = Boost::new(&config("live_rooms_override = ['wohnzimmer']
+seed = 3"));
+        drive(&boost, 0, 5, 18.0, None, |_| 19.0);
+        let started = drive(&boost, 5, 10, 21.0, None, rise);
+        assert!(matches!(started.last().unwrap().directives.get(ROOM), Some(Directive::Boost { .. })));
+        let stop = if gap_reconnect {
+            boost.observe(5, LOCAL_TEMPERATURE, 20.0, 40 * 60_000);
+            boost.step(&step_in(40 * 60_000, 21.0, None))
+        } else {
+            boost.step(&step_in(30 * 60_000, 21.0, None))
+        };
+        let rows = cycle_events(std::slice::from_ref(&stop));
+        assert!(!rows.is_empty() && rows.iter().all(|r| r["end"] == "sensor_stale"), "{gap_reconnect}");
+        assert!(matches!(stop.directives.get(ROOM), Some(Directive::Switch)), "{gap_reconnect}");
+        assert!(boost.view(ROOM)["cycle"].is_null());
+    }
+}
