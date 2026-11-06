@@ -78,6 +78,7 @@ struct Inner {
     last_roll: Option<(i64, bool)>,
     control_us: Option<i64>,
     br: Option<crate::br_watchdog::BrSnapshot>,
+    stale_us: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,6 +89,10 @@ impl Status {
         let status = Self::default();
         status.0.lock().unwrap().started_us = started_us;
         status
+    }
+
+    pub fn set_stale_after(&self, after_s: u64) {
+        self.0.lock().unwrap().stale_us = Some(after_s as i64 * 1_000_000);
     }
 
     pub fn register_nodes(&self, nodes: impl IntoIterator<Item = u64>) {
@@ -208,7 +213,13 @@ impl Status {
         let nodes: Vec<Value> = inner
             .nodes
             .iter()
-            .map(|(id, n)| json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "reports": n.reports}))
+            .map(|(id, n)| {
+                let mut node = json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "reports": n.reports});
+                if let Some(limit) = inner.stale_us {
+                    node["stale"] = json!(n.last_report_us.is_none_or(|t| now_us - t > limit));
+                }
+                node
+            })
             .collect();
         let degraded = inner.nodes.values().any(|n| matches!(n.state, SubState::Lost | SubState::Resubscribing));
         json!({
@@ -246,6 +257,12 @@ impl Status {
                 let _ = writeln!(out, "heatd_node_last_report_age_seconds{{node=\"{id}\"}} {}", age(t));
             }
         });
+        if let Some(limit) = inner.stale_us {
+            family(&mut out, "heatd_node_stale", "1 if the node has not reported for longer than the stale threshold", "gauge");
+            inner.nodes.iter().for_each(|(id, n)| {
+                let _ = writeln!(out, "heatd_node_stale{{node=\"{id}\"}} {}", u8::from(n.last_report_us.is_none_or(|t| now_us - t > limit)));
+            });
+        }
         family(&mut out, "heatd_node_reports_total", "attribute reports seen per node since start", "counter");
         inner.nodes.iter().for_each(|(id, n)| {
             let _ = writeln!(out, "heatd_node_reports_total{{node=\"{id}\"}} {}", n.reports);

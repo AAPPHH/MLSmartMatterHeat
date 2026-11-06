@@ -455,6 +455,24 @@ impl Default for SupplySection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct StaleSection {
+    pub after_s: u64,
+}
+
+impl Default for StaleSection {
+    fn default() -> Self {
+        Self { after_s: 900 }
+    }
+}
+
+impl StaleSection {
+    pub fn after_ms(&self) -> i64 {
+        self.after_s as i64 * 1000
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -494,6 +512,7 @@ pub struct Config {
     pub supply: SupplySection,
     pub boost: BoostSection,
     pub failsafe: FailsafeSection,
+    pub stale: StaleSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
 }
 
@@ -538,6 +557,7 @@ impl Default for Config {
             supply: SupplySection::default(),
             boost: BoostSection::default(),
             failsafe: FailsafeSection::default(),
+            stale: StaleSection::default(),
             br_watchdog: Default::default(),
         }
     }

@@ -209,6 +209,7 @@ async fn serve(config: Config) -> Result<()> {
     println!("window history: {replayed} readings");
     lake::spawn_background(sink.clone());
     let status = status::Status::new(lake::now_us());
+    status.set_stale_after(config.stale.after_s);
     status.register_nodes(config.all_nodes());
     let boost = boost::Boost::new(&config);
     let config = Arc::new(config);
