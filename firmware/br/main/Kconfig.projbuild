@@ -23,13 +23,13 @@ menu "BR Watchdog"
             the watchdog stays dry_run until on-device interop with the Rust client has passed.
 
     config BR_CONN_REBOOT_MINUTES
-        int "Reboot after this many minutes without a WiFi IP (0 = never)"
+        int "Restart the WiFi station after this many minutes without an IP (0 = never)"
         range 0 1440
         default 15
         help
-            Values 1..10 are raised to 11 so a new OTA image can finish validation first.
-            After a connectivity reboot the next one waits 4x, then 24x this time (15 min, 1 h, 6 h
-            by default) until the IP has been stable for 10 minutes. Never taken while an armed
-            failsafe is pending or running, or while the running image is unverified.
+            Only the WiFi driver is restarted (disconnect and reconnect), OpenThread keeps running.
+            The next restart waits 4x, then 24x this time (15 min, 1 h, 6 h by default) until the IP
+            has been stable for 10 minutes. Skipped while a heartbeat arrived in the last 5 minutes.
+            Values 1..10 are raised to 11.
 
 endmenu

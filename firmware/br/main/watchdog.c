@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "esp_wifi.h"
+#include "openthread/instance.h"
 #include "openthread/thread.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +46,7 @@
 #define HDR_TOKEN "X-Heatd-Token"
 #define OT_PROBE_S 5
 #define SUP_TASK_STACK 3072
+#define OTA_MAX_TIMEOUTS 12
 #define CONN_BASE_S (CONFIG_BR_CONN_REBOOT_MINUTES == 0 ? 0 : MAX(CONFIG_BR_CONN_REBOOT_MINUTES, 11) * 60)
 
 typedef struct {
@@ -63,13 +65,14 @@ static volatile uint32_t s_stack_free_min = WD_TASK_STACK;
 static RTC_NOINIT_ATTR wd_rtc_t s_rtc;
 static wd_conn_t s_conn;
 static wd_diag_t s_diag;
-static uint32_t s_conn_reboots;
+static uint32_t s_wifi_restarts;
+static TaskHandle_t s_sup_task;
 static volatile uint32_t s_last_tick_s;
 static volatile bool s_send_active;
 static volatile uint32_t s_send_since_s;
 static volatile bool s_ot_seen;
 static volatile bool s_probe_pending;
-static volatile bool s_ip_ok = true;
+static volatile uint32_t s_disc_count;
 static volatile uint32_t s_disc_reason;
 
 typedef void (*ot_task_t)(void *);
@@ -204,7 +207,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     bool have = read_temp(&c);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     wd_diag_t dg = s_diag;
-    dg.conn_reboots = s_conn_reboots;
+    dg.wifi_restarts = s_wifi_restarts;
     dg.conn_level = s_conn.level;
     dg.has_ip = s_conn.has_ip;
     dg.noip_s = s_conn.has_ip ? 0 : uptime_s() - s_conn.since_s;
@@ -288,8 +291,9 @@ static esp_err_t ambient_handler(httpd_req_t *req)
 
 static esp_err_t heap_handler(httpd_req_t *req)
 {
-    char out[192];
-    snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u,\"wd_stack_size\":%u,\"wd_stack_free_min\":%u}", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), (unsigned)WD_TASK_STACK, (unsigned)s_stack_free_min);
+    char out[256];
+    unsigned sup = s_sup_task ? (unsigned)uxTaskGetStackHighWaterMark(s_sup_task) * sizeof(StackType_t) : 0;
+    snprintf(out, sizeof(out), "{\"free\":%u,\"min_free\":%u,\"largest_block\":%u,\"wd_stack_size\":%u,\"wd_stack_free_min\":%u,\"sup_stack_size\":%u,\"sup_stack_free_min\":%u}", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), (unsigned)WD_TASK_STACK, (unsigned)s_stack_free_min, (unsigned)SUP_TASK_STACK, sup);
     return send_json(req, "200 OK", out);
 }
 
@@ -325,9 +329,14 @@ static esp_err_t ota_handler(httpd_req_t *req)
     }
     size_t got = 0;
     const char *err = NULL;
+    int timeouts = 0;
     while (got < req->content_len && !err) {
         int r = httpd_req_recv(req, buf, MIN(OTA_CHUNK, req->content_len - got));
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts >= OTA_MAX_TIMEOUTS) err = "stalled";
+            continue;
+        }
+        timeouts = 0;
         if (r <= 0) err = "recv";
         else if (esp_ota_write(h, buf, (size_t)r) != ESP_OK) err = "write";
         else got += (size_t)r;
@@ -352,7 +361,7 @@ static esp_err_t ota_handler(httpd_req_t *req)
 static bool thread_attached(void)
 {
     otInstance *inst = esp_openthread_get_instance();
-    if (!inst || !esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) return false;
+    if (!otInstanceIsInitialized(inst) || !esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) return false;
     otDeviceRole role = otThreadGetDeviceRole(inst);
     esp_openthread_lock_release();
     return role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER;
@@ -492,17 +501,15 @@ static bool rtc_load(void)
     s_diag.reset_code = (int)rr;
     s_diag.reset_name = reset_name(rr);
     bool ok = rr != ESP_RST_POWERON && wd_rtc_valid(&s_rtc);
-    if (ok && rr == ESP_RST_SW && s_rtc.conn_pending) s_diag.reset_name = "conn_reboot";
     if (!ok) memset(&s_rtc, 0, sizeof(s_rtc));
     s_diag.restored = ok;
-    s_conn_reboots = s_rtc.conn_reboots;
+    s_wifi_restarts = s_rtc.wifi_restarts;
     s_disc_reason = s_rtc.disc_reason;
     return ok;
 }
 
 static bool sta_has_ip(void)
 {
-    if (!s_ip_ok) return false;
     esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip;
     return !nif || (esp_netif_get_ip_info(nif, &ip) == ESP_OK && ip.ip.addr != 0);
@@ -510,14 +517,18 @@ static bool sta_has_ip(void)
 
 static void net_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_disc_reason = ((wifi_event_sta_disconnected_t *)data)->reason;
-        s_ip_ok = false;
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        s_ip_ok = true;
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
-        s_ip_ok = false;
+    s_disc_reason = ((wifi_event_sta_disconnected_t *)data)->reason;
+    s_disc_count++;
+}
+
+static void wifi_restart(void)
+{
+    uint32_t before = s_disc_count;
+    esp_wifi_disconnect();
+    for (int i = 0; i < 10 && s_disc_count == before; i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
+    if (s_disc_count == before) esp_wifi_connect();
 }
 
 static void ot_probe(void *arg)
@@ -528,12 +539,6 @@ static void ot_probe(void *arg)
     s_probe_pending = false;
 }
 
-static bool ota_pending_verify(void)
-{
-    esp_ota_img_states_t st;
-    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
-}
-
 static void supervisor_task(void *arg)
 {
     esp_task_wdt_add(NULL);
@@ -542,7 +547,7 @@ static void supervisor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t now = uptime_s();
         if (wd_feed_ok(now, s_last_tick_s, s_send_active, s_send_since_s, s_ot_seen)) esp_task_wdt_reset();
-        if (!s_probe_pending && now - probe_s >= OT_PROBE_S && esp_openthread_get_instance()) {
+        if (!s_probe_pending && now - probe_s >= OT_PROBE_S && otInstanceIsInitialized(esp_openthread_get_instance())) {
             s_probe_pending = true;
             probe_s = now;
             if (esp_openthread_task_queue_post(ot_probe, NULL) != ESP_OK) s_probe_pending = false;
@@ -550,19 +555,19 @@ static void supervisor_task(void *arg)
         bool ip = sta_has_ip();
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) continue;
         wd_conn_update(&s_conn, ip, now);
-        bool go = CONN_BASE_S > 0 && wd_conn_due(&s_conn, now, CONN_BASE_S) && wd_conn_reboot_ok(&s_conn, &s_state, now, CONN_BASE_S, ota_pending_verify());
+        bool go = wd_wifi_restart_ok(&s_conn, &s_state, now, CONN_BASE_S);
         if (go) {
             if (s_conn.level < WD_CONN_LEVELS - 1) s_conn.level++;
-            s_conn_reboots++;
+            s_conn.since_s = now;
+            s_wifi_restarts++;
         }
         wd_rtc_t r;
-        wd_rtc_pack(&r, &s_state, now, &s_conn, s_conn_reboots, s_disc_reason, go);
+        wd_rtc_pack(&r, &s_state, now, &s_conn, s_wifi_restarts, s_disc_reason);
         xSemaphoreGive(s_lock);
         s_rtc = r;
         if (go) {
-            ESP_LOGW(TAG, "no IP for %us (wifi reason %u): connectivity reboot #%u", (unsigned)(now - s_conn.since_s), (unsigned)s_disc_reason, (unsigned)s_conn_reboots);
-            vTaskDelay(pdMS_TO_TICKS(300));
-            esp_restart();
+            ESP_LOGW(TAG, "no IP (wifi reason %u): WiFi restart #%u, Thread keeps running", (unsigned)s_disc_reason, (unsigned)s_wifi_restarts);
+            wifi_restart();
         }
     }
 }
@@ -579,8 +584,6 @@ void br_watchdog_start(void)
     s_last_tick_s = boot_s;
 #if CONFIG_EXAMPLE_CONNECT_WIFI
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, net_event, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, net_event, NULL);
 #endif
     temperature_sensor_config_t tc = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
     if (temperature_sensor_install(&tc, &s_tsens) != ESP_OK || temperature_sensor_enable(s_tsens) != ESP_OK) {
@@ -591,6 +594,6 @@ void br_watchdog_start(void)
     start_http();
     xTaskCreate(watchdog_task, "br_watchdog", WD_TASK_STACK, NULL, 4, NULL);
     xTaskCreate(validate_task, "ota_validate", 3072, NULL, 3, NULL);
-    xTaskCreate(supervisor_task, "br_supervisor", SUP_TASK_STACK, NULL, 6, NULL);
+    xTaskCreate(supervisor_task, "br_supervisor", SUP_TASK_STACK, NULL, 6, &s_sup_task);
     ESP_LOGI(TAG, "started: mode %s, timeout %us, creds %s, reset %s%s, hb age %us", cfg.armed ? "armed" : "dry_run", (unsigned)cfg.timeout_s, s_have_creds ? "present" : "absent", s_diag.reset_name, s_diag.restored ? " (state restored)" : "", (unsigned)wd_age_s(&s_state, boot_s));
 }
