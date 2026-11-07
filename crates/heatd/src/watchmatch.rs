@@ -636,6 +636,11 @@ impl WatchMatch {
         }
     }
 
+    pub fn holds(&self) -> Vec<(String, String, i64)> {
+        let inner = self.inner.lock().unwrap();
+        inner.devices.iter().filter_map(|(d, v)| v.hold.as_ref().map(|h| (d.clone(), h.0.clone(), h.1))).collect()
+    }
+
     pub fn stay(&self) -> Option<(String, String, i64)> {
         let inner = self.inner.lock().unwrap();
         inner.stays.iter().map(|(d, (r, t))| (d.clone(), r.clone(), *t)).max_by_key(|s| s.2)

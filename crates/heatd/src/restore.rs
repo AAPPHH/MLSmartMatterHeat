@@ -8,13 +8,15 @@ use arrow::array::{Array, BooleanArray, Float64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 const MIN_MS: i64 = 60_000;
+const LABEL_LOOKBACK_MS: i64 = 24 * 3_600_000;
 
 struct Rec {
     ts: i64,
+    to: Option<i64>,
     text: Vec<Option<String>>,
     num: Vec<Option<f64>>,
     flag: Vec<Option<bool>>,
@@ -26,6 +28,7 @@ fn records(root: &Path, table: Table, from_ms: i64, now_ms: i64, text: &[&str], 
     let mut out = Vec::new();
     for batch in read_raw(root, table, Some(&dates))? {
         let ts = ts_column(&batch, "ts")?;
+        let to = ts_column(&batch, "to_ts").ok();
         let pick = |name: &str, to: DataType| batch.column_by_name(name).and_then(|c| cast(c, &to).ok());
         let texts: Vec<Option<StringArray>> = text.iter().map(|n| pick(n, DataType::Utf8).and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned())).collect();
         let nums: Vec<Option<Float64Array>> = num.iter().map(|n| pick(n, DataType::Float64).and_then(|c| c.as_any().downcast_ref::<Float64Array>().cloned())).collect();
@@ -37,6 +40,7 @@ fn records(root: &Path, table: Table, from_ms: i64, now_ms: i64, text: &[&str], 
             }
             out.push(Rec {
                 ts: ms,
+                to: to.as_ref().filter(|t| !t.is_null(i)).map(|t| t.value(i) / 1000),
                 text: texts.iter().map(|c| c.as_ref().filter(|c| !c.is_null(i)).map(|c| c.value(i).to_string())).collect(),
                 num: nums.iter().map(|c| c.as_ref().filter(|c| !c.is_null(i)).map(|c| c.value(i))).collect(),
                 flag: flags.iter().map(|c| c.as_ref().filter(|c| !c.is_null(i)).map(|c| c.value(i))).collect(),
@@ -49,24 +53,25 @@ fn records(root: &Path, table: Table, from_ms: i64, now_ms: i64, text: &[&str], 
 
 enum Stay {
     Label { room: String, id: Option<String> },
-    Void(String),
     Scan,
 }
 
 fn stays(root: &Path, from_ms: i64, now_ms: i64) -> Result<Vec<(i64, String, Stay)>> {
     let mut out = Vec::new();
-    for r in records(root, Table::Labels, from_ms, now_ms, &["source", "device", "room", "label_id", "voided_label_id"], &[], &["heat"])? {
-        let [source, Some(device), room, id, voided] = &r.text[..] else { continue };
-        if let Some(v) = voided {
-            out.push((r.ts, device.clone(), Stay::Void(v.clone())));
-        } else if source.as_deref() == Some("watch") && r.flag[0] != Some(false) {
-            out.push((r.ts, device.clone(), Stay::Label { room: room.clone().unwrap_or_default(), id: id.clone() }));
+    let mut voided = HashSet::new();
+    let rows = records(root, Table::Labels, now_ms - LABEL_LOOKBACK_MS.max(now_ms - from_ms), now_ms, &["source", "device", "room", "label_id", "voided_label_id"], &[], &["heat"])?;
+    voided.extend(rows.iter().filter_map(|r| r.text[4].clone()));
+    for r in rows {
+        let [source, Some(device), room, id, None] = &r.text[..] else { continue };
+        let at = r.to.unwrap_or(r.ts).min(r.ts);
+        if source.as_deref() == Some("watch") && r.flag[0] != Some(false) && at >= from_ms && !id.as_ref().is_some_and(|i| voided.contains(i)) {
+            out.push((at, device.clone(), Stay::Label { room: room.clone().unwrap_or_default(), id: id.clone() }));
         }
     }
     for r in records(root, Table::Events, from_ms, now_ms, &["kind", "detail"], &[], &[])? {
         let [Some(k), Some(detail)] = &r.text[..] else { continue };
         let Ok(d) = serde_json::from_str::<Value>(detail) else { continue };
-        if k == kind::WATCH_STATE && d["n_aps"].as_u64().unwrap_or(0) > 0 {
+        if k == kind::WATCH_STATE && d["n_aps"].as_u64().unwrap_or(0) > 0 && d["heat"].as_bool().unwrap_or(true) {
             if let Some(device) = d["device"].as_str() {
                 out.push((r.ts, device.to_string(), Stay::Scan));
             }
@@ -117,9 +122,6 @@ pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
     for (ts, device, s) in stays(root, from_ms, now_ms)? {
         match s {
             Stay::Label { room, id } => state.watchmatch.note_stay(&device, ts, Some(&room), id.as_deref()),
-            Stay::Void(id) => {
-                state.watchmatch.void_stay(&device, &id);
-            }
             Stay::Scan => state.watchmatch.note_stay(&device, ts, None, None),
         }
     }
@@ -129,11 +131,8 @@ pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
         .map(|r| (r.ts, r.text[1].clone(), r.num[0].unwrap_or(0.0)))
         .collect();
     let mut held = None;
-    if let (Some(device), Some((ts, Some(room), confidence))) = (watch, rooms.iter().rev().find(|r| r.1.is_some())) {
+    if let (Some(device), Some((ts, Some(room), _))) = (watch, rooms.iter().rev().find(|r| r.1.is_some())) {
         state.watchmatch.restore_hold(&device.device, room, *ts);
-        if state.storage.last_predictions()?.iter().all(|p| p.device != device.device || p.ts < *ts) {
-            state.storage.insert_prediction(*ts, &device.device, room, *confidence)?;
-        }
         let since = rooms.iter().rev().take_while(|r| r.1.is_none() || r.1.as_deref() == Some(room.as_str())).filter(|r| r.1.is_some()).last().map_or(*ts, |r| r.0);
         held = Some((room.clone(), since));
     }

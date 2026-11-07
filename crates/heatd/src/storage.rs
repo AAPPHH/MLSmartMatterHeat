@@ -267,6 +267,7 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn insert_prediction(&self, ts_ms: i64, device: &str, room: &str, probability: f64) -> Result<()> {
         self.conn.lock().unwrap().execute("INSERT INTO predictions VALUES (epoch_ms(?), ?, ?, ?)", params![ts_ms, device, room, probability])?;
         Ok(())

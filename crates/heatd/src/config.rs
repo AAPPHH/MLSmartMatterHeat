@@ -300,7 +300,7 @@ pub struct PresenceSection {
 
 impl Default for PresenceSection {
     fn default() -> Self {
-        Self { restore: true, tracker_lookback_h: 24.0 }
+        Self { restore: true, tracker_lookback_h: 72.0 }
     }
 }
 

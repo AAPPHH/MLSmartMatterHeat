@@ -277,7 +277,7 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     if heat && (!body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty())) {
         state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref(), body.label_id.as_deref());
     }
-    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "away": body.away, "bedtime": body.bedtime, "id": body.id});
+    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "heat": heat, "away": body.away, "bedtime": body.bedtime, "id": body.id});
     let mut state_event = Event::now(kind::WATCH_STATE, "watch").with_detail(detail);
     state_event.ts = body.ts * 1000;
     if let Err(e) = state.sink.append(state_event) {
@@ -664,7 +664,19 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"rooms": rooms, "devices": state.storage.last_predictions()?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+}
+
+fn devices_view(state: &AppState) -> anyhow::Result<Vec<Value>> {
+    let rows = state.storage.last_predictions()?;
+    let mut out: Vec<Value> = rows.iter().map(|p| json!(p)).collect();
+    for (device, room, ts) in state.watchmatch.holds() {
+        if rows.iter().all(|p| p.device != device || p.ts < ts) {
+            out.retain(|v| v["device"] != json!(device));
+            out.push(json!({"device": device, "room": room, "probability": null, "ts": ts}));
+        }
+    }
+    Ok(out)
 }
 
 async fn snapshot(State(state): State<AppState>) -> ApiResult {
@@ -2332,7 +2344,27 @@ nodes = [5]
         assert_eq!((p.detected(&fresh.config), p.prediction_age_minutes.unwrap().round()), (Some("wohnzimmer".into()), 5.0));
         let step = fresh.commanded.lock().unwrap().occ_probe(Some("wohnzimmer"), now, 0);
         assert!(step.held.contains("wohnzimmer"));
-        assert_eq!(fresh.storage.last_predictions().unwrap()[0].room, "wohnzimmer");
+        assert!(fresh.storage.last_predictions().unwrap().is_empty());
+        assert_eq!(fresh.watchmatch.holds()[0].1, "wohnzimmer");
+    }
+
+    #[tokio::test]
+    async fn restart_orders_stays_by_label_end_and_honours_late_voids() {
+        let h = late_harness();
+        let now = now_ms();
+        let label = |id: &str, from: i64, to: i64| json!({"device": "pixel-watch", "from": from, "to": to, "label": "kueche", "label_id": id}).to_string();
+        call(&h.state, "POST", "/watch/label", Some(label("stale", now - 3 * 3_600_000, now - 2 * 3_600_000))).await;
+        let fresh = restarted(&h);
+        crate::restore::restore(&fresh, now_ms()).unwrap();
+        assert!(fresh.watchmatch.stay().is_none());
+        call(&h.state, "POST", "/watch/label", Some(label("gone", now - 600_000, now - 300_000))).await;
+        call(&h.state, "POST", "/watch/label", Some(label("kept", now - 900_000, now - 800_000))).await;
+        call(&h.state, "POST", "/watch/label/void", Some(json!({"device": "pixel-watch", "label_id": "gone", "ts": now - 400_000}).to_string())).await;
+        let fresh = restarted(&h);
+        crate::restore::restore(&fresh, now_ms()).unwrap();
+        let stay = fresh.watchmatch.stay().unwrap();
+        assert_eq!(stay.2, now - 800_000);
+        assert_eq!(fresh.watchmatch.void_stay("pixel-watch", "kept"), true);
     }
 
     #[tokio::test]
