@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 from heattrain.boiler import boiler
+from heattrain.boostlearn import boostcheck, boostlearn
 from heattrain.thermal import thermal
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
@@ -64,6 +65,19 @@ CONFIG = {
             "xgb": {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8, "colsample_bytree": 0.7, "min_child_weight": 30, "reg_lambda": 5.0, "trim": 0.03, "pooled": True},
         },
     },
+    "boost": {
+        "seed": 0, "keep_bundles": 14, "dead_zone": 0.25, "strong_dose": 4.0, "ramp_tau_min": 10.0, "merge_gap_min": 3, "pulse_cap_min": 30, "min_dose": 1.0, "pre_min": 15, "post_min": 90, "min_window_min": 20, "min_pulse_tail_min": 10, "loss_scale": 3.0, "kappa_max": 4.0, "min_temp_frac": 0.7, "max_temp_gap_min": 20,
+        "kernel_len_min": 120, "kernel_shape": 2.0, "horizon_min": 240, "closed_hold_min": 240, "since_open_cap_min": 360, "resume_cap_min": 180, "setpoint_drop_k": 1.0, "cooldown_min": 30, "out_default": 5.0, "wind_default": 2.0,
+        "morning_jump_k": 1.0, "morning_hours": [5.0, 10.0], "home_hours": [11.0, 23.5], "home_jump_k": 2.0, "away_max_c": 18.5, "scenario_pre_min": 5, "scenario_post_min": 90, "boost_match_min": 5, "known_overshoot_k": 0.5,
+        "passive_step_min": 10, "passive_min_points": 200, "passive_a_bounds": [1e-4, 0.02], "passive_delta_bounds": [0.0, 15.0], "passive_default": {"a": 0.003, "delta": 5.0},
+        "gain_prior": [0.3, 1.0], "delay_prior": [12.0, 0.7], "gain_bounds": [1e-3, 5.0], "delay_bounds": [2.0, 80.0], "sigma0": 0.3, "sigma_floor": 0.2, "boost_weight": 2.0,
+        "eb_iter": 3, "hyper_min_windows": 2, "hyper_shrink": 2.0, "tau_floor": 0.15, "n_samples": 64, "peak_sigma_floor": 0.3,
+        "dose_min": 5.0, "dose_max": 20.0, "dose_step": 1.0, "p_max": 0.10, "margin_k": 0.5, "thompson_margin_k": 0.25, "boost_setpoint": 24.0, "abort_c": 24.0, "growth": 1.1,
+        "knn_k": 5, "radius_quantile": 0.25, "radius_default": 2.5, "other_room_weight": 0.5, "scenario_penalty": 2.0, "room_penalty": 1.0,
+        "feature_weight": {"out": 1.0, "wind": 0.5, "rad": 0.5, "start_temp": 1.0, "gap": 1.0, "supply_ok": 1.0, "since_resume": 0.5, "vm60": 0.5, "vm180": 0.5, "since_open": 0.5, "hour_sin": 0.5, "hour_cos": 0.5},
+        "typical": {"morning": {"scenario": "morning", "start": 18.0, "target": 20.0, "out": 5.0, "wind": 3.0, "rad": 0.0, "resume": 60.0, "hour": 6.5},
+                    "homecoming": {"scenario": "homecoming", "start": 14.0, "target": 20.0, "out": 5.0, "wind": 3.0, "rad": 0.0, "resume": 180.0, "hour": 17.5}},
+    },
     "boiler": {
         "timezone": "Europe/Berlin", "dt_s": 60.0, "temp_valid": [0.0, 95.0], "max_gap_s": 900.0, "invalid_wants_k": 1.0, "night_hours": [21, 6],
         "open_frac": 0.3, "full_open": 0.85, "warm_window_min": 20, "warm_rise_k": 1.0, "merge_gap_min": 10, "supply_hold_min": 15,
@@ -113,7 +127,17 @@ def run_window_export(config, src, models_dir):
     print(out, meta["eval"], meta["rows"])
 
 
-COMMANDS = {"window": run_window_export, "windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
+def run_boost(config, src, models_dir, validate=False):
+    out, bundle, meta = boostlearn(config, src, models_dir, validate)
+    print(out, meta["episodes"], meta["radius"])
+    return meta
+
+
+def run_boostcheck(config, src, models_dir):
+    sys.exit(boostcheck(config, src, models_dir))
+
+
+COMMANDS = {"boostlearn": run_boost, "boostcheck": run_boostcheck, "window": run_window_export, "windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
 
 
 def main(argv):
@@ -121,8 +145,10 @@ def main(argv):
         return run_window(CONFIG, *argv[2:])
     if len(argv) in (2, 3, 4) and argv[1] == "windowroom":
         return run_windowroom(CONFIG, *(argv[3:] or [None]), lake=argv[2] if len(argv) > 2 else None)
+    if len(argv) == 5 and argv[1] == "boostlearn":
+        return run_boost(CONFIG, argv[2], argv[3], argv[4] == "validate")
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 
