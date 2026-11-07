@@ -6,4 +6,5 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 COPY nightly-container.sh /usr/local/bin/nightly
+COPY boost-container.sh /usr/local/bin/boost
 ENTRYPOINT ["sh", "/usr/local/bin/nightly"]
