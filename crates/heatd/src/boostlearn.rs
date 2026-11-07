@@ -6,6 +6,15 @@ use std::path::Path;
 const KIND: &str = "boost_learn";
 const FEATURES: usize = 12;
 const ROUND: f64 = 1000.0;
+const MAX_SETPOINT_C: f64 = 24.0;
+const MAX_ABORT_C: f64 = 24.0;
+const MIN_DOSE_MIN: f64 = 5.0;
+const MAX_DOSE_MIN: f64 = 20.0;
+const MAX_GROWTH: f64 = 1.1;
+const MAX_P_ATTRIBUTABLE: f64 = 0.10;
+const MAX_MARGIN_K: f64 = 0.5;
+const SCENARIOS: [&str; 2] = ["morning", "homecoming"];
+const EPS: f64 = 1e-9;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Context {
@@ -180,6 +189,17 @@ impl BoostModel {
         if finite.iter().any(|v| !v.is_finite()) || d.step_min <= 0.0 || d.max_min < d.min_min || k.len_min == 0 || k.shape <= 0.0 || raw.horizon_min == 0 || raw.ramp_tau_min <= 0.0 || raw.risk.peak_sigma_k <= 0.0 || raw.rooms.is_empty() {
             bail!("boost bundle {}: invalid parameters", raw.version);
         }
+        let outside = raw.boost_setpoint_c > MAX_SETPOINT_C + EPS
+            || raw.abort_c > MAX_ABORT_C + EPS
+            || d.min_min < MIN_DOSE_MIN - EPS
+            || d.max_min > MAX_DOSE_MIN + EPS
+            || t.growth > MAX_GROWTH + EPS
+            || raw.risk.p_max > MAX_P_ATTRIBUTABLE + EPS
+            || raw.risk.margin_k > MAX_MARGIN_K + EPS
+            || raw.scenarios.iter().any(|s| !SCENARIOS.contains(&s.as_str()));
+        if outside {
+            bail!("boost bundle {}: outside the safety envelope", raw.version);
+        }
         let bad_vec = [&t.mean, &t.std, &t.weights].iter().any(|v| v.len() != FEATURES || v.iter().any(|x| !x.is_finite()));
         if bad_vec || t.std.iter().any(|s| *s <= 0.0) || t.episodes.iter().any(|e| e.x.len() != FEATURES || !e.dose.is_finite() || e.x.iter().any(|v| !v.is_finite())) {
             bail!("boost bundle {}: invalid trust table", raw.version);
@@ -334,11 +354,24 @@ impl BoostModel {
         Known { dose: Some(known), n_similar: near.len(), neighbours, nearest: None }
     }
 
+    fn safe_dose(&self, p: &[f64], p_no_boost: f64) -> f64 {
+        p.iter().rposition(|v| *v - p_no_boost <= self.raw.risk.p_max).map_or(0.0, |i| self.cand[i])
+    }
+
+    pub fn manual(&self, room: &str, ctx: &Context, target: f64, hist: Option<&[f64]>, minutes: f64) -> Result<Decision> {
+        let model = self.room(room)?;
+        let (p, _) = self.risk(room, ctx, target, hist)?;
+        let p_no_boost = self.exceed(model, &[&self.peaks(model, ctx, target, hist, &[0.0])[0]], target)[0];
+        let p_dose = self.exceed(model, &[&self.peaks(model, ctx, target, hist, &[minutes])[0]], target)[0];
+        Ok(Decision { nearest_dist: None, nearest_dose: None, d_safe: self.safe_dose(&p, p_no_boost), known: None, n_similar: 0, allowed: minutes, chosen: minutes, p_overshoot: p_dose, p_at_allowed: p_dose, p_no_boost, j: None, neighbours: Vec::new() })
+    }
+
     pub fn decide(&self, room: &str, ctx: &Context, scenario: &str, target: f64, hist: Option<&[f64]>, pick: &dyn Fn(usize) -> usize) -> Result<Decision> {
         let model = self.room(room)?;
         let (p, pk) = self.risk(room, ctx, target, hist)?;
         let dmin = self.raw.dose.min_min;
-        let d_safe = p.iter().rposition(|v| *v <= self.raw.risk.p_max).map_or(0.0, |i| self.cand[i]);
+        let p_no_boost = self.exceed(model, &[&self.peaks(model, ctx, target, hist, &[0.0])[0]], target)[0];
+        let d_safe = self.safe_dose(&p, p_no_boost);
         let Known { dose: known, n_similar, neighbours, nearest } = self.known(ctx, room, scenario);
         let cap = d_safe.min(known.map_or(dmin, |k| dmin.max(self.raw.trust.growth * k)));
         let allowed = if self.scenario_allowed(scenario) && ctx.supply_ok > 0.0 && cap >= dmin - 1e-9 { cap } else { 0.0 };
@@ -356,7 +389,6 @@ impl BoostModel {
             let probs = self.exceed(model, &[grid[k], grid[grid.len() - 1]], target);
             (p_chosen, p_allowed, j) = (probs[0], probs[1], Some(col));
         }
-        let p_no_boost = self.exceed(model, &[&self.peaks(model, ctx, target, hist, &[0.0])[0]], target)[0];
         Ok(Decision { nearest_dist: nearest.map(|n| n.0), nearest_dose: nearest.map(|n| n.1), d_safe, known, n_similar, allowed, chosen, p_overshoot: p_chosen, p_at_allowed: p_allowed, p_no_boost, j, neighbours })
     }
 }

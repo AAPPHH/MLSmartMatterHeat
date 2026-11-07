@@ -1,5 +1,5 @@
 use super::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const TOL: f64 = 1e-6;
 
@@ -98,4 +98,45 @@ fn newest_valid_bundle_wins_with_fallback() {
     std::fs::write(dir.path().join("20261102T000000Z/bundle.json"), text.replace("boost_learn", "other")).unwrap();
     assert_eq!(try_load(dir.path().to_str().unwrap()).unwrap().version(), "old");
     assert!(try_load(dir.path().join("none").to_str().unwrap()).is_none());
+}
+
+#[test]
+fn bundles_outside_the_safety_envelope_are_rejected() {
+    let ok = fixture()["bundle"].clone();
+    assert!(BoostModel::parse(&ok.to_string()).is_ok());
+    for (path, value) in [
+        ("/boost_setpoint_c", json!(24.5)),
+        ("/abort_c", json!(25.0)),
+        ("/dose/min_min", json!(4.0)),
+        ("/dose/max_min", json!(25.0)),
+        ("/trust/growth", json!(1.3)),
+        ("/risk/p_max", json!(0.2)),
+        ("/risk/margin_k", json!(0.8)),
+        ("/scenarios", json!(["morning", "room_change"])),
+    ] {
+        let mut b = ok.clone();
+        *b.pointer_mut(path).unwrap() = value;
+        let err = BoostModel::parse(&b.to_string()).unwrap_err().to_string();
+        assert!(err.contains("safety envelope"), "{path}: {err}");
+    }
+    let mut tighter = ok.clone();
+    *tighter.pointer_mut("/scenarios").unwrap() = json!(["morning"]);
+    *tighter.pointer_mut("/risk/p_max").unwrap() = json!(0.05);
+    assert!(BoostModel::parse(&tighter.to_string()).is_ok());
+}
+
+#[test]
+fn the_risk_bound_is_attributable_to_the_boost() {
+    let m = model();
+    for case in fixture()["cases"].as_array().unwrap() {
+        let ctx: Context = serde_json::from_value(case["ctx"].clone()).unwrap();
+        let (room, target) = (case["room"].as_str().unwrap(), case["target"].as_f64().unwrap());
+        let d = m.decide(room, &ctx, "morning", target, None, &|_| 0).unwrap();
+        let (p, _) = m.risk(room, &ctx, target, None).unwrap();
+        let expected = p.iter().rposition(|v| v - d.p_no_boost <= 0.10).map_or(0.0, |i| m.doses()[i]);
+        assert_eq!(d.d_safe, expected);
+    }
+    let ctx: Context = serde_json::from_value(fixture()["cases"][1]["ctx"].clone()).unwrap();
+    let manual = m.manual("wohnzimmer", &ctx, 20.0, None, 7.0).unwrap();
+    assert_eq!((manual.allowed, manual.chosen, manual.known, manual.n_similar), (7.0, 7.0, None, 0));
 }

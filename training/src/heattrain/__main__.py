@@ -68,7 +68,7 @@ CONFIG = {
     "boost": {
         "seed": 0, "keep_bundles": 14, "dead_zone": 0.25, "strong_dose": 4.0, "ramp_tau_min": 10.0, "merge_gap_min": 3, "pulse_cap_min": 30, "min_dose": 1.0, "pre_min": 15, "post_min": 90, "min_window_min": 20, "min_pulse_tail_min": 10, "loss_scale": 3.0, "kappa_max": 4.0, "min_temp_frac": 0.7, "max_temp_gap_min": 20,
         "kernel_len_min": 120, "kernel_shape": 2.0, "horizon_min": 240, "closed_hold_min": 240, "since_open_cap_min": 360, "resume_cap_min": 180, "setpoint_drop_k": 1.0, "cooldown_min": 30, "out_default": 5.0, "wind_default": 2.0,
-        "morning_jump_k": 1.0, "morning_hours": [5.0, 10.0], "home_hours": [11.0, 23.5], "home_jump_k": 2.0, "away_max_c": 18.5, "scenario_pre_min": 5, "scenario_post_min": 90, "boost_match_min": 5, "known_overshoot_k": 0.5,
+        "morning_jump_k": 1.0, "morning_hours": [5.0, 11.0], "home_hours": [11.0, 23.5], "home_jump_k": 2.0, "away_max_c": 18.5, "scenario_pre_min": 5, "scenario_post_min": 90, "boost_match_min": 5, "known_overshoot_k": 0.5,
         "passive_step_min": 10, "passive_min_points": 200, "passive_a_bounds": [1e-4, 0.02], "passive_delta_bounds": [0.0, 15.0], "passive_default": {"a": 0.003, "delta": 5.0},
         "gain_prior": [0.3, 1.0], "delay_prior": [12.0, 0.7], "gain_bounds": [1e-3, 5.0], "delay_bounds": [2.0, 80.0], "sigma0": 0.3, "sigma_floor": 0.2, "boost_weight": 2.0,
         "eb_iter": 3, "hyper_min_windows": 2, "hyper_shrink": 2.0, "tau_floor": 0.15, "n_samples": 64, "peak_sigma_floor": 0.3,

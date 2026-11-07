@@ -118,10 +118,15 @@ def test_safe_dose_bound_and_monotone_in_dose():
     dec = d.decide("wohnzimmer", c, "homecoming", 20.0)
     assert (np.diff(p) >= -1e-12).all()
     i = int(round((dec["d_safe"] - 5) / 0.1))
+    assert dec["p_no_boost"] > 0.5 and abs(dec["d_safe"] - 20.0) < 1e-6
     if dec["d_safe"]:
-        assert p[i] <= 0.10
-    if 0 < dec["d_safe"] < 20:
-        assert p[i + 1] > 0.10
+        assert p[i] - dec["p_no_boost"] <= 0.10
+    if 0 < dec["d_safe"] and i + 1 < len(p):
+        assert p[i + 1] - dec["p_no_boost"] > 0.10
+    hot = d.decide("wohnzimmer", ctx(start_temp=19.4, gap=0.6), "morning", 20.0)
+    j = int(round((hot["d_safe"] - 5) / 0.1))
+    pk, _ = d.risk("wohnzimmer", ctx(start_temp=19.4, gap=0.6), 20.0)
+    assert hot["d_safe"] == 0.0 or (pk[j] - hot["p_no_boost"] <= 0.10 and (j + 1 >= len(pk) or pk[j + 1] - hot["p_no_boost"] > 0.10))
     weak = Dosing(synthetic([], g=0.05)).decide("wohnzimmer", c, "homecoming", 20.0)
     assert weak["d_safe"] >= dec["d_safe"]
     assert d.decide("wohnzimmer", ctx(gap=0.2, start_temp=21.0), "morning", 21.2)["allowed"] == 0.0

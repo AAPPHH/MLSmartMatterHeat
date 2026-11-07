@@ -193,12 +193,13 @@ class Episodes:
         for x, y in zip(a, b):
             ok = x >= 1 and np.isfinite(s.temp[x]) and np.isfinite(s.setpoint[x]) and not s.bad[x]
             dose = float(s.u[x:min(y, x + c["pulse_cap_min"])].sum())
+            measured = dose
             boost = next((cy for cy in cycles if abs(cy["start_idx"] - x) <= c["boost_match_min"]), None)
             if ok and dose >= c["min_dose"]:
                 ctx = s.vector(x, (boost or {}).get("target"))
                 ctx["since_open"] = float(min(x - prev_end, c["since_open_cap_min"]))
                 if boost and boost["dose"] is not None:
-                    dose = float(boost["dose"])
+                    dose = min(float(boost["dose"]), measured)
                 p = {"room": room, "start": int(x), "end": int(y), "dose": dose, "ctx": ctx, "scenario": (boost or {}).get("scenario") or str(s.scenario[x]), "boost": boost is not None, "overshoot_c": (boost or {}).get("overshoot_c")}
                 self.pulses.append(p)
                 spans.append(p)
@@ -240,7 +241,7 @@ class Episodes:
 
     def did_not_overshoot(self, p):
         c = self.cfg
-        if not p["clean"] or not np.isfinite(p["rise"]) or p["hi"] - p["end"] < c["known_post_min"]:
+        if p["scenario"] == "manual" or not p["clean"] or not np.isfinite(p["rise"]) or p["hi"] - p["end"] < c["known_post_min"]:
             return False
         if p["boost"] and (p["overshoot_c"] is None or p["overshoot_c"] > c["known_overshoot_k"]):
             return False
@@ -439,7 +440,8 @@ class Dosing:
         b = self.b
         dmin = b["dose"]["min_min"]
         p, pk = self.risk(room, ctx, target, valve_hist)
-        feasible = np.flatnonzero(p <= b["risk"]["p_max"])
+        p0 = float(self.exceed(room, self.peaks(room, ctx, target, valve_hist, [0.0]), target)[0])
+        feasible = np.flatnonzero(p - p0 <= b["risk"]["p_max"])
         d_safe = float(self.cand[feasible.max()]) if len(feasible) else 0.0
         t = self.trust or Trust.from_bundle(b)
         self.trust = t
@@ -458,7 +460,7 @@ class Dosing:
             k = int(ok.max()) if len(ok) else 0
             chosen = float(doses[k])
             p_chosen, p_allowed = (float(v) for v in self.exceed(room, grid[[k, -1]], target))
-        return {"nearest_dist": kn.get("nearest_dist"), "nearest_dose": kn.get("nearest_dose"), "d_safe": d_safe, "known": kn["dose"], "n_similar": kn["n_similar"], "allowed": allowed, "chosen": chosen, "p_overshoot": p_chosen, "p_at_allowed": p_allowed, "j": j, "p_no_boost": float(self.exceed(room, self.peaks(room, ctx, target, valve_hist, [0.0]), target)[0])}
+        return {"nearest_dist": kn.get("nearest_dist"), "nearest_dose": kn.get("nearest_dose"), "d_safe": d_safe, "known": kn["dose"], "n_similar": kn["n_similar"], "allowed": allowed, "chosen": chosen, "p_overshoot": p_chosen, "p_at_allowed": p_allowed, "j": j, "p_no_boost": p0}
 
 
 class BoostLearn:
@@ -639,7 +641,7 @@ def boost_cycles(lake, grid, cfg):
         r = det.get("room")
         if r in grid.rooms and det.get("start_ts_ms"):
             idx = grid.minute(utc(det["start_ts_ms"] / 1000.0).isoformat())
-            out.setdefault(r, []).append({"start_idx": idx, "target": det.get("target"), "overshoot_c": det.get("overshoot_c"), "dose": det.get("boost_min", det.get("applied_t_off_min")), "scenario": det.get("scenario") if det.get("scenario") in ("morning", "homecoming") else None})
+            out.setdefault(r, []).append({"start_idx": idx, "target": det.get("target"), "overshoot_c": det.get("overshoot_c"), "dose": det.get("boost_min", det.get("applied_t_off_min")), "scenario": det.get("scenario") if det.get("scenario") in ("morning", "homecoming", "manual") else None})
     return out
 
 
