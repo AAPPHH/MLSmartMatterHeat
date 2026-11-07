@@ -153,6 +153,15 @@ prompt_gap_min = 10.0
 prompt_global_gap_min = 30.0
 prompt_max_per_day = 6
 
+[boost]
+enabled = true
+model_dir = "/models/boost"
+reload_min = 5.0
+morning_hours = [5.0, 11.0]
+min_rise_k = 1.0
+trigger_window_min = 3.0
+measure_min = 60.0
+
 [failsafe]
 setpoint = 18.0
 max_c = 22.0
