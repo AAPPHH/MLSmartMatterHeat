@@ -74,7 +74,7 @@ CONFIG = {
         "eb_iter": 3, "hyper_min_windows": 2, "hyper_shrink": 2.0, "tau_floor": 0.15, "n_samples": 64, "peak_sigma_floor": 0.3,
         "dose_min": 5.0, "dose_max": 20.0, "dose_step": 0.1, "p_max": 0.10, "margin_k": 0.5, "thompson_margin_k": 0.25, "boost_setpoint": 24.0, "abort_c": 24.0, "growth": 1.1,
         "knn_k": 5, "radius_quantile": 0.25, "radius_default": 2.5, "radius_floor": 0.5, "scenario_penalty": 2.0, "known_post_min": 20,
-        "closure_excl_min": 90, "closure_gap": [2.0, 6.0], "closure_min_points": 300, "closure_kp": [0.2, 10.0], "closure_gap0_max": 3.0, "closure_active_gap": 1.0, "closure_min_active": 100, "closure_scales": [0.0, 0.03, 0.06, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0], "closure_tol": 0.03, "closure_min_pulses": 20, "closure_default": {"kp": 1.0, "gap0": 1.0},
+        "closure_excl_min": 90, "closure_gap": [2.0, 6.0], "closure_min_points": 300, "closure_kp": [0.02, 10.0], "closure_gap0_max": 3.0, "closure_active_gap": 1.0, "closure_min_active": 0, "closure_scales": [0.0, 0.03, 0.06, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0], "closure_tol": 0.03, "closure_min_pulses": 20, "closure_default": {"kp": 1.0, "gap0": 1.0},
         "loeo_min_strong": 6, "sigma_max": 4.0, "sigma_step": 0.05, "coverage_target": 0.9, "bounds_trials": 100, "monotone_trials": 100, "retry": {"base_min": 10, "max_min": 360},
         "feature_weight": {"out": 1.0, "wind": 0.5, "rad": 0.5, "start_temp": 1.0, "gap": 1.0, "supply_ok": 1.0, "since_resume": 0.5, "vm60": 0.5, "vm180": 0.5, "since_open": 0.5, "hour_sin": 0.5, "hour_cos": 0.5},
         "typical": {"morning": {"scenario": "morning", "start": 18.0, "target": 20.0, "out": 5.0, "wind": 3.0, "rad": 0.0, "resume": 60.0, "hour": 6.5},

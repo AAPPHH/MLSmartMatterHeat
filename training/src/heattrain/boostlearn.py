@@ -182,7 +182,7 @@ class Episodes:
             self.extract(r, boost_cycles.get(r, []))
         pts = {r: closure_points(self.series[r], boost_cycles.get(r, []), cfg) for r in grid.rooms}
         pooled = fit_closure(np.concatenate([p[0] for p in pts.values()]), np.concatenate([p[1] for p in pts.values()]), cfg) if sum(len(p[0]) for p in pts.values()) >= cfg["closure_min_points"] else dict(cfg["closure_default"], n=0, rmse=None)
-        self.closure = {r: fit_closure(*pts[r], cfg) if (pts[r][0] > cfg["closure_active_gap"]).sum() >= cfg["closure_min_active"] else dict(pooled, pooled=True) for r in grid.rooms}
+        self.closure = {r: fit_closure(*pts[r], cfg) if len(pts[r][0]) >= cfg["closure_min_points"] and (pts[r][0] > cfg["closure_active_gap"]).sum() >= cfg["closure_min_active"] else dict(pooled, pooled=True) for r in grid.rooms}
 
     def extract(self, room, cycles):
         c, s = self.cfg, self.series[room]
