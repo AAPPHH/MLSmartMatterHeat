@@ -117,7 +117,7 @@ class Grid:
                     d[name] = np.full(len(t), np.nan)
             d["since_open"] = since_open(d["valve"], cfg["open_valve_pct"])
             room[r] = d
-        shared = cls.weather(lake, t)
+        shared = cls.weather(lake, t, cfg["weather_max_age_min"])
         ev = rows(lake, "events", ["ts", "kind", "node", "detail"], lambda d: (d["ts"], d["kind"], d["node"], d["detail"]))
         cls.mark_events(ev, t, rooms, room, shared, cfg)
         dec = rows(lake, "decisions", ["ts", "room", "rule", "setpoint_new", "applied"], lambda d: (d["ts"], d["room"], d["rule"], d["setpoint_new"], d["applied"]))
@@ -125,7 +125,7 @@ class Grid:
         return cls(t, rooms, room, shared, cfg)
 
     @staticmethod
-    def weather(lake, t):
+    def weather(lake, t, max_age_min):
         w = rows(lake, "weather", ["ts", "kind", "temp_c", "wind_ms", "radiation_wm2"], lambda d: (d["ts"], d["kind"]))
         w = sorted((epoch(d["ts"]), d) for d in w if d["kind"] == "obs")
         ts = np.array([x[0] for x in w])
@@ -133,7 +133,7 @@ class Grid:
         for name, col in {"out": "temp_c", "wind": "wind_ms", "rad": "radiation_wm2"}.items():
             v = np.array([np.nan if x[1][col] is None else x[1][col] for x in w], dtype=float)
             ok = np.isfinite(v)
-            out[name] = np.interp(t, ts[ok], v[ok]) if ok.any() else np.full(len(t), np.nan)
+            out[name] = ffill(ts[ok], v[ok], t, max_age_min * 60.0) if ok.any() else np.full(len(t), np.nan)
         return out
 
     @staticmethod
@@ -342,34 +342,48 @@ def run_windowml(config, name, lake=None):
     return r
 
 
+FEATURE_NAMES = ["valve_mean_h", "valve_f4_lag", "valve_f4", "valve_f12_lag", "valve_f12", "valve_f40_lag", "valve_f40", "valve_lag", "valve", "setpoint_lag_minus_s0", "out_minus_s0", "out_lag_minus_s0", "rad_100", "wind_times_out_minus_s0", "since_open_lag", "since_open"]
+
+
+def dilate(mask, pad):
+    out = mask.copy()
+    for s, e in zip(*runs(mask)):
+        out[e:e + pad] = True
+    return out
+
+
 class PhysicsResidual(Approach):
     refit = True
 
     def __init__(self, cfg):
         super().__init__(cfg)
         self.c = cfg["phys"]
-        self.model = {}
+        self.model, self.rows = {}, {}
 
     def features(self, grid, r):
         c, d = self.c, grid.room[r]
-        H = c["horizon"]
+        H, n = c["horizon"], len(grid.t)
         s, v, sp = d["temp"], d["valve"] / 100.0, d["setpoint"]
         out, rad, wind = grid.shared["out"], grid.shared["rad"], grid.shared["wind"]
-        vz = np.nan_to_num(v, nan=0.0)
-        cols = [np.cumsum(vz)]
-        cs = cols[0]
-        win = np.full(len(s), np.nan)
-        win[H:] = (cs[H:] - cs[:-H]) / H
+        good = np.isfinite(v)
+        vz = np.where(good, v, 0.0)
+        cs = np.concatenate([[0.0], np.cumsum(vz)])
+        win = np.full(n, np.nan)
+        win[H:] = (cs[H + 1:] - cs[1:n - H + 1]) / H
         f = [win]
         for tau in c["taus"]:
             a = np.exp(-1.0 / tau)
             st = lfilter([1 - a], [1, -a], vz)
             f += [lag(st, H), st]
         s0 = lag(s, H)
-        f += [lag(v, H), v, lag(sp, H) - s0, out - s0, lag(out, H) - s0, rad / 100.0, (out - s0) * wind, np.minimum(lag(d["since_open"], H), 90) / 90.0, np.minimum(d["since_open"], 90) / 90.0]
+        so = np.where(good & np.isnan(d["since_open"]), c["since_open_cap"], d["since_open"])
+        cap = c["since_open_cap"]
+        f += [lag(v, H), v, lag(sp, H) - s0, out - s0, lag(out, H) - s0, rad / 100.0, (out - s0) * wind, np.minimum(lag(so, H), cap) / cap, np.minimum(so, cap) / cap]
         X = np.column_stack(f)
         y = s - s0
-        ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        idx = np.arange(n)
+        run = idx - np.maximum.accumulate(np.where(good, -1, idx))
+        ok = np.isfinite(X).all(axis=1) & np.isfinite(y) & (run >= H + c["valve_guard_min"] + 1)
         return X, y, ok
 
     def fit(self, grid, train_days):
@@ -389,56 +403,149 @@ class PhysicsResidual(Approach):
                 res = yt - mdl.predict(Xt)
                 keep = np.abs(res) <= np.quantile(np.abs(res), 1 - c["trim"])
             sig = float(np.sqrt(np.mean(res[keep] ** 2)))
-            self.model[r] = (mdl, max(sig, c["sigma_floor"]))
+            self.rows[r] = int(m.sum())
+            self.model[r] = (np.array(mdl.coef_, float), float(mdl.intercept_), max(sig, c["sigma_floor"]))
         return self
 
     def evidence(self, grid):
         c = self.c
         z = {}
-        veto = np.zeros(len(grid.t), bool)
-        pad = c["veto_pad_min"]
-        for k in ("supply_event", "supply_onset"):
-            sup = np.nan_to_num(grid.shared[k]).astype(bool)
-            veto |= sup
-        idx = np.flatnonzero(veto)
-        for i in idx:
-            veto[i:i + pad] = True
         for r in grid.rooms:
             if r not in self.model:
                 z[r] = np.full(len(grid.t), np.nan)
                 continue
-            mdl, sig = self.model[r]
+            coef, icpt, sig = self.model[r]
             X, y, ok = self.features(grid, r)
-            res = np.full(len(y), np.nan)
-            res[ok] = (y[ok] - mdl.predict(X[ok])) / sig
-            e = -res
-            if c["extra_loss"]:
-                a = np.exp(-1.0 / c["leak_min"])
-                e = lfilter([1.0 / c["horizon"]], [1, -a], np.nan_to_num(e))
-                e = np.where(np.isfinite(res), e, np.nan)
+            e = np.full(len(y), np.nan)
+            e[ok] = -(y[ok] - (X[ok] @ coef + icpt)) / sig
             z[r] = np.minimum(e, c["clip"])
-        z["veto"] = veto
         return z
 
     def house(self, z, grid):
-        c = self.c
-        w = c["weights"]
+        w = self.c["weights"]
         zs = np.array([np.maximum(z[r], 0.0) * w[r] for r in grid.rooms])
-        cnt = np.array([w[r] for r in grid.rooms])[:, None] * np.isfinite(zs)
-        tot = np.nansum(zs, axis=0)
-        if c["agg"] == "mean":
-            tot = tot / np.maximum(cnt.sum(axis=0), 1e-9)
-        elif c["agg"] == "rms":
-            tot = np.sqrt(np.nansum(zs ** 2, axis=0) / np.maximum(cnt.sum(axis=0), 1e-9))
-        return np.where(np.isfinite(zs).any(axis=0), tot, np.nan)
+        return np.where(np.isfinite(zs).any(axis=0), np.nansum(zs, axis=0), np.nan)
 
     def series(self, grid):
         z = self.evidence(grid)
-        veto = z.pop("veto")
         z["house"] = self.house(z, grid)
+        veto = dilate(np.nan_to_num(grid.shared["supply_event"]).astype(bool), self.c["veto_pad_min"])
         return {k: np.where(veto, np.nan, v) for k, v in z.items()}
 
     def score(self, grid, day):
         s = self.series(grid)
         i = grid.day_idx[day]
         return {k: v[i] for k, v in s.items()}
+
+
+class StreamScorer:
+    def __init__(self, bundle):
+        self.b = bundle
+        self.rooms = list(bundle["rooms"])
+        H = bundle["horizon_min"]
+        self.hist = {r: [] for r in self.rooms}
+        self.st = {r: [0.0] * len(bundle["taus"]) for r in self.rooms}
+        self.run = dict.fromkeys(self.rooms, 0)
+        self.last_open = dict.fromkeys(self.rooms)
+        self.win = {r: [] for r in self.rooms}
+        self.t = -1
+        self.since_supply = None
+        self.H = H
+
+    def step(self, shared, inputs):
+        b, H = self.b, self.H
+        self.t += 1
+        sup = bool(shared["supply"])
+        self.since_supply = 0 if sup else (None if self.since_supply is None else self.since_supply + 1)
+        veto = sup or (self.since_supply is not None and self.since_supply <= b["veto_pad_min"])
+        z = {}
+        for r in self.rooms:
+            temp, valve, sp = inputs[r]
+            good = np.isfinite(valve)
+            v = valve / 100.0 if good else np.nan
+            vz = v if good else 0.0
+            self.run[r] = self.run[r] + 1 if good else 0
+            if good and valve > b["open_valve_pct"]:
+                self.last_open[r] = self.t
+            so = b["since_open_cap"] if self.last_open[r] is None else min(self.t - self.last_open[r], b["since_open_cap"])
+            self.st[r] = [np.exp(-1.0 / tau) * x + (1 - np.exp(-1.0 / tau)) * vz for tau, x in zip(b["taus"], self.st[r])]
+            self.win[r].append(vz)
+            h = self.hist[r]
+            h.append({"temp": temp, "v": v, "sp": sp, "out": shared["out"], "so": so, "st": list(self.st[r])})
+            z[r] = np.nan
+            if len(h) <= H:
+                continue
+            old = h[-1 - H]
+            del h[0]
+            wm = sum(self.win[r][-H:]) / H
+            del self.win[r][:-H]
+            m = b["rooms"][r]
+            s0 = old["temp"]
+            f = [wm]
+            for a, c in zip(old["st"], self.st[r]):
+                f += [a, c]
+            cap = b["since_open_cap"]
+            f += [old["v"], v, old["sp"] - s0, shared["out"] - s0, old["out"] - s0, shared["rad"] / 100.0, (shared["out"] - s0) * shared["wind"], old["so"] / cap, so / cap]
+            x = np.array(f, float)
+            if self.run[r] < H + b["valve_guard_min"] + 1 or not np.isfinite(x).all() or not np.isfinite(temp):
+                continue
+            z[r] = min(-((temp - s0) - (float(np.dot(x, m["coef"])) + m["intercept"])) / m["sigma"], b["clip"])
+        zs = [max(z[r], 0.0) * b["rooms"][r]["weight"] for r in self.rooms if np.isfinite(z[r])]
+        house = sum(zs) if zs else np.nan
+        return z, house, veto
+
+
+def window_bundle(config, lake, models_dir, version=None):
+    cfg = config["window"]
+    grid = Grid.load(lake, cfg)
+    oof = loo_scores(grid, PhysicsResidual, cfg)
+    res = Evaluator(grid, cfg).run({"house": oof["house"]})
+    ap = PhysicsResidual(cfg).fit(grid, grid.days)
+    c = ap.c
+    ground = [r for r in cfg["floor"]["ground"] if r in ap.model]
+    if not res["pass"] or len(ground) < 2:
+        raise SystemExit(f"window bundle not validated: pass={res['pass']} detected={res['detected']} alarms_in_supply={res['alarms_in_supply']} ground_rooms={ground}")
+    version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bundle = {"version": version, "kind": "window_physics_residual", "horizon_min": c["horizon"], "taus": c["taus"], "feature_names": FEATURE_NAMES, "since_open_cap": c["since_open_cap"], "open_valve_pct": cfg["open_valve_pct"],
+              "valve_guard_min": c["valve_guard_min"], "clip": c["clip"], "veto_pad_min": c["veto_pad_min"], "threshold": res["threshold"], "merge_min": cfg["criterion"]["merge_min"],
+              "ffill_min": cfg["ffill_min"], "valid": cfg["valid"], "weather_max_age_min": cfg["weather_max_age_min"],
+              "rooms": {r: {"node": cfg["nodes"][r], "weight": c["weights"][r], "coef": coef.tolist(), "intercept": icpt, "sigma": sig} for r, (coef, icpt, sig) in ap.model.items()}}
+    meta = {"version": version, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "train_from": utc(grid.t[0]).isoformat(), "train_to": utc(grid.t[-1]).isoformat(), "days": len(grid.days), "minutes": len(grid.t), "rows": ap.rows,
+            "eval": {k: res[k] for k in ("pass", "detected", "latency_min", "threshold", "alarms", "alarms_per_day", "gt_rank", "alarms_in_supply")}, "alarms": [{k: e[k] for k in ("start_utc", "minutes", "peak", "rooms", "gt")} for e in res["episodes"]]}
+    out = Path(models_dir) / "window" / version
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "bundle.json").write_text(json.dumps(bundle, indent=1))
+    (out / "meta.json").write_text(json.dumps(meta, indent=1))
+    return out, bundle, meta, ap, grid
+
+
+def slice_grid(grid, sl):
+    room = {r: {k: v[sl] for k, v in d.items() if k != "since_open"} for r, d in grid.room.items()}
+    for d in room.values():
+        d["since_open"] = since_open(d["valve"], grid.cfg["open_valve_pct"])
+    shared = {k: v[sl] for k, v in grid.shared.items()}
+    return Grid(grid.t[sl], grid.rooms, room, shared, grid.cfg)
+
+
+def stream_run(bundle, grid, sl):
+    sc = StreamScorer(bundle)
+    sub = slice_grid(grid, sl)
+    rec = []
+    for i in range(len(sub.t)):
+        shared = {"supply": bool(sub.shared["supply_event"][i]), "out": sub.shared["out"][i], "wind": sub.shared["wind"][i], "rad": sub.shared["rad"][i]}
+        z, house, veto = sc.step(shared, {r: (sub.room[r]["temp"][i], sub.room[r]["valve"][i], sub.room[r]["setpoint"][i]) for r in sc.rooms})
+        rec.append((shared, z, house, veto))
+    return sub, rec
+
+
+def parity_csv(bundle, grid, sl):
+    sub, rec = stream_run(bundle, grid, sl)
+    rooms = list(bundle["rooms"])
+    f = lambda x: "" if not np.isfinite(x) else repr(float(x))
+    head = ["ts", "supply", "out", "wind", "rad"] + [f"{r}_{k}" for r in rooms for k in ("temp", "valve", "setpoint")] + [f"z_{r}" for r in rooms] + ["house", "veto"]
+    lines = [",".join(head)]
+    for i, (shared, z, house, veto) in enumerate(rec):
+        cells = [str(int(sub.t[i])), str(int(shared["supply"])), f(shared["out"]), f(shared["wind"]), f(shared["rad"])]
+        cells += [f(sub.room[r][k][i]) for r in rooms for k in ("temp", "valve", "setpoint")] + [f(z[r]) for r in rooms] + [f(house), str(int(veto))]
+        lines.append(",".join(cells))
+    return "\n".join(lines) + "\n"

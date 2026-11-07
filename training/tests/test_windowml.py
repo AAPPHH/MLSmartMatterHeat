@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.windowml import Approach, Evaluator, Grid, V1Like, UnheatedFloor, budget_threshold, episodes, evaluate, since_open
+from heattrain.windowml import Approach, Evaluator, Grid, PhysicsResidual, StreamScorer, V1Like, UnheatedFloor, budget_threshold, dilate, episodes, evaluate, parity_csv, since_open, stream_run, window_bundle
 
 CFG = copy.deepcopy(CONFIG["window"])
 CFG["rooms"] = ["wohnzimmer", "bad"]
@@ -47,7 +47,7 @@ def test_loader(lake):
     assert w["valve"][2] == 50.0 and w["valve"][30] == 0.0
     assert w["setpoint"][5] == 22.0 and np.isnan(w["setpoint"][4])
     assert w["since_open"][2] == 0 and w["since_open"][30] == 1
-    assert g.shared["out"][30] == pytest.approx(4.0 + 2.0 * 30 / 60)
+    assert g.shared["out"][30] == 4.0 and g.shared["out"][0] == 4.0 and g.shared["wind"][30] == 1.0
     assert b["supply_event"][20] and b["supply_event"][25] and not b["supply_event"][26] and not b["supply_event"][19]
     assert b["supply_onset"][10] and not b["supply_onset"][9]
     assert g.shared["supply_event"].sum() == 6
@@ -165,20 +165,78 @@ def test_baseline_semantics():
     assert f["house"][1005] == pytest.approx(3.0)
 
 
-def test_physics_residual_flags_unexplained_drop():
-    from heattrain.windowml import PhysicsResidual
-    n = 3000
-    rng = np.random.default_rng(0)
+def phys_grid(n=4000, seed=0, gaps=()):
+    rng = np.random.default_rng(seed)
     t = 1.7e9 + 60 * np.arange(n)
-    temp = 20 + 0.1 * rng.standard_normal(n)
-    temp[2500:2600] -= np.linspace(0, 3, 100)
-    temp[2600:] -= 3
-    d = {"temp": temp, "valve": np.zeros(n), "setpoint": np.full(n, 21.0), "since_open": np.full(n, 500.0)}
-    sh = {"out": np.full(n, 5.0), "wind": np.full(n, 2.0), "rad": np.zeros(n), "supply_event": np.zeros(n, bool), "supply_onset": np.zeros(n, bool)}
+    sh = {"out": 5 + np.sin(np.arange(n) / 500.0), "wind": 2 + rng.uniform(0, 1, n), "rad": np.maximum(0, 100 * np.sin(np.arange(n) / 700.0)), "supply_event": np.zeros(n, bool)}
+    room = {}
+    for r in ("wohnzimmer", "bad", "schlafzimmer"):
+        valve = np.clip(50 + 50 * np.sin(np.arange(n) / 90.0 + len(r)), 0, 100)
+        temp = 20 + np.cumsum(0.02 * (valve / 100 - 0.4)) * 0 + 0.3 * np.sin(np.arange(n) / 150.0) + 0.05 * rng.standard_normal(n)
+        d = {"temp": temp, "valve": valve, "setpoint": np.full(n, 21.0)}
+        for a, b in gaps:
+            d["valve"][a:b] = np.nan
+        d["since_open"] = since_open(d["valve"], 10.0)
+        room[r] = d
     cfg = copy.deepcopy(CFG)
-    cfg["rooms"] = ["wohnzimmer"]
-    g = Grid(t, ["wohnzimmer"], {"wohnzimmer": d}, sh, cfg)
+    cfg["rooms"] = list(room)
+    cfg["nodes"] = {"wohnzimmer": 5, "bad": 7, "schlafzimmer": 6}
+    return Grid(t, list(room), room, sh, cfg), cfg
+
+
+def test_missing_valve_is_unscorable_not_closed():
+    g, cfg = phys_grid(gaps=[(2000, 2005)])
+    X, y, ok = PhysicsResidual(cfg).features(g, "bad")
+    g0 = cfg["phys"]["horizon"] + cfg["phys"]["valve_guard_min"]
+    assert not ok[2000:2005 + g0].any() and ok[2005 + g0] and ok[1999]
+    assert not ok[:g0].any() and ok[g0]
+
+
+def test_causal_supply_veto():
+    g, cfg = phys_grid()
+    g.shared["supply_event"][1500:1600] = True
+    g.shared["supply_onset"] = np.zeros(len(g.t), bool)
+    g.shared["supply_onset"][1000:1600] = True
     ap = PhysicsResidual(cfg).fit(g, g.days)
     s = ap.series(g)
-    assert np.nanmax(s["wohnzimmer"][2500:2620]) > 1.4 * np.nanmax(s["wohnzimmer"][600:2400])
-    assert np.isfinite(s["house"]).any()
+    assert np.isfinite(s["house"][1499]) and np.isnan(s["house"][1500]) and np.isnan(s["house"][1659]) and np.isfinite(s["house"][1660])
+    assert dilate(np.array([0, 1, 0, 0, 0], bool), 2).tolist() == [False, True, True, True, False]
+
+
+def test_stream_matches_vectorized_with_gaps_and_veto():
+    g, cfg = phys_grid(gaps=[(2000, 2005), (3000, 3300)])
+    g.shared["supply_event"][2600:2650] = True
+    ap = PhysicsResidual(cfg).fit(g, g.days)
+    b = {"horizon_min": 20, "taus": cfg["phys"]["taus"], "since_open_cap": 90.0, "open_valve_pct": 10.0, "valve_guard_min": 120, "clip": 6.0, "veto_pad_min": 60,
+         "rooms": {r: {"weight": cfg["phys"]["weights"][r], "coef": c.tolist(), "intercept": i, "sigma": sg} for r, (c, i, sg) in ap.model.items()}}
+    sub, rec = stream_run(b, g, slice(0, len(g.t)))
+    s = ap.series(g)
+    n_fin = 0
+    for i, (sh, z, house, veto) in enumerate(rec):
+        for r in g.rooms:
+            want = s[r][i]
+            got = np.nan if veto else z[r]
+            assert np.isnan(want) == np.isnan(got)
+            if np.isfinite(want):
+                n_fin += 1
+                assert want == pytest.approx(got, abs=1e-9)
+        want, got = s["house"][i], np.nan if veto else house
+        assert np.isnan(want) == np.isnan(got) and (np.isnan(want) or want == pytest.approx(got, abs=1e-9))
+    assert n_fin > 3000 and any(r[3] for r in rec)
+
+
+def test_export_requires_validation_and_writes_bundle(tmp_path, monkeypatch):
+    g, cfg = phys_grid()
+    monkeypatch.setattr(Grid, "load", classmethod(lambda cls, lake, c: g))
+    config = {"window": cfg}
+    with pytest.raises(SystemExit):
+        window_bundle(config, "x", tmp_path)
+    ok = {"pass": True, "detected": True, "latency_min": 25, "threshold": 7.5, "alarms": 1, "alarms_per_day": 0.1, "gt_rank": 1, "alarms_in_supply": 0, "episodes": []}
+    monkeypatch.setattr(Evaluator, "run", lambda self, sc: ok)
+    out, bundle, meta, ap, _ = window_bundle(config, "x", tmp_path, version="v1")
+    b = json.loads((out / "bundle.json").read_text())
+    assert out == tmp_path / "window" / "v1" and b["threshold"] == 7.5 and set(b["rooms"]) == {"wohnzimmer", "bad", "schlafzimmer"}
+    assert all(len(m["coef"]) == len(b["feature_names"]) == 16 for m in b["rooms"].values())
+    assert json.loads((out / "meta.json").read_text())["eval"]["pass"]
+    csv = parity_csv(b, g, slice(0, 600)).splitlines()
+    assert csv[0].startswith("ts,supply,out,wind,rad,wohnzimmer_temp") and len(csv) == 601 and csv[-1].split(",")[-1] == "0"
