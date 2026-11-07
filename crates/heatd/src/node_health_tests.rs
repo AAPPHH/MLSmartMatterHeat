@@ -438,3 +438,22 @@ async fn the_setpoint_alert_survives_silence_and_failed_writes_clear_when_the_de
     step(&r.state, r.t0 + 1302 * s).await;
     assert_eq!(r.state.status.node_snapshot(6).unwrap().health.set.consecutive_failures, 0);
 }
+
+#[test]
+fn the_first_alert_is_the_oldest_active_one_so_a_new_alert_does_not_displace_it() {
+    let r = rig();
+    let set = |node: u64, since_ms: i64| {
+        r.state.status.update_health(node, |rec| {
+            rec.state = Health::Unreachable;
+            rec.since_us = since_ms * 1000;
+        })
+    };
+    set(6, 1000);
+    let first = alerts(&r.state)[0]["id"].clone();
+    assert!(first.as_str().unwrap().starts_with("node_unreachable:6@1000"));
+    set(5, 2000);
+    let both = alerts(&r.state);
+    assert_eq!((both.len(), both[0]["id"].clone()), (2, first.clone()));
+    r.state.status.update_health(5, |rec| rec.state = Health::Ok);
+    assert_eq!(alerts(&r.state)[0]["id"], first);
+}

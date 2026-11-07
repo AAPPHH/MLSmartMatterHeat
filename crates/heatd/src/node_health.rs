@@ -387,6 +387,7 @@ pub fn alerts(state: &AppState) -> Vec<Value> {
             out.push(json!({"id": format!("setpoint_not_applied:{node}@{}", since / 1000), "title": "Heizung: Thermostat", "text": format!("{}: Solltemperatur {target:.1} Grad wird nicht uebernommen{reported}. heatd schreibt sie erneut.", label(state, node))}));
         }
     }
+    out.sort_by_key(|a| a["id"].as_str().and_then(|id| id.rsplit_once('@')).and_then(|(_, since)| since.parse::<i64>().ok()).unwrap_or(i64::MAX));
     out
 }
 

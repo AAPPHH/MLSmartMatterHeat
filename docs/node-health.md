@@ -21,12 +21,12 @@ Every transition writes a lake event `node_health` (aspect `link`, from, to, sil
 
 ## Setpoint verification
 
-If the device-reported `occupied_heating_setpoint` differs from the value heatd commanded (more than `tolerance_c`, no manual hold, report newer than the write) for `verify_min` while the node answers, heatd writes it again with backoff (`backoff_start_s` doubling). Each rewrite and each failed write is counted (`heatd_node_setpoint_rewrites_total`, `heatd_node_setpoint_failures_total`, event aspect `setpoint`). After `alert_retries` ineffective rewrites or consecutive failed writes the setpoint alert is raised; it clears when the device matches or a write succeeds.
+If the device-reported `occupied_heating_setpoint` differs from the value heatd commanded (more than `tolerance_c`, no manual hold, report newer than the write) for `verify_min` while the node answers, heatd writes it again with backoff (`backoff_start_s` doubling). Each rewrite and each failed write is counted (`heatd_node_setpoint_rewrites_total`, `heatd_node_setpoint_failures_total`, event aspect `setpoint`). After `alert_retries` ineffective rewrites or consecutive failed writes the setpoint alert is raised; rewriting then stops (at most `alert_retries` rewrites per target) and the alert stays, also while the node is silent, until the device matches the target or a write succeeds. The tolerance is at least the control `setpoint_deadband`; a value the device acknowledged after the write (clamped or rounded) counts as applied.
 
 ## Reporting
 
 - `/health`: `nodes[].health` (state, since_ts, since_age_s, attempts, attempts_total, last_attempt_age_s, last_action, last_error, setpoint{...}); `status` is degraded while any node is not ok.
 - `/api/state`: `rooms[].nodes[].health` and top-level `alerts`.
 - `/metrics`: `heatd_node_health`, `heatd_node_health_since_seconds`, `heatd_node_recovery_attempts_total`, `heatd_node_health_transitions_total`, `heatd_node_setpoint_mismatch`, `heatd_node_setpoint_rewrites_total`, `heatd_node_setpoint_failures_total`, `heatd_node_alert`.
-- `/api/scan` and `/api/scans`: `alerts` (only present while an alert is active; list of `{id, title, text}`: router watchdog first, then `node_unreachable:<node>@<since_ms>` and `setpoint_not_applied:<node>@<since_ms>`). `alert` stays and carries the first entry, so old clients show it.
+- `/api/scan` and `/api/scans`: `alerts` (only present while an alert is active; list of `{id, title, text}`: router watchdog first, then `node_unreachable:<node>@<since_ms>` and `setpoint_not_applied:<node>@<since_ms>`). The list is ordered oldest first with ids stable per episode, so `alert` (the first entry, for old clients) does not change when another alert appears and the watch does not notify again.
 - Daily report: section "Thermostat-Gesundheit".
