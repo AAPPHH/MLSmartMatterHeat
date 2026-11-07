@@ -2306,4 +2306,68 @@ nodes = [5]
         assert_eq!(call(&h.state, "POST", "/watch/window_label", Some(json!({"device": "w", "ts": 1}).to_string())).await.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(lake_rows(&h, "labels").is_empty());
     }
+
+    fn late_harness() -> Harness {
+        let head = format!("away_guard_minutes = 0\n[watchmatch]\nenabled = true\nmodel_dir = '{}'\nscan_fresh_s = 36000\n", fixture_models().replace('\\', "/"));
+        harness_with(false, &head, "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n")
+    }
+
+    fn restarted(h: &Harness) -> AppState {
+        h.state.sink.flush().unwrap();
+        AppState { watchmatch: WatchMatch::new(&h.state.config.watchmatch, h.state.sink.clone(), h.state.status.clone()), tracker: Default::default(), commanded: Default::default(), ..h.state.clone() }
+    }
+
+    #[tokio::test]
+    async fn restart_restores_room_and_occupancy_inside_the_timeout() {
+        let h = late_harness();
+        let now = now_ms();
+        call(&h.state, "POST", "/watch/measurement", Some(scan_form(700, now - 5 * 60_000, "pixel-watch-000700", false, "still").to_string())).await;
+        let fresh = restarted(&h);
+        assert!(fresh.watchmatch.effective(now).is_none_or(|m| m.is_none()) && fresh.watchmatch.stay().is_none());
+        let summary = crate::restore::restore(&fresh, now).unwrap();
+        assert!(summary.starts_with("room wohnzimmer"), "{summary}");
+        let held = fresh.watchmatch.effective(now).unwrap().unwrap();
+        assert_eq!((held.0.as_str(), fresh.watchmatch.stay().map(|s| s.1)), ("wohnzimmer", Some("kueche".to_string())));
+        let p = crate::rules::current_presence(&fresh, now).unwrap().unwrap();
+        assert_eq!((p.detected(&fresh.config), p.prediction_age_minutes.unwrap().round()), (Some("wohnzimmer".into()), 5.0));
+        let step = fresh.commanded.lock().unwrap().occ_probe(Some("wohnzimmer"), now, 0);
+        assert!(step.held.contains("wohnzimmer"));
+        assert_eq!(fresh.storage.last_predictions().unwrap()[0].room, "wohnzimmer");
+    }
+
+    #[tokio::test]
+    async fn restart_ignores_data_older_than_the_timeout() {
+        let h = late_harness();
+        let now = now_ms();
+        call(&h.state, "POST", "/watch/measurement", Some(scan_form(701, now - 90 * 60_000, "pixel-watch-000701", false, "still").to_string())).await;
+        let fresh = restarted(&h);
+        let summary = crate::restore::restore(&fresh, now).unwrap();
+        assert!(summary.starts_with("room -"), "{summary}");
+        assert!(fresh.watchmatch.effective(now).is_none_or(|m| m.is_none()) && fresh.watchmatch.stay().is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_while_away_stays_away_and_respects_the_guard() {
+        let h = late_harness();
+        let now = now_ms();
+        for (batch, ts, id, motion) in [(702, now - 40 * 60_000, "pixel-watch-000702", "moving"), (703, now - 5 * 60_000, "pixel-watch-000703", "still")] {
+            call(&h.state, "POST", "/watch/measurement", Some(scan_form(batch, ts, id, true, motion).to_string())).await;
+        }
+        let fresh = restarted(&h);
+        assert!(!fresh.tracker.lock().unwrap().confirmed("pixel-watch"));
+        let summary = crate::restore::restore(&fresh, now).unwrap();
+        assert!(summary.contains("away true"), "{summary}");
+        assert!(fresh.tracker.lock().unwrap().confirmed("pixel-watch"));
+        let p = crate::rules::current_presence(&fresh, now).unwrap().unwrap();
+        assert_eq!(p.occupancy(&fresh.config), crate::rules::Occupancy::Away);
+        let guarded = harness_with(false, "away_guard_minutes = 60
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        call(&guarded.state, "POST", "/watch/measurement", Some(scan_form(704, now - 40 * 60_000, "pixel-watch-000704", true, "moving").to_string())).await;
+        let again = restarted(&guarded);
+        crate::restore::restore(&again, now).unwrap();
+        assert!(!again.tracker.lock().unwrap().confirmed("pixel-watch"));
+    }
 }

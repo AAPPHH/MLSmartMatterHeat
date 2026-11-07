@@ -87,10 +87,6 @@ pub fn bundle_candidates(base: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
-pub fn newest_bundle(base: &Path) -> Option<(String, PathBuf)> {
-    bundle_candidates(base).into_iter().next()
-}
-
 pub fn try_load(base: &str) -> Option<Bundle> {
     bundle_candidates(Path::new(base)).into_iter().find_map(|(_, path)| Bundle::load(&path).ok())
 }

@@ -293,6 +293,19 @@ impl Default for FailsafeSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct PresenceSection {
+    pub restore: bool,
+    pub tracker_lookback_h: f64,
+}
+
+impl Default for PresenceSection {
+    fn default() -> Self {
+        Self { restore: true, tracker_lookback_h: 24.0 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct WindowSection {
     pub enabled: bool,
     pub model_dir: String,
@@ -411,6 +424,7 @@ pub struct Config {
     pub poll_silence_s: u64,
     pub watchmatch: WatchMatchSection,
     pub window: WindowSection,
+    pub presence: PresenceSection,
     pub supply: SupplySection,
     pub boost: BoostSection,
     pub failsafe: FailsafeSection,
@@ -456,6 +470,7 @@ impl Default for Config {
             poll_silence_s: 60,
             watchmatch: WatchMatchSection::default(),
             window: WindowSection::default(),
+            presence: PresenceSection::default(),
             supply: SupplySection::default(),
             boost: BoostSection::default(),
             failsafe: FailsafeSection::default(),

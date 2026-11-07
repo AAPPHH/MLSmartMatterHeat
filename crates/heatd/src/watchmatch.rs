@@ -14,7 +14,7 @@ use std::time::Duration;
 
 pub const MATCHER_ROOM: &str = "room";
 pub const NO_MODEL: &str = "none";
-const SIGNAL_KEEP_MS: i64 = 1_800_000;
+pub const SIGNAL_KEEP_MS: i64 = 1_800_000;
 const NO_SCAN_AFTER_MS: i64 = 120_000;
 const HISTORY_KEEP: usize = 32;
 const RELOAD_EVERY_TICKS: u64 = 5;
@@ -622,6 +622,17 @@ impl WatchMatch {
                 inner.stay_ids.remove(device);
             }
             None => {}
+        }
+    }
+
+    pub fn restore_hold(&self, device: &str, room: &str, ts_ms: i64) {
+        if self.is_anchor(device) {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let dev = inner.devices.entry(device.into()).or_default();
+        if dev.hold.as_ref().is_none_or(|h| h.1 < ts_ms) {
+            dev.hold = Some((room.into(), ts_ms));
         }
     }
 

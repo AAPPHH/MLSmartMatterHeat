@@ -114,6 +114,15 @@ pub struct DeviceStatus {
     pub contact_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateRow {
+    pub device: String,
+    pub ts: i64,
+    pub away: bool,
+    pub motion: Option<Motion>,
+    pub power: Option<Power>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Reading {
     pub node: u64,
@@ -214,6 +223,17 @@ impl Storage {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    pub fn state_history(&self, since_ms: i64) -> Result<Vec<StateRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT device, epoch_ms(ts), coalesce(away, false), motion, power FROM device_state WHERE ts >= epoch_ms(?) ORDER BY ts, received_at")?;
+        let rows = stmt.query_map([since_ms], |r| {
+            let motion: Option<String> = r.get(3)?;
+            let power: Option<String> = r.get(4)?;
+            Ok(StateRow { device: r.get(0)?, ts: r.get(1)?, away: r.get(2)?, motion: motion.as_deref().and_then(Motion::parse), power: power.as_deref().and_then(Power::parse) })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn device_statuses(&self) -> Result<Vec<DeviceStatus>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -247,7 +267,6 @@ impl Storage {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn insert_prediction(&self, ts_ms: i64, device: &str, room: &str, probability: f64) -> Result<()> {
         self.conn.lock().unwrap().execute("INSERT INTO predictions VALUES (epoch_ms(?), ?, ?, ?)", params![ts_ms, device, room, probability])?;
         Ok(())

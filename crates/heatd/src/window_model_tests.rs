@@ -81,10 +81,10 @@ fn newest_bundle_is_the_latest_version_directory_with_a_bundle() {
         std::fs::write(dir.path().join(v).join("bundle.json"), toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string()).unwrap();
     }
     std::fs::create_dir_all(dir.path().join("20261104T030000Z")).unwrap();
-    let (name, path) = newest_bundle(dir.path()).unwrap();
+    let (name, path) = bundle_candidates(dir.path()).remove(0);
     assert_eq!(name, "20261103T030000Z");
     assert_eq!(Bundle::load(&path).unwrap().version, "toy");
-    assert!(newest_bundle(&dir.path().join("missing")).is_none() && try_load(dir.path().join("missing").to_str().unwrap()).is_none());
+    assert!(bundle_candidates(&dir.path().join("missing")).is_empty() && try_load(dir.path().join("missing").to_str().unwrap()).is_none());
 }
 
 #[test]
@@ -97,9 +97,9 @@ fn newest_bundle_ignores_foreign_dirs_and_load_falls_back_to_the_next_valid() {
     write("20261101T030000Z", toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string());
     write("parity", toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string());
     write("20261105", toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string());
-    assert_eq!(newest_bundle(dir.path()).unwrap().0, "20261101T030000Z");
+    assert_eq!(bundle_candidates(dir.path()).remove(0).0, "20261101T030000Z");
     write("20261103T030000Z", "{".into());
-    assert_eq!(newest_bundle(dir.path()).unwrap().0, "20261103T030000Z");
+    assert_eq!(bundle_candidates(dir.path()).remove(0).0, "20261103T030000Z");
     assert_eq!(bundle_candidates(dir.path()).len(), 2);
     assert!(try_load(dir.path().to_str().unwrap()).is_some());
     write("20261101T030000Z", "{".into());

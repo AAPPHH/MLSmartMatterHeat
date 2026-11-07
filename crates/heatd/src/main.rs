@@ -25,6 +25,7 @@ mod report;
 mod report_tests;
 #[cfg(test)]
 mod dynamics_tests;
+mod restore;
 mod rules;
 mod status;
 mod storage;
@@ -240,6 +241,10 @@ async fn serve(config: Config) -> Result<()> {
     };
     boost::spawn_background(boost, std::path::PathBuf::from(&state.config.data_dir));
     failsafe::spawn_background(state.clone());
+    match restore::restore(&state, lake::now_us() / 1000) {
+        Ok(summary) => println!("presence restore: {summary}"),
+        Err(e) => eprintln!("presence restore: {e:#}"),
+    }
     rules::spawn_background(state.clone());
     if state.config.br_watchdog.enabled {
         br_watchdog::spawn(state.clone());

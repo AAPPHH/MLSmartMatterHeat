@@ -75,6 +75,13 @@ impl Occ {
         OccStep { held: self.seen.keys().cloned().collect(), ended, pending }
     }
 
+    fn restore(&mut self, room: &str, since: i64, now: i64, enter_ms: i64) {
+        self.candidate = Some((room.into(), since));
+        if now - since >= enter_ms {
+            self.seen.insert(room.into(), (since, now));
+        }
+    }
+
     fn fresh_pending(&mut self, pending: &Option<(String, i64)>) -> bool {
         match pending {
             Some(p) if self.logged.as_ref() != Some(p) => {
@@ -100,6 +107,15 @@ pub struct Commands {
 }
 
 impl Commands {
+    #[cfg(test)]
+    pub fn occ_probe(&mut self, detected: Option<&str>, now: i64, enter_ms: i64) -> OccStep {
+        self.occ.step(detected, false, false, now, enter_ms, 3_600_000)
+    }
+
+    pub fn restore_occupancy(&mut self, room: &str, since: i64, now: i64, enter_ms: i64) {
+        self.occ.restore(room, since, now, enter_ms);
+    }
+
     pub fn target(&self, node: u64) -> Option<f64> {
         self.sent.get(&node).map(|s| s.target)
     }
