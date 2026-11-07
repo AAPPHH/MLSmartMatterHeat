@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 pub const MORNING: &str = "morning";
 pub const HOMECOMING: &str = "homecoming";
+pub const MANUAL: &str = "manual";
 const MIN_MS: i64 = 60_000;
 const KEEP_MS: i64 = 8 * 3_600_000;
 const INPUT_FRESH_MS: i64 = 150_000;
@@ -18,6 +19,8 @@ const TARGET_EPS_C: f64 = 0.05;
 const KNOWN_OVERSHOOT_K: f64 = 0.5;
 const MIN_HEADROOM_K: f64 = 1.0;
 const MIN_MANUAL_MIN: f64 = 0.5;
+const DEFAULT_MANUAL_MIN: f64 = 5.0;
+const MAX_MANUAL_MIN: f64 = 20.0;
 
 fn value_at(points: &VecDeque<(i64, f64)>, t_ms: i64) -> Option<f64> {
     let i = points.partition_point(|p| p.0 <= t_ms);
@@ -40,6 +43,7 @@ pub struct StepIn<'a> {
     pub hour: f64,
     pub outdoor: Option<(f64, Option<f64>)>,
     pub radiation: Option<f64>,
+    pub presence_known: bool,
     pub sleep: bool,
     pub away: bool,
     pub rooms: &'a [RoomIn],
@@ -226,6 +230,18 @@ impl Boost {
         }
     }
 
+    pub fn settle(&self, finals: &[(&str, &str)], now_ms: i64) {
+        let mut inner = self.inner.lock().unwrap();
+        for (room, _) in finals.iter().filter(|(_, r)| *r != "boost") {
+            let Some(idx) = inner.rooms.iter().position(|r| r.name == *room) else { continue };
+            if inner.rooms[idx].cycle.as_ref().is_some_and(|c| c.switch_ms.is_none()) {
+                let mut out = StepOut::default();
+                inner.finish(idx, now_ms, "overridden", &mut out);
+                inner.pending.extend(out.events);
+            }
+        }
+    }
+
     pub fn next_deadline_ms(&self) -> Option<i64> {
         let inner = self.inner.lock().unwrap();
         inner.rooms.iter().filter_map(|r| r.cycle.as_ref()).filter_map(|c| c.written_ms.filter(|_| c.switch_ms.is_none()).map(|w| w + (c.minutes * MIN_MS as f64) as i64)).min()
@@ -250,13 +266,13 @@ impl Boost {
         out
     }
 
-    pub fn request(&self, room: &str, minutes: Option<f64>, scenario: Option<&str>, now_ms: i64) -> Value {
+    pub fn request(&self, room: &str, minutes: Option<f64>, now_ms: i64) -> Value {
         let mut inner = self.inner.lock().unwrap();
-        let scenario = scenario.map_or_else(|| if inner.in_morning(inner.hour_now()) { MORNING } else { HOMECOMING }.to_string(), str::to_string);
+        let scenario = MANUAL.to_string();
         let Some(idx) = inner.rooms.iter().position(|r| r.name == room) else {
             return json!({"ok": false, "room": room, "scenario": scenario, "reason": format!("unbekannter Raum {room}")});
         };
-        let result = if minutes.is_some_and(|m| !m.is_finite() || m <= 0.0) { Err("Minuten muessen groesser als 0 sein".to_string()) } else { inner.open(idx, &scenario, "manual", minutes, now_ms, true) };
+        let result = if minutes.is_some_and(|m| !m.is_finite() || m <= 0.0) { Err("Minuten muessen groesser als 0 sein".to_string()) } else { inner.open(idx, MANUAL, "manual", minutes, now_ms, true) };
         if let Err(reason) = &result {
             let event = inner.refusal_event(idx, now_ms, reason);
             inner.pending.push(event);
@@ -303,17 +319,14 @@ impl Boost {
 const REACH_C: f64 = 0.3;
 
 impl Inner {
-    fn hour_now(&self) -> f64 {
-        use chrono::Timelike;
-        let now = chrono::Local::now();
-        f64::from(now.hour()) + f64::from(now.minute()) / 60.0
-    }
-
     fn in_morning(&self, hour: f64) -> bool {
         (self.cfg.morning_hours[0]..self.cfg.morning_hours[1]).contains(&hour)
     }
 
     fn detect_trigger(&mut self, input: &StepIn) {
+        if !input.presence_known {
+            return;
+        }
         let found = if self.prev_away == Some(true) && !input.away {
             Some(HOMECOMING)
         } else if self.prev_sleep == Some(true) && !input.sleep && !input.away && self.in_morning(input.hour) {
@@ -410,11 +423,20 @@ impl Inner {
         let ctx = self.context(idx, &model, target, temp, now_ms);
         let hist: Vec<f64> = (0..model.kernel_len() as i64).map(|i| self.u_at(idx, &model, now_ms - (model.kernel_len() as i64 - i) * MIN_MS)).collect();
         let u = self.rng.unit();
-        let decision = model.decide(&rs.name, &ctx, scenario, target, Some(&hist), &|n| ((u * n as f64) as usize).min(n.saturating_sub(1))).map_err(|e| (e.to_string(), None))?;
-        if decision.allowed <= 0.0 {
-            return Err((explain(&model, &decision, scenario, &ctx), Some(Box::new(decision))));
-        }
-        let minutes = requested.map_or(decision.chosen, |r| r.min(decision.allowed).max(MIN_MANUAL_MIN));
+        let (decision, minutes) = if manual {
+            if ctx.supply_ok <= 0.0 {
+                return Err(refuse("Heizungsversorgung unterbrochen, kein Boost"));
+            }
+            let minutes = requested.unwrap_or(DEFAULT_MANUAL_MIN).clamp(MIN_MANUAL_MIN, MAX_MANUAL_MIN);
+            (model.manual(&rs.name, &ctx, target, Some(&hist), minutes).map_err(|e| (e.to_string(), None))?, minutes)
+        } else {
+            let decision = model.decide(&rs.name, &ctx, scenario, target, Some(&hist), &|n| ((u * n as f64) as usize).min(n.saturating_sub(1))).map_err(|e| (e.to_string(), None))?;
+            if decision.allowed <= 0.0 {
+                return Err((explain(&model, &decision, scenario, &ctx), Some(Box::new(decision))));
+            }
+            let minutes = decision.chosen;
+            (decision, minutes)
+        };
         let reason = format!(
             "Boost {scenario} {minutes:.1} min auf {:.1} C (erlaubt {:.1}, sicher bis {:.1}, bekannt {}, Risiko {:.2})",
             model.boost_setpoint(),
@@ -492,6 +514,8 @@ impl Inner {
             Some("target_decrease".into())
         } else if (want.setpoint - c.target).abs() >= TARGET_EPS_C {
             Some("target_changed".into())
+        } else if want.no_supply {
+            Some("no_supply".into())
         } else if boosting && sensor.is_some_and(|s| s.1 >= abort_c) {
             Some("sensor_limit".into())
         } else {
@@ -526,7 +550,8 @@ impl Inner {
         let written = c.written_ms;
         let applied = written.map_or(0.0, |w| (c.switch_ms.unwrap_or(now_ms) - w) as f64 / MIN_MS as f64);
         let overshoot = (c.peak - c.target).max(0.0);
-        let measured = written.is_some() && (why == "complete" || overshoot > KNOWN_OVERSHOOT_K);
+        let invalid = matches!(why, "no_supply" | "overridden");
+        let measured = written.is_some() && !invalid && (why == "complete" || overshoot > KNOWN_OVERSHOOT_K);
         let mode = if written.is_some() { "live" } else { "aborted" };
         let detail = json!({
             "room": rs.name, "variant": "boost_learn", "mode": mode, "cycle_id": c.id, "start_ts_ms": written.unwrap_or(c.decided_ms), "decided_ts_ms": c.decided_ms, "target": c.target, "setpoint_old": c.old, "boost_setpoint": c.setpoint,

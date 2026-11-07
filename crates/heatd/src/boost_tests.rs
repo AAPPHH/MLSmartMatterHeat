@@ -40,7 +40,7 @@ impl Rig {
 
     fn tick_with(&self, min: f64, hour: f64, flags: (bool, bool), room: RoomIn) -> StepOut {
         self.feed(min, self.temp);
-        self.boost.step(&StepIn { now_ms: at(min), hour, outdoor: Some((5.0, Some(3.0))), radiation: Some(0.0), sleep: flags.0, away: flags.1, rooms: &[room] })
+        self.boost.step(&StepIn { now_ms: at(min), hour, outdoor: Some((5.0, Some(3.0))), radiation: Some(0.0), presence_known: true, sleep: flags.0, away: flags.1, rooms: &[room] })
     }
 
     fn tick(&self, min: f64, hour: f64, flags: (bool, bool), setpoint: f64) -> StepOut {
@@ -107,7 +107,6 @@ fn room_change_and_ordinary_rises_never_boost() {
     }
     let v = rig.boost.view(ROOM);
     assert_eq!((v["state"].as_str(), v["scenario"].clone(), v["reason"].as_str()), (Some("idle"), Value::Null, Some("noch keine Boost-Entscheidung")));
-    assert!(rig.boost.request(ROOM, None, Some("room_change"), at(5.0))["ok"] == false);
 }
 
 #[test]
@@ -144,7 +143,7 @@ fn missing_bundle_never_boosts_and_says_why() {
     let refused: Vec<Value> = out.events.iter().map(detail).collect();
     assert_eq!((refused.len(), refused[0]["mode"].as_str(), refused[0]["reason"].as_str()), (1, Some("refused"), Some("kein Boost-Modell geladen")));
     assert_eq!(rig.boost.view(ROOM)["reason"], "kein Boost-Modell geladen");
-    let reply = rig.boost.request(ROOM, Some(3.0), Some("morning"), at(1.0));
+    let reply = rig.boost.request(ROOM, Some(3.0), at(1.0));
     assert_eq!((reply["ok"].clone(), reply["reason"].as_str()), (false.into(), Some("kein Boost-Modell geladen")));
 }
 
@@ -238,10 +237,10 @@ fn abort_paths_hand_back_or_step_aside() {
         rig.boosting();
         let room = RoomIn { blocked, ..Rig::room(setpoint) };
         let out = if temp.is_nan() {
-            rig.boost.step(&StepIn { now_ms: at(30.0), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, sleep: false, away: false, rooms: &[room] })
+            rig.boost.step(&StepIn { now_ms: at(30.0), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep: false, away: false, rooms: &[room] })
         } else {
             rig.boost.observe(NODE, crate::window::LOCAL_TEMPERATURE, temp, at(2.0));
-            rig.boost.step(&StepIn { now_ms: at(2.0), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, sleep: false, away: false, rooms: &[room] })
+            rig.boost.step(&StepIn { now_ms: at(2.0), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep: false, away: false, rooms: &[room] })
         };
         assert_eq!(out.directives.get(ROOM) == Some(&Directive::Switch), switch, "{name}");
         assert!(!is_boost(&out), "{name}");
@@ -257,43 +256,74 @@ fn abort_paths_hand_back_or_step_aside() {
 }
 
 #[test]
-fn manual_boost_uses_the_same_safety_path() {
+fn manual_boost_is_tagged_manual_with_the_default_dose_and_one_cycle_at_a_time() {
     let rig = Rig::new();
     rig.tick(0.0, 6.0, (false, false), 21.0);
-    let reply = rig.boost.request(ROOM, None, Some("morning"), at(0.5));
-    assert_eq!(reply["ok"], true);
-    let (allowed, chosen) = (reply["allowed"].as_f64().unwrap(), reply["chosen"].as_f64().unwrap());
-    assert!(allowed >= 5.0 && chosen <= allowed && reply["state"] == "armed" && reply["source"] == "manual" && reply["cycle"]["minutes"].as_f64() == Some(chosen), "{reply}");
+    let reply = rig.boost.request(ROOM, None, at(0.5));
+    assert_eq!((reply["ok"].clone(), reply["scenario"].as_str(), reply["source"].as_str(), reply["state"].as_str(), reply["cycle"]["minutes"].as_f64(), reply["cycle"]["setpoint"].as_f64()), (true.into(), Some("manual"), Some("manual"), Some("armed"), Some(5.0), Some(24.0)), "{reply}");
     assert!(is_boost(&rig.tick(1.0, 6.0, (false, false), 21.0)));
-    let again = rig.boost.request(ROOM, None, Some("morning"), at(1.0));
+    let again = rig.boost.request(ROOM, None, at(1.0));
     assert!(again["ok"] == false && again["reason"].as_str().unwrap().contains("laeuft bereits"));
 }
 
 #[test]
-fn manual_dose_is_capped_by_the_model_unless_the_request_is_shorter() {
-    for (asked, check) in [(Some(2.0), 2.0), (Some(1000.0), -1.0), (None, 0.0)] {
+fn manual_dose_is_the_request_capped_at_twenty_minutes() {
+    for (asked, expected) in [(Some(2.0), 2.0), (Some(12.0), 12.0), (Some(1000.0), 20.0), (None, 5.0)] {
         let rig = Rig::new();
         rig.tick(0.0, 6.0, (false, false), 21.0);
-        let reply = rig.boost.request(ROOM, asked, Some("homecoming"), at(0.5));
-        let (allowed, chosen, minutes) = (reply["allowed"].as_f64().unwrap(), reply["chosen"].as_f64().unwrap(), reply["cycle"]["minutes"].as_f64().unwrap());
-        let expected = if check > 0.0 { check } else if check < 0.0 { allowed } else { chosen };
-        assert!((minutes - expected).abs() < 1e-9 && minutes <= allowed + 1e-9, "{asked:?} {reply}");
+        let reply = rig.boost.request(ROOM, asked, at(0.5));
+        assert_eq!(reply["cycle"]["minutes"].as_f64(), Some(expected), "{asked:?} {reply}");
     }
 }
 
 #[test]
-fn manual_boost_refuses_other_scenarios_unknown_rooms_stale_ticks_and_bad_minutes() {
+fn manual_boost_refuses_unknown_rooms_stale_ticks_bad_minutes_and_lost_supply() {
     let rig = Rig::new();
-    assert!(rig.boost.request(ROOM, None, Some("morning"), at(0.0))["reason"].as_str().unwrap().contains("Regelschritt"));
+    assert!(rig.boost.request(ROOM, None, at(0.0))["reason"].as_str().unwrap().contains("Regelschritt"));
     rig.tick(0.0, 6.0, (false, false), 21.0);
-    let other = rig.boost.request(ROOM, Some(5.0), Some("other"), at(0.5));
-    assert!(other["ok"] == false && other["reason"].as_str().unwrap().contains("kein Boost-Szenario") && other["allowed"].as_f64() == Some(0.0), "{other}");
-    assert!(rig.boost.request("keller", None, None, at(0.5))["reason"].as_str().unwrap().contains("unbekannter Raum"));
-    assert!(rig.boost.request(ROOM, Some(-1.0), Some("morning"), at(0.5))["reason"].as_str().unwrap().contains("groesser als 0"));
-    assert!(rig.boost.request(ROOM, None, Some("morning"), at(10.0))["reason"].as_str().unwrap().contains("Regelschritt"));
+    assert!(rig.boost.request("keller", None, at(0.5))["reason"].as_str().unwrap().contains("unbekannter Raum"));
+    assert!(rig.boost.request(ROOM, Some(-1.0), at(0.5))["reason"].as_str().unwrap().contains("groesser als 0"));
+    assert!(rig.boost.request(ROOM, None, at(10.0))["reason"].as_str().unwrap().contains("Regelschritt"));
     assert_eq!(rig.boost.view(ROOM)["state"], "idle");
-    let refused = rig.boost.step(&StepIn { now_ms: at(11.0), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, sleep: false, away: false, rooms: &[] }).events;
-    assert_eq!(refused.len(), 3);
+    let refused = rig.boost.step(&StepIn { now_ms: at(11.0), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep: false, away: false, rooms: &[] }).events;
+    assert_eq!(refused.len(), 2);
+    let blocked = Rig::new();
+    blocked.tick_with(0.0, 6.0, (false, false), RoomIn { no_supply: true, ..Rig::room(21.0) });
+    assert!(blocked.boost.request(ROOM, None, at(0.5))["reason"].as_str().unwrap().contains("versorgung"));
+}
+
+#[test]
+fn manual_cycles_are_logged_as_manual_and_unknown_presence_never_triggers() {
+    let rig = Rig::new();
+    rig.tick(0.0, 6.0, (false, false), 21.0);
+    assert_eq!(rig.boost.request(ROOM, Some(3.0), at(0.5))["ok"], true);
+    rig.boost.wrote(ROOM, "boost", at(0.6));
+    rig.tick(4.0, 6.0, (false, false), 21.0);
+    let out = rig.tick(100.0, 6.0, (false, false), 21.0);
+    let d: Vec<Value> = out.events.iter().map(detail).collect();
+    assert_eq!((d[0]["scenario"].as_str(), d[0]["source"].as_str(), d[0]["end"].as_str()), (Some("manual"), Some("manual"), Some("complete")), "{d:?}");
+    let gap = Rig::new();
+    gap.tick(0.0, 6.0, (true, false), 18.0);
+    gap.boost.step(&StepIn { now_ms: at(0.5), hour: 6.0, outdoor: Some((5.0, None)), radiation: None, presence_known: false, sleep: false, away: false, rooms: &[Rig::room(18.0)] });
+    assert!(is_boost(&gap.tick(1.0, 6.0, (false, false), 21.0)));
+}
+
+#[test]
+fn no_supply_or_a_foreign_final_reason_invalidates_the_running_boost() {
+    for how in ["no_supply", "overridden"] {
+        let rig = Rig::new();
+        rig.boosting();
+        rig.feed(2.0, 19.0);
+        let out = if how == "no_supply" {
+            rig.tick_with(2.0, 6.0, (false, false), RoomIn { no_supply: true, ..Rig::room(21.0) })
+        } else {
+            rig.boost.settle(&[(ROOM, "no_supply")], at(2.0));
+            rig.tick(2.0, 6.0, (false, false), 21.0)
+        };
+        let d: Vec<Value> = out.events.iter().map(detail).collect();
+        assert_eq!((d.len(), d[0]["end"].as_str(), d[0]["overshoot_c"].is_null()), (1, Some(how), true), "{how} {d:?}");
+        assert_eq!(rig.boost.view(ROOM)["state"], "idle");
+    }
 }
 
 #[test]

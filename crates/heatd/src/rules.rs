@@ -599,7 +599,7 @@ fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Opt
         return Verdict::Free;
     }
     let levels = [state.config.failsafe.setpoint, state.config.br_watchdog.setpoint_c];
-    if !commands.restored.contains(&want.node) && old.is_some_and(|o| levels.iter().any(|l| (o - l).abs() < MANUAL_TOLERANCE_C)) {
+    if want.reason != "boost" && !commands.restored.contains(&want.node) && old.is_some_and(|o| levels.iter().any(|l| (o - l).abs() < MANUAL_TOLERANCE_C)) {
         return Verdict::Exempt("restore");
     }
     if want.reason == "no_supply" {
@@ -717,8 +717,8 @@ fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], no
 }
 
 #[allow(clippy::too_many_arguments)]
-fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now: NaiveDateTime, now_ms: i64, window_busy: &HashSet<String>, flags: (bool, bool), exploring: &HashMap<String, Experiment>) {
-    let (away, sleep) = flags;
+fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now: NaiveDateTime, now_ms: i64, window_busy: &HashSet<String>, flags: (bool, bool, bool), exploring: &HashMap<String, Experiment>) {
+    let (presence_known, away, sleep) = flags;
     if !state.boost.enabled() {
         return;
     }
@@ -745,7 +745,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
         })
         .collect();
     let now_us = lake::now_us();
-    let out = state.boost.step(&crate::boost::StepIn { now_ms, hour: f64::from(now.hour()) + f64::from(now.minute()) / 60.0, outdoor: state.status.outdoor(now_us), radiation: state.status.radiation(now_us), sleep, away, rooms: &rooms });
+    let out = state.boost.step(&crate::boost::StepIn { now_ms, hour: f64::from(now.hour()) + f64::from(now.minute()) / 60.0, outdoor: state.status.outdoor(now_us), radiation: state.status.radiation(now_us), presence_known, sleep, away, rooms: &rooms });
     out.events.into_iter().for_each(|e| log("boost event", state.sink.append(e)));
     for want in wants.iter_mut() {
         match out.directives.get(&want.room) {
@@ -815,8 +815,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     }
     let readings = state.latest.all();
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
-    boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
+    boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (presence.is_some(), away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
+    state.boost.settle(&wants.iter().map(|w| (w.room.as_str(), w.reason)).collect::<Vec<_>>(), now_ms);
     let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().holding(&r.nodes), away })).collect();
     state.windows.lock().unwrap().set_context(contexts);
     let current = |commands: &Commands, node: u64| {

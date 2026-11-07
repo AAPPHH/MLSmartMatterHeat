@@ -700,11 +700,10 @@ async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> 
 struct BoostBody {
     room: String,
     minutes: Option<f64>,
-    scenario: Option<String>,
 }
 
 async fn boost(State(state): State<AppState>, Json(body): Json<BoostBody>) -> Response {
-    let reply = crate::intent::apply(&state, crate::intent::Intent::Boost { room: body.room, minutes: body.minutes, scenario: body.scenario });
+    let reply = crate::intent::apply(&state, crate::intent::Intent::Boost { room: body.room, minutes: body.minutes });
     (reply.status, Json(reply.body)).into_response()
 }
 
@@ -2512,10 +2511,11 @@ nodes = [5]
             h.state.boost.observe(5, attribute, value, now);
         }
         let rooms = [crate::boost::RoomIn { room: "wohnzimmer".into(), setpoint: 20.0, blocked: None, no_raise: false, no_supply: false }];
-        h.state.boost.step(&crate::boost::StepIn { now_ms: now, hour: 6.5, outdoor: Some((5.0, None)), radiation: None, sleep: false, away: false, rooms: &rooms });
-        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "minutes": 3.0, "scenario": "morning"}).to_string())).await;
+        h.state.boost.step(&crate::boost::StepIn { now_ms: now, hour: 6.5, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep: false, away: false, rooms: &rooms });
+        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "minutes": 3.0}).to_string())).await;
         assert_eq!((status, body["ok"].clone(), body["state"].as_str(), body["cycle"]["minutes"].as_f64(), body["source"].as_str()), (StatusCode::OK, true.into(), Some("armed"), Some(3.0), Some("manual")));
-        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "scenario": "room_change"}).to_string())).await;
+        assert_eq!(body["scenario"], "manual");
+        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer"}).to_string())).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(body["reason"].as_str().unwrap().contains("laeuft bereits"), "{body}");
         let (status, body) = call(&h.state, "POST", "/api/window", Some(json!({"room": "wohnzimmer", "open": true}).to_string())).await;

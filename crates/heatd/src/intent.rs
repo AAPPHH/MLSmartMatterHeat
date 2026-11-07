@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
-    Boost { room: String, minutes: Option<f64>, scenario: Option<String> },
+    Boost { room: String, minutes: Option<f64> },
     WindowOpen { room: String },
     WindowClose { room: String },
 }
@@ -17,8 +17,8 @@ pub struct Reply {
 
 pub fn apply(state: &AppState, intent: Intent) -> Reply {
     match intent {
-        Intent::Boost { room, minutes, scenario } => {
-            let body = state.boost.request(&room, minutes, scenario.as_deref(), now_ms());
+        Intent::Boost { room, minutes } => {
+            let body = state.boost.request(&room, minutes, now_ms());
             let status = if body["ok"].as_bool() == Some(true) {
                 StatusCode::OK
             } else if state.config.rooms.iter().any(|r| r.name == room) {

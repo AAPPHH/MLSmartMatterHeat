@@ -203,7 +203,7 @@ async fn a_boost_consumes_the_hourly_raise_and_the_return_is_a_free_decrease() {
         e.at(m).await;
     }
     assert_eq!((e.writes(), e.used(8)), (vec![18.0], 0));
-    let reply = e.state.boost.request("a", Some(5.0), Some("morning"), T0 + 8 * MIN + 30_000);
+    let reply = e.state.boost.request("a", Some(5.0), T0 + 8 * MIN + 30_000);
     assert_eq!(reply["ok"], true, "{reply}");
     for m in 9..=29 {
         feed(m);
@@ -234,6 +234,6 @@ async fn a_spent_raise_blocks_the_boost_and_a_boost_blocks_nothing_else() {
         e.at(m).await;
     }
     assert_eq!((e.writes(), e.used(6)), (vec![18.0, 21.0], 1));
-    let reply = e.state.boost.request("a", None, Some("morning"), T0 + 6 * MIN + 30_000);
+    let reply = e.state.boost.request("a", None, T0 + 6 * MIN + 30_000);
     assert!(reply["ok"] == false && reply["reason"].as_str().unwrap().contains("Budget"), "{reply}");
 }
