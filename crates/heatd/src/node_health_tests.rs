@@ -400,7 +400,7 @@ async fn a_late_priming_report_with_the_old_value_after_a_rewrite_is_no_manual_c
         step(&r.state, r.t0 + t * s).await;
     }
     assert_eq!(r.mock.setpoint_writes().len(), 1);
-    r.push(5, 19.0, r.t0 + 200 * s);
+    r.push(5, 19.0, r.t0 + 600 * s);
     assert!(r.state.commanded.lock().unwrap().hold(5).is_none());
     r.push(5, 17.0, r.t0 + 700 * s);
     assert!(r.state.commanded.lock().unwrap().hold(5).is_some());

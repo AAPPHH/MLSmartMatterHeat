@@ -605,7 +605,7 @@ fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Opt
     if want.reason == "no_supply" {
         return Verdict::Exempt("supply_cap");
     }
-    if last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset")) {
+    if last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset")) && !matches!(want.reason, "boost" | "exploration") && want.setpoint <= state.config.occupied_setpoint.max(state.config.default_setpoint) {
         return Verdict::Exempt("window_close");
     }
     if commands.budget.allows(&want.room, now_ms, limit) {
@@ -929,7 +929,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
         return None;
     }
     let in_grace = now_ms - sent.written_ms < grace_ms;
-    if sent.acked.is_some_and(|a| near(a, report.value)) || (in_grace && sent.stale.is_some_and(|a| near(a, report.value))) {
+    if sent.acked.is_some_and(|a| near(a, report.value)) || sent.stale.is_some_and(|a| near(a, report.value)) {
         return None;
     }
     if in_grace {
