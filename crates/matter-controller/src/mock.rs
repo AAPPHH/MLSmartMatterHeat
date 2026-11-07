@@ -4,7 +4,7 @@ use crate::{
     THERMOSTAT_CLUSTER,
 };
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
@@ -28,6 +28,9 @@ struct Inner {
     write_log: Vec<(&'static str, NodeId, f64)>,
     limit_rejecting: bool,
     resubscribes: Vec<NodeId>,
+    silent: BTreeSet<NodeId>,
+    dropping: BTreeSet<NodeId>,
+    restarts: usize,
 }
 
 pub struct MockController {
@@ -50,6 +53,26 @@ impl MockController {
 
     pub fn resubscribes(&self) -> Vec<NodeId> {
         self.inner.lock().unwrap().resubscribes.clone()
+    }
+
+    pub fn set_node_silent(&self, node: NodeId, silent: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if silent { inner.silent.insert(node) } else { inner.silent.remove(&node) };
+    }
+
+    pub fn set_writes_dropped(&self, node: NodeId, dropped: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if dropped { inner.dropping.insert(node) } else { inner.dropping.remove(&node) };
+    }
+
+    pub fn set_device_setpoint(&self, node: NodeId, celsius: f64) {
+        if let Some(n) = self.inner.lock().unwrap().nodes.get_mut(&node) {
+            n.setpoint = celsius;
+        }
+    }
+
+    pub fn restarts(&self) -> usize {
+        self.inner.lock().unwrap().restarts
     }
 
     pub fn set_poll_failing(&self, failing: bool) {
@@ -173,10 +196,18 @@ impl MatterController for MockController {
     async fn write_heating_setpoint(&self, node: NodeId, celsius: f64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let value = f64::from(centi_degrees(celsius)) / 100.0;
-        inner.nodes.get_mut(&node).ok_or(Error::UnknownNode(node))?.setpoint = value;
+        if !inner.nodes.contains_key(&node) {
+            return Err(Error::UnknownNode(node));
+        }
+        if inner.silent.contains(&node) {
+            return Err(Error::Command(format!("no write status after 90s: node {node}")));
+        }
         inner.setpoint_writes.push((node, value));
         inner.write_log.push(("setpoint", node, value));
-        self.publish(&mut inner, node, OCCUPIED_HEATING_SETPOINT.snake, value);
+        if !inner.dropping.contains(&node) {
+            inner.nodes.get_mut(&node).ok_or(Error::UnknownNode(node))?.setpoint = value;
+            self.publish(&mut inner, node, OCCUPIED_HEATING_SETPOINT.snake, value);
+        }
         Ok(())
     }
 
@@ -240,10 +271,18 @@ impl MatterController for MockController {
         Ok(())
     }
 
+    async fn restart_session(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.restarts += 1;
+        let nodes: Vec<NodeId> = inner.nodes.keys().copied().collect();
+        nodes.into_iter().for_each(|n| Self::send_capture(&inner, n, CaptureItem::Subscribed { node: Some(n) }));
+        Ok(())
+    }
+
     async fn poll(&self, node: NodeId) -> Result<usize> {
         let inner = self.inner.lock().unwrap();
         let state = inner.nodes.get(&node).ok_or(Error::UnknownNode(node))?;
-        if inner.poll_failing {
+        if inner.poll_failing || inner.silent.contains(&node) {
             return Err(Error::Command(format!("no poll response from node {node}")));
         }
         let values = [

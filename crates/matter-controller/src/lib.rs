@@ -122,5 +122,6 @@ pub trait MatterController: Send + Sync {
     async fn capture(&self, node: NodeId) -> Result<Receiver<CaptureItem>>;
     async fn poll(&self, node: NodeId) -> Result<usize>;
     async fn resubscribe(&self, node: NodeId) -> Result<()>;
+    async fn restart_session(&self) -> Result<()>;
     async fn inventory(&self, node: NodeId) -> Result<Inventory>;
 }

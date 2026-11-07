@@ -644,6 +644,15 @@ impl Session {
         result
     }
 
+    async fn restart(&self) -> Result<()> {
+        let _turn = self.exclusive_gate.lock().await;
+        self.pause.send_replace(true);
+        let mut ready = self.ready.subscribe();
+        let stopped = timeout(PAUSE_WAIT, ready.wait_for(|r| !*r)).await.is_ok();
+        self.pause.send_replace(false);
+        stopped.then_some(()).ok_or_else(|| Error::Command("chip-tool interactive session did not stop for the restart".into()))
+    }
+
     async fn start_node(&self, stdin: &mut ChildStdin, node: NodeId) -> Result<()> {
         if self.hub.sent.lock().unwrap().insert(node) {
             for line in self.config.subscribe_lines(node) {
@@ -921,6 +930,13 @@ impl MatterController for ChipToolController {
         match &self.session {
             Some(session) => session.resubscribe(node).await,
             None => Err(Error::Command("resubscribe needs a serving controller".into())),
+        }
+    }
+
+    async fn restart_session(&self) -> Result<()> {
+        match &self.session {
+            Some(session) => session.restart().await,
+            None => Err(Error::Command("restart_session needs a serving controller".into())),
         }
     }
 
