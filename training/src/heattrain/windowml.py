@@ -3,6 +3,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
+from scipy.signal import lfilter
+from sklearn.linear_model import Ridge
 import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy.lib.stride_tricks import sliding_window_view
@@ -338,3 +340,105 @@ def run_windowml(config, name, lake=None):
     r = evaluate(grid, resolve(name), cfg)
     print(format_report(name, r))
     return r
+
+
+class PhysicsResidual(Approach):
+    refit = True
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.c = cfg["phys"]
+        self.model = {}
+
+    def features(self, grid, r):
+        c, d = self.c, grid.room[r]
+        H = c["horizon"]
+        s, v, sp = d["temp"], d["valve"] / 100.0, d["setpoint"]
+        out, rad, wind = grid.shared["out"], grid.shared["rad"], grid.shared["wind"]
+        vz = np.nan_to_num(v, nan=0.0)
+        cols = [np.cumsum(vz)]
+        cs = cols[0]
+        win = np.full(len(s), np.nan)
+        win[H:] = (cs[H:] - cs[:-H]) / H
+        f = [win]
+        for tau in c["taus"]:
+            a = np.exp(-1.0 / tau)
+            st = lfilter([1 - a], [1, -a], vz)
+            f += [lag(st, H), st]
+        s0 = lag(s, H)
+        f += [lag(v, H), v, lag(sp, H) - s0, out - s0, lag(out, H) - s0, rad / 100.0, (out - s0) * wind, np.minimum(lag(d["since_open"], H), 90) / 90.0, np.minimum(d["since_open"], 90) / 90.0]
+        X = np.column_stack(f)
+        y = s - s0
+        ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        return X, y, ok
+
+    def fit(self, grid, train_days):
+        c = self.c
+        tr = np.zeros(len(grid.t), bool)
+        for dd in train_days:
+            tr[grid.day_idx[dd]] = True
+        for r in grid.rooms:
+            X, y, ok = self.features(grid, r)
+            m = ok & tr
+            if m.sum() < c["min_rows"]:
+                continue
+            Xt, yt = X[m], y[m]
+            keep = np.ones(len(yt), bool)
+            for _ in range(2):
+                mdl = Ridge(alpha=c["ridge"]).fit(Xt[keep], yt[keep])
+                res = yt - mdl.predict(Xt)
+                keep = np.abs(res) <= np.quantile(np.abs(res), 1 - c["trim"])
+            sig = float(np.sqrt(np.mean(res[keep] ** 2)))
+            self.model[r] = (mdl, max(sig, c["sigma_floor"]))
+        return self
+
+    def evidence(self, grid):
+        c = self.c
+        z = {}
+        veto = np.zeros(len(grid.t), bool)
+        pad = c["veto_pad_min"]
+        for k in ("supply_event", "supply_onset"):
+            sup = np.nan_to_num(grid.shared[k]).astype(bool)
+            veto |= sup
+        idx = np.flatnonzero(veto)
+        for i in idx:
+            veto[i:i + pad] = True
+        for r in grid.rooms:
+            if r not in self.model:
+                z[r] = np.full(len(grid.t), np.nan)
+                continue
+            mdl, sig = self.model[r]
+            X, y, ok = self.features(grid, r)
+            res = np.full(len(y), np.nan)
+            res[ok] = (y[ok] - mdl.predict(X[ok])) / sig
+            e = -res
+            if c["extra_loss"]:
+                a = np.exp(-1.0 / c["leak_min"])
+                e = lfilter([1.0 / c["horizon"]], [1, -a], np.nan_to_num(e))
+                e = np.where(np.isfinite(res), e, np.nan)
+            z[r] = np.minimum(e, c["clip"])
+        z["veto"] = veto
+        return z
+
+    def house(self, z, grid):
+        c = self.c
+        w = c["weights"]
+        zs = np.array([np.maximum(z[r], 0.0) * w[r] for r in grid.rooms])
+        cnt = np.array([w[r] for r in grid.rooms])[:, None] * np.isfinite(zs)
+        tot = np.nansum(zs, axis=0)
+        if c["agg"] == "mean":
+            tot = tot / np.maximum(cnt.sum(axis=0), 1e-9)
+        elif c["agg"] == "rms":
+            tot = np.sqrt(np.nansum(zs ** 2, axis=0) / np.maximum(cnt.sum(axis=0), 1e-9))
+        return np.where(np.isfinite(zs).any(axis=0), tot, np.nan)
+
+    def series(self, grid):
+        z = self.evidence(grid)
+        veto = z.pop("veto")
+        z["house"] = self.house(z, grid)
+        return {k: np.where(veto, np.nan, v) for k, v in z.items()}
+
+    def score(self, grid, day):
+        s = self.series(grid)
+        i = grid.day_idx[day]
+        return {k: v[i] for k, v in s.items()}

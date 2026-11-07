@@ -163,3 +163,22 @@ def test_baseline_semantics():
     f = UnheatedFloor(CFG).series(g)
     assert f["bad"][1005] == 1.5 and f["bad"][1030] == 0.0 and f["bad"][500] == 0.0
     assert f["house"][1005] == pytest.approx(3.0)
+
+
+def test_physics_residual_flags_unexplained_drop():
+    from heattrain.windowml import PhysicsResidual
+    n = 3000
+    rng = np.random.default_rng(0)
+    t = 1.7e9 + 60 * np.arange(n)
+    temp = 20 + 0.1 * rng.standard_normal(n)
+    temp[2500:2600] -= np.linspace(0, 3, 100)
+    temp[2600:] -= 3
+    d = {"temp": temp, "valve": np.zeros(n), "setpoint": np.full(n, 21.0), "since_open": np.full(n, 500.0)}
+    sh = {"out": np.full(n, 5.0), "wind": np.full(n, 2.0), "rad": np.zeros(n), "supply_event": np.zeros(n, bool), "supply_onset": np.zeros(n, bool)}
+    cfg = copy.deepcopy(CFG)
+    cfg["rooms"] = ["wohnzimmer"]
+    g = Grid(t, ["wohnzimmer"], {"wohnzimmer": d}, sh, cfg)
+    ap = PhysicsResidual(cfg).fit(g, g.days)
+    s = ap.series(g)
+    assert np.nanmax(s["wohnzimmer"][2500:2620]) > 1.4 * np.nanmax(s["wohnzimmer"][600:2400])
+    assert np.isfinite(s["house"]).any()
