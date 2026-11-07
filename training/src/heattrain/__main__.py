@@ -4,7 +4,7 @@ from heattrain.boiler import boiler
 from heattrain.thermal import thermal
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
-from heattrain.windowml import run_windowml, window_bundle
+from heattrain.windowml import run_windowml, run_windowroom, window_bundle
 
 CONFIG = {
     "timezone": "Europe/Berlin",
@@ -57,7 +57,9 @@ CONFIG = {
             "gt": [{"id": "A", "open_utc": "2026-11-07T08:05:00+00:00", "hit_min": 20, "channels": ["house", "bad"], "exclude_utc": ["2026-11-07T07:30:00+00:00", "2026-11-07T10:00:00+00:00"]},
                    {"id": "B", "open_utc": "2026-11-07T17:27:00+00:00", "hit_min": 20, "channels": ["wohnzimmer"], "exclude_utc": ["2026-11-07T17:20:00+00:00", "2026-11-07T18:30:00+00:00"]}],
             "margin": 0.9, "ratio_quantile": 0.995, "merge_min": 30, "house_clip": 6.0, "sigma_trim": 0.03, "sigma_floor": 0.15, "list_n": 60,
-            "boiler": {"enabled": True, "open_pct": 30.0, "closed_pct": 10.0, "closed_z": 1.5},
+            "models": {"ridge": ["PhysicsResidual", False], "xgb": ["XgbResidual", False], "ridge_react": ["PhysicsResidual", True], "xgb_react": ["XgbResidual", True]},
+            "react": {"enabled": False, "horizon": 5, "sp_hold": 30, "sigma_floor": 5.0, "trim": 0.03},
+            "boiler": {"enabled": True, "open_pct": 30.0, "open_z": 1.0, "closed_pct": 10.0, "closed_z": 1.5},
             "feat": {"dose": [10, 20, 30, 90], "slope": [5, 10, 20], "floor_window": 180, "floor_settled": 20, "age_cap": 240, "step_k": 0.25, "dv_min": 5},
             "xgb": {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8, "colsample_bytree": 0.7, "min_child_weight": 30, "reg_lambda": 5.0, "trim": 0.03, "pooled": True},
         },
@@ -117,8 +119,10 @@ COMMANDS = {"window": run_window_export, "windowml": run_window, "watchroom": ru
 def main(argv):
     if len(argv) in (3, 4) and argv[1] == "windowml":
         return run_window(CONFIG, *argv[2:])
+    if len(argv) in (2, 3, 4) and argv[1] == "windowroom":
+        return run_windowroom(CONFIG, *(argv[3:] or [None]), lake=argv[2] if len(argv) > 2 else None)
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake]")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 

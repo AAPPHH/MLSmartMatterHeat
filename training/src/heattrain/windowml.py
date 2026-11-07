@@ -430,13 +430,26 @@ class PhysicsResidual(Approach):
         ok = np.isfinite(X).all(axis=1) & np.isfinite(y) & (run >= H + c["valve_guard_min"] + 1)
         return X, y, ok
 
+    def feat(self, grid, r):
+        return grid.cache.setdefault((type(self).__name__, r), self.features(grid, r))
+
+    def predict(self, grid):
+        out = {}
+        for r in grid.rooms:
+            X, y, ok = self.feat(grid, r)
+            yh = np.full(len(y), np.nan)
+            if r in self.model:
+                yh[ok] = X[ok] @ self.model[r][0] + self.model[r][1]
+            out[r] = (np.where(ok, y, np.nan), yh)
+        return out
+
     def fit(self, grid, train_days):
         c = self.c
         tr = np.zeros(len(grid.t), bool)
         for dd in train_days:
             tr[grid.day_idx[dd]] = True
         for r in grid.rooms:
-            X, y, ok = self.features(grid, r)
+            X, y, ok = self.feat(grid, r)
             m = ok & tr
             if m.sum() < c["min_rows"]:
                 continue
@@ -480,6 +493,315 @@ class PhysicsResidual(Approach):
         s = self.series(grid)
         i = grid.day_idx[day]
         return {k: v[i] for k, v in s.items()}
+
+
+def wsum(x, k):
+    cs = np.concatenate([[0.0], np.cumsum(x)])
+    out = np.full(len(x), np.nan)
+    out[k - 1:] = cs[k:] - cs[:-k]
+    return out
+
+
+def peak_last(v, pct):
+    out = np.zeros(len(v))
+    cur, was = 0.0, False
+    for i, x in enumerate(v):
+        if np.isfinite(x):
+            cur = (max(cur, x) if was else x) if x > pct else cur
+            was = x > pct
+        out[i] = cur
+    return out
+
+
+def last_step(s, thr, cap):
+    ds = np.diff(s, prepend=np.nan)
+    idx = np.arange(len(s), dtype=float)
+    last = np.maximum.accumulate(np.where(np.abs(ds) >= thr, idx, -1.0))
+    li = np.maximum(last, 0).astype(int)
+    return np.where(last >= 0, np.minimum(idx - last, cap), cap), np.where(last >= 0, np.sign(ds[li]), 0.0)
+
+
+def floor_dist(s, so, w, settled):
+    ok = np.where((so >= settled) & np.isfinite(s), s, np.inf)
+    fl = sliding_window_view(np.concatenate([np.full(w - 1, np.inf), ok]), w).min(axis=1)
+    return np.where(np.isfinite(fl), s - fl, np.nan)
+
+
+def since_true(mask, cap):
+    idx = np.arange(len(mask), dtype=float)
+    last = np.maximum.accumulate(np.where(mask, idx, -1.0))
+    return np.where(last >= 0, np.minimum(idx - last, cap), cap)
+
+
+class XgbResidual(PhysicsResidual):
+    def features(self, grid, r):
+        X0, y, _ = PhysicsResidual.features(self, grid, r)
+        c, f, H = self.c, grid.cfg["room"]["feat"], self.c["horizon"]
+        d, sh, pc = grid.room[r], grid.shared, grid.cfg["presence"]
+        s, vp, n = d["temp"], d["valve"], len(grid.t)
+        good = np.isfinite(vp)
+        v = np.where(good, vp / 100.0, 0.0)
+        cap, so = f["age_cap"], d["since_open"]
+        s0 = lag(s, H)
+        cols, names = list(X0.T), list(FEATURE_NAMES)
+        add = lambda nm, x: (cols.append(x), names.append(nm))
+        for k in f["dose"]:
+            add(f"dose{k}", wsum(v, k))
+        add("closed_min", np.where(good & np.isnan(so), cap, np.minimum(so, cap)))
+        add("peak_last", peak_last(vp, grid.cfg["open_valve_pct"]) / 100.0)
+        add("dvalve", (vp - lag(vp, f["dv_min"])) / 100.0)
+        for k in f["slope"]:
+            add(f"slope{k}", (s0 - lag(s, H + k)) / k)
+        age, dirn = last_step(s, f["step_k"], cap)
+        add("step_age", lag(age, H))
+        add("step_dir", lag(dirn, H))
+        add("floor_dist", lag(floor_dist(s, so, f["floor_window"], f["floor_settled"]), H))
+        hr = grid.local_hour * 2 * np.pi / 24
+        add("hour_sin", np.sin(hr))
+        add("hour_cos", np.cos(hr))
+        sup = np.nan_to_num(sh["supply_event"]).astype(bool)
+        add("supply", sup.astype(float))
+        add("since_resume", since_true(sup, 600))
+        others = [np.nan_to_num(grid.room[o]["valve"]) > grid.cfg["room"]["boiler"]["open_pct"] for o in grid.rooms if o != r]
+        add("others_open", np.sum(others, axis=0).astype(float) if others else np.zeros(n))
+        add("in_room_age", d["in_room_age"])
+        add("in_room", (d["in_room_age"] <= pc["in_room_min"]).astype(float))
+        add("home", (sh["home_age"] <= pc["home_min"]).astype(float))
+        add("home_age", sh["home_age"])
+        add("asleep", sh["asleep"])
+        self.names = names
+        run = np.arange(n) - np.maximum.accumulate(np.where(good, -1, np.arange(n)))
+        ok = np.isfinite(y) & (run >= H + c["valve_guard_min"] + 1) & np.isfinite(sh["out"] - s0)
+        return np.column_stack(cols), y, ok
+
+    def design(self, grid, r):
+        X, y, ok = self.feat(grid, r)
+        oh = np.zeros((len(y), len(grid.rooms)))
+        oh[:, grid.rooms.index(r)] = 1.0
+        return np.hstack([X, oh]), y, ok
+
+    def groups(self, grid):
+        return [list(grid.rooms)] if self.cfg["room"]["xgb"]["pooled"] else [[r] for r in grid.rooms]
+
+    def fit(self, grid, train_days):
+        c = self.cfg["room"]["xgb"]
+        tr = np.zeros(len(grid.t), bool)
+        for dd in train_days:
+            tr[grid.day_idx[dd]] = True
+        params = {k: v for k, v in c.items() if k not in ("trim", "pooled")}
+        self.model = {}
+        for grp in self.groups(grid):
+            parts = [self.design(grid, r) for r in grp]
+            Xt = np.vstack([X[ok & tr] for X, y, ok in parts])
+            yt = np.concatenate([y[ok & tr] for X, y, ok in parts])
+            if len(yt) < self.c["min_rows"]:
+                continue
+            keep = np.ones(len(yt), bool)
+            for _ in range(2):
+                mdl = XGBRegressor(**params, n_jobs=1, tree_method="hist", random_state=0).fit(Xt[keep], yt[keep])
+                res = yt - mdl.predict(Xt)
+                keep = np.abs(res) <= np.quantile(np.abs(res), 1 - c["trim"])
+            for r in grp:
+                self.model[r] = mdl
+        return self
+
+    def predict(self, grid):
+        out = {}
+        for r in grid.rooms:
+            X, y, ok = self.design(grid, r)
+            yh = np.full(len(y), np.nan)
+            if r in self.model and ok.any():
+                yh[ok] = self.model[r].predict(X[ok])
+            out[r] = (np.where(ok, y, np.nan), yh)
+        return out
+
+
+def oof_predictions(grid, cls, cfg):
+    out = {r: (np.full(len(grid.t), np.nan), np.full(len(grid.t), np.nan)) for r in grid.rooms}
+    for d in grid.days:
+        pred = cls(cfg).fit(grid, [x for x in grid.days if x != d]).predict(grid)
+        i = grid.day_idx[d]
+        for r in grid.rooms:
+            out[r][0][i], out[r][1][i] = pred[r][0][i], pred[r][1][i]
+    return out
+
+
+def mean_valve(grid, r, k):
+    v = grid.room[r]["valve"]
+    return np.where(wsum(np.isfinite(v).astype(float), k) >= k, wsum(np.nan_to_num(v), k) / k, np.nan)
+
+
+def valve_reaction(grid, r, c, use, z):
+    d = grid.room[r]
+    dv = d["valve"] - lag(d["valve"], c["horizon"])
+    still = np.nan_to_num(np.abs(d["setpoint"] - lag(d["setpoint"], c["sp_hold"])), nan=9.0) <= 0.01
+    x = np.where(still & np.isfinite(dv), np.maximum(dv, 0.0), np.nan)
+    f = x[np.isfinite(x) & use]
+    sig = max(float(np.sqrt(np.mean(f[np.abs(f) <= np.quantile(np.abs(f), 1 - c["trim"])] ** 2))), c["sigma_floor"]) if len(f) else c["sigma_floor"]
+    return np.where(np.isfinite(z), np.maximum(z, 0.0) + np.nan_to_num(x) / sig, np.nan)
+
+
+def room_channels(grid, pred, cfg, spared=None):
+    c = cfg["room"]
+    keep = np.ones(len(grid.t), bool) if spared is None else ~spared
+    veto = dilate(np.nan_to_num(grid.shared["supply_event"]).astype(bool), cfg["phys"]["veto_pad_min"])
+    res, z, sig = {}, {}, {}
+    for r in grid.rooms:
+        y, yh = pred[r]
+        res[r] = y - yh
+        f = res[r][np.isfinite(res[r]) & keep & ~veto]
+        f = f[np.abs(f) <= np.quantile(np.abs(f), 1 - c["sigma_trim"])]
+        sig[r] = max(float(np.sqrt(np.mean(f ** 2))), c["sigma_floor"]) if len(f) else c["sigma_floor"]
+        z[r] = -res[r] / sig[r]
+    b = c["boiler"]
+    flag = np.zeros(len(grid.t), bool)
+    if b["enabled"]:
+        vm = {r: mean_valve(grid, r, cfg["phys"]["horizon"]) for r in grid.rooms}
+        opened = np.any([(vm[r] > b["open_pct"]) & (z[r] > b["open_z"]) for r in grid.rooms], axis=0)
+        closed = [(vm[r] <= b["closed_pct"]) & np.isfinite(z[r]) for r in grid.rooms]
+        cold_closed = np.any([m & (z[r] > b["closed_z"]) for m, r in zip(closed, grid.rooms)], axis=0)
+        flag = opened & np.any(closed, axis=0) & ~cold_closed
+    ev = {r: valve_reaction(grid, r, c["react"], keep & ~veto, z[r]) for r in grid.rooms} if c["react"]["enabled"] else z
+    ground = [r for r in cfg["floor"]["ground"] if r in z]
+    zs = np.array([np.minimum(np.maximum(z[r], 0.0), c["house_clip"]) for r in ground])
+    S = dict(ev)
+    S["house"] = np.where(np.isfinite(zs).any(axis=0), np.nansum(zs, axis=0), np.nan)
+    mute = veto | flag
+    return {k: np.where(mute, np.nan, v) for k, v in S.items()}, res, sig, flag
+
+
+class RoomEvaluator:
+    def __init__(self, grid, cfg):
+        self.g, self.cfg, self.c = grid, cfg, cfg["room"]
+        self.gt = [dict(w, i0=grid.minute(w["open_utc"]), span=grid.span(*w["exclude_utc"])) for w in self.c["gt"]]
+        self.excl = np.zeros(len(grid.t), bool)
+        for w in self.gt:
+            self.excl[w["span"]] = True
+
+    def window(self, w):
+        return slice(w["i0"], w["i0"] + w["hit_min"] + 1)
+
+    def thresholds(self, S):
+        c, thr = self.c, {}
+        for w in self.gt:
+            for ch in w["channels"]:
+                v = S[ch][self.window(w)]
+                if np.isfinite(v).any():
+                    thr[ch] = min(thr.get(ch, np.inf), c["margin"] * float(np.nanmax(v)))
+        q = {ch: float(np.nanquantile(np.where(self.excl, np.nan, S[ch]), c["ratio_quantile"])) for ch in S}
+        ratios = [thr[ch] / q[ch] for ch in thr if ch != "house" and q[ch] > 0]
+        med = float(np.median(ratios)) if ratios else np.nan
+        for ch in S:
+            thr.setdefault(ch, med * q[ch])
+        return thr, q, med
+
+    def detection(self, S, thr):
+        out = {}
+        for w in self.gt:
+            best = None
+            for ch in w["channels"]:
+                v = S[ch][self.window(w)]
+                hit = np.flatnonzero(np.nan_to_num(v, nan=-np.inf) > thr[ch])
+                if len(hit) and (best is None or hit[0] < best[0]):
+                    best = (int(hit[0]), ch)
+            out[w["id"]] = {"detected": best is not None, "latency_min": None if best is None else best[0], "channel": None if best is None else best[1]}
+        return out
+
+    def alarms(self, S, thr):
+        per = sorted((s, e, ch) for ch in S for s, e in episodes(S[ch], thr[ch], self.c["merge_min"]))
+        out = []
+        for s, e, ch in per:
+            if out and s - out[-1]["end"] < self.c["merge_min"]:
+                out[-1]["end"] = max(out[-1]["end"], e)
+                out[-1]["eps"].append((ch, s, e))
+            else:
+                out.append({"start": s, "end": e, "eps": [(ch, s, e)]})
+        for a in out:
+            a["gt"] = any(ch in w["channels"] and w["i0"] <= s <= w["i0"] + w["hit_min"] for ch, s, e in a["eps"] for w in self.gt)
+            a["in_event"] = bool(self.excl[a["start"]])
+            a["peaks"] = {ch: float(np.nanmax(S[ch][s:e])) / thr[ch] for ch, s, e in a["eps"]}
+        return out
+
+    def run(self, S, res, sig, reason):
+        thr, q, med = self.thresholds(S)
+        det = self.detection(S, thr)
+        al = self.alarms(S, thr)
+        days = float(np.isfinite(np.where(self.excl, np.nan, np.vstack(list(S.values())))).any(axis=0).sum()) / 1440.0
+        extra = [a for a in al if not a["gt"] and not a["in_event"]]
+        g = self.g
+        for a in al:
+            ch = max(a["peaks"], key=a["peaks"].get)
+            i = min(s for c_, s, e in a["eps"] if c_ == ch)
+            a["channel"], a["reason"] = ch, reason(ch, i, S)
+            a["local"] = (utc(g.t[a["start"]]) + timedelta(minutes=g.cfg["utc_offset_min"])).strftime("%m-%d %H:%M")
+            a["channels"] = sorted(a["peaks"])
+        lat = [d["latency_min"] for d in det.values()]
+        return {"detection": det, "detected_all": all(d["detected"] for d in det.values()), "latency_sum": None if None in lat else sum(lat), "threshold": thr, "ratio_median": med, "quantile": q,
+                "alarms": al, "extra": len(extra), "alarms_per_day": len(extra) / days if days else None, "days": days, "sigma": sig}
+
+
+class Reasoner:
+    def __init__(self, grid, res):
+        self.g, self.res, self.cfg = grid, res, grid.cfg
+
+    def __call__(self, ch, i, S):
+        g, c, pc = self.g, self.cfg, self.cfg["presence"]
+        ground = [r for r in c["floor"]["ground"] if r in g.rooms]
+        r = ch if ch != "house" else max(ground, key=lambda x: np.nan_to_num(-self.res[x][i], nan=-9.0))
+        d, sh = g.room[r], g.shared
+        v, so = d["valve"][i], d["since_open"][i]
+        vt = "valve unknown" if not np.isfinite(v) else (f"valve closed {so:.0f} min" if v <= c["open_valve_pct"] and np.isfinite(so) else f"valve {v:.0f} % open")
+        age = d["in_room_age"][i]
+        ut = f"user in room {age:.0f} min ago" if age <= pc["in_room_min"] else ("user asleep" if sh["asleep"][i] else ("user elsewhere in the house" if sh["home_age"][i] <= pc["home_min"] else "no watch sighting"))
+        n_open = sum(np.nan_to_num(g.room[o]["valve"][i]) > c["room"]["boiler"]["open_pct"] for o in g.rooms if o != r)
+        k = -self.res[r][i]
+        pre = f"house score {S['house'][i]:.1f}: " if ch == "house" else ""
+        return f"{pre}{r} {k:.1f} K below forecast, {vt}, {ut}, outdoor {sh['out'][i]:.1f} C, {n_open} other rooms heating"
+
+
+def evaluate_room(grid, cls, cfg):
+    pred = oof_predictions(grid, cls, cfg)
+    ev = RoomEvaluator(grid, cfg)
+    S, res, sig, flag = room_channels(grid, pred, cfg, ev.excl)
+    out = ev.run(S, res, sig, Reasoner(grid, res))
+    out.update({"S": S, "pred": pred, "res": res, "flag": flag, "evaluator": ev})
+    return out
+
+
+def format_room(name, r, list_n):
+    gtch = {ch for w in r["evaluator"].gt for ch in w["channels"]}
+    per = {}
+    for a in r["alarms"]:
+        if not a["gt"] and not a["in_event"]:
+            per[a["channel"]] = per.get(a["channel"], 0) + 1
+    ext = f" by_channel={per} muted_by_boiler_logic={int(r['flag'].sum())}min"
+    head = " ".join(f"{k}:{'-' if not d['detected'] else str(d['latency_min']) + 'min/' + d['channel']}" for k, d in r["detection"].items())
+    thr = " ".join(f"{k}={v:.2f}" for k, v in r["threshold"].items())
+    lines = [f"{name}: detect {head} latency_sum={r['latency_sum']} non_gt_alarms={r['extra']} per_day={r['alarms_per_day']:.2f} days={r['days']:.1f} thr[{thr}] ratio_med={r['ratio_median']:.2f}{ext}"]
+    for a in [a for a in r["alarms"] if not a["gt"]][:list_n]:
+        lines.append(f"  {a['local']} local {a['end'] - a['start']:3d}min {'IN-EVENT ' if a['in_event'] else ''}{','.join(a['channels'])}: {a['reason']}")
+    return "\n".join(lines)
+
+
+def rank_key(r):
+    return (not r["detected_all"], 1e9 if r["latency_sum"] is None else r["latency_sum"], r["alarms_per_day"])
+
+
+def run_windowroom(config, names=None, lake=None):
+    cfg = config["window"]
+    grid = Grid.load(lake or cfg["lake"], cfg)
+    models = cfg["room"]["models"]
+    out = {}
+    for name in (names.split(",") if names else models):
+        cls, react = models[name]
+        mc = copy.deepcopy(cfg)
+        mc["room"]["react"]["enabled"] = react
+        grid.cfg, grid.cache = mc, {}
+        out[name] = evaluate_room(grid, resolve(cls), mc)
+        print(format_room(name, out[name], cfg["room"]["list_n"]))
+    best = sorted(out, key=lambda k: rank_key(out[k]))
+    print("ranking (detect all, latency sum, non-GT alarms/day): " + " > ".join(f"{k} {out[k]['latency_sum']}min {out[k]['alarms_per_day']:.2f}/d" for k in best))
+    return out
 
 
 class StreamScorer:

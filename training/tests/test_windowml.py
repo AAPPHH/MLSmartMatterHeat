@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.windowml import Approach, Evaluator, Grid, PhysicsResidual, StreamScorer, V1Like, UnheatedFloor, budget_threshold, dilate, episodes, evaluate, parity_csv, since_open, stream_run, window_bundle
+from heattrain.windowml import Approach, Evaluator, Grid, PhysicsResidual, RoomEvaluator, StreamScorer, V1Like, UnheatedFloor, XgbResidual, budget_threshold, dilate, episodes, evaluate, evaluate_room, floor_dist, last_step, parity_csv, peak_last, rank_key, room_channels, since_open, since_true, stream_run, utc, valve_reaction, window_bundle
 
 CFG = copy.deepcopy(CONFIG["window"])
 CFG["rooms"] = ["wohnzimmer", "bad"]
@@ -240,3 +240,132 @@ def test_export_requires_validation_and_writes_bundle(tmp_path, monkeypatch):
     assert json.loads((out / "meta.json").read_text())["eval"]["pass"]
     csv = parity_csv(b, g, slice(0, 600)).splitlines()
     assert csv[0].startswith("ts,supply,out,wind,rad,wohnzimmer_temp") and len(csv) == 601 and csv[-1].split(",")[-1] == "0"
+
+
+def with_presence(g):
+    for d in g.room.values():
+        d["in_room_age"] = np.full(len(g.t), 240.0)
+    g.shared.update({"home_age": np.full(len(g.t), 240.0), "asleep": np.zeros(len(g.t))})
+    return g
+
+
+def room_cfg(g, cfg, drop_at=2500, rooms=("wohnzimmer",)):
+    cfg["room"] = copy.deepcopy(cfg["room"])
+    cfg["room"]["xgb"].update(n_estimators=20, max_depth=3)
+    cfg["room"]["gt"] = [{"id": "A", "open_utc": utc(g.t[drop_at]).isoformat(), "hit_min": 20, "channels": list(rooms), "exclude_utc": [utc(g.t[drop_at - 30]).isoformat(), utc(g.t[drop_at + 90]).isoformat()]}]
+    cfg["floor"] = dict(cfg["floor"], ground=["wohnzimmer", "bad"])
+
+
+def test_presence_is_causal(lake):
+    sch = pa.schema([("ts", pa.timestamp("us", "UTC")), ("result_room", pa.string()), ("abstained", pa.bool_()), ("state", pa.string())])
+    write(lake, "watch_inference", [ts([5, 6, 25]), ["wohnzimmer", "bad", "schlafzimmer"], [False, True, False], ["rest", "rest", "rest"]], sch)
+    lb = pa.schema([("ts", pa.timestamp("us", "UTC")), ("room", pa.string()), ("source", pa.string())])
+    write(lake, "labels", [ts([20]), ["keiner"], ["watch"]], lb)
+    g = Grid.load(lake, CFG)
+    w, cap = g.room["wohnzimmer"]["in_room_age"], CFG["presence"]["age_cap_min"]
+    assert w[4] == cap and w[5] == 0 and w[12] == 7 and g.room["bad"]["in_room_age"][6] == cap
+    assert g.shared["home_age"][4] == cap and g.shared["home_age"][10] == 5 and g.shared["home_age"][21] == cap and g.shared["home_age"][26] == 1
+    assert g.shared["asleep"][24] == 0 and g.shared["asleep"][26] == 1
+
+
+def test_xgb_features_use_no_future():
+    g, cfg = phys_grid()
+    with_presence(g)
+    room_cfg(g, cfg)
+    ap = XgbResidual(cfg)
+    X, y, ok = ap.features(g, "bad")
+    assert X.shape[1] == len(ap.names) and len(set(ap.names)) == len(ap.names)
+    t = 3000
+    h = copy.deepcopy(g)
+    rng = np.random.default_rng(1)
+    for d in h.room.values():
+        for k in ("temp", "valve", "setpoint"):
+            d[k][t + 1:] = rng.uniform(0, 50, len(d[k]) - t - 1)
+        d["since_open"] = since_open(d["valve"], 10.0)
+    h.shared["out"][t + 1:] = 99.0
+    X2, y2, ok2 = XgbResidual(cfg).features(h, "bad")
+    assert np.allclose(X[:t + 1], X2[:t + 1], equal_nan=True) and np.array_equal(ok[:t + 1], ok2[:t + 1])
+
+
+def test_peak_floor_and_step_features():
+    v = np.array([0, 20, 50, 30, 5, 0, 15, 12, 0.0])
+    assert peak_last(v, 10.0).tolist() == [0, 20, 50, 50, 50, 50, 15, 15, 15]
+    age, d = last_step(np.array([20.0, 20, 19.5, 19.5, 19.5, 20.0]), 0.25, 240)
+    assert age.tolist() == [240, 240, 0, 1, 2, 0] and d.tolist() == [0, 0, -1, -1, -1, 1]
+    s = np.array([20.0, 19.0, 20.0, 20.0, 20.0])
+    assert floor_dist(s, np.full(5, 30.0), 3, 20)[3] == 1.0 and np.isnan(floor_dist(s, np.zeros(5), 3, 20)).all()
+    assert since_true(np.array([0, 1, 0, 0], bool), 5).tolist() == [5, 0, 1, 2]
+
+
+def test_room_pipeline_detects_injected_drop_with_xgb_and_ridge():
+    for cls in (XgbResidual, PhysicsResidual):
+        g, cfg = phys_grid(n=4300)
+        with_presence(g)
+        room_cfg(g, cfg)
+        g.cfg = cfg
+        g.room["wohnzimmer"]["temp"][2500:] -= np.minimum(np.arange(1800), 10) * 0.5
+        r = evaluate_room(g, cls, cfg)
+        d = r["detection"]["A"]
+        assert d["detected"] and d["channel"] == "wohnzimmer" and 0 <= d["latency_min"] <= 20
+        assert r["threshold"]["wohnzimmer"] == pytest.approx(cfg["room"]["margin"] * np.nanmax(r["S"]["wohnzimmer"][2500:2521]))
+        assert set(r["S"]) == {"wohnzimmer", "bad", "schlafzimmer", "house"} and all(a["reason"] for a in r["alarms"])
+        assert any("K below forecast" in a["reason"] for a in r["alarms"] if a["gt"])
+
+
+def test_thresholds_use_gt_peak_and_median_ratio_for_unlabelled_rooms():
+    g, cfg = phys_grid()
+    room_cfg(g, cfg, rooms=("wohnzimmer", "bad"))
+    ev = RoomEvaluator(g, cfg)
+    rng = np.random.default_rng(0)
+    S = {k: rng.uniform(0, 1, len(g.t)) for k in ("wohnzimmer", "bad", "schlafzimmer", "house")}
+    S["wohnzimmer"][2505:2510] = 10.0
+    S["bad"][2515:2518] = 4.0
+    thr, q, med = ev.thresholds(S)
+    assert thr["wohnzimmer"] == pytest.approx(9.0) and thr["bad"] == pytest.approx(3.6)
+    assert med == pytest.approx(np.median([9.0 / q["wohnzimmer"], 3.6 / q["bad"]])) and thr["schlafzimmer"] == pytest.approx(med * q["schlafzimmer"])
+    assert ev.detection(S, thr)["A"] == {"detected": True, "latency_min": 5, "channel": "wohnzimmer"}
+    al = ev.alarms(S, thr)
+    assert sum(a["gt"] for a in al) == 1
+
+
+def test_valve_reaction_needs_a_quiet_setpoint():
+    g, cfg = phys_grid()
+    n = len(g.t)
+    d = g.room["bad"]
+    d["valve"] = np.zeros(n)
+    d["valve"][1000:] = 40.0
+    d["valve"][2000:] = 80.0
+    d["setpoint"] = np.full(n, 21.0)
+    d["setpoint"][995:] = 22.0
+    out = valve_reaction(g, "bad", cfg["room"]["react"], np.ones(n, bool), np.zeros(n))
+    assert out[1003] == 0.0 and out[2003] > 5.0 and out[2010] == 0.0
+
+
+def test_boiler_logic_mutes_only_when_a_closed_room_is_fine_and_none_is_cold():
+    g, cfg = phys_grid()
+    n = len(g.t)
+    for r, v in (("wohnzimmer", 60.0), ("bad", 0.0), ("schlafzimmer", 0.0)):
+        g.room[r]["valve"] = np.full(n, v)
+    rng = np.random.default_rng(0)
+
+    def pred(cold_room=None, cold_woh=True):
+        p = {r: (np.zeros(n), 0.2 * rng.standard_normal(n)) for r in g.rooms}
+        for r in ([cold_room] if cold_room else []) + (["wohnzimmer"] if cold_woh else []):
+            p[r][1][1000:2000] += 2.0
+        return p
+    S, res, sig, flag = room_channels(g, pred(), cfg)
+    assert flag[1100:1900].mean() > 0.7 and np.isnan(S["house"][1100:1900][flag[1100:1900]]).all() and not flag[:900].any()
+    S, res, sig, flag = room_channels(g, pred("bad"), cfg)
+    assert flag[1100:1900].mean() < 0.05
+    for r in g.rooms:
+        g.room[r]["valve"] = np.full(n, 60.0)
+    assert not room_channels(g, pred(), cfg)[3].any()
+
+
+def test_rank_key_orders_detection_then_latency_then_alarm_rate():
+    a = {"detected_all": True, "latency_sum": 19, "alarms_per_day": 9.0}
+    b = {"detected_all": True, "latency_sum": 19, "alarms_per_day": 5.0}
+    c = {"detected_all": True, "latency_sum": 23, "alarms_per_day": 1.0}
+    d = {"detected_all": False, "latency_sum": None, "alarms_per_day": 0.0}
+    m = dict(a=a, b=b, c=c, d=d)
+    assert sorted(m, key=lambda k: rank_key(m[k])) == ["b", "a", "c", "d"]
