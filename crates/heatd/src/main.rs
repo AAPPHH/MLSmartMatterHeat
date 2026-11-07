@@ -20,6 +20,9 @@ mod lake;
 #[cfg(test)]
 mod lake_tests;
 mod migrate;
+mod node_health;
+#[cfg(test)]
+mod node_health_tests;
 mod report;
 #[cfg(test)]
 mod report_tests;
@@ -249,6 +252,7 @@ async fn serve(config: Config) -> Result<()> {
     if state.config.br_watchdog.enabled {
         br_watchdog::spawn(state.clone());
     }
+    node_health::spawn(state.clone());
     capture::spawn(state.clone(), capture::Timing::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);

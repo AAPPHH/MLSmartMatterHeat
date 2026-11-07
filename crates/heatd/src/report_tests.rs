@@ -89,6 +89,9 @@ fn sample_lake(root: &Path) {
     for (minute, detail) in [(340, "{\"detector\":\"v3\",\"room\":\"a\",\"source\":\"auto\",\"duration_min\":20.0,\"house\":9.0,\"label\":\"yes\",\"latency_min\":2.0}"), (341, "{\"detector\":\"v3\",\"room\":\"b\",\"source\":\"auto\",\"duration_min\":14.0,\"house\":8.0,\"label\":\"none\",\"latency_min\":null}")] {
         sink.append(Event { detail: Some(detail.into()), ..event(minute, kind::WINDOW_EPISODE, None) }).unwrap();
     }
+    for (minute, detail) in [(700, "{\"aspect\":\"link\",\"from\":\"ok\",\"to\":\"silent\",\"silent_s\":610,\"episode_s\":0,\"attempts\":0}"), (730, "{\"aspect\":\"link\",\"from\":\"silent\",\"to\":\"ok\",\"silent_s\":0,\"episode_s\":1800,\"attempts\":4}")] {
+        sink.append(Event { detail: Some(detail.into()), ..event(minute, kind::NODE_HEALTH, Some(2)) }).unwrap();
+    }
     for (room, source, n) in [("a", "watch", 2), ("b", "watch", 1), ("a", "override", 1)] {
         for i in 0..n {
             sink.append(Label { ts: at(10 + i), room: room.into(), source: source.into(), ..Default::default() }).unwrap();
@@ -464,4 +467,15 @@ fn usage_counts_valve_hours_ignores_invalid_and_weights_proxy() {
     assert_eq!(json["days"][0]["rooms"]["a"]["hourly_valve_hours"].as_array().unwrap().len(), 24);
     assert_eq!(json["days"][0]["rooms"]["a"]["first"], "2026-10-20T02:00:00Z");
     assert!(build(dir.path(), day()).unwrap().0.contains("## Heizbetrieb"));
+}
+
+#[test]
+fn report_lists_node_health_transitions() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(build(dir.path(), day()).unwrap().0.contains("## Thermostat-Gesundheit
+
+Keine Stoerungen"));
+    sample_lake(dir.path());
+    let md = build(dir.path(), day()).unwrap().0;
+    assert!(md.contains("## Thermostat-Gesundheit") && md.contains("| 2 | 2 | silent | 30 min | 0 | 0 |") && md.contains("Node 2: silent -> ok"), "{md}");
 }

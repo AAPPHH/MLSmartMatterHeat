@@ -578,13 +578,19 @@ async fn scan(State(state): State<AppState>, Json(body): Json<ScanBody>) -> ApiR
     if out.duplicate {
         response["duplicate"] = json!(true);
     }
-    if let Some(alert) = state.status.br_alert() {
-        response["alert"] = alert;
-    }
+    add_alerts(&state, &mut response);
     if let Some(prompt) = window_prompt(&state, [&body]) {
         response["window_prompt"] = prompt;
     }
     Ok(Json(response))
+}
+
+fn add_alerts(state: &AppState, response: &mut Value) {
+    let alerts = crate::node_health::alerts(state);
+    if let Some(first) = alerts.first() {
+        response["alert"] = first.clone();
+        response["alerts"] = Value::Array(alerts);
+    }
 }
 
 fn window_prompt<'a>(state: &AppState, scans: impl IntoIterator<Item = &'a ScanBody>) -> Option<Value> {
@@ -613,9 +619,7 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     if let Some((_, m)) = matched {
         response["match"] = m;
     }
-    if let Some(alert) = state.status.br_alert() {
-        response["alert"] = alert;
-    }
+    add_alerts(&state, &mut response);
     if let Some(prompt) = window_prompt(&state, &body.scans) {
         response["window_prompt"] = prompt;
     }
@@ -655,6 +659,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                         "last_report_age_s": report_age,
                         "stale": report_age.is_none_or(|a| a > state.config.stale.after_s as f64),
                         "commanded_setpoint": commands.target(node),
+                        "health": state.status.node_health_view(node, now_us),
                         "manual_hold": commands.hold(node).map(|h| json!({"value": h.value, "since_ts": h.since_ms})),
                         "reason": setpoint.map(|s| s.reason.clone()),
                         "setpoint_ts": setpoint.map(|s| s.ts),
@@ -664,7 +669,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 fn devices_view(state: &AppState) -> anyhow::Result<Vec<Value>> {
@@ -1040,6 +1045,37 @@ nodes = [5]
         assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
         let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(text.contains("heatd_node_subscription{node=\"5\",state=\"subscribed\"} 1") && text.contains("heatd_node_reports_total{node=\"5\"} 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn node_health_reaches_state_health_metrics_and_the_scan_replies_as_alerts() {
+        let h = harness(false);
+        h.state.status.register_nodes([5]);
+        let (_, quiet) = call(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        assert!(quiet.get("alerts").is_none() && quiet.get("alert").is_none());
+        h.state.status.update_health(5, |r| {
+            r.state = crate::node_health::Health::Unreachable;
+            r.since_us = crate::lake::now_us();
+            r.attempts_total = 4;
+            r.last_error = Some("no poll response".into());
+        });
+        let (_, scan) = call(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        assert_eq!(scan["alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(scan["alert"], scan["alerts"][0]);
+        assert!(scan["alert"]["id"].as_str().unwrap().starts_with("node_unreachable:5@") && scan["alert"]["title"].is_string() && scan["alert"]["text"].is_string());
+        let (_, batch) = call(&h.state, "POST", "/api/scans", Some(fixture("batch_example.json"))).await;
+        assert_eq!(batch["alerts"][0]["id"], scan["alert"]["id"]);
+        let (_, state) = call(&h.state, "GET", "/api/state", None).await;
+        let node = &state["rooms"][0]["nodes"][0];
+        assert_eq!((node["health"]["state"].as_str(), node["health"]["attempts_total"].as_u64(), node["health"]["last_error"].as_str()), (Some("unreachable"), Some(4), Some("no poll response")));
+        assert_eq!(state["alerts"].as_array().unwrap().len(), 1);
+        let (_, health) = call(&h.state, "GET", "/health", None).await;
+        assert_eq!((health["status"].as_str(), health["nodes"][0]["health"]["state"].as_str()), (Some("degraded"), Some("unreachable")));
+        let text = String::from_utf8(router(h.state.clone()).oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap().into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(text.contains("heatd_node_health{node=\"5\",state=\"unreachable\"} 3") && text.contains("heatd_node_recovery_attempts_total{node=\"5\"} 4") && text.contains("heatd_node_alert{node=\"5\",kind=\"unreachable\"} 1"), "{text}");
+        h.state.status.update_health(5, |r| r.state = crate::node_health::Health::Ok);
+        let (_, gone) = call(&h.state, "POST", "/api/scan", Some(scan_body())).await;
+        assert!(gone.get("alerts").is_none() && gone.get("alert").is_none());
     }
 
     #[tokio::test]

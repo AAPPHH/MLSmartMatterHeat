@@ -35,6 +35,7 @@ pub struct NodeStatus {
     pub last_report_us: Option<i64>,
     pub reports: u64,
     pub last_subscription_us: Option<i64>,
+    pub health: crate::node_health::Record,
 }
 
 const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
@@ -80,6 +81,7 @@ struct Inner {
     control_us: Option<i64>,
     br: Option<crate::br_watchdog::BrSnapshot>,
     stale_us: Option<i64>,
+    restart_us: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,8 +102,59 @@ impl Status {
         let mut inner = self.0.lock().unwrap();
         let started = inner.started_us;
         nodes.into_iter().for_each(|n| {
-            inner.nodes.entry(n).or_insert_with(|| NodeStatus { since_us: started, ..Default::default() });
+            inner.nodes.entry(n).or_insert_with(|| NodeStatus { since_us: started, health: crate::node_health::Record::at(started), ..Default::default() });
         });
+    }
+
+    pub fn started_us(&self) -> i64 {
+        self.0.lock().unwrap().started_us
+    }
+
+    pub fn node_snapshot(&self, node: u64) -> Option<NodeStatus> {
+        self.0.lock().unwrap().nodes.get(&node).cloned()
+    }
+
+    pub fn nodes_snapshot(&self) -> Vec<(u64, NodeStatus)> {
+        self.0.lock().unwrap().nodes.iter().map(|(id, n)| (*id, n.clone())).collect()
+    }
+
+    pub fn update_health<R>(&self, node: u64, f: impl FnOnce(&mut crate::node_health::Record) -> R) -> R {
+        f(&mut self.0.lock().unwrap().nodes.entry(node).or_default().health)
+    }
+
+    pub fn poll_result(&self, node: u64, error: Option<String>) {
+        self.update_health(node, |r| match error {
+            Some(e) => r.last_error = Some(format!("poll: {e}")),
+            None => r.last_error = r.last_error.take().filter(|e| !e.starts_with("poll: ")),
+        });
+    }
+
+    pub fn setpoint_write(&self, node: u64, error: Option<String>) {
+        self.update_health(node, |r| match error {
+            Some(e) => {
+                r.set.failures_total += 1;
+                r.set.consecutive_failures += 1;
+                r.set.last_error = Some(e);
+            }
+            None => r.set.consecutive_failures = 0,
+        });
+    }
+
+    pub fn claim_restart(&self, now_us: i64, gap_us: i64) -> bool {
+        let mut inner = self.0.lock().unwrap();
+        let free = inner.restart_us.is_none_or(|t| now_us - t >= gap_us);
+        if free {
+            inner.restart_us = Some(now_us);
+        }
+        free
+    }
+
+    pub fn session_restarted(&self, now_us: i64) {
+        self.0.lock().unwrap().nodes.values_mut().filter(|n| n.health.state != crate::node_health::Health::Ok).for_each(|n| n.health.last_attempt_us = Some(now_us));
+    }
+
+    pub fn node_health_view(&self, node: u64, now_us: i64) -> Option<Value> {
+        self.0.lock().unwrap().nodes.get(&node).map(|n| n.health.view(now_us))
     }
 
     pub fn node_report(&self, node: u64, ts_us: i64) {
@@ -115,10 +168,6 @@ impl Status {
         let mut inner = self.0.lock().unwrap();
         let n = inner.nodes.entry(node).or_default();
         n.last_subscription_us = Some(n.last_subscription_us.map_or(ts_us, |t| t.max(ts_us)));
-    }
-
-    pub fn lost_for_us(&self, node: u64, now_us: i64) -> Option<i64> {
-        self.0.lock().unwrap().nodes.get(&node).filter(|n| n.state == SubState::Lost).map(|n| now_us - n.since_us)
     }
 
     pub fn subscription(&self, node: u64, state: SubState, ts_us: i64) {
@@ -232,14 +281,14 @@ impl Status {
             .nodes
             .iter()
             .map(|(id, n)| {
-                let mut node = json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "last_subscription_report_age_s": age(n.last_subscription_us), "polling_only": n.state == SubState::Lost && n.last_report_us.is_some_and(|t| n.last_subscription_us.is_none_or(|s| t > s)), "reports": n.reports});
+                let mut node = json!({"node": id, "subscription": n.state.name(), "subscription_age_s": age(Some(n.since_us)), "last_report_age_s": age(n.last_report_us), "last_subscription_report_age_s": age(n.last_subscription_us), "polling_only": n.state == SubState::Lost && n.last_report_us.is_some_and(|t| n.last_subscription_us.is_none_or(|s| t > s)), "reports": n.reports, "health": n.health.view(now_us)});
                 if let Some(limit) = inner.stale_us {
                     node["stale"] = json!(n.last_report_us.is_none_or(|t| now_us - t > limit));
                 }
                 node
             })
             .collect();
-        let degraded = inner.nodes.values().any(|n| matches!(n.state, SubState::Lost | SubState::Resubscribing));
+        let degraded = inner.nodes.values().any(|n| matches!(n.state, SubState::Lost | SubState::Resubscribing) || n.health.state != crate::node_health::Health::Ok);
         json!({
             "status": if degraded { "degraded" } else { "ok" },
             "uptime_s": age(Some(inner.started_us)),
@@ -285,6 +334,31 @@ impl Status {
         inner.nodes.iter().for_each(|(id, n)| {
             let _ = writeln!(out, "heatd_node_reports_total{{node=\"{id}\"}} {}", n.reports);
         });
+        for (name, help, kind, pick) in [
+            ("heatd_node_health", "link health per node (0 ok, 1 degraded, 2 silent, 3 unreachable)", "gauge", 0),
+            ("heatd_node_health_since_seconds", "seconds the node has been in its current health state", "gauge", 1),
+            ("heatd_node_recovery_attempts_total", "automatic recovery attempts (resubscribe, session restart) per node since start", "counter", 2),
+            ("heatd_node_health_transitions_total", "health state transitions per node since start", "counter", 3),
+            ("heatd_node_setpoint_mismatch", "1 if the device reports a setpoint different from the one heatd commanded", "gauge", 4),
+            ("heatd_node_setpoint_rewrites_total", "setpoint rewrites by the verification per node since start", "counter", 5),
+            ("heatd_node_setpoint_failures_total", "failed setpoint writes per node since start", "counter", 6),
+            ("heatd_node_alert", "1 while an alert is active for the node", "gauge", 7),
+        ] {
+            family(&mut out, name, help, kind);
+            for (id, n) in &inner.nodes {
+                let r = &n.health;
+                let _ = match pick {
+                    0 => writeln!(out, "{name}{{node=\"{id}\",state=\"{}\"}} {}", r.state.name(), r.state.code()),
+                    1 => writeln!(out, "{name}{{node=\"{id}\"}} {}", age(r.since_us)),
+                    2 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.attempts_total),
+                    3 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.transitions),
+                    4 => writeln!(out, "{name}{{node=\"{id}\"}} {}", u8::from(r.set.mismatch_since_us.is_some())),
+                    5 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.set.rewrites_total),
+                    6 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.set.failures_total),
+                    _ => writeln!(out, "{name}{{node=\"{id}\",kind=\"unreachable\"}} {}\n{name}{{node=\"{id}\",kind=\"setpoint\"}} {}", u8::from(r.state == crate::node_health::Health::Unreachable), u8::from(r.setpoint_alert())),
+                };
+            }
+        }
         if let Some(offset) = inner.ntp_offset_s {
             family(&mut out, "heatd_ntp_offset_seconds", "last measured clock offset against the NTP server", "gauge");
             let _ = writeln!(out, "heatd_ntp_offset_seconds {offset}");

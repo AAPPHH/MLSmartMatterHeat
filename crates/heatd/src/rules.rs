@@ -120,6 +120,15 @@ impl Commands {
         self.sent.get(&node).map(|s| s.target)
     }
 
+    pub fn mismatch(&self, node: u64, tolerance: f64) -> Option<(f64, f64)> {
+        let (sent, device, at) = (self.sent.get(&node)?, self.device.get(&node)?, self.device_ms.get(&node)?);
+        (!self.holds.contains_key(&node) && sent.written_ms > 0 && *at >= sent.written_ms && (device - sent.target).abs() >= tolerance).then_some((sent.target, *device))
+    }
+
+    pub fn note_rewrite(&mut self, node: u64, target: f64, previous: f64, now_ms: i64) {
+        self.sent.insert(node, Sent { target, previous: Some(previous), written_ms: now_ms, acked: None });
+    }
+
     pub fn forget_desired_writes(&mut self) {
         self.sent.clear();
         self.device.clear();
@@ -715,6 +724,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         state.commanded.lock().unwrap().sent.insert(want.node, Sent { target: want.setpoint, previous: old, written_ms: now_ms, acked: None });
         let outcome = send_setpoint(state, want.node, want.setpoint).await;
         let error = outcome.as_ref().err().map(|e| e.to_string());
+        state.status.setpoint_write(want.node, error.clone());
         log("decision result", state.sink.append(result_row(&decision, want.reason, error)));
         match outcome {
             Ok(()) => {

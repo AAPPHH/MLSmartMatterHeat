@@ -158,3 +158,17 @@ setpoint = 18.0
 max_c = 22.0
 boost_max_c = 28.5
 shutdown_timeout_s = 30
+
+[node_health]
+enabled = true
+tick_s = 30.0
+silent_min = 10.0
+unreachable_min = 30.0
+push_silent_min = 60.0
+min_gap_s = 60.0
+backoff_start_s = 120.0
+backoff_max_min = 10.0
+reset_gap_min = 30.0
+verify_min = 10.0
+tolerance_c = 0.05
+alert_retries = 3

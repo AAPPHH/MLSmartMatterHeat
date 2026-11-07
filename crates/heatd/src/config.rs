@@ -430,6 +430,7 @@ pub struct Config {
     pub failsafe: FailsafeSection,
     pub stale: StaleSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
+    pub node_health: crate::node_health::NodeHealthSection,
 }
 
 impl Default for Config {
@@ -476,6 +477,7 @@ impl Default for Config {
             failsafe: FailsafeSection::default(),
             stale: StaleSection::default(),
             br_watchdog: Default::default(),
+            node_health: Default::default(),
         }
     }
 }

@@ -302,8 +302,6 @@ async fn capture_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing:
 async fn poll_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing: Timing) {
     let mut failures = 0u32;
     let silence_us = state.config.poll_silence_s as i64 * 1_000_000;
-    let (lost_us, gap_us) = (state.config.stale.resubscribe_after_s as i64 * 1_000_000, state.config.stale.resubscribe_gap_s as i64 * 1_000_000);
-    let mut asked_us: Option<i64> = None;
     loop {
         sleep(poll_delay(timing.poll, failures)).await;
         let silent = state.status.last_report_us(node).is_none_or(|t| lake::now_us() - t >= silence_us);
@@ -313,17 +311,11 @@ async fn poll_loop(state: AppState, node: u64, busy: Arc<AtomicBool>, timing: Ti
         match state.controller.poll(node).await {
             Ok(_) => {
                 failures = 0;
-                let now = lake::now_us();
-                if state.status.lost_for_us(node, now).is_some_and(|d| d >= lost_us) && asked_us.is_none_or(|t| now - t >= gap_us) {
-                    asked_us = Some(now);
-                    match state.controller.resubscribe(node).await {
-                        Ok(()) => eprintln!("node {node}: subscription lost while polls succeed, subscribing again"),
-                        Err(e) => eprintln!("resubscribe node {node}: {e}"),
-                    }
-                }
+                state.status.poll_result(node, None);
             }
             Err(e) => {
                 failures += 1;
+                state.status.poll_result(node, Some(e.to_string()));
                 let detail = json!({"error": e.to_string(), "consecutive": failures, "next_poll_s": poll_delay(timing.poll, failures).as_secs()});
                 log_error(state.sink.append(Event::now(kind::POLL_FAILED, SOURCE_HEATD).with_node(node).with_detail(detail)));
             }
@@ -446,12 +438,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn state(dir: &std::path::Path, mock: Arc<MockController>) -> AppState {
+        state_with(dir, mock, "")
+    }
+
+    pub(crate) fn state_with(dir: &std::path::Path, mock: Arc<MockController>, extra: &str) -> AppState {
         let toml = format!("poll_silence_s = 0
 inventory_dir = '{0}/inventory'\n[[rooms]]\nname = 'a'\nnodes = [5]
 [stale]
 resubscribe_after_s = 0
 resubscribe_gap_s = 3600
-", dir.to_str().unwrap().replace('\\', "/"));
+{1}
+", dir.to_str().unwrap().replace('\\', "/"), extra);
         let config = Config::parse(&toml).unwrap();
         let sink = lake::Sink::open(lake::LakeConfig::new(dir.join("lake"))).unwrap();
         let status = crate::status::Status::new(lake::now_us());
@@ -474,12 +471,12 @@ resubscribe_gap_s = 3600
         }
     }
 
-    fn lake_rows(dir: &std::path::Path, table: &str) -> usize {
+    pub(crate) fn lake_rows(dir: &std::path::Path, table: &str) -> usize {
         let Ok(entries) = std::fs::read_dir(dir.join("lake/raw").join(table)) else { return 0 };
         entries.filter_map(|e| e.ok()).map(|e| lake::load_stream(&e.path()).unwrap().batches.iter().map(|b| b.num_rows()).sum::<usize>()).sum()
     }
 
-    fn string_column(dir: &std::path::Path, table: &str, column: &str) -> Vec<String> {
+    pub(crate) fn string_column(dir: &std::path::Path, table: &str, column: &str) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(dir.join("lake/raw").join(table)) else { return Vec::new() };
         let mut out = Vec::new();
         for entry in entries.filter_map(|e| e.ok()) {
@@ -492,7 +489,7 @@ resubscribe_gap_s = 3600
         out
     }
 
-    async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    pub(crate) async fn until(what: &str, mut cond: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !cond() {
             assert!(std::time::Instant::now() < deadline, "timeout waiting for {what}");
@@ -536,10 +533,12 @@ resubscribe_gap_s = 3600
         let dir = tempfile::tempdir().unwrap();
         let mock = Arc::new(MockController::new(1));
         mock.add_node(5, 19.0, 19.0);
-        let state = state(dir.path(), mock.clone());
+        let state = state_with(dir.path(), mock.clone(), "[node_health]
+tick_s = 0.3");
         state.status.register_nodes([5]);
         let timing = Timing { poll: Duration::from_millis(20), settle: Duration::from_millis(5), retry: Duration::from_millis(5), reconnect_start: Duration::from_millis(5), reconnect_max: Duration::from_millis(10) };
         spawn(state.clone(), timing);
+        crate::node_health::spawn(state.clone());
         let sub = |s: &AppState| s.status.health(lake::now_us())["nodes"][0]["subscription"].as_str().unwrap().to_string();
         until("subscribed", || sub(&state) == "subscribed").await;
         mock.push_capture(5, CaptureItem::SubscriptionLost { node: Some(5), reason: "gone".into(), backoff_s: None });
