@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 from scipy.optimize import least_squares
+from scipy.stats import norm
 from scipy.signal import lfilter
 from numpy.lib.stride_tricks import sliding_window_view
 from heattrain.thermal import read_arrows
@@ -366,9 +367,8 @@ class Dosing:
 
     def risk(self, room, ctx, target, valve_hist=None):
         pk = self.peaks(room, ctx, valve_hist)
-        noise = np.random.default_rng(self.b["seed"]).normal(0.0, self.b["risk"]["peak_sigma_k"], pk.shape[1])
         limit = min(target + self.b["risk"]["margin_k"], self.b["abort_c"])
-        return ((pk + noise) > limit).mean(axis=1), pk
+        return norm.sf((limit - pk) / self.b["risk"]["peak_sigma_k"]).mean(axis=1), pk
 
     def decide(self, room, ctx, scenario, target, valve_hist=None, draw=0):
         b = self.b
@@ -432,7 +432,7 @@ class BoostLearn:
             s = self.post.samples(f, c["n_samples"], rng)
             rooms[r] = {"node": c["nodes"][r], "a": round(f["a"], 6), "delta": round(f["delta"], 4), "sigma": round(f["sigma"], 4), "windows": f["n_win"], "pulses": f["n_pulse"],
                         "theta": f["theta"].round(5).tolist(), "cov": f["cov"].round(6).tolist(), "samples": s.round(5).tolist()}
-        return {"version": version, "kind": "boost_learn", "seed": c["seed"], "horizon_min": c["horizon_min"], "ramp_tau_min": c["ramp_tau_min"], "kernel": {"shape": c["kernel_shape"], "len_min": c["kernel_len_min"]},
+        return {"version": version, "kind": "boost_learn", "seed": c["seed"], "horizon_min": c["horizon_min"], "ramp_tau_min": c["ramp_tau_min"], "dead_zone": c["dead_zone"], "pulse_cap_min": c["pulse_cap_min"], "open_gap_merge_min": c["merge_gap_min"], "kernel": {"shape": c["kernel_shape"], "len_min": c["kernel_len_min"]},
                 "dose": {"min_min": c["dose_min"], "max_min": c["dose_max"], "step_min": c["dose_step"]}, "boost_setpoint_c": c["boost_setpoint"], "abort_c": c["abort_c"], "raise_budget_per_room_hour": 1,
                 "risk": {"p_max": c["p_max"], "margin_k": c["margin_k"], "peak_sigma_k": round(peak_sigma, 4), "thompson_margin_k": c["thompson_margin_k"]}, "scenarios": ["morning", "homecoming"],
                 "since_open_cap_min": c["since_open_cap_min"], "hyper": {"mu": self.post.mu.round(4).tolist(), "tau": self.post.tau.round(4).tolist()}, "rooms": rooms, "trust": self.trust.export()}
@@ -598,7 +598,7 @@ def latest_bundle_time(models_dir):
 
 
 def needs_retrain(lake, models_dir):
-    ts = [ts for ts, _ in cycle_rows(lake)]
+    ts = [e["ts"] for e in newest_cycles(lake)]
     if not ts:
         return False
     newest = max(ts)

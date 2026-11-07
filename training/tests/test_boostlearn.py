@@ -193,6 +193,8 @@ def test_boost_cycle_enters_as_known_episode_and_overshoot_excluded(lake, tmp_pa
 
 
 def test_retrain_trigger(lake, tmp_path):
+    add_cycle(lake, 400, room="wohnzimmer", mode="shadow")
+    assert not needs_retrain(lake, tmp_path / "m0")
     models = tmp_path / "models"
     assert boostcheck(CFG, lake, models) == 0
     add_cycle(lake, 500)
