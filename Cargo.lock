@@ -733,6 +733,7 @@ dependencies = [
  "chrono",
  "duckdb",
  "http-body-util",
+ "libm",
  "matter-controller",
  "ort",
  "parquet",

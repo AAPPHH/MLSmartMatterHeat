@@ -280,8 +280,8 @@ fn export_and_report_section_with_data() {
     assert!(section.contains("### Sprungantworten des Tages") && section.contains("| a |") && section.contains("schedule") && section.contains("optimistisch"), "{section}");
 }
 
-fn boost_event(variant: &str, mode: &str, extra: serde_json::Value) -> Event {
-    let mut detail = serde_json::json!({"room": "a", "variant": variant, "mode": mode, "cycle_id": "boost-a-1", "start_ts_ms": at(100) / 1000, "target": 20.0, "setpoint_old": 18.0, "start_temp": 18.0, "model_version": "v1", "exploration": mode == "live"});
+fn boost_event(mode: &str, extra: serde_json::Value) -> Event {
+    let mut detail = serde_json::json!({"room": "a", "variant": "boost_learn", "mode": mode, "cycle_id": "boost-a-1", "start_ts_ms": at(100) / 1000, "target": 20.0, "setpoint_old": 18.0, "start_temp": 18.0, "model_version": "v1", "scenario": "morning"});
     detail.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
     let mut event = Event::now("boost_cycle", "heatd").with_detail(detail);
     event.ts = at(190);
@@ -293,19 +293,16 @@ fn boost_event(variant: &str, mode: &str, extra: serde_json::Value) -> Event {
 fn boost_cycles_extend_step_responses_and_the_report() {
     let dir = tempfile::tempdir().unwrap();
     write_lake(dir.path(), &two_rooms(), |sink| {
-        sink.append(boost_event("grey_box", "shadow", serde_json::json!({"planned_t_off_min": 31.0, "predicted_peak_c": 20.0, "overshoot_c": 0.0, "minutes_to_target_0_3": 40.0, "valve_over_50_min": 35.0}))).unwrap();
-        sink.append(boost_event("residual", "shadow", serde_json::json!({"planned_t_off_min": 28.0, "predicted_peak_c": 19.97, "overshoot_c": 0.0, "minutes_to_target_0_3": 38.0, "valve_over_50_min": 30.0}))).unwrap();
-        sink.append(boost_event("residual", "shadow", serde_json::json!({"status": "unavailable"}))).unwrap();
+        sink.append(boost_event("live", serde_json::json!({"boost_min": 7.0, "allowed_min": 8.0, "overshoot_c": 0.1, "minutes_to_target_0_3": 40.0}))).unwrap();
+        sink.append(boost_event("refused", serde_json::json!({"reason": "kein sicherer Boost", "scenario": "homecoming"}))).unwrap();
+        sink.append(boost_event("aborted", serde_json::json!({"end": "not_written"}))).unwrap();
     });
     let db = open_dynamics(dir.path(), day(), day()).unwrap();
-    let row = |variant: &str, col: &str| -> Option<f64> { db.conn.query_row(&format!("SELECT {col} FROM step_responses WHERE room = 'a' AND variant = '{variant}'"), [], |r| r.get(0)).unwrap() };
     assert_eq!(count(&db, "SELECT count(*) FROM step_responses WHERE variant = 'baseline' AND mode = 'measured'"), 4);
-    assert_eq!(count(&db, "SELECT count(*) FROM step_responses WHERE mode = 'shadow'"), 2);
-    assert_eq!(row("grey_box", "planned_t_off_min"), Some(31.0));
-    assert_eq!(row("residual", "predicted_peak_c"), Some(19.97));
-    assert_eq!(row("grey_box", "valve_over_50_min"), Some(35.0));
+    assert_eq!(count(&db, "SELECT count(*) FROM step_responses WHERE variant = 'boost_learn'"), 1);
+    assert_eq!(count(&db, "SELECT count(*) FROM step_responses WHERE variant = 'boost_learn' AND mode = 'live'"), 1);
     assert!(db.conn.query_row::<Option<f64>, _, _>("SELECT minutes_to_target_0_3 FROM step_responses WHERE variant = 'baseline' AND room = 'a' AND direction = 'heat_up'", [], |r| r.get(0)).unwrap().is_some());
     assert_eq!(count(&db, "SELECT count(*) FROM radiator_summary"), 2);
     let section = report_section(dir.path(), day()).unwrap();
-    assert!(section.contains("### Aufheizen: baseline gegen grey_box und residual") && section.contains("| a | baseline / measured |") && section.contains("| a | grey_box / shadow | 1 |") && section.contains("| a | residual / shadow | 1 |") && section.contains("Schatten, noch 6 Tage"), "{section}");
+    assert!(section.contains("### Aufheizen: Boost nach Szenario") && section.contains("| a | morning | 1 | 7,0 | 8,0 | 0,10 | 0,10 |") && section.contains("| a | homecoming | 1 | kein sicherer Boost |"), "{section}");
 }

@@ -223,7 +223,6 @@ impl BrWatchdog {
         }
         let die = self.runtime.lock().unwrap().die_temperature_c.filter(|_| polled.is_ok());
         if let Some(value) = die {
-            state.boost.note_ambient("die_c", value);
             log("br ambient", state.sink.append(lake::Ambient { ts: now_us, source: "br".into(), sensor: "die_c".into(), value, unit: "C".into() }));
         }
         if healthy {

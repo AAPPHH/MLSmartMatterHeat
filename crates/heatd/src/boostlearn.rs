@@ -1,4 +1,3 @@
-use crate::window_model::bundle_candidates;
 use anyhow::{anyhow, bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -136,6 +135,13 @@ pub struct Decision {
     pub neighbours: Vec<Neighbour>,
 }
 
+struct Known {
+    dose: Option<f64>,
+    n_similar: usize,
+    neighbours: Vec<Neighbour>,
+    nearest: Option<(f64, f64)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BoostModel {
     raw: Raw,
@@ -239,6 +245,7 @@ impl BoostModel {
         self.raw.scenarios.iter().any(|s| s == scenario)
     }
 
+    #[cfg(test)]
     pub fn doses(&self) -> &[f64] {
         &self.cand
     }
@@ -302,7 +309,7 @@ impl BoostModel {
         Ok((self.exceed(model, &pk.iter().collect::<Vec<_>>(), target), pk))
     }
 
-    fn known(&self, ctx: &Context, room: &str, scenario: &str) -> (Option<f64>, usize, Vec<Neighbour>, Option<(f64, f64)>) {
+    fn known(&self, ctx: &Context, room: &str, scenario: &str) -> Known {
         let t = &self.raw.trust;
         let f = ctx.features(self.raw.since_open_cap_min);
         let z: [f64; FEATURES] = std::array::from_fn(|i| (f[i] - t.mean[i]) / t.std[i]);
@@ -319,12 +326,12 @@ impl BoostModel {
         let mut near: Vec<(usize, f64)> = own.iter().copied().filter(|(_, d)| *d <= t.radius).collect();
         if near.is_empty() {
             let nearest = own.iter().copied().fold(None, |best: Option<(usize, f64)>, c| if best.is_none_or(|b| c.1 < b.1) { Some(c) } else { best });
-            return (None, 0, Vec::new(), nearest.map(|(i, d)| (round3(d), round3(t.episodes[i].dose))));
+            return Known { dose: None, n_similar: 0, neighbours: Vec::new(), nearest: nearest.map(|(i, d)| (round3(d), round3(t.episodes[i].dose))) };
         }
         near.sort_by(|a, b| a.1.total_cmp(&b.1));
         let known = near.iter().map(|(i, _)| t.episodes[*i].dose).fold(f64::NEG_INFINITY, f64::max);
         let neighbours = near.iter().take(t.k).map(|(i, d)| Neighbour { i: *i, dist: round3(*d), dose: round3(t.episodes[*i].dose) }).collect();
-        (Some(known), near.len(), neighbours, None)
+        Known { dose: Some(known), n_similar: near.len(), neighbours, nearest: None }
     }
 
     pub fn decide(&self, room: &str, ctx: &Context, scenario: &str, target: f64, hist: Option<&[f64]>, pick: &dyn Fn(usize) -> usize) -> Result<Decision> {
@@ -332,7 +339,7 @@ impl BoostModel {
         let (p, pk) = self.risk(room, ctx, target, hist)?;
         let dmin = self.raw.dose.min_min;
         let d_safe = p.iter().rposition(|v| *v <= self.raw.risk.p_max).map_or(0.0, |i| self.cand[i]);
-        let (known, n_similar, neighbours, nearest) = self.known(ctx, room, scenario);
+        let Known { dose: known, n_similar, neighbours, nearest } = self.known(ctx, room, scenario);
         let cap = d_safe.min(known.map_or(dmin, |k| dmin.max(self.raw.trust.growth * k)));
         let allowed = if self.scenario_allowed(scenario) && ctx.supply_ok > 0.0 && cap >= dmin - 1e-9 { cap } else { 0.0 };
         let (mut chosen, mut p_chosen, mut p_allowed, mut j) = (0.0, p[0], p[0], None);
@@ -354,10 +361,11 @@ impl BoostModel {
     }
 }
 
+#[cfg(test)]
 pub fn try_load(base: &str) -> Option<BoostModel> {
-    bundle_candidates(Path::new(base)).into_iter().find_map(|(_, path)| BoostModel::load(&path).ok())
+    crate::window_model::bundle_candidates(Path::new(base)).into_iter().find_map(|(_, path)| BoostModel::load(&path).ok())
 }
 
 #[cfg(test)]
 #[path = "boostlearn_tests.rs"]
-mod tests;
+pub(crate) mod tests;

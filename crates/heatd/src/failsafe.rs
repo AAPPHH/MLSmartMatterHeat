@@ -59,7 +59,7 @@ impl Failsafe {
 
     pub fn cap_for(&self, target: Option<f64>) -> f64 {
         match target {
-            Some(t) if t > self.0.section.max_c + MARGIN_C => self.0.section.boost_max_c,
+            Some(t) if t > self.0.section.max_c + MARGIN_C => ((t * 2.0).ceil() / 2.0).min(self.0.section.boost_max_c),
             _ => self.0.section.max_c,
         }
     }
@@ -252,8 +252,15 @@ mod tests {
         }
         assert_eq!(
             mock.write_log(),
-            vec![("limit", 5, 22.0), ("setpoint", 5, 20.0), ("limit", 5, 28.5), ("setpoint", 5, 28.0), ("setpoint", 5, 28.0), ("setpoint", 5, 18.0), ("limit", 5, 22.0), ("setpoint", 5, 8.0)]
+            vec![("limit", 5, 22.0), ("setpoint", 5, 20.0), ("limit", 5, 28.0), ("setpoint", 5, 28.0), ("setpoint", 5, 28.0), ("setpoint", 5, 18.0), ("limit", 5, 22.0), ("setpoint", 5, 8.0)]
         );
+    }
+
+    #[test]
+    fn the_cap_rises_only_as_far_as_the_boost_needs() {
+        let f = Failsafe::new(&crate::config::FailsafeSection::default(), None);
+        let caps = [None, Some(21.0), Some(22.0), Some(24.0), Some(24.2), Some(27.9), Some(40.0)].map(|t| f.cap_for(t));
+        assert_eq!(caps, [22.0, 22.0, 22.0, 24.0, 24.5, 28.0, 28.5]);
     }
 
     #[tokio::test]

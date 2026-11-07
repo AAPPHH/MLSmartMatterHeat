@@ -150,6 +150,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/state", get(api_state))
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
+        .route("/api/boost", get(boost_state).post(boost))
         .route("/api/label", post(label))
         .route("/api/label/void", post(label_void))
         .route("/api/labels/progress", get(labels_progress))
@@ -178,7 +179,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 ");
     state.latest.all().iter().for_each(|r| ages.push_str(&format!("heatd_reading_age_seconds{{node=\"{}\",attribute=\"{}\"}} {}
 ", r.node, r.attribute, ((now - r.ts) as f64 / 1000.0).max(0.0))));
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{ages}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour)))
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour)))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -669,7 +670,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "boost": state.boost.summary(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 fn devices_view(state: &AppState) -> anyhow::Result<Vec<Value>> {
@@ -689,11 +690,27 @@ async fn snapshot(State(state): State<AppState>) -> ApiResult {
     Ok(Json(json!({"path": state.config.snapshot_path})))
 }
 
-async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> ApiResult {
-    let event = state.windows.lock().unwrap().manual(&body.room, body.open, now_ms());
-    event.into_iter().for_each(|e| crate::rules::window_event(&state, e));
-    let open = state.windows.lock().unwrap().open_rooms();
-    Ok(Json(json!({"window_open": open.iter().collect::<Vec<_>>()})))
+async fn window(State(state): State<AppState>, Json(body): Json<WindowBody>) -> Response {
+    let intent = if body.open { crate::intent::Intent::WindowOpen { room: body.room } } else { crate::intent::Intent::WindowClose { room: body.room } };
+    let reply = crate::intent::apply(&state, intent);
+    (reply.status, Json(reply.body)).into_response()
+}
+
+#[derive(Deserialize)]
+struct BoostBody {
+    room: String,
+    minutes: Option<f64>,
+    scenario: Option<String>,
+}
+
+async fn boost(State(state): State<AppState>, Json(body): Json<BoostBody>) -> Response {
+    let reply = crate::intent::apply(&state, crate::intent::Intent::Boost { room: body.room, minutes: body.minutes, scenario: body.scenario });
+    (reply.status, Json(reply.body)).into_response()
+}
+
+async fn boost_state(State(state): State<AppState>) -> Json<Value> {
+    let rooms: Vec<Value> = state.config.rooms.iter().filter(|r| !r.nodes.is_empty()).map(|r| json!({"room": r.name, "boost": state.boost.view(&r.name)})).collect();
+    Json(json!({"summary": state.boost.summary(), "rooms": rooms}))
 }
 
 const LABEL_DEDUP_US: i64 = 35_000_000;
@@ -828,9 +845,6 @@ async fn ambient(State(state): State<AppState>, Json(body): Json<AmbientBody>) -
             return Err(ApiError::bad("reading needs sensor ^[a-z0-9_]{1,16}$, unit 1..8 alphanumeric characters and a finite value"));
         }
     }
-    for r in body.readings.iter().filter(|r| crate::thermal::AMBIENT.contains(&r.sensor.as_str())) {
-        state.boost.note_ambient(&r.sensor, r.value);
-    }
     let rows: Vec<lake::Ambient> = body.readings.into_iter().map(|r| lake::Ambient { ts: body.ts * 1000, source: body.source.clone(), sensor: r.sensor, value: r.value, unit: r.unit }).collect();
     let stored = rows.len();
     state.sink.append_many(rows)?;
@@ -889,6 +903,7 @@ mod tests {
         let config = Config::parse(&toml).unwrap();
         let mock = Arc::new(MockController::new(1));
         mock.add_node(5, 19.0, 19.0);
+        let boost = crate::boost::Boost::new(&config);
         let model = with_model.then(|| Arc::new(RoomModel::load(&Path::new(FIXTURES).join("room_model.onnx")).unwrap()));
         let sink = crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap();
         let status = crate::status::Status::new(crate::lake::now_us());
@@ -906,7 +921,7 @@ mod tests {
             commanded: Default::default(),
             explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
             tracker: Default::default(),
-            boost: Default::default(),
+            boost,
             batch_seq: Arc::new(AtomicU64::new(1)),
         };
         Harness { state, mock, _dir: dir }
@@ -2297,7 +2312,6 @@ nodes = [5]
             assert!(call(&h.state, "POST", "/api/ambient", Some(b.clone())).await.0.is_client_error(), "{b}");
         }
         assert_eq!(lake_rows(&h, "ambient").iter().map(|b| b.num_rows()).sum::<usize>(), 2);
-        assert_eq!((h.state.boost.ambient_value("nvme_c"), h.state.boost.ambient_value("pkg_w"), h.state.boost.ambient_value("die_c")), (Some(41.5), Some(3.25), None));
     }
 
     #[tokio::test]
@@ -2473,5 +2487,40 @@ nodes = [5]
         let again = restarted(&guarded);
         crate::restore::restore(&again, now).unwrap();
         assert!(!again.tracker.lock().unwrap().confirmed("pixel-watch"));
+    }
+
+    #[tokio::test]
+    async fn boost_api_refuses_without_a_bundle_and_reports_the_state() {
+        let h = harness(false);
+        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "minutes": 5}).to_string())).await;
+        assert_eq!((status, body["ok"].clone(), body["reason"].as_str()), (StatusCode::CONFLICT, false.into(), Some("kein Boost-Modell geladen")));
+        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "keller"}).to_string())).await;
+        assert_eq!((status, body["reason"].as_str()), (StatusCode::NOT_FOUND, Some("unbekannter Raum keller")));
+        let (status, body) = call(&h.state, "GET", "/api/boost", None).await;
+        assert_eq!((status, body["rooms"][0]["room"].as_str(), body["rooms"][0]["boost"]["state"].as_str(), body["rooms"][0]["boost"]["reason"].as_str(), body["summary"]["model_version"].is_null()), (StatusCode::OK, Some("wohnzimmer"), Some("idle"), Some("kein Boost-Modell geladen"), true));
+        let (_, state) = call(&h.state, "GET", "/api/state", None).await;
+        assert_eq!((state["rooms"][0]["boost"]["reason"].as_str(), state["boost"]["enabled"].as_bool()), (Some("kein Boost-Modell geladen"), Some(true)));
+        assert!(call_text(&h.state, "/metrics").await.1.contains("heatd_boost_model_loaded 0"));
+    }
+
+    #[tokio::test]
+    async fn boost_api_decides_through_the_model_and_the_window_route_uses_the_intent_layer() {
+        let h = harness(false);
+        h.state.boost.set_model(crate::boostlearn::tests::light_model());
+        let now = now_ms();
+        for (attribute, value) in [(crate::window::LOCAL_TEMPERATURE, 16.0), (crate::window::PI_HEATING_DEMAND, 10.0)] {
+            h.state.boost.observe(5, attribute, value, now);
+        }
+        let rooms = [crate::boost::RoomIn { room: "wohnzimmer".into(), setpoint: 20.0, blocked: None, no_raise: false, no_supply: false }];
+        h.state.boost.step(&crate::boost::StepIn { now_ms: now, hour: 6.5, outdoor: Some((5.0, None)), radiation: None, sleep: false, away: false, rooms: &rooms });
+        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "minutes": 3.0, "scenario": "morning"}).to_string())).await;
+        assert_eq!((status, body["ok"].clone(), body["state"].as_str(), body["cycle"]["minutes"].as_f64(), body["source"].as_str()), (StatusCode::OK, true.into(), Some("armed"), Some(3.0), Some("manual")));
+        let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "scenario": "room_change"}).to_string())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["reason"].as_str().unwrap().contains("laeuft bereits"), "{body}");
+        let (status, body) = call(&h.state, "POST", "/api/window", Some(json!({"room": "wohnzimmer", "open": true}).to_string())).await;
+        assert_eq!((status, body["window_open"].clone()), (StatusCode::OK, json!(["wohnzimmer"])));
+        let (_, body) = call(&h.state, "POST", "/api/window", Some(json!({"room": "wohnzimmer", "open": false}).to_string())).await;
+        assert_eq!(body["window_open"], json!([]));
     }
 }

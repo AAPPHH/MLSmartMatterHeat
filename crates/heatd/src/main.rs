@@ -15,6 +15,7 @@ mod dynamics;
 #[cfg(test)]
 mod context_tests;
 mod http;
+mod intent;
 mod infer;
 mod inventory;
 mod lake;
@@ -33,7 +34,6 @@ mod restore;
 mod rules;
 mod status;
 mod storage;
-mod thermal;
 mod watchmatch;
 #[cfg(test)]
 mod watchmatch_tests;
@@ -245,7 +245,7 @@ async fn serve(config: Config) -> Result<()> {
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(lake::now_us() as u64)),
         config,
     };
-    boost::spawn_background(boost, std::path::PathBuf::from(&state.config.data_dir));
+    boost::spawn_background(boost);
     failsafe::spawn_background(state.clone());
     match restore::restore(&state, lake::now_us() / 1000) {
         Ok(summary) => println!("presence restore: {summary}"),

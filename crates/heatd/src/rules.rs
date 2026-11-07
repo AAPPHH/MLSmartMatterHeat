@@ -650,7 +650,7 @@ pub fn clamp_setpoint(readings: &[Reading], node: u64, setpoint: f64, cap: f64) 
     setpoint.clamp(lo, hi.min(cap))
 }
 
-fn clamp_boost(readings: &[Reading], node: u64, setpoint: f64, cap: f64) -> f64 {
+pub(crate) fn clamp_boost(readings: &[Reading], node: u64, setpoint: f64, cap: f64) -> f64 {
     setpoint.clamp(setpoint_limits(readings, node).0, cap)
 }
 
@@ -717,11 +717,13 @@ fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], no
 }
 
 #[allow(clippy::too_many_arguments)]
-fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now: NaiveDateTime, now_ms: i64, window_busy: &HashSet<String>, away: bool, exploring: &HashMap<String, Experiment>) {
+fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now: NaiveDateTime, now_ms: i64, window_busy: &HashSet<String>, flags: (bool, bool), exploring: &HashMap<String, Experiment>) {
+    let (away, sleep) = flags;
     if !state.boost.enabled() {
         return;
     }
     let held = |room: &Room| state.commanded.lock().unwrap().holding(&room.nodes);
+    let no_supply = state.windows.lock().unwrap().no_supply_rooms();
     let rooms: Vec<crate::boost::RoomIn> = state
         .config
         .rooms
@@ -739,16 +741,16 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
             } else {
                 None
             };
-            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour) })
+            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour), no_supply: no_supply.contains(&room.name) })
         })
         .collect();
     let now_us = lake::now_us();
-    let out = state.boost.step(&crate::boost::StepIn { now_ms, hour: f64::from(now.hour()) + f64::from(now.minute()) / 60.0, outdoor: state.status.outdoor(now_us), radiation: state.status.radiation(now_us), rooms: &rooms });
+    let out = state.boost.step(&crate::boost::StepIn { now_ms, hour: f64::from(now.hour()) + f64::from(now.minute()) / 60.0, outdoor: state.status.outdoor(now_us), radiation: state.status.radiation(now_us), sleep, away, rooms: &rooms });
     out.events.into_iter().for_each(|e| log("boost event", state.sink.append(e)));
     for want in wants.iter_mut() {
         match out.directives.get(&want.room) {
-            Some(crate::boost::Directive::Boost { experiment_id }) => {
-                want.setpoint = clamp_boost(readings, want.node, state.config.boost.boost_setpoint, state.failsafe.boost_max_c());
+            Some(crate::boost::Directive::Boost { experiment_id, setpoint }) => {
+                want.setpoint = clamp_boost(readings, want.node, *setpoint, state.failsafe.boost_max_c());
                 want.reason = "boost";
                 want.rule = "boost";
                 want.experiment_id = Some(experiment_id.clone());
@@ -813,7 +815,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     }
     let readings = state.latest.all();
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
-    boost_step(state, &mut wants, &readings, now, now_ms, window_busy, away, &exploring);
+    boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
     let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().holding(&r.nodes), away })).collect();
     state.windows.lock().unwrap().set_context(contexts);
@@ -895,6 +897,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                         commands.budget.record(&want.room, now_ms);
                     }
                 }
+                state.boost.wrote(&want.room, want.reason, now_ms);
                 if !matches!(want.reason, "window_open" | "no_supply" | "pi_reset") && old.is_some_and(|o| want.setpoint < o) {
                     state.windows.lock().unwrap().note_decrease(&want.room, now_ms);
                 }
@@ -994,8 +997,14 @@ pub fn spawn_background(state: AppState) {
     let looper = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let wake = looper.boost.waker();
         loop {
-            tick.tick().await;
+            let until_deadline = looper.boost.next_deadline_ms().map(|d| Duration::from_millis((d - now_ms()).max(1000) as u64));
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep(until_deadline.unwrap_or(Duration::from_secs(3600))), if until_deadline.is_some() => {}
+            }
             match control_step(&looper, Local::now().naive_local(), now_ms()).await {
                 Ok(_) if !looper.failsafe.stopping() => looper.status.control_step_done(lake::now_us()),
                 Ok(_) => {}

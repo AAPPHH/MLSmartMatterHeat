@@ -29,6 +29,7 @@ fn env(head: &str, schedule: &[(&str, &str, f64)]) -> Env {
     let status = crate::status::Status::new(crate::lake::now_us());
     let mock = Arc::new(MockController::new(1));
     mock.add_node(5, 19.0, 19.0);
+    let boost = crate::boost::Boost::new(&config);
     let state = AppState {
         watchmatch: crate::watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone()),
         storage: Arc::new(Storage::open(&config.db_path).unwrap()),
@@ -43,7 +44,7 @@ fn env(head: &str, schedule: &[(&str, &str, f64)]) -> Env {
         status,
         explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
         tracker: Default::default(),
-        boost: Default::default(),
+        boost,
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
     };
     Env { state, mock, _dir: dir }
@@ -186,4 +187,53 @@ async fn every_window_close_in_the_hour_returns_at_once() {
     }
     assert_eq!(e.writes(), vec![18.0, 21.0, 7.5, 21.0, 7.5, 21.0]);
     assert_eq!(e.used(10), 1);
+}
+
+#[tokio::test]
+async fn a_boost_consumes_the_hourly_raise_and_the_return_is_a_free_decrease() {
+    let e = env("", &[("12:00", "12:30", 18.0), ("12:30", "23:00", 21.0)]);
+    e.state.boost.set_model(crate::boostlearn::tests::light_model_for("a"));
+    e.state.status.outdoor_obs(crate::lake::now_us(), 5.0, Some(3.0));
+    let feed = |m: i64| {
+        e.state.boost.observe(5, crate::window::LOCAL_TEMPERATURE, 14.0, T0 + m * MIN);
+        e.state.boost.observe(5, crate::window::PI_HEATING_DEMAND, 10.0, T0 + m * MIN);
+    };
+    for m in 0..=8 {
+        feed(m);
+        e.at(m).await;
+    }
+    assert_eq!((e.writes(), e.used(8)), (vec![18.0], 0));
+    let reply = e.state.boost.request("a", Some(5.0), Some("morning"), T0 + 8 * MIN + 30_000);
+    assert_eq!(reply["ok"], true, "{reply}");
+    for m in 9..=29 {
+        feed(m);
+        e.at(m).await;
+    }
+    assert_eq!(e.writes(), vec![18.0, 24.0, 18.0]);
+    assert_eq!((e.used(29), e.deferred()), (1, None));
+    let limits: Vec<(&str, f64)> = e.mock.write_log().into_iter().filter(|w| w.0 == "limit" || w.2 >= 22.0 || w.2 == 18.0).map(|w| (w.0, w.2)).collect();
+    assert_eq!(limits, vec![("setpoint", 18.0), ("limit", 22.0), ("limit", 24.0), ("setpoint", 24.0), ("setpoint", 18.0), ("limit", 22.0)]);
+    for m in 30..=31 {
+        feed(m);
+        e.at(m).await;
+    }
+    assert_eq!((e.writes(), e.used(31), e.deferred()), (vec![18.0, 24.0, 18.0], 1, Some(21.0)));
+    feed(70);
+    e.at(70).await;
+    assert_eq!((e.writes().last().copied(), e.used(70)), (Some(21.0), 1));
+}
+
+#[tokio::test]
+async fn a_spent_raise_blocks_the_boost_and_a_boost_blocks_nothing_else() {
+    let e = env("", &[("12:00", "12:05", 18.0), ("12:05", "23:00", 21.0)]);
+    e.state.boost.set_model(crate::boostlearn::tests::light_model_for("a"));
+    e.state.status.outdoor_obs(crate::lake::now_us(), 5.0, Some(3.0));
+    for m in 0..=6 {
+        e.state.boost.observe(5, crate::window::LOCAL_TEMPERATURE, 14.0, T0 + m * MIN);
+        e.state.boost.observe(5, crate::window::PI_HEATING_DEMAND, 10.0, T0 + m * MIN);
+        e.at(m).await;
+    }
+    assert_eq!((e.writes(), e.used(6)), (vec![18.0, 21.0], 1));
+    let reply = e.state.boost.request("a", None, Some("morning"), T0 + 6 * MIN + 30_000);
+    assert!(reply["ok"] == false && reply["reason"].as_str().unwrap().contains("Budget"), "{reply}");
 }

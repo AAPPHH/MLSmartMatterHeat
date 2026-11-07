@@ -11,6 +11,21 @@ fn model() -> BoostModel {
     BoostModel::parse(&fixture()["bundle"].to_string()).unwrap()
 }
 
+pub fn light_model() -> BoostModel {
+    light_model_for("wohnzimmer")
+}
+
+pub fn light_model_for(room: &str) -> BoostModel {
+    let mut b: Value = serde_json::from_str(&fixture()["bundle"].to_string().replace("\"wohnzimmer\"", &format!("\"{room}\""))).unwrap();
+    b["kernel"]["len_min"] = 30.into();
+    b["horizon_min"] = 60.into();
+    for room in [room, "bad"] {
+        let keep: Vec<Value> = b["rooms"][room]["samples"].as_array().unwrap().iter().take(4).cloned().collect();
+        b["rooms"][room]["samples"] = Value::Array(keep);
+    }
+    BoostModel::parse(&b.to_string()).unwrap()
+}
+
 fn opt(v: &Value) -> Option<f64> {
     v.as_f64()
 }

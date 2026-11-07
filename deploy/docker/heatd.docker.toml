@@ -70,14 +70,8 @@ anchor_devices = ["minix-anchor"]
 
 [boost]
 enabled = true
-auto_live = true
-live_gate_days = 7
-live_min_backtest_cycles = 3
-live_rooms_override = []
-explore_min = 10.0
-model_dir = "/models/thermal"
+model_dir = "/models/boost"
 reload_min = 5.0
-boost_setpoint = 28.0
 
 [watchmatch.state]
 hr_rest_max = 70

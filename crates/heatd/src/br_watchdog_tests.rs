@@ -134,7 +134,6 @@ async fn heartbeat_carries_token_contract_body_and_die_temperature_becomes_ambie
         assert_eq!(body["ts"].as_i64(), Some(now / 1000));
     }
     assert_eq!((strings(&e, "ambient", "source"), strings(&e, "ambient", "sensor"), strings(&e, "ambient", "value")), (vec!["br".to_string()], vec!["die_c".to_string()], vec!["41.5".to_string()]));
-    assert_eq!(e.state.boost.ambient_value("die_c"), Some(41.5));
     let view = e.state.status.br_view(now).unwrap();
     assert_eq!((view["state"].as_str(), view["br_mode"].as_str(), view["br_triggered"].as_bool(), view["die_temperature_c"].as_f64()), (Some("ok"), Some("dry_run"), Some(false), Some(41.5)));
     assert!(view["last_heartbeat_ok_age_s"].as_f64().unwrap() < 5.0);

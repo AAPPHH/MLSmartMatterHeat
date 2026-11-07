@@ -1,4 +1,3 @@
-use crate::thermal::{backtest, newest_bundle_dir, BASELINE};
 use crate::report::{dur, hhmm, midnight_us, open_lake, opt, quote, rows, LakeDb, ROOM_MINUTE_SQL};
 use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
@@ -200,7 +199,7 @@ fn analyse(cx: &Env, series: &Series, idx: usize, next_start: usize, old: f64, n
         others_heating: others,
         exploration: transient.clone().any(|k| s[k].exploration),
         experiment_id: command.and_then(|c| c.experiment_id.clone()),
-        variant: BASELINE.into(),
+        variant: "baseline".into(),
         mode: "measured".into(),
         ttt_0_3: reached.map(|k| (k - idx) as f64),
         valve_over_50: Some(transient.clone().filter(|&k| s[k].valve.is_some_and(|v| v > 50.0)).count() as f64),
@@ -284,7 +283,7 @@ fn boost_steps(conn: &Connection, from_us: i64, to_us: i64) -> Result<Vec<Step>>
     for text in found {
         let Ok(d) = serde_json::from_str::<Json>(&text) else { continue };
         let (Some(room), Some(start_ms), Some(variant), Some(mode)) = (d["room"].as_str(), d["start_ts_ms"].as_i64(), d["variant"].as_str(), d["mode"].as_str()) else { continue };
-        if d["status"].as_str() == Some("unavailable") || start_ms * 1000 < from_us || start_ms * 1000 >= to_us {
+        if mode != "live" || start_ms * 1000 < from_us || start_ms * 1000 >= to_us {
             continue;
         }
         let f = |k: &str| d[k].as_f64();
@@ -485,38 +484,32 @@ pub fn report_section(root: &Path, date: NaiveDate) -> Result<String> {
     Ok(md)
 }
 
-type BoostRow = (String, String, i64, Option<f64>, Option<f64>, Option<f64>);
+type BoostRow = (String, String, i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+
+const BOOST_LIVE_SQL: &str = "SELECT json_extract_string(detail, '$.room'), json_extract_string(detail, '$.scenario'), count(*), avg(CAST(json_extract(detail, '$.boost_min') AS DOUBLE)), avg(CAST(json_extract(detail, '$.allowed_min') AS DOUBLE)), avg(CAST(json_extract(detail, '$.overshoot_c') AS DOUBLE)), max(CAST(json_extract(detail, '$.overshoot_c') AS DOUBLE)) FROM events WHERE kind = 'boost_cycle' AND json_extract_string(detail, '$.variant') = 'boost_learn' AND json_extract_string(detail, '$.mode') = 'live' GROUP BY 1, 2 ORDER BY 1, 2";
+const BOOST_REFUSED_SQL: &str = "SELECT json_extract_string(detail, '$.room'), coalesce(json_extract_string(detail, '$.scenario'), ''), count(*), any_value(json_extract_string(detail, '$.reason')) FROM events WHERE kind = 'boost_cycle' AND json_extract_string(detail, '$.mode') = 'refused' GROUP BY 1, 2 ORDER BY 1, 2";
 
 fn boost_report(c: &Connection) -> Result<String> {
-    let cfg = crate::config::Config::load(Path::new(&std::env::var("HEATD_CONFIG").unwrap_or_else(|_| "heatd.toml".into()))).map(|c| c.boost).unwrap_or_default();
-    let metrics = newest_bundle_dir(Path::new(&cfg.model_dir)).and_then(|(_, p)| std::fs::read_to_string(p.join("bundle.json")).ok()).and_then(|t| serde_json::from_str::<Json>(&t).ok()).map_or(Json::Null, |d| d["metrics"].clone());
-    let mut md = format!("### Aufheizen: baseline gegen grey_box und residual ({SUMMARY_DAYS} Tage)\n\nZiel: Raumluft-Spitze genau am Sollwert. baseline = Thermostat allein (gemessen), grey_box und residual = Schattenlauf (Prognose) bzw. live (gemessen). Spruenge ab 1 K; Ventil > 50 % in Minuten.\n\n");
-    let data: Vec<BoostRow> = rows(
-        c,
-        "SELECT room, variant, mode, count(*), avg(overshoot_c), avg(minutes_to_target_0_3), avg(valve_over_50_min) FROM step_responses WHERE direction = 'heat_up' AND step_c >= 1.0 GROUP BY room, variant, mode ORDER BY room, CASE variant WHEN 'baseline' THEN 0 WHEN 'grey_box' THEN 1 ELSE 2 END, mode",
-        |r| Ok((r.get::<_, String>(0)?, format!("{} / {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-    )?;
-    if data.is_empty() {
-        md.push_str("Keine Aufheizzyklen im Zeitraum.\n\n");
+    let mut md = format!("### Aufheizen: Boost nach Szenario ({SUMMARY_DAYS} Tage)\n\nBoost nur morgens (Uhr meldet Aufwachen) und bei Heimkehr, 24 C fuer 5 bis 20 Minuten, Dosis nie mehr als 10 % ueber der staerksten bekannten Dosis. Ueberschwingen = Spitze ueber dem Ziel in den 60 Minuten nach dem Boost.\n\n");
+    let live: Vec<BoostRow> = rows(c, BOOST_LIVE_SQL, |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
+    let refused: Vec<(String, String, i64, String)> = rows(c, BOOST_REFUSED_SQL, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<String>>(3)?.unwrap_or_default())))?;
+    if live.is_empty() && refused.is_empty() {
+        md.push_str("Keine Boost-Zyklen und keine verweigerten Boosts im Zeitraum.\n\n");
         return Ok(md);
     }
-    let days: BTreeMap<String, i64> = rows(c, "SELECT room, count(DISTINCT CAST(t_start AS DATE)) FROM step_responses WHERE mode = 'shadow' GROUP BY room", |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.into_iter().collect();
-    let live: BTreeMap<String, String> = rows(c, "SELECT DISTINCT room, variant FROM step_responses WHERE mode = 'live'", |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?.into_iter().collect();
-    md.push_str("| Raum | Variante / Modus | Zyklen | mittl. Ueberschwingen K | bis Ziel min | Ventil > 50 % min | Backtest RMSE K | Live-Status |\n|---|---|---|---|---|---|---|---|\n");
-    for (room, label, n, over, ttt, v50) in data {
-        let variant = label.split(" / ").next().unwrap_or_default();
-        let key = [room.clone(), format!("{room}_0")].into_iter().find(|k| metrics["backtest"][k.as_str()].is_object()).unwrap_or_else(|| room.clone());
-        let rmse = if variant == BASELINE { None } else { backtest(&metrics, &key, variant).0 };
-        let status = if variant == BASELINE {
-            "-".to_string()
-        } else if live.get(&room).is_some_and(|v| v == variant) {
-            "live".to_string()
-        } else {
-            let left = (cfg.live_gate_days as i64 - days.get(&room).copied().unwrap_or(0)).max(0);
-            if left == 0 { "Gate erfuellt".to_string() } else { format!("Schatten, noch {left} Tage") }
-        };
-        let _ = writeln!(md, "| {room} | {label} | {n} | {} | {} | {} | {} | {status} |", de(over, 2), de(ttt, 0), de(v50, 0), de(rmse, 3));
+    if !live.is_empty() {
+        md.push_str("| Raum | Szenario | Zyklen | Boost min (mittel) | erlaubt min (mittel) | Ueberschwingen K (mittel) | Ueberschwingen K (max) |\n|---|---|---|---|---|---|---|\n");
+        for (room, scenario, n, dose, allowed, over, worst) in live {
+            let _ = writeln!(md, "| {room} | {scenario} | {n} | {} | {} | {} | {} |", de(dose, 1), de(allowed, 1), de(over, 2), de(worst, 2));
+        }
+        md.push('\n');
     }
-    md.push('\n');
+    if !refused.is_empty() {
+        md.push_str("Verweigert (Szenario erkannt, aber kein sicherer oder erlaubter Boost):\n\n| Raum | Szenario | Anzahl | letzter Grund |\n|---|---|---|---|\n");
+        for (room, scenario, n, reason) in refused {
+            let _ = writeln!(md, "| {room} | {scenario} | {n} | {reason} |");
+        }
+        md.push('\n');
+    }
     Ok(md)
 }
