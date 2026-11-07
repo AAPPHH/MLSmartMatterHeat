@@ -924,10 +924,15 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
         commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
         return None;
     };
-    if near(report.value, sent.target) || [sent.acked, sent.stale].into_iter().flatten().any(|a| near(a, report.value)) {
+    if near(report.value, sent.target) {
+        (sent.acked, sent.stale) = (None, None);
         return None;
     }
-    if now_ms - sent.written_ms < grace_ms {
+    let in_grace = now_ms - sent.written_ms < grace_ms;
+    if sent.acked.is_some_and(|a| near(a, report.value)) || (in_grace && sent.stale.is_some_and(|a| near(a, report.value))) {
+        return None;
+    }
+    if in_grace {
         if !sent.previous.is_some_and(|p| near(p, report.value)) {
             sent.acked = Some(report.value);
         }
