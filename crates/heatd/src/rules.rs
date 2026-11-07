@@ -20,25 +20,25 @@ type Series<'a> = (&'a str, &'a str, &'a str, &'a dyn Fn(&Room) -> f64);
 
 #[derive(Debug, Default)]
 pub struct RaiseBudget {
-    raises: HashMap<String, Vec<(i64, bool)>>,
+    raises: HashMap<String, Vec<i64>>,
     held: HashMap<u64, f64>,
     deferred_total: HashMap<String, u64>,
 }
 
 impl RaiseBudget {
-    fn live(&self, room: &str, now_ms: i64) -> Vec<(i64, bool)> {
-        self.raises.get(room).into_iter().flatten().copied().filter(|(t, _)| now_ms - t < BUDGET_WINDOW_MS).collect()
+    fn live(&self, room: &str, now_ms: i64) -> Vec<i64> {
+        self.raises.get(room).into_iter().flatten().copied().filter(|t| now_ms - t < BUDGET_WINDOW_MS).collect()
     }
 
-    pub fn allows(&self, room: &str, now_ms: i64, limit: u32, priority: bool) -> bool {
+    pub fn allows(&self, room: &str, now_ms: i64, limit: u32) -> bool {
         let live = self.live(room, now_ms);
-        limit == 0 || live.iter().any(|(t, _)| *t == now_ms) || live.iter().filter(|(_, p)| *p || !priority).count() < limit as usize
+        limit == 0 || live.contains(&now_ms) || live.len() < limit as usize
     }
 
-    fn record(&mut self, room: &str, now_ms: i64, priority: bool) {
+    fn record(&mut self, room: &str, now_ms: i64) {
         let entries = self.raises.entry(room.into()).or_default();
-        entries.retain(|(t, _)| now_ms - t < BUDGET_WINDOW_MS);
-        entries.push((now_ms, priority));
+        entries.retain(|t| now_ms - t < BUDGET_WINDOW_MS);
+        entries.push(now_ms);
     }
 
     pub fn used(&self, room: &str, now_ms: i64) -> usize {
@@ -47,7 +47,7 @@ impl RaiseBudget {
 
     pub fn next_free_ms(&self, room: &str, now_ms: i64, limit: u32) -> Option<i64> {
         let live = self.live(room, now_ms);
-        (limit > 0 && live.len() >= limit as usize).then(|| live[live.len() - limit as usize].0 + BUDGET_WINDOW_MS)
+        (limit > 0 && live.len() >= limit as usize).then(|| live[live.len() - limit as usize] + BUDGET_WINDOW_MS)
     }
 
     fn defer(&mut self, room: &str, node: u64, setpoint: f64) -> bool {
@@ -605,9 +605,11 @@ fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Opt
     if want.reason == "no_supply" {
         return Verdict::Exempt("supply_cap");
     }
-    let priority = last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset"));
-    if commands.budget.allows(&want.room, now_ms, limit, priority) {
-        Verdict::Raise { priority }
+    if last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset")) {
+        return Verdict::Exempt("window_close");
+    }
+    if commands.budget.allows(&want.room, now_ms, limit) {
+        Verdict::Raise
     } else {
         Verdict::Deferred
     }
@@ -617,7 +619,7 @@ fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Opt
 enum Verdict {
     Free,
     Exempt(&'static str),
-    Raise { priority: bool },
+    Raise,
     Deferred,
 }
 
@@ -737,7 +739,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
             } else {
                 None
             };
-            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour, false) })
+            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour) })
         })
         .collect();
     let now_us = lake::now_us();
@@ -793,7 +795,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
         let base = |room: &Room| base_setpoint(room, &state.config, now);
         let mut explorer = state.explorer.lock().unwrap();
-        let no_raise = |room: &str| !state.commanded.lock().unwrap().budget.allows(room, now_ms, state.config.raise_budget_per_hour, false);
+        let no_raise = |room: &str| !state.commanded.lock().unwrap().budget.allows(room, now_ms, state.config.raise_budget_per_hour);
         let lifecycle = explorer.tick(now, &Inputs { config: &state.config, blocked: &blocked, no_raise: &no_raise, base: &base });
         let active = explorer.active().clone();
         drop(explorer);
@@ -870,7 +872,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         let mut decision = proposal(state, &want, now_ms, old, &readings, presence.as_ref());
         match verdict {
             Verdict::Exempt(why) => tag_budget(&mut decision, &format!("exempt_{why}")),
-            Verdict::Raise { .. } => tag_budget(&mut decision, "raise"),
+            Verdict::Raise => tag_budget(&mut decision, "raise"),
             _ => {}
         }
         log("decision", state.sink.append(decision.clone()));
@@ -889,8 +891,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                     commands.deferred.remove(&want.node);
                     commands.budget.held.remove(&want.node);
                     commands.restored.insert(want.node);
-                    if let Verdict::Raise { priority } = verdict {
-                        commands.budget.record(&want.room, now_ms, priority);
+                    if verdict == Verdict::Raise {
+                        commands.budget.record(&want.room, now_ms);
                     }
                 }
                 if !matches!(want.reason, "window_open" | "no_supply" | "pi_reset") && old.is_some_and(|o| want.setpoint < o) {

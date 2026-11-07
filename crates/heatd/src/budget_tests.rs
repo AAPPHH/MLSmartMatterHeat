@@ -50,6 +50,19 @@ fn env(head: &str, schedule: &[(&str, &str, f64)]) -> Env {
 }
 
 impl Env {
+    fn tags(&self) -> Vec<String> {
+        use arrow::array::{Array, AsArray, StructArray};
+        self.state.sink.flush().unwrap();
+        let mut files: Vec<_> = std::fs::read_dir(self._dir.path().join("lake/raw/decisions")).unwrap().flatten().map(|e| e.path()).collect();
+        files.sort();
+        files.iter().flat_map(|f| crate::lake::load_stream(f).unwrap().batches).flat_map(|b| {
+            let inputs = b.column_by_name("inputs").unwrap().as_any().downcast_ref::<StructArray>().unwrap().column_by_name("extra").unwrap().clone();
+            let text = arrow::compute::cast(&inputs, &arrow::datatypes::DataType::Utf8).unwrap();
+            let text = text.as_string::<i32>();
+            (0..text.len()).filter(|i| !text.is_null(*i)).map(|i| text.value(i).to_string()).collect::<Vec<_>>()
+        }).collect()
+    }
+
     async fn at(&self, minute: i64) {
         let now = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap() + chrono::Duration::minutes(minute);
         control_step(&self.state, now, T0 + minute * MIN).await.unwrap();
@@ -143,7 +156,7 @@ async fn forgetting_writes_after_the_br_failsafe_makes_the_next_raise_exempt() {
 }
 
 #[tokio::test]
-async fn window_close_takes_the_budget_ahead_of_other_raises() {
+async fn window_close_is_exempt_from_the_budget_and_logged_so() {
     let e = env("", &[("12:05", "12:40", 21.0), ("12:40", "23:00", 22.0)]);
     e.through(0, 20).await;
     let start = T0 + 21 * MIN;
@@ -152,14 +165,15 @@ async fn window_close_takes_the_budget_ahead_of_other_raises() {
     e.state.windows.lock().unwrap().manual("a", false, start + MIN);
     e.at(22).await;
     assert_eq!(e.writes(), vec![18.0, 21.0, 7.5, 21.0]);
-    assert_eq!(e.used(22), 2);
+    assert_eq!(e.used(22), 1);
     e.through(23, 45).await;
     assert_eq!(e.writes(), vec![18.0, 21.0, 7.5, 21.0]);
     assert_eq!(e.deferred(), Some(22.0));
+    assert_eq!(e.tags().iter().filter(|x| x.contains("exempt_window_close")).count(), 1, "{:?}", e.tags());
 }
 
 #[tokio::test]
-async fn a_second_window_close_in_the_hour_waits() {
+async fn every_window_close_in_the_hour_returns_at_once() {
     let e = env("", &[("12:05", "23:00", 21.0)]);
     e.through(0, 6).await;
     for (i, minute) in [(0, 7), (1, 9)] {
@@ -168,7 +182,8 @@ async fn a_second_window_close_in_the_hour_waits() {
         e.at(minute).await;
         e.state.windows.lock().unwrap().manual("a", false, ts + MIN);
         e.at(minute + 1).await;
-        assert_eq!(e.writes().len(), 4 + i, "round {i}");
+        assert_eq!(e.writes().len(), 4 + 2 * i, "round {i}");
     }
-    assert_eq!(e.writes(), vec![18.0, 21.0, 7.5, 21.0, 7.5]);
+    assert_eq!(e.writes(), vec![18.0, 21.0, 7.5, 21.0, 7.5, 21.0]);
+    assert_eq!(e.used(10), 1);
 }
