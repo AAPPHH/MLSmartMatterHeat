@@ -166,7 +166,7 @@ impl ChipToolConfig {
     }
 
     pub fn resubscribe_lines(&self, node: NodeId) -> Vec<String> {
-        vec![self.wildcard_line_keeping("subscribe-by-id", node, 0), self.wildcard_line_keeping("subscribe-event-by-id", node, 0)]
+        vec![self.wildcard_line_keeping("subscribe-by-id", node, 0), self.wildcard_line_keeping("subscribe-event-by-id", node, 1)]
     }
 
     pub fn subscribe_lines(&self, node: NodeId) -> Vec<String> {
@@ -1006,7 +1006,9 @@ mod tests {
     #[test]
     fn builds_wildcard_subscribe_and_poll_lines() {
         let c = config();
-        assert!(c.resubscribe_lines(5).iter().all(|l| l.contains("--keepSubscriptions 0 --auto-resubscribe 1")));
+        let resubscribe = c.resubscribe_lines(5);
+        assert!(resubscribe[0].starts_with("any subscribe-by-id") && resubscribe[0].contains("--keepSubscriptions 0 --auto-resubscribe 1"));
+        assert!(resubscribe[1].starts_with("any subscribe-event-by-id") && resubscribe[1].contains("--keepSubscriptions 1 --auto-resubscribe 1"));
         assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
         assert_eq!(
             c.subscribe_lines(5),
