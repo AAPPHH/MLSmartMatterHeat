@@ -4,6 +4,7 @@ from heattrain.boiler import boiler
 from heattrain.thermal import thermal
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
+from heattrain.windowml import run_windowml
 
 CONFIG = {
     "timezone": "Europe/Berlin",
@@ -40,6 +41,15 @@ CONFIG = {
         "cycle_closed_min": 30, "cycle_window_min": 240, "cycle_min_len": 60, "target_tol": 0.3,
         "horizon_min": 300, "toff_max": 180, "toff_step": 1, "overshoot_tol": 0.3, "boost_setpoint": 28.0,
         "parity_rows": 400, "parity_tol": 1e-4, "parity_nan_frac": 0.05,
+    },
+    "window": {
+        "lake": "/home/user/AppData/Local/Temp/claude/ebd84cbf4dbe962a/349be985-dace-4f4a-be42-5da1745ce8a6/scratchpad/lake",
+        "rooms": ["wohnzimmer", "schlafzimmer", "bad", "kueche"], "nodes": {"wohnzimmer": 5, "schlafzimmer": 6, "bad": 7, "kueche": 8},
+        "utc_offset_min": 60, "valid": {"temp": [0.0, 45.0], "valve": [0.0, 100.0]}, "ffill_min": {"temp": 10, "valve": 30, "setpoint": 360},
+        "open_valve_pct": 10.0, "v1_open_cap_min": 40, "frost_max_c": 8.5, "frost_cap_min": 360,
+        "v1_like_min": 10, "floor": {"window_min": 180, "settled_min": 20, "ground": ["wohnzimmer", "kueche", "bad"]},
+        "criterion": {"exclude_utc": ["2026-11-07T07:30:00+00:00", "2026-11-07T10:00:00+00:00"], "hit_utc": ["2026-11-07T08:05:00+00:00", "2026-11-07T08:40:00+00:00"],
+                      "gt_channels": ["house", "wohnzimmer", "kueche", "bad"], "rate": 0.5, "report_rate": 3.0, "merge_min": 30, "top_k": 3, "list_n": 15, "max_candidates": 1500},
     },
     "boiler": {
         "timezone": "Europe/Berlin", "dt_s": 60.0, "temp_valid": [0.0, 95.0], "max_gap_s": 900.0, "invalid_wants_k": 1.0, "night_hours": [21, 6],
@@ -81,12 +91,18 @@ def run_thermalml(config, src, models_dir):
     print(out, {r: v["valid"] for r, v in bundle["rooms"].items()}, bundle["metrics"]["backtest"])
 
 
-COMMANDS = {"watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
+def run_window(config, name, lake=None):
+    run_windowml(config, name, lake)
+
+
+COMMANDS = {"windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
 
 
 def main(argv):
+    if len(argv) in (3, 4) and argv[1] == "windowml":
+        return run_window(CONFIG, *argv[2:])
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir>")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | windowml <ClassName|module:Class> [lake]")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 
