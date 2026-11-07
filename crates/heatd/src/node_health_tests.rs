@@ -4,7 +4,7 @@ use crate::status::{NodeStatus, SubState};
 use serde_json::{json, Value};
 use crate::capture::tests::{state_with, string_column};
 use crate::http::AppState;
-use matter_controller::{AttributeReport, MatterController, MockController};
+use matter_controller::{AttributeReport, MockController};
 use std::sync::Arc;
 
 const MIN: i64 = 60_000_000;
@@ -138,6 +138,12 @@ async fn a_silent_node_walks_the_ladder_with_backoff_restarts_the_session_once_a
     r.report(5, r.t0 + 402 * s);
     step(&r.state, r.t0 + 403 * s).await;
     assert_eq!(r.health(5), Health::Ok);
+    assert!(r.state.status.node_snapshot(5).unwrap().health.attempts >= 4);
+    for t in (404..600).step_by(30) {
+        r.report(5, r.t0 + t * s);
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
     assert_eq!(r.state.status.node_snapshot(5).unwrap().health.attempts, 0);
     assert!(alerts_empty(&r.state));
     assert_eq!(r.links(), vec!["ok>silent", "silent>unreachable", "unreachable>ok"]);
@@ -297,12 +303,14 @@ async fn an_unreachable_node_is_restarted_once_per_episode_then_only_resubscribe
     let gaps: Vec<i64> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
     assert!(attempts.len() <= 16 && *gaps.last().unwrap() >= 3600, "{attempts:?}");
     r.mock.set_node_silent(5, false);
-    r.report(5, r.t0 + 6 * 3600 * s);
-    step(&r.state, r.t0 + 6 * 3600 * s + s).await;
+    for t in (0..300).step_by(30) {
+        r.report(5, r.t0 + (6 * 3600 + t) * s);
+        step(&r.state, r.t0 + (6 * 3600 + t) * s + s).await;
+    }
     assert_eq!(r.health(5), Health::Ok);
     r.mock.set_node_silent(5, true);
     for t in (1..600).step_by(10) {
-        let at = r.t0 + (6 * 3600 + t) * s;
+        let at = r.t0 + (6 * 3600 + 300 + t) * s;
         r.report(6, at);
         step(&r.state, at).await;
     }
@@ -392,7 +400,7 @@ async fn a_late_priming_report_with_the_old_value_after_a_rewrite_is_no_manual_c
         step(&r.state, r.t0 + t * s).await;
     }
     assert_eq!(r.mock.setpoint_writes().len(), 1);
-    r.push(5, 19.0, r.t0 + 600 * s);
+    r.push(5, 19.0, r.t0 + 200 * s);
     assert!(r.state.commanded.lock().unwrap().hold(5).is_none());
     r.push(5, 17.0, r.t0 + 700 * s);
     assert!(r.state.commanded.lock().unwrap().hold(5).is_some());
@@ -456,4 +464,131 @@ fn the_first_alert_is_the_oldest_active_one_so_a_new_alert_does_not_displace_it(
     assert_eq!((both.len(), both[0]["id"].clone()), (2, first.clone()));
     r.state.status.update_health(5, |rec| rec.state = Health::Ok);
     assert_eq!(alerts(&r.state)[0]["id"], first);
+}
+
+fn quad() -> Rig {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockController::new(1));
+    for n in 5..=8 { mock.add_node(n, 19.0, 19.0); }
+    let state = state_with(dir.path(), mock.clone(), "[[rooms]]\nname = 'b'\nnodes = [6, 7, 8]\n");
+    state.status.register_nodes([5, 6, 7, 8]);
+    Rig { t0: state.status.started_us(), state, mock, dir }
+}
+
+async fn day(r: &Rig, periods: &[(u64, Option<i64>)]) -> (Vec<usize>, usize) {
+    let s = 1_000_000;
+    for n in 5..=8 { r.report(n, r.t0); }
+    for t in (30..86_400).step_by(30) {
+        for n in 5..=8 {
+            let p = periods.iter().find(|(x, _)| *x == n).map_or(Some(240), |(_, p)| *p);
+            if p.is_some_and(|p| t % p == 0) { r.report(n, r.t0 + t * s); }
+        }
+        step(&r.state, r.t0 + t * s).await;
+    }
+    let subs = r.mock.resubscribes();
+    ((5..=8).map(|n| subs.iter().filter(|x| **x == n).count()).collect(), r.mock.restarts())
+}
+
+#[tokio::test]
+async fn a_day_with_a_dead_node_and_flapping_nodes_stays_within_the_resubscribe_and_restart_caps() {
+    let r = quad();
+    let (subs, restarts) = day(&r, &[(5, Some(25 * 60)), (7, Some(45 * 60)), (8, None)]).await;
+    eprintln!("SIM mixed subs={subs:?} restarts={restarts}");
+    assert!(restarts <= 2, "{restarts}");
+    assert!(subs.iter().all(|c| *c <= 24) && subs[1] == 0, "{subs:?}");
+}
+
+#[tokio::test]
+async fn a_dead_node_alone_costs_one_restart_and_a_few_resubscribes_a_day() {
+    let r = quad();
+    let (subs, restarts) = day(&r, &[(5, None)]).await;
+    eprintln!("SIM dead subs={subs:?} restarts={restarts}");
+    assert_eq!((restarts, subs[1..].to_vec()), (1, vec![0, 0, 0]));
+    assert!(subs[0] <= 24, "{subs:?}");
+}
+
+#[tokio::test]
+async fn a_node_flapping_every_25_minutes_never_restarts_the_session_and_resubscribes_within_the_cap() {
+    let r = quad();
+    let (subs, restarts) = day(&r, &[(5, Some(25 * 60))]).await;
+    eprintln!("SIM flap25 subs={subs:?} restarts={restarts}");
+    assert_eq!(restarts, 0);
+    assert!(subs[0] <= 24 && subs[1..] == [0, 0, 0], "{subs:?}");
+}
+
+#[tokio::test]
+async fn a_node_flapping_every_45_minutes_restarts_the_session_at_most_once_a_day() {
+    let r = quad();
+    let (subs, restarts) = day(&r, &[(5, Some(45 * 60))]).await;
+    eprintln!("SIM flap45 subs={subs:?} restarts={restarts}");
+    assert_eq!(restarts, 1);
+    assert!(subs[0] <= 24 && subs[1..] == [0, 0, 0], "{subs:?}");
+}
+
+#[tokio::test]
+async fn the_rolling_day_caps_limit_restarts_and_resubscribes_across_nodes() {
+    let r = rig_with(&format!("{FAST}max_restarts = 9
+max_restarts_per_day = 2
+max_resubscribes_per_day = 3
+"));
+    let s = 1_000_000;
+    r.mock.set_node_silent(5, true);
+    r.mock.set_node_silent(6, true);
+    for t in (30..20_000).step_by(30) {
+        step(&r.state, r.t0 + t * s).await;
+    }
+    let subs = r.mock.resubscribes();
+    assert_eq!((r.mock.restarts(), subs.iter().filter(|n| **n == 5).count(), subs.iter().filter(|n| **n == 6).count()), (2, 3, 3));
+    for t in (86_400..86_400 + 3_600).step_by(30) {
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert!(r.mock.restarts() > 2 && r.mock.resubscribes().len() > 6);
+}
+
+#[tokio::test]
+async fn a_short_ok_blip_keeps_the_episode_counters_and_a_stable_ok_resets_them() {
+    let r = rig();
+    let s = 1_000_000;
+    r.report(5, r.t0);
+    r.mock.set_node_silent(5, true);
+    for t in (1..400).step_by(5) {
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    let before = r.state.status.node_snapshot(5).unwrap().health;
+    assert!(before.restarts == 1 && before.attempts >= 4);
+    r.report(5, r.t0 + 401 * s);
+    step(&r.state, r.t0 + 402 * s).await;
+    let blip = r.state.status.node_snapshot(5).unwrap().health;
+    assert_eq!((blip.state, blip.restarts, blip.attempts), (Health::Ok, 1, before.attempts));
+    for t in (430..620).step_by(30) {
+        r.report(5, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert_eq!(r.state.status.node_snapshot(5).unwrap().health.attempts, 0);
+}
+
+#[tokio::test]
+async fn a_manual_change_back_to_the_pre_rewrite_value_an_hour_later_is_held_and_not_overwritten() {
+    let r = rig();
+    let s = 1_000_000;
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, r.t0 / 1000);
+    r.device(5, 19.0, r.t0 + s);
+    for t in (1..140).step_by(5) {
+        r.report(5, r.t0 + t * s);
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    let writes = r.mock.setpoint_writes();
+    assert_eq!(writes, vec![(5, 21.0)]);
+    r.push(5, 21.0, r.t0 + 150 * s);
+    assert!(r.state.commanded.lock().unwrap().hold(5).is_none());
+    r.push(5, 19.0, r.t0 + 3600 * s);
+    assert!(r.state.commanded.lock().unwrap().hold(5).is_some());
+    for t in (3600..4800).step_by(5) {
+        r.report(5, r.t0 + t * s);
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert_eq!(r.mock.setpoint_writes(), writes);
 }

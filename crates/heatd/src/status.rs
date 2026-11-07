@@ -40,7 +40,8 @@ pub struct NodeStatus {
 
 const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
 const STARTUP_GRACE_US: i64 = 600_000_000;
-const BATTERY_KEEP_US: i64 = 86_400_000_000;
+pub const DAY_US: i64 = 86_400_000_000;
+const BATTERY_KEEP_US: i64 = DAY_US;
 const BATTERY_MAX_STEP_US: i64 = 1_800_000_000;
 const BATTERY_MIN_HOURS: f64 = 0.5;
 
@@ -82,6 +83,7 @@ struct Inner {
     br: Option<crate::br_watchdog::BrSnapshot>,
     stale_us: Option<i64>,
     restart_us: Option<i64>,
+    restart_log: std::collections::VecDeque<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -140,11 +142,15 @@ impl Status {
         });
     }
 
-    pub fn claim_restart(&self, now_us: i64, gap_us: i64) -> bool {
+    pub fn claim_restart(&self, now_us: i64, gap_us: i64, per_day: u32) -> bool {
         let mut inner = self.0.lock().unwrap();
-        let free = inner.restart_us.is_none_or(|t| now_us - t >= gap_us);
+        while inner.restart_log.front().is_some_and(|t| now_us - t >= DAY_US) {
+            inner.restart_log.pop_front();
+        }
+        let free = inner.restart_us.is_none_or(|t| now_us - t >= gap_us) && inner.restart_log.len() < per_day as usize;
         if free {
             inner.restart_us = Some(now_us);
+            inner.restart_log.push_back(now_us);
         }
         free
     }

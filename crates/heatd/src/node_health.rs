@@ -2,7 +2,7 @@ use crate::config::StaleSection;
 use crate::http::AppState;
 use crate::lake::{self, kind, Event};
 use crate::rules::Check;
-use crate::status::{NodeStatus, SubState};
+use crate::status::{NodeStatus, SubState, DAY_US};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt::Write;
@@ -29,11 +29,13 @@ pub struct NodeHealthSection {
     pub verify_min: f64,
     pub tolerance_c: f64,
     pub alert_retries: u32,
+    pub max_restarts_per_day: u32,
+    pub max_resubscribes_per_day: u32,
 }
 
 impl Default for NodeHealthSection {
     fn default() -> Self {
-        Self { enabled: true, tick_s: 30.0, silent_min: 10.0, unreachable_min: 30.0, min_gap_s: 60.0, backoff_start_s: 120.0, backoff_max_min: 10.0, reset_gap_min: 30.0, max_restarts: 1, restart_grace_s: 180.0, unreachable_backoff_max_min: 240.0, verify_min: 10.0, tolerance_c: 0.3, alert_retries: 3 }
+        Self { enabled: true, tick_s: 30.0, silent_min: 10.0, unreachable_min: 30.0, min_gap_s: 60.0, backoff_start_s: 120.0, backoff_max_min: 10.0, reset_gap_min: 30.0, max_restarts: 1, restart_grace_s: 180.0, unreachable_backoff_max_min: 240.0, verify_min: 10.0, tolerance_c: 0.3, alert_retries: 3, max_restarts_per_day: 2, max_resubscribes_per_day: 24 }
     }
 }
 
@@ -89,6 +91,9 @@ pub struct Record {
     pub state: Health,
     pub since_us: i64,
     pub episode_us: i64,
+    pub entered_us: i64,
+    pub ok_since_us: Option<i64>,
+    pub resub_log: std::collections::VecDeque<i64>,
     pub attempts: u32,
     pub attempts_total: u64,
     pub transitions: u64,
@@ -105,7 +110,7 @@ fn age(now_us: i64, t: Option<i64>) -> Option<f64> {
 
 impl Record {
     pub fn at(started_us: i64) -> Self {
-        Self { since_us: started_us, episode_us: started_us, ..Default::default() }
+        Self { since_us: started_us, episode_us: started_us, entered_us: started_us, ..Default::default() }
     }
 
     pub fn setpoint_alert(&self) -> bool {
@@ -168,6 +173,15 @@ fn backoff_us(cfg: &NodeHealthSection, count: u32, max_min: f64) -> i64 {
     s_us(grown.clamp(cfg.min_gap_s, (max_min * 60.0).max(cfg.min_gap_s)))
 }
 
+fn settle_episode(state: &AppState, node: u64, now_us: i64) {
+    let stable = min_us(state.config.node_health.unreachable_min);
+    state.status.update_health(node, |r| {
+        if r.state == Health::Ok && r.ok_since_us.is_some_and(|t| now_us - t >= stable) {
+            (r.attempts, r.restarts, r.last_attempt_us, r.ok_since_us) = (0, 0, None, None);
+        }
+    });
+}
+
 fn emit(state: &AppState, node: u64, detail: Value) {
     if let Err(e) = state.sink.append(Event::now(kind::NODE_HEALTH, SOURCE).with_node(node).with_detail(detail)) {
         eprintln!("node health event: {e:#}");
@@ -182,7 +196,11 @@ fn transition(state: &AppState, node: u64, snap: &NodeStatus, next: Health, star
         }
         let from = r.state;
         if from == Health::Ok {
-            r.episode_us = now_us;
+            r.entered_us = now_us;
+            r.ok_since_us = None;
+            if r.attempts == 0 {
+                r.episode_us = now_us;
+            }
         }
         r.state = next;
         r.since_us = now_us;
@@ -190,7 +208,7 @@ fn transition(state: &AppState, node: u64, snap: &NodeStatus, next: Health, star
         let episode_s = (now_us - r.episode_us) / 1_000_000;
         let attempts = r.attempts;
         if next == Health::Ok {
-            (r.attempts, r.restarts, r.last_attempt_us) = (0, 0, None);
+            r.ok_since_us = Some(now_us);
         }
         Some(json!({"aspect": "link", "from": from.name(), "to": next.name(), "silent_s": silent_s, "episode_s": episode_s, "attempts": attempts, "subscription": snap.state.name(), "last_action": r.last_action, "last_error": r.last_error}))
     });
@@ -223,11 +241,23 @@ async fn recover(state: &AppState, node: u64, health: Health, now_us: i64) {
     if state.status.restart_grace(now_us, s_us(cfg.restart_grace_s)) {
         return;
     }
-    let (due, may_restart) = state.status.update_health(node, |r| (now_us >= r.last_attempt_us.unwrap_or(r.since_us) + gap_us(cfg, stale, health, r.attempts), health == Health::Unreachable && r.restarts < cfg.max_restarts));
+    let (due, may_restart, capped) = state.status.update_health(node, |r| {
+        while r.resub_log.front().is_some_and(|t| now_us - t >= DAY_US) {
+            r.resub_log.pop_front();
+        }
+        let base = r.last_attempt_us.unwrap_or(r.since_us).max(r.entered_us);
+        (now_us >= base + gap_us(cfg, stale, health, r.attempts), health == Health::Unreachable && r.restarts < cfg.max_restarts, r.resub_log.len() >= cfg.max_resubscribes_per_day as usize)
+    });
     if !due {
         return;
     }
-    let rung = if may_restart && state.status.claim_restart(now_us, min_us(cfg.reset_gap_min)) { Rung::Restart } else { Rung::Resubscribe };
+    let rung = if may_restart && state.status.claim_restart(now_us, min_us(cfg.reset_gap_min), cfg.max_restarts_per_day) {
+        Rung::Restart
+    } else if capped {
+        return;
+    } else {
+        Rung::Resubscribe
+    };
     let outcome = match rung {
         Rung::Resubscribe => state.controller.resubscribe(node).await,
         Rung::Restart => state.controller.restart_session().await,
@@ -238,6 +268,9 @@ async fn recover(state: &AppState, node: u64, health: Health, now_us: i64) {
         r.attempts_total += 1;
         r.last_attempt_us = Some(now_us);
         r.restarts += u32::from(rung == Rung::Restart);
+        if rung == Rung::Resubscribe {
+            r.resub_log.push_back(now_us);
+        }
         r.last_action = Some(rung.name());
         r.last_error = error.clone();
     });
@@ -343,6 +376,7 @@ async fn step_node(state: AppState, node: u64, now_us: i64) {
     let started = state.status.started_us();
     let next = classify(&state.config.node_health, &snap, started, now_us);
     transition(&state, node, &snap, next, started, now_us);
+    settle_episode(&state, node, now_us);
     recover(&state, node, next, now_us).await;
     verify(&state, node, next, now_us).await;
 }
