@@ -170,7 +170,7 @@ class MainActivity : ComponentActivity() {
                 if (r != Routes.HOME) nav.navigate(r) { popUpTo(Routes.HOME); launchSingleTop = true }
             }
         }
-        SwipeDismissableNavHost(nav, startDestination = start) {
+        SwipeDismissableNavHost(nav, startDestination = start, userSwipeEnabled = start != Routes.ROOMS) {
             composable(Routes.HOME) { HomeRoute(store, nav, show, ui) }
             composable(Routes.ROOMS) { RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt) { if (prompt) finish() } }
             composable(Routes.DATA) { DataRoute(store) }
@@ -227,7 +227,7 @@ class MainActivity : ComponentActivity() {
         }
         AskScreen(ask) { answer ->
             WindowPrompter.answer(this, ask.id, answer, "page") { id ->
-                ui { if (id == null) leave() else show(when (answer) { WindowAnswer.YES -> "Fenster offen"; WindowAnswer.NO -> "Fenster zu"; else -> "Weiß nicht" }, id) }
+                ui { if (id == null) leave() else show(WindowEvent.outcome(ask, answer), id) }
             }
         }
     }
@@ -247,7 +247,9 @@ class MainActivity : ComponentActivity() {
         var busy by remember { mutableStateOf<String?>(null) }
         val reload = { Remote.boostState(this) { r -> runOnUiThread { rooms = r } } }
         LaunchedEffect(Unit) { reload() }
-        BoostScreen(rooms, result, busy) { room ->
+        var confirm by remember { mutableStateOf<String?>(null) }
+        BoostScreen(rooms, result, busy, confirm, { confirm = it }) { room ->
+            confirm = null
             busy = room
             Remote.boost(this, room) { r ->
                 runOnUiThread {

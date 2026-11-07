@@ -126,7 +126,7 @@ internal fun HomeScreen(s: HomeState, a: HomeActions) {
         if (s.openWindows.isNotEmpty()) item {
             Text("Offen: " + s.openWindows.joinToString { WindowEvent.caption(it) }, Modifier.fillMaxWidth().transformedHeight(this, spec), color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center)
         }
-        s.ask?.let { ask -> action(spec, WindowEvent.QUESTION, WindowEvent.text(ask), tonal = false, onClick = a.onAsk) }
+        s.ask?.let { ask -> action(spec, WindowEvent.question(ask), WindowEvent.text(ask), tonal = false, onClick = a.onAsk) }
         s.alerts.forEach { al ->
             item(key = al.id) {
                 TitleCard(onClick = {}, title = { Text(al.title, maxLines = 2) }, modifier = Modifier.fillMaxWidth().transformedHeight(this, spec), transformation = SurfaceTransformation(spec)) { Text(al.text, maxLines = 4) }
@@ -155,11 +155,11 @@ internal fun AskScreen(ask: WindowAsk, onAnswer: (WindowAnswer) -> Unit) {
     val spec = rememberTransformationSpec()
     ScreenScaffold(scrollState = state, edgeButton = EdgeAction(WindowEvent.YES) { onAnswer(WindowAnswer.YES) }) { padding ->
         TransformingLazyColumn(state = state, contentPadding = padding) {
-            header(spec, WindowEvent.QUESTION)
+            header(spec, WindowEvent.question(ask))
             item {
                 Text(WindowEvent.text(ask), Modifier.fillMaxWidth().transformedHeight(this, spec), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
             }
-            pair(spec, WindowEvent.YES, true, WindowEvent.NO, false, "Ja, Fenster ${WindowEvent.caption(ask.room)} ist offen", "Nein, Fenster ${WindowEvent.caption(ask.room)} ist zu", { onAnswer(WindowAnswer.YES) }, { onAnswer(WindowAnswer.NO) })
+            pair(spec, WindowEvent.YES, true, WindowEvent.NO, false, WindowEvent.yesDescription(ask), WindowEvent.noDescription(ask), { onAnswer(WindowAnswer.YES) }, { onAnswer(WindowAnswer.NO) })
             action(spec, WindowEvent.UNKNOWN) { onAnswer(WindowAnswer.UNKNOWN) }
         }
     }
@@ -179,7 +179,15 @@ internal fun WindowsScreen(rooms: List<String>, open: List<String>, onReport: (S
 }
 
 @Composable
-internal fun BoostScreen(rooms: List<BoostRoom>?, result: BoostResult?, busy: String?, onBoost: (String) -> Unit) {
+internal fun BoostScreen(rooms: List<BoostRoom>?, result: BoostResult?, busy: String?, confirm: String?, onAsk: (String?) -> Unit, onBoost: (String) -> Unit) {
+    if (confirm != null) return ListScreen { spec ->
+        header(spec, "Boost")
+        item {
+            Text(Boost.question(confirm), Modifier.fillMaxWidth().transformedHeight(this, spec), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+        }
+        action(spec, Boost.START, tonal = false) { onBoost(confirm) }
+        action(spec, Boost.CANCEL) { onAsk(null) }
+    }
     ListScreen { spec ->
         header(spec, "Boost")
         result?.let { r ->
@@ -190,7 +198,7 @@ internal fun BoostScreen(rooms: List<BoostRoom>?, result: BoostResult?, busy: St
         val list = rooms ?: Defaults.ROOMS.filter { Heat.heatable(it, null) }.map { BoostRoom(it, "", "") }
         list.forEach { r ->
             val second = listOf(Boost.state(r.state).takeIf { r.state.isNotEmpty() }, r.reason.takeIf { it.isNotEmpty() }).filterNotNull().joinToString(" - ").ifEmpty { null }
-            action(spec, WindowEvent.caption(r.room) + " " + Boost.DEFAULT_MIN + " min", if (busy == r.room) "..." else second, enabled = busy == null) { onBoost(r.room) }
+            action(spec, WindowEvent.caption(r.room) + " " + Boost.DEFAULT_MIN + " min", if (busy == r.room) "..." else second, enabled = busy == null) { onAsk(r.room) }
         }
         if (rooms == null) item { Text("Zustand nicht geladen", Modifier.fillMaxWidth().transformedHeight(this, spec), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyExtraSmall, textAlign = TextAlign.Center) }
     }

@@ -1862,8 +1862,66 @@ class CoreTest {
         assertNull(WindowEvent.parse(null, 7L))
         assertEquals("Ist das Fenster im Wohnzimmer offen?", WindowEvent.title(WindowAsk("w1", "wohnzimmer", true)))
         assertEquals("Ist das Fenster im Schlafzimmer offen?", WindowEvent.title(WindowAsk("w1", "schlafzimmer", true)))
-        assertEquals("Ist das Fenster im Bad offen?", WindowEvent.title(WindowAsk("w1", "bad", false)))
+        assertEquals("Ist das Fenster im Bad zu?", WindowEvent.title(WindowAsk("w1", "bad", false)))
         assertEquals("Ist das Fenster in der Küche offen?", WindowEvent.title(WindowAsk("w1", "kueche", true)))
+    }
+
+    @Test
+    fun windowQuestionMatchesServerQuestionAndYesIsNotInverted() {
+        val open = WindowAsk("w1", "bad", true)
+        val closed = WindowAsk("w2", "bad", false)
+        assertEquals("Fenster offen?", WindowEvent.question(open))
+        assertEquals("Fenster zu?", WindowEvent.question(closed))
+        assertEquals("Ja, Fenster Bad ist offen", WindowEvent.yesDescription(open))
+        assertEquals("Ja, Fenster Bad ist zu", WindowEvent.yesDescription(closed))
+        assertEquals("Nein, Fenster Bad ist zu", WindowEvent.noDescription(open))
+        assertEquals("Nein, Fenster Bad ist offen", WindowEvent.noDescription(closed))
+        listOf(open, closed).forEach {
+            assertEquals(WindowEvent.yesDescription(it).endsWith("offen"), WindowEvent.open(it, WindowAnswer.YES))
+            assertEquals(WindowEvent.noDescription(it).endsWith("offen"), WindowEvent.open(it, WindowAnswer.NO))
+            assertEquals("Fenster " + (if (WindowEvent.open(it, WindowAnswer.YES)) "offen" else "zu"), WindowEvent.outcome(it, WindowAnswer.YES))
+        }
+        assertEquals("Fenster zu", WindowEvent.outcome(closed, WindowAnswer.YES))
+        assertEquals("Fenster offen", WindowEvent.outcome(closed, WindowAnswer.NO))
+        assertEquals(WindowEvent.UNKNOWN, WindowEvent.outcome(closed, WindowAnswer.UNKNOWN))
+    }
+
+    @Test
+    fun swipeIsUnknownWhileExpiredSwipeIsTimeout() {
+        val ask = WindowAsk("w1", "bad", true, 1_000L)
+        assertEquals(Pair(WindowAnswer.UNKNOWN, "swipe"), WindowEvent.resolve(ask, WindowAnswer.UNKNOWN, "swipe", 2_000L))
+        assertEquals(Pair(WindowAnswer.TIMEOUT, "expiry"), WindowEvent.resolve(ask, WindowAnswer.UNKNOWN, "swipe", 1_000L + WindowEvent.EXPIRY_MS))
+        assertEquals(Pair(WindowAnswer.YES, "page"), WindowEvent.resolve(ask, WindowAnswer.YES, "page", 1_000L + WindowEvent.EXPIRY_MS))
+        val e = WindowEvent.answerEntry("w", 5L, ask, WindowAnswer.UNKNOWN, "swipe")
+        assertEquals("unknown", e.getString("answer"))
+        assertEquals("swipe", e.getString("via"))
+    }
+
+    @Test
+    fun voidedEntryKeepsPromptRecord() {
+        val e = WindowEvent.voidedEntry("w", 5L, WindowAsk("w1", "bad", true))
+        assertEquals("voided", e.getString("answer"))
+        assertEquals("undo", e.getString("via"))
+        assertEquals("w1", e.getString("prompt_id"))
+        assertEquals("bad", e.getString("room"))
+        assertTrue(WindowEvent.isWindow(e))
+        assertEquals("voided", JSONObject(WindowEvent.body(e)).getString("answer"))
+    }
+
+    @Test
+    fun oldAlertIdMigratesIntoSeen() {
+        assertEquals(listOf("a", "b"), AlertList.migrate(listOf("a"), "b"))
+        assertEquals(listOf("a", "b"), AlertList.migrate(listOf("a", "b"), "b"))
+        assertEquals(listOf("a"), AlertList.migrate(listOf("a"), null))
+        assertEquals(listOf("a"), AlertList.migrate(listOf("a"), ""))
+        assertEquals(40, AlertList.migrate((1..40).map { "i$it" }, "n").size)
+        assertTrue(AlertList.fresh(listOf(Alert("b", "t", "x")), AlertList.migrate(emptyList(), "b")).isEmpty())
+    }
+
+    @Test
+    fun boostConfirmationQuestionNamesRoomAndMinutes() {
+        assertEquals("Küche 5 min aufheizen?", Boost.question("kueche"))
+        assertEquals("Kein WLAN", Boost.failed(Boost.NO_WIFI).line)
     }
 
     @Test
@@ -1944,7 +2002,7 @@ class CoreTest {
             assertEquals("notification", b.getString("via"))
             assertEquals("id-" + answer.wire, b.getString("label_id"))
         }
-        assertEquals(listOf("yes", "no", "unknown", "timeout"), WindowAnswer.values().map { it.wire })
+        assertEquals(listOf("yes", "no", "unknown", "timeout", "voided"), WindowAnswer.values().map { it.wire })
         assertEquals(false, WindowEvent.open(WindowAsk("w", "bad", false), WindowAnswer.YES))
         assertEquals(true, WindowEvent.open(WindowAsk("w", "bad", false), WindowAnswer.NO))
         val self = JSONObject(WindowEvent.body(WindowEvent.entry("watch", 1L, "bad", true, null, "s1", via = "self")))

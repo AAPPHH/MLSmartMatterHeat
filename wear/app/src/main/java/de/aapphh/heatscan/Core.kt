@@ -85,7 +85,7 @@ class OneShot {
 
 data class WindowAsk(val id: String, val room: String, val open: Boolean, val at: Long = 0L, val reason: String = "")
 
-enum class WindowAnswer(val wire: String) { YES("yes"), NO("no"), UNKNOWN("unknown"), TIMEOUT("timeout") }
+enum class WindowAnswer(val wire: String) { YES("yes"), NO("no"), UNKNOWN("unknown"), TIMEOUT("timeout"), VOIDED("voided") }
 
 object WindowEvent {
     const val KIND = "window"
@@ -96,7 +96,9 @@ object WindowEvent {
     const val YES = "Ja"
     const val NO = "Nein"
     const val UNKNOWN = "Weiß nicht"
-    const val QUESTION = "Fenster offen?"
+    const val SWIPE = "swipe"
+    const val EXPIRY = "expiry"
+    const val UNDO = "undo"
     const val SELF_ON = "Fenster auf"
     const val SELF_OFF = "Fenster zu"
     const val OPEN = "auf"
@@ -107,7 +109,23 @@ object WindowEvent {
 
     private val PLACES = mapOf("wohnzimmer" to "im Wohnzimmer", "schlafzimmer" to "im Schlafzimmer", "bad" to "im Bad", "kueche" to "in der Küche", "flur" to "im Flur")
 
-    fun title(a: WindowAsk) = "Ist das Fenster ${PLACES[a.room] ?: "im ${Defaults.CAPTIONS[a.room] ?: a.room}"} offen?"
+    private fun word(open: Boolean) = if (open) "offen" else "zu"
+
+    fun question(a: WindowAsk) = "Fenster ${word(a.open)}?"
+
+    fun title(a: WindowAsk) = "Ist das Fenster ${PLACES[a.room] ?: "im ${Defaults.CAPTIONS[a.room] ?: a.room}"} ${word(a.open)}?"
+
+    fun yesDescription(a: WindowAsk) = "Ja, Fenster ${caption(a.room)} ist ${word(a.open)}"
+
+    fun noDescription(a: WindowAsk) = "Nein, Fenster ${caption(a.room)} ist ${word(!a.open)}"
+
+    fun outcome(a: WindowAsk, answer: WindowAnswer) = when (answer) {
+        WindowAnswer.YES, WindowAnswer.NO -> "Fenster ${word(open(a, answer))}"
+        else -> UNKNOWN
+    }
+
+    fun resolve(a: WindowAsk, answer: WindowAnswer, via: String, now: Long): Pair<WindowAnswer, String> =
+        if (via == SWIPE && expired(a, now)) Pair(WindowAnswer.TIMEOUT, EXPIRY) else Pair(answer, via)
 
     fun caption(room: String) = Defaults.CAPTIONS[room] ?: room
 
@@ -150,6 +168,8 @@ object WindowEvent {
 
     fun answerEntry(device: String, ts: Long, a: WindowAsk, answer: WindowAnswer, via: String, id: String = LabelEvent.newId()): JSONObject =
         entry(device, ts, a.room, open(a, answer), a.id, id, answer, via)
+
+    fun voidedEntry(device: String, ts: Long, a: WindowAsk): JSONObject = entry(device, ts, a.room, false, a.id, answer = WindowAnswer.VOIDED, via = UNDO)
 
     fun isWindow(o: JSONObject) = o.optString("kind") == KIND
 
@@ -1248,6 +1268,12 @@ class Store(private val ctx: Context) {
     var windowPending: WindowAsk?
         get() = WindowEvent.fromJson(sp.getString("windowPending", null))
         set(v) = sp.edit().also { if (v == null) it.remove("windowPending") else it.putString("windowPending", WindowEvent.json(v)) }.apply()
+    var answered: Pair<String, WindowAsk>?
+        get() = try { sp.getString("answered", null)?.let { JSONObject(it) }?.let { Pair(it.getString("label"), WindowEvent.fromJson(it.getString("ask"))!!) } } catch (e: Exception) { null }
+        set(v) = sp.edit().also { if (v == null) it.remove("answered") else it.putString("answered", JSONObject().put("label", v.first).put("ask", WindowEvent.json(v.second)).toString()) }.apply()
+    var glanceTryAt: Long
+        get() = sp.getLong("glanceTryAt", 0L)
+        set(v) = sp.edit().putLong("glanceTryAt", v).apply()
     var windowSeen: List<String>
         get() = (sp.getString("windowSeen", "") ?: "").split(",").filter { it.isNotEmpty() }
         set(v) = sp.edit().putString("windowSeen", v.joinToString(",")).apply()
@@ -1267,7 +1293,11 @@ class Store(private val ctx: Context) {
         p?.takeIf { it.id != before?.id }
     }
     var alertSeen: List<String>
-        get() = (sp.getString("alertSeen", "") ?: "").split(AlertList.SEP).filter { it.isNotEmpty() }
+        get() = synchronized(Store::class.java) {
+            val seen = (sp.getString("alertSeen", "") ?: "").split(AlertList.SEP).filter { it.isNotEmpty() }
+            val old = sp.getString("alertId", null) ?: return@synchronized seen
+            AlertList.migrate(seen, old).also { sp.edit().putString("alertSeen", it.joinToString(AlertList.SEP)).remove("alertId").apply() }
+        }
         set(v) = sp.edit().putString("alertSeen", v.joinToString(AlertList.SEP)).apply()
     var alerts: List<Alert>
         get() = AlertList.fromJson(sp.getString("alerts", null))

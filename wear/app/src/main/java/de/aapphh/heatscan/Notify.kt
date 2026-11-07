@@ -77,13 +77,13 @@ object WindowPrompter {
             )
             val actions = listOf(action(c, a, WindowAnswer.YES, WindowEvent.YES), action(c, a, WindowAnswer.NO, WindowEvent.NO), action(c, a, WindowAnswer.UNKNOWN, WindowEvent.UNKNOWN))
             val b = Notification.Builder(c, CHANNEL)
-                .setContentTitle(WindowEvent.QUESTION)
+                .setContentTitle(WindowEvent.question(a))
                 .setContentText(WindowEvent.text(a))
                 .setStyle(Notification.BigTextStyle().bigText(WindowEvent.text(a)))
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setTimeoutAfter(WindowEvent.EXPIRY_MS)
                 .setContentIntent(open)
-                .setDeleteIntent(intent(c, a.id, WindowAnswer.TIMEOUT, "dismiss"))
+                .setDeleteIntent(intent(c, a.id, WindowAnswer.UNKNOWN, WindowEvent.SWIPE))
                 .setCategory(Notification.CATEGORY_MESSAGE)
                 .setOnlyAlertOnce(true)
             actions.forEach { b.addAction(it) }
@@ -124,7 +124,12 @@ object WindowPrompter {
         if (ask == null) return done(null)
         cancel(app)
         val labelId = LabelEvent.newId()
-        post(app, true, { s, now -> WindowEvent.answerEntry(s.device, now, ask, answer, via, labelId) }) { done(labelId) }
+        val swipe = via == WindowEvent.SWIPE
+        if (!swipe) Store(app).answered = Pair(labelId, ask)
+        post(app, !swipe, { s, now ->
+            val (a, v) = WindowEvent.resolve(ask, answer, via, now)
+            WindowEvent.answerEntry(s.device, if (v == WindowEvent.EXPIRY) WindowEvent.lapseTs(ask, now) else now, ask, a, v, labelId)
+        }) { done(labelId) }
     }
 
     fun selfReport(c: Context, room: String, open: Boolean, done: (String) -> Unit = {}) {
@@ -136,7 +141,7 @@ object WindowPrompter {
     fun lapse(c: Context, ask: WindowAsk?, now: Long) {
         if (ask == null) return
         val app = c.applicationContext
-        val via = if (WindowEvent.expired(ask, now)) "expiry" else "replaced"
+        val via = if (WindowEvent.expired(ask, now)) WindowEvent.EXPIRY else "replaced"
         cancel(app)
         post(app, false, { s, _ -> WindowEvent.answerEntry(s.device, WindowEvent.lapseTs(ask, now), ask, WindowAnswer.TIMEOUT, via) }) {}
     }
@@ -156,7 +161,12 @@ object WindowPrompter {
         try {
             io.execute {
                 val now = System.currentTimeMillis()
-                ScanQueue.get(app).add(LabelEvent.voidEntry(Store(app).device, id, now), now)
+                val store = Store(app)
+                ScanQueue.get(app).add(LabelEvent.voidEntry(store.device, id, now), now)
+                store.answered?.takeIf { it.first == id }?.let {
+                    ScanQueue.get(app).add(WindowEvent.voidedEntry(store.device, now, it.second), now)
+                    store.answered = null
+                }
                 Trace.i("window_void", "id" to id)
                 ScanService.instance?.flush("window")
             }

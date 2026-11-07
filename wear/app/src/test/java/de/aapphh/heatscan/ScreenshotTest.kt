@@ -36,7 +36,7 @@ class ScreenshotTest {
     private val noop = HomeActions({}, {}, {}, {}, {}, {}, {}, {})
 
     @Composable private fun boost() = BoostScreen(
-        listOf(BoostRoom("wohnzimmer", "idle", "kein Boost-Modell geladen"), BoostRoom("kueche", "boosting", "Szenario manual")), BoostResult(false, "kein Boost-Modell geladen"), null
+        listOf(BoostRoom("wohnzimmer", "idle", "kein Boost-Modell geladen"), BoostRoom("kueche", "boosting", "Szenario manual")), BoostResult(false, "kein Boost-Modell geladen"), null, null, {}
     ) {}
 
     @Test fun rooms_none() = shot("rooms_none") { RoomsPage(null, null) {} }
@@ -65,6 +65,10 @@ class ScreenshotTest {
     @Test fun windows_small() = shot("windows_small") { WindowsScreen(listOf("wohnzimmer", "bad", "kueche"), listOf("bad")) { _, _ -> } }
 
     @Test fun boost_small() = shot("boost_small") { boost() }
+
+    @Test fun boost_confirm_small() = shot("boost_confirm_small") { BoostScreen(null, null, null, "kueche", {}) {} }
+
+    @Test fun ask_closed_small() = shot("ask_closed_small") { AskScreen(ask.copy(open = false)) {} }
 
     @Test fun saved_small() = shot("saved_small") { SavedPage("Fenster Küche auf", {}, {}) }
 
