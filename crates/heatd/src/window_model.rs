@@ -328,7 +328,10 @@ pub fn spawn_reload(windows: Arc<Mutex<crate::window::Windows>>, dir: String, ev
                 let mut failures = Vec::new();
                 for (name, path) in candidates {
                     if current.as_deref() == Some(name.as_str()) {
-                        return Ok(None);
+                        if failures.is_empty() {
+                            return Ok(None);
+                        }
+                        bail!("newer window bundles failed to load, keeping the current model ({}): {}", name, failures.join("; "));
                     }
                     match Bundle::load(&path) {
                         Ok(bundle) => return Ok(Some(bundle)),
