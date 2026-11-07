@@ -7,7 +7,7 @@ import pyarrow.ipc as ipc
 import pytest
 from heattrain import windowml
 from heattrain.__main__ import CONFIG
-from heattrain.windowml import Approach, Evaluator, Grid, PhysicsResidual, RoomEvaluator, StreamScorer, V1Like, UnheatedFloor, XgbResidual, budget_threshold, dilate, episodes, evaluate, evaluate_room, floor_dist, last_step, parity_csv, peak_last, rank_key, room_channels, since_open, since_true, stream_run, utc, valve_reaction, window_bundle
+from heattrain.windowml import Approach, Evaluator, Grid, PhysicsResidual, RoomEvaluator, StreamScorer, V1Like, UnheatedFloor, XgbResidual, budget_threshold, dilate, episodes, evaluate, evaluate_room, floor_dist, last_step, parity_csv, peak_last, rank_key, room_channels, since_open, since_true, stream_run, utc, valve_reaction, window_bundle, ground_truth_windows
 
 CFG = copy.deepcopy(CONFIG["window"])
 CFG["rooms"] = ["wohnzimmer", "bad"]
@@ -395,3 +395,23 @@ def test_rank_key_orders_detection_then_latency_then_alarm_rate():
     d = {"detected_all": False, "latency_sum": None, "alarms_per_day": 0.0}
     m = dict(a=a, b=b, c=c, d=d)
     assert sorted(m, key=lambda k: rank_key(m[k])) == ["b", "a", "c", "d"]
+
+
+def test_ground_truth_file_drives_the_export_gate_and_rooms_outside_the_grid_are_ignored(tmp_path, monkeypatch):
+    g, cfg = phys_grid()
+    (tmp_path / "ground_truth").mkdir()
+    first, late = utc(g.t[500]).isoformat(), utc(g.t[2000]).isoformat()
+    rows = [{"rooms_open": ["bad", "flur"], "open_utc": first}, {"rooms_open": ["wohnzimmer"], "open_utc": late, "close_utc": utc(g.t[2010]).isoformat()},
+            {"rooms_open": ["flur"], "open_utc": late}, {"rooms_open": ["bad"], "open_utc": utc(g.t[-1] + 600).isoformat()}, {"rooms_open": ["bad"], "open_utc": "2020-01-01T00:00:00+00:00"}]
+    (tmp_path / "ground_truth" / "windows.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    gt = ground_truth_windows(tmp_path, g, cfg)
+    assert [(w["id"], w["channels"]) for w in gt] == [("1", ["house", "bad"]), ("2", ["wohnzimmer"])]
+    assert gt[1]["exclude_utc"][1] == utc(g.t[2010] + 60 * cfg["room"]["gt_pad_min"]).isoformat() and ground_truth_windows(tmp_path / "none", g, cfg) is None
+    seen = {}
+    monkeypatch.setattr(Grid, "load", classmethod(lambda cls, lake, c: g))
+    monkeypatch.setattr(windowml, "evaluate_room", lambda grid, c, conf: seen.update(gt=conf["room"]["gt"]) or fake_room_result(True))
+    window_bundle({"window": cfg}, tmp_path, tmp_path / "m", version="v1")
+    assert [w["id"] for w in seen["gt"]] == ["1", "2"]
+    (tmp_path / "ground_truth" / "windows.jsonl").write_text(json.dumps(rows[-1]) + "\n")
+    with pytest.raises(SystemExit):
+        window_bundle({"window": cfg}, tmp_path, tmp_path / "m", version="v2")

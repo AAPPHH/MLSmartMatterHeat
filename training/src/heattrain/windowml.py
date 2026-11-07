@@ -849,9 +849,38 @@ class StreamScorer:
         return {r: min(v, b["clip"]) for r, v in z.items()}, house, veto
 
 
+def ground_truth_windows(lake, grid, cfg):
+    path = Path(lake) / "ground_truth" / "windows.jsonl"
+    if not path.is_file():
+        return None
+    rc, pad = cfg["room"], cfg["room"]["gt_pad_min"]
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        w = json.loads(line) if line.strip() else None
+        if not w:
+            continue
+        opened = datetime.fromisoformat(w["open_utc"])
+        closed = datetime.fromisoformat(w["close_utc"]) if w.get("close_utc") else opened + timedelta(minutes=rc["gt_open_min"])
+        if not grid.t[0] <= opened.timestamp() <= grid.t[-1]:
+            continue
+        rooms = [r for r in w["rooms_open"] if r in grid.rooms]
+        channels = (["house"] if len(w["rooms_open"]) > 1 else []) + rooms
+        if not channels:
+            continue
+        out.append({"id": f"{len(out) + 1}", "open_utc": opened.isoformat(), "hit_min": rc["hit_min"], "channels": channels,
+                    "exclude_utc": [(opened - timedelta(minutes=pad)).isoformat(), (closed + timedelta(minutes=pad)).isoformat()]})
+    return out
+
+
 def window_bundle(config, lake, models_dir, version=None):
     cfg = config["window"]
     grid = Grid.load(lake, cfg)
+    gt = ground_truth_windows(lake, grid, cfg)
+    if gt is not None:
+        if not gt:
+            raise SystemExit("window bundle not validated: no ground truth window inside the lake range")
+        cfg = copy.deepcopy(cfg)
+        cfg["room"]["gt"] = gt
     rc = cfg["room"]
     mc = copy.deepcopy(cfg)
     mc["room"]["react"]["enabled"] = False

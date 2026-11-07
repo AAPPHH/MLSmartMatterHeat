@@ -5,7 +5,7 @@ W="${LOCALAPPDATA:-/c/Users/$USERNAME/AppData/Local}/heatd-train"
 mkdir -p "$W"
 cd "$W"
 rm -rf lake models_thermal models_room models_window && mkdir lake
-ssh -o ConnectTimeout=20 "$M" "cd ~/MLSmartMatterHeat/data && tar cz raw parquet" | tar xz -C lake
+ssh -o ConnectTimeout=20 "$M" "cd ~/MLSmartMatterHeat/data && tar cz raw parquet \$(test -d ground_truth && echo ground_truth)" | tar xz -C lake
 cd "$R/training"
 uv run -q python -m heattrain thermalml "$W/lake" "$W/models_thermal" > "$W/thermal.log" 2>&1
 v=$(ls "$W/models_thermal/thermal" | tail -1)

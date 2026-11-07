@@ -2,6 +2,7 @@ set -e
 W=/tmp/w
 mkdir -p $W/lake
 cp -r /data/raw /data/parquet $W/lake/
+[ -d /data/ground_truth ] && cp -r /data/ground_truth $W/lake/ || true
 cd /app
 uv run --no-sync python -m heattrain thermalml $W/lake $W/thermal
 v=$(ls $W/thermal/thermal | tail -1)
