@@ -2436,7 +2436,7 @@ nodes = [5]
         crate::restore::restore(&fresh, now_ms()).unwrap();
         let stay = fresh.watchmatch.stay().unwrap();
         assert_eq!(stay.2, now - 500_000);
-        assert_eq!(fresh.watchmatch.void_stay("pixel-watch", "foreign"), true);
+        assert!(fresh.watchmatch.void_stay("pixel-watch", "foreign"));
     }
 
     #[tokio::test]

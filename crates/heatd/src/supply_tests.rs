@@ -156,11 +156,12 @@ hold_min = 5.0");
     for i in 0..60 {
         let k = (i - 30).max(0) as f64;
         e.t += MIN;
-        let mut w = e.state.windows.lock().unwrap();
-        w.observe(&e.state.config, 5, crate::window::LOCAL_TEMPERATURE, 20.0 - 0.4 * k, e.t);
-        w.observe(&e.state.config, 5, crate::window::PI_HEATING_DEMAND, 30.0, e.t);
-        w.observe(&e.state.config, 5, crate::window::OCCUPIED_SETPOINT, 20.0, e.t);
-        drop(w);
+        {
+            let mut w = e.state.windows.lock().unwrap();
+            w.observe(&e.state.config, 5, crate::window::LOCAL_TEMPERATURE, 20.0 - 0.4 * k, e.t);
+            w.observe(&e.state.config, 5, crate::window::PI_HEATING_DEMAND, 30.0, e.t);
+            w.observe(&e.state.config, 5, crate::window::OCCUPIED_SETPOINT, 20.0, e.t);
+        }
         crate::rules::control_step(&e.state, noon, e.t).await.unwrap();
         if e.target() == Some(7.5) {
             break;
@@ -171,10 +172,11 @@ hold_min = 5.0");
     let opened = e.t;
     while e.target() == Some(7.5) && e.t - opened < 10 * MIN {
         e.t += MIN;
-        let mut w = e.state.windows.lock().unwrap();
-        w.observe(&e.state.config, 5, crate::window::LOCAL_TEMPERATURE, 12.0, e.t);
-        w.observe(&e.state.config, 5, crate::window::PI_HEATING_DEMAND, 30.0, e.t);
-        drop(w);
+        {
+            let mut w = e.state.windows.lock().unwrap();
+            w.observe(&e.state.config, 5, crate::window::LOCAL_TEMPERATURE, 12.0, e.t);
+            w.observe(&e.state.config, 5, crate::window::PI_HEATING_DEMAND, 30.0, e.t);
+        }
         crate::rules::control_step(&e.state, noon, e.t).await.unwrap();
     }
     assert!(e.t - opened >= 5 * MIN && e.t - opened < 10 * MIN, "{}", (e.t - opened) / MIN);
