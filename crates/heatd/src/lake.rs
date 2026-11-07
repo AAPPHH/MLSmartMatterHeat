@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 pub const COMMIT: &str = env!("HEATD_COMMIT");
 pub const ROW_GROUP_ROWS: usize = 65_536;
 pub const EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
@@ -139,6 +139,7 @@ impl Table {
                 tsf("ts", false), tsf("from_ts", true), tsf("to_ts", true), fld("room", dict(), false), fld("source", dict(), false), fld("device", dict(), true),
                 fld("confidence", DataType::Float32, true), fld("model_id", DataType::Utf8, true), fld("probs", DataType::Utf8, true), fld("heat", DataType::Boolean, true),
                 fld("label_id", DataType::Utf8, true), fld("voided_label_id", DataType::Utf8, true), fld("window_open", DataType::Boolean, true),
+                fld("answer", DataType::Utf8, true), fld("via", DataType::Utf8, true),
             ],
             Table::WatchRaw => vec![
                 tsf("ts", false), tsf("device_ts", true), fld("sender", dict(), false), fld("rssi", DataType::Int8, false), fld("channel", DataType::UInt8, true), fld("batch_id", DataType::UInt64, false),
@@ -413,6 +414,8 @@ pub struct Label {
     pub label_id: Option<String>,
     pub voided_label_id: Option<String>,
     pub window_open: Option<bool>,
+    pub answer: Option<String>,
+    pub via: Option<String>,
 }
 
 impl Row for Label {
@@ -422,6 +425,7 @@ impl Row for Label {
             ts_col(rows, |r| Some(r.ts)), ts_col(rows, |r| r.from_ts), ts_col(rows, |r| r.to_ts), dict_col(rows, |r| Some(&r.room)), dict_col(rows, |r| Some(&r.source)),
             dict_col(rows, |r| r.device.as_deref()), prim::<Float32Type, _>(rows, |r| r.confidence), str_col(rows, |r| r.model_id.as_deref()), str_col(rows, |r| r.probs.as_deref()), bool_col(rows, |r| r.heat),
             str_col(rows, |r| r.label_id.as_deref()), str_col(rows, |r| r.voided_label_id.as_deref()), bool_col(rows, |r| r.window_open),
+            str_col(rows, |r| r.answer.as_deref()), str_col(rows, |r| r.via.as_deref()),
         ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }

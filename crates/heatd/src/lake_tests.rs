@@ -55,7 +55,7 @@ fn schema_decisions() {
 
 #[test]
 fn schema_labels() {
-    let row = Label { ts: 1, from_ts: Some(0), to_ts: Some(2), room: "bad".into(), source: "watch".into(), ..Default::default() };
+    let row = Label { ts: 1, from_ts: Some(0), to_ts: Some(2), room: "bad".into(), source: "watch".into(), answer: Some("yes".into()), via: Some("page".into()), ..Default::default() };
     check_schema(Table::Labels, Label::to_batch(&[row]).unwrap());
 }
 

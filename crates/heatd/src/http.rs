@@ -76,12 +76,57 @@ struct WindowLabelBody {
     device: String,
     ts: i64,
     room: String,
-    open: bool,
+    #[serde(default)]
+    open: Option<bool>,
+    #[serde(default)]
+    answer: Option<WindowAnswer>,
+    #[serde(default)]
+    via: Option<String>,
     #[serde(default)]
     prompt_id: Option<String>,
     #[serde(default)]
     label_id: Option<String>,
 }
+
+#[derive(Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum WindowAnswer {
+    Yes,
+    No,
+    Unknown,
+    Timeout,
+    Voided,
+}
+
+impl WindowAnswer {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Unknown => "unknown",
+            Self::Timeout => "timeout",
+            Self::Voided => "voided",
+        }
+    }
+    fn resolve(answer: Option<Self>, open: Option<bool>) -> Result<Self, ApiError> {
+        let from_open = open.map(|o| if o { Self::Yes } else { Self::No });
+        match (answer, from_open) {
+            (None, None) => Err(ApiError::bad("open or answer is required")),
+            (None, Some(a)) | (Some(a), None) => Ok(a),
+            (Some(a), Some(b)) if a == b || !matches!(a, Self::Yes | Self::No) => Ok(a),
+            _ => Err(ApiError::bad("open contradicts answer")),
+        }
+    }
+    fn open(self) -> Option<bool> {
+        match self {
+            Self::Yes => Some(true),
+            Self::No => Some(false),
+            _ => None,
+        }
+    }
+}
+
+const WINDOW_VIA: [&str; 6] = ["notification", "page", "self", "swipe", "expiry", "replaced"];
 
 #[derive(Deserialize)]
 struct LabelBody {
@@ -775,15 +820,19 @@ async fn label_void(State(state): State<AppState>, Json(body): Json<VoidBody>) -
     if body.label_id.is_empty() || body.label_id.len() > 64 {
         return Err(ApiError::bad("label_id must be 1..64 characters"));
     }
-    let ts = body.ts.unwrap_or_else(now_ms).min(now_ms()) * 1000;
-    let row = Label { ts, room: String::new(), source: "void".into(), device: Some(body.device.clone()), voided_label_id: Some(body.label_id.clone()), ..Default::default() };
+    let cleared = void_label_id(&state, &body.device, &body.label_id, body.ts.unwrap_or_else(now_ms));
+    Ok(Json(json!({"voided": body.label_id, "stay_cleared": cleared})))
+}
+
+fn void_label_id(state: &AppState, device: &str, label_id: &str, ts_ms: i64) -> bool {
+    let row = Label { ts: ts_ms.min(now_ms()) * 1000, room: String::new(), source: "void".into(), device: Some(device.into()), voided_label_id: Some(label_id.into()), ..Default::default() };
     if let Err(e) = state.sink.append(row) {
         eprintln!("labels: {e}");
     }
-    let cleared = state.watchmatch.void_stay(&body.device, &body.label_id);
-    let reverted = state.windows.lock().unwrap().void_label(&body.label_id, now_ms());
-    reverted.into_iter().for_each(|e| crate::rules::window_event(&state, e));
-    Ok(Json(json!({"voided": body.label_id, "stay_cleared": cleared})))
+    let cleared = state.watchmatch.void_stay(device, label_id);
+    let reverted = state.windows.lock().unwrap().void_label(label_id, now_ms());
+    reverted.into_iter().for_each(|e| crate::rules::window_event(state, e));
+    cleared
 }
 
 async fn window_label(State(state): State<AppState>, Json(body): Json<WindowLabelBody>) -> ApiResult {
@@ -793,18 +842,41 @@ async fn window_label(State(state): State<AppState>, Json(body): Json<WindowLabe
     if body.device.is_empty() || body.label_id.as_ref().is_some_and(|id| id.is_empty() || id.len() > 64) {
         return Err(ApiError::bad("device must not be empty and label_id must be 1..64 characters"));
     }
+    let answer = WindowAnswer::resolve(body.answer, body.open)?;
+    if body.via.as_deref().is_some_and(|v| !WINDOW_VIA.contains(&v)) {
+        return Err(ApiError::bad("via must be notification, page, self, swipe, expiry or replaced"));
+    }
+    if answer == WindowAnswer::Voided && body.prompt_id.is_none() && body.label_id.is_none() {
+        return Err(ApiError::bad("a voided answer needs prompt_id or label_id"));
+    }
     if let Some(id) = &body.label_id {
-        if !state.storage.claim_id(&body.device, &format!("window_label:{id}"))? {
+        let kind = if answer == WindowAnswer::Voided { "window_void" } else { "window_label" };
+        if !state.storage.claim_id(&body.device, &format!("{kind}:{id}"))? {
             return Ok(Json(json!({"stored": 0, "duplicate": true})));
         }
     }
     let ts = body.ts.min(now_ms() + MAX_FUTURE_MS);
-    let row = Label { ts: ts * 1000, room: body.room.clone(), source: "window".into(), device: Some(body.device.clone()), heat: Some(false), label_id: body.label_id.clone(), window_open: Some(body.open), ..Default::default() };
+    let row = Label { ts: ts * 1000, room: body.room.clone(), source: "window".into(), device: Some(body.device.clone()), heat: Some(false), label_id: body.label_id.clone(), window_open: answer.open(), answer: Some(answer.as_str().into()), via: body.via.clone(), ..Default::default() };
     state.sink.append(row)?;
-    let event = state.windows.lock().unwrap().label(&body.room, ts, body.open, body.prompt_id.as_deref(), body.label_id.as_deref(), now_ms());
-    event.into_iter().for_each(|e| crate::rules::window_event(&state, e));
+    match (answer, answer.open()) {
+        (WindowAnswer::Voided, _) => {
+            let earlier = body.prompt_id.as_deref().map(|p| state.windows.lock().unwrap().void_prompt(p)).unwrap_or_default();
+            earlier.iter().chain(body.label_id.iter()).collect::<std::collections::BTreeSet<_>>().into_iter().for_each(|id| {
+                void_label_id(&state, &body.device, id, ts);
+            });
+        }
+        (_, Some(open)) => {
+            let event = state.windows.lock().unwrap().label(&body.room, ts, open, body.prompt_id.as_deref(), body.label_id.as_deref(), now_ms());
+            event.into_iter().for_each(|e| crate::rules::window_event(&state, e));
+        }
+        _ => {
+            if let Some(p) = &body.prompt_id {
+                state.windows.lock().unwrap().dismiss_prompt(p);
+            }
+        }
+    }
     let open = state.windows.lock().unwrap().open_rooms();
-    Ok(Json(json!({"stored": 1, "manual": body.prompt_id.is_none(), "window_open": open.iter().collect::<Vec<_>>()})))
+    Ok(Json(json!({"stored": 1, "answer": answer.as_str(), "manual": body.prompt_id.is_none(), "window_open": open.iter().collect::<Vec<_>>()})))
 }
 
 #[derive(Deserialize)]
@@ -2381,6 +2453,84 @@ nodes = [5]
         assert_eq!(status, StatusCode::OK);
         assert!(h.state.windows.lock().unwrap().open_rooms().is_empty());
         assert_eq!(some(&column(&lake_rows(&h, "labels"), "source")), ["window", "window", "window", "void"]);
+    }
+
+    fn answer_body(answer: Option<&str>, open: Option<bool>, prompt: &str, label: &str, via: Option<&str>) -> Option<String> {
+        Some(json!({"device": "pixel-watch", "ts": now_ms(), "room": "wohnzimmer", "open": open, "answer": answer, "via": via, "prompt_id": prompt, "label_id": label}).to_string())
+    }
+
+    fn prompt_id(h: &Harness) -> String {
+        h.state.windows.lock().unwrap().prompt(&h.state.config.window, now_ms()).unwrap()["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn window_answers_yes_and_no_drive_confirmation_and_unknown_timeout_never_do() {
+        let h = harness(false);
+        let mut seen = Vec::new();
+        for (answer, via) in [("yes", "notification"), ("no", "page"), ("unknown", "swipe"), ("timeout", "expiry")] {
+            raise_prompt(&h, "closed");
+            let id = prompt_id(&h);
+            let (status, body) = call(&h.state, "POST", "/watch/window_label", answer_body(Some(answer), None, &id, &format!("a-{answer}"), Some(via))).await;
+            assert_eq!((status, body["stored"].clone(), body["answer"].clone()), (StatusCode::OK, json!(1), json!(answer)));
+            assert!(h.state.windows.lock().unwrap().prompt(&h.state.config.window, now_ms()).is_none(), "{answer} clears the prompt");
+            h.state.windows.lock().unwrap().test_forget_prompt_gap();
+            seen.push(h.state.windows.lock().unwrap().test_label_count());
+        }
+        assert_eq!(seen, [1, 2, 2, 2]);
+        let labels = lake_rows(&h, "labels");
+        assert_eq!(some(&column(&labels, "answer")), ["yes", "no", "unknown", "timeout"]);
+        assert_eq!(some(&column(&labels, "via")), ["notification", "page", "swipe", "expiry"]);
+        assert_eq!(some(&column(&labels, "window_open")), ["true", "false", "-", "-"]);
+    }
+
+    #[tokio::test]
+    async fn window_answer_unknown_leaves_an_open_window_and_rejects_bad_values() {
+        let h = harness(false);
+        call(&h.state, "POST", "/watch/window_label", Some(json!({"device": "pixel-watch", "ts": now_ms(), "room": "wohnzimmer", "open": true, "label_id": "m1"}).to_string())).await;
+        raise_prompt(&h, "closed");
+        let id = prompt_id(&h);
+        let (_, body) = call(&h.state, "POST", "/watch/window_label", answer_body(Some("unknown"), None, &id, "u1", None)).await;
+        assert_eq!(body["window_open"], json!(["wohnzimmer"]));
+        for bad in [answer_body(Some("maybe"), None, &id, "b1", None), answer_body(None, None, &id, "b2", None)] {
+            let status = call(&h.state, "POST", "/watch/window_label", bad).await.0;
+            assert!(status.is_client_error(), "{status}");
+        }
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", answer_body(Some("yes"), Some(false), &id, "b3", None)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", answer_body(Some("no"), None, &id, "b4", Some("telepathy"))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", Some(json!({"device": "w", "ts": 1, "room": "wohnzimmer", "answer": "voided"}).to_string())).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&h.state, "POST", "/watch/window_label", answer_body(Some("unknown"), Some(true), &id, "b5", None)).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn window_answer_voided_voids_the_earlier_answer_of_the_prompt() {
+        let h = harness(false);
+        raise_prompt(&h, "closed");
+        let id = prompt_id(&h);
+        call(&h.state, "POST", "/watch/window_label", answer_body(Some("yes"), None, &id, "first", Some("notification"))).await;
+        assert_eq!(h.state.windows.lock().unwrap().test_label_count(), 1);
+        let (status, body) = call(&h.state, "POST", "/watch/window_label", answer_body(Some("voided"), None, &id, "second", Some("replaced"))).await;
+        assert_eq!((status, body["answer"].clone()), (StatusCode::OK, json!("voided")));
+        assert_eq!(h.state.windows.lock().unwrap().test_label_count(), 0);
+        let labels = lake_rows(&h, "labels");
+        assert_eq!(some(&column(&labels, "source")), ["window", "window", "void", "void"]);
+        assert_eq!(some(&column(&labels, "answer"))[..2], ["yes", "voided"]);
+        assert_eq!(some(&column(&labels, "window_open"))[..2], ["true", "-"]);
+        let mut voided: Vec<_> = column(&labels, "voided_label_id").into_iter().flatten().collect();
+        voided.sort();
+        assert_eq!(voided, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn old_client_window_label_without_answer_keeps_the_old_behaviour() {
+        let h = harness(false);
+        raise_prompt(&h, "closed");
+        let id = prompt_id(&h);
+        let old = json!({"device": "pixel-watch", "ts": now_ms(), "room": "wohnzimmer", "open": false, "prompt_id": id, "label_id": "old"}).to_string();
+        let (status, body) = call(&h.state, "POST", "/watch/window_label", Some(old)).await;
+        assert_eq!((status, body["stored"].clone(), body["answer"].clone()), (StatusCode::OK, json!(1), json!("no")));
+        let labels = lake_rows(&h, "labels");
+        assert_eq!((some(&column(&labels, "window_open")), some(&column(&labels, "answer")), some(&column(&labels, "via"))), (vec!["false".to_string()], vec!["no".to_string()], vec!["-".to_string()]));
+        assert_eq!(h.state.windows.lock().unwrap().test_label_count(), 1);
     }
 
     #[tokio::test]

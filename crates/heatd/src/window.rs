@@ -28,6 +28,7 @@ pub struct RoomCtx {
 #[derive(Debug, Clone)]
 pub struct LabelRec {
     pub label_id: Option<String>,
+    pub prompt_id: Option<String>,
     pub room: String,
     pub ts: i64,
     pub open: bool,
@@ -331,6 +332,17 @@ impl Windows {
         self.raise(cfg, room, question, None, now);
     }
 
+    #[cfg(test)]
+    pub fn test_forget_prompt_gap(&mut self) {
+        self.prompt_at.clear();
+        self.prompt_times.clear();
+    }
+
+    #[cfg(test)]
+    pub fn test_label_count(&self) -> usize {
+        self.labels.len()
+    }
+
     pub fn prompt(&self, cfg: &WindowSection, now: i64) -> Option<Value> {
         self.prompt.as_ref().filter(|p| now - p.created_ms < mins(cfg.prompt_expire_min)).map(|p| json!({"id": p.id, "room": p.room, "question": p.question, "reason": p.reason}))
     }
@@ -340,7 +352,7 @@ impl Windows {
         if prompt_id.is_some_and(|id| self.prompt.as_ref().is_some_and(|p| p.id == id)) {
             self.prompt = None;
         }
-        self.labels.push_back(LabelRec { label_id: label_id.map(Into::into), room: room.into(), ts, open, manual: prompt_id.is_none(), question });
+        self.labels.push_back(LabelRec { label_id: label_id.map(Into::into), prompt_id: prompt_id.map(Into::into), room: room.into(), ts, open, manual: prompt_id.is_none(), question });
         while self.labels.front().is_some_and(|l| l.ts < now - 24 * 3_600_000) || self.labels.len() > 500 {
             self.labels.pop_front();
         }
@@ -358,6 +370,19 @@ impl Windows {
             }
         }
         event
+    }
+
+    pub fn dismiss_prompt(&mut self, prompt_id: &str) {
+        if self.prompt.as_ref().is_some_and(|p| p.id == prompt_id) {
+            self.prompt = None;
+        }
+    }
+
+    pub fn void_prompt(&mut self, prompt_id: &str) -> Vec<String> {
+        self.dismiss_prompt(prompt_id);
+        let (voided, kept): (VecDeque<LabelRec>, VecDeque<LabelRec>) = std::mem::take(&mut self.labels).into_iter().partition(|l| l.prompt_id.as_deref() == Some(prompt_id));
+        self.labels = kept;
+        voided.into_iter().filter_map(|l| l.label_id).collect()
     }
 
     pub fn void_label(&mut self, label_id: &str, now: i64) -> Option<WinEvent> {
