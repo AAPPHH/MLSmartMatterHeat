@@ -5,7 +5,7 @@ heatd detects, repairs and reports thermostat failures itself. One state per nod
 | state | condition |
 |---|---|
 | ok | reports arrive and the subscription pushes |
-| degraded | subscription lost (or no push for `push_silent_min`) while polls still answer |
+| degraded | subscription lost while polls still answer (attribute pushes alone are not evidence: an unchanged thermostat sends none) |
 | silent | no report of any source (push, poll, event) for `silent_min`; a node that never reported counts from heatd start |
 | unreachable | silent for `unreachable_min` |
 
@@ -15,7 +15,8 @@ Every transition writes a lake event `node_health` (aspect `link`, from, to, sil
 
 - degraded: resubscribe after `[stale] resubscribe_after_s`, then at most every `resubscribe_gap_s`.
 - silent / unreachable: resubscribe first `min_gap_s` after entering the state, then with backoff `backoff_start_s` doubling up to `backoff_max_min`. Never faster than `min_gap_s`.
-- unreachable: the rung becomes `restart_session` (the interactive chip-tool is restarted, dropping every CASE session; all nodes subscribe again). At most once per `reset_gap_min` for the whole controller, otherwise resubscribe.
+- unreachable: the first attempt of an episode becomes `restart_session` (the interactive chip-tool is restarted, dropping every CASE session; all nodes subscribe again). At most `max_restarts` per unreachable episode and node, at most once per `reset_gap_min` for the whole controller; afterwards only resubscribe, with backoff growing up to `unreachable_backoff_max_min`.
+- after a `restart_session` the ladder is suppressed for every node for `restart_grace_s` (chip-tool resubscribes by itself). A new episode starts its gap timer fresh.
 - poll reads stay with the capture poll loop (own failure backoff, 60 s base, capped at 16x); its outcome lands in `last_error` as `poll: ...`.
 
 ## Setpoint verification

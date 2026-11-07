@@ -149,8 +149,8 @@ impl Status {
         free
     }
 
-    pub fn session_restarted(&self, now_us: i64) {
-        self.0.lock().unwrap().nodes.values_mut().filter(|n| n.health.state != crate::node_health::Health::Ok).for_each(|n| n.health.last_attempt_us = Some(now_us));
+    pub fn restart_grace(&self, now_us: i64, grace_us: i64) -> bool {
+        self.0.lock().unwrap().restart_us.is_some_and(|t| now_us - t < grace_us)
     }
 
     pub fn node_health_view(&self, node: u64, now_us: i64) -> Option<Value> {

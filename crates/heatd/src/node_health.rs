@@ -18,11 +18,13 @@ pub struct NodeHealthSection {
     pub tick_s: f64,
     pub silent_min: f64,
     pub unreachable_min: f64,
-    pub push_silent_min: f64,
     pub min_gap_s: f64,
     pub backoff_start_s: f64,
     pub backoff_max_min: f64,
     pub reset_gap_min: f64,
+    pub max_restarts: u32,
+    pub restart_grace_s: f64,
+    pub unreachable_backoff_max_min: f64,
     pub verify_min: f64,
     pub tolerance_c: f64,
     pub alert_retries: u32,
@@ -30,7 +32,7 @@ pub struct NodeHealthSection {
 
 impl Default for NodeHealthSection {
     fn default() -> Self {
-        Self { enabled: true, tick_s: 30.0, silent_min: 10.0, unreachable_min: 30.0, push_silent_min: 60.0, min_gap_s: 60.0, backoff_start_s: 120.0, backoff_max_min: 10.0, reset_gap_min: 30.0, verify_min: 10.0, tolerance_c: 0.05, alert_retries: 3 }
+        Self { enabled: true, tick_s: 30.0, silent_min: 10.0, unreachable_min: 30.0, min_gap_s: 60.0, backoff_start_s: 120.0, backoff_max_min: 10.0, reset_gap_min: 30.0, max_restarts: 1, restart_grace_s: 180.0, unreachable_backoff_max_min: 240.0, verify_min: 10.0, tolerance_c: 0.3, alert_retries: 3 }
     }
 }
 
@@ -90,6 +92,7 @@ pub struct Record {
     pub attempts_total: u64,
     pub transitions: u64,
     pub last_attempt_us: Option<i64>,
+    pub restarts: u32,
     pub last_action: Option<&'static str>,
     pub last_error: Option<String>,
     pub set: SetpointCheck,
@@ -142,7 +145,7 @@ pub fn classify(cfg: &NodeHealthSection, n: &NodeStatus, started_us: i64, now_us
         Health::Unreachable
     } else if silent_for >= min_us(cfg.silent_min) {
         Health::Silent
-    } else if n.state == SubState::Lost || now_us - n.last_subscription_us.unwrap_or(started_us) >= min_us(cfg.push_silent_min) {
+    } else if n.state == SubState::Lost {
         Health::Degraded
     } else {
         Health::Ok
@@ -154,13 +157,14 @@ pub fn gap_us(cfg: &NodeHealthSection, stale: &StaleSection, health: Health, att
         (Health::Degraded, 0) => s_us(stale.resubscribe_after_s as f64),
         (Health::Degraded, _) => s_us(stale.resubscribe_gap_s as f64),
         (_, 0) => s_us(cfg.min_gap_s),
-        _ => backoff_us(cfg, attempts),
+        (Health::Unreachable, _) => backoff_us(cfg, attempts, cfg.unreachable_backoff_max_min),
+        _ => backoff_us(cfg, attempts, cfg.backoff_max_min),
     }
 }
 
-fn backoff_us(cfg: &NodeHealthSection, count: u32) -> i64 {
+fn backoff_us(cfg: &NodeHealthSection, count: u32, max_min: f64) -> i64 {
     let grown = cfg.backoff_start_s * 2f64.powi(count.saturating_sub(1).min(MAX_DOUBLINGS) as i32);
-    s_us(grown.clamp(cfg.min_gap_s, (cfg.backoff_max_min * 60.0).max(cfg.min_gap_s)))
+    s_us(grown.clamp(cfg.min_gap_s, (max_min * 60.0).max(cfg.min_gap_s)))
 }
 
 fn emit(state: &AppState, node: u64, detail: Value) {
@@ -185,7 +189,7 @@ fn transition(state: &AppState, node: u64, snap: &NodeStatus, next: Health, star
         let episode_s = (now_us - r.episode_us) / 1_000_000;
         let attempts = r.attempts;
         if next == Health::Ok {
-            r.attempts = 0;
+            (r.attempts, r.restarts, r.last_attempt_us) = (0, 0, None);
         }
         Some(json!({"aspect": "link", "from": from.name(), "to": next.name(), "silent_s": silent_s, "episode_s": episode_s, "attempts": attempts, "subscription": snap.state.name(), "last_action": r.last_action, "last_error": r.last_error}))
     });
@@ -215,23 +219,24 @@ async fn recover(state: &AppState, node: u64, health: Health, now_us: i64) {
         return;
     }
     let (cfg, stale) = (&state.config.node_health, &state.config.stale);
-    let due = state.status.update_health(node, |r| now_us >= r.last_attempt_us.unwrap_or(r.since_us) + gap_us(cfg, stale, health, r.attempts));
+    if state.status.restart_grace(now_us, s_us(cfg.restart_grace_s)) {
+        return;
+    }
+    let (due, may_restart) = state.status.update_health(node, |r| (now_us >= r.last_attempt_us.unwrap_or(r.since_us) + gap_us(cfg, stale, health, r.attempts), health == Health::Unreachable && r.restarts < cfg.max_restarts));
     if !due {
         return;
     }
-    let rung = if health == Health::Unreachable && state.status.claim_restart(now_us, min_us(cfg.reset_gap_min)) { Rung::Restart } else { Rung::Resubscribe };
+    let rung = if may_restart && state.status.claim_restart(now_us, min_us(cfg.reset_gap_min)) { Rung::Restart } else { Rung::Resubscribe };
     let outcome = match rung {
         Rung::Resubscribe => state.controller.resubscribe(node).await,
         Rung::Restart => state.controller.restart_session().await,
     };
     let error = outcome.err().map(|e| e.to_string());
-    if rung == Rung::Restart {
-        state.status.session_restarted(now_us);
-    }
     state.status.update_health(node, |r| {
         r.attempts += 1;
         r.attempts_total += 1;
         r.last_attempt_us = Some(now_us);
+        r.restarts += u32::from(rung == Rung::Restart);
         r.last_action = Some(rung.name());
         r.last_error = error.clone();
     });
@@ -300,7 +305,7 @@ async fn verify(state: &AppState, node: u64, health: Health, now_us: i64) {
             }
             None => r.set.consecutive_failures = 0,
         }
-        r.set.next_us = now_us + backoff_us(&state.config.node_health, r.set.rewrites);
+        r.set.next_us = now_us + backoff_us(&state.config.node_health, r.set.rewrites, state.config.node_health.backoff_max_min);
         (r.set.rewrites, settle_alert(r, retries, now_us))
     });
     eprintln!("node {node}: setpoint {target} not applied (device reports {device}), rewrite {rewrites}{}", error.as_ref().map(|e| format!(" failed: {e}")).unwrap_or_default());

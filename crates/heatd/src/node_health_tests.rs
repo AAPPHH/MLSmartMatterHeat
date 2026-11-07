@@ -11,16 +11,19 @@ const MIN: i64 = 60_000_000;
 const CONFIG: &str = "[node_health]
 silent_min = 1
 unreachable_min = 3
-push_silent_min = 1000
 min_gap_s = 10
 backoff_start_s = 20
 backoff_max_min = 1
 reset_gap_min = 5
 verify_min = 2
 alert_retries = 2
-[[rooms]]
+";
+const ROOMS: &str = "[[rooms]]
 name = 'b'
 nodes = [6]
+";
+const FAST: &str = "unreachable_backoff_max_min = 1
+restart_grace_s = 0
 ";
 
 struct Rig {
@@ -31,11 +34,16 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    rig_with(FAST)
+}
+
+fn rig_with(extra: &str) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockController::new(1));
     mock.add_node(5, 19.0, 19.0);
     mock.add_node(6, 19.0, 19.0);
-    let state = state_with(dir.path(), mock.clone(), CONFIG);
+    let state = state_with(dir.path(), mock.clone(), &format!("{CONFIG}{extra}
+{ROOMS}"));
     state.status.register_nodes([5, 6]);
     Rig { t0: state.status.started_us(), state, mock, dir }
 }
@@ -66,7 +74,7 @@ impl Rig {
 
 #[test]
 fn classification_follows_the_silence_and_subscription_thresholds() {
-    let cfg = NodeHealthSection { push_silent_min: 60.0, ..Default::default() };
+    let cfg = NodeHealthSection::default();
     let mut n = NodeStatus { last_report_us: Some(100 * MIN), last_subscription_us: Some(100 * MIN), ..Default::default() };
     let at = |n: &NodeStatus, minutes: i64| classify(&cfg, n, 0, (100 + minutes) * MIN);
     assert_eq!([0, 9, 10, 29, 30, 100].map(|m| at(&n, m)), [Health::Ok, Health::Ok, Health::Silent, Health::Silent, Health::Unreachable, Health::Unreachable]);
@@ -74,7 +82,8 @@ fn classification_follows_the_silence_and_subscription_thresholds() {
     assert_eq!((at(&n, 1), at(&n, 11)), (Health::Degraded, Health::Silent));
     n.state = SubState::Subscribed;
     n.last_report_us = Some(159 * MIN);
-    assert_eq!((at(&n, 59), at(&n, 61)), (Health::Ok, Health::Degraded));
+    n.last_subscription_us = Some(100 * MIN);
+    assert_eq!((at(&n, 59), at(&n, 61)), (Health::Ok, Health::Ok));
     assert_eq!(classify(&cfg, &NodeStatus::default(), 0, 11 * MIN), Health::Silent);
 }
 
@@ -262,4 +271,89 @@ fn the_report_section_summarises_transitions_per_node() {
     assert!(text.contains("| 6 | 2 | silent | 25 min | 0 | 0 |"), "{text}");
     assert!(text.contains("| 5 | 0 | ok |") && text.contains("Node 6: ok -> silent") && text.contains("Sollwert 21.0 nicht uebernommen"), "{text}");
     assert!(report_section(&[]).starts_with("Keine Stoerungen"));
+}
+
+#[tokio::test]
+async fn an_unreachable_node_is_restarted_once_per_episode_then_only_resubscribed_with_growing_gaps() {
+    let r = rig_with("");
+    let s = 1_000_000;
+    r.report(5, r.t0);
+    r.mock.set_node_silent(5, true);
+    let mut attempts = Vec::new();
+    for t in (1..6 * 3600).step_by(10) {
+        r.report(6, r.t0 + t * s);
+        let before = r.mock.resubscribes().len();
+        step(&r.state, r.t0 + t * s).await;
+        if r.mock.resubscribes().len() > before {
+            attempts.push(t);
+        }
+    }
+    assert_eq!(r.mock.restarts(), 1);
+    assert_eq!(r.mock.resubscribes(), vec![5; r.mock.resubscribes().len()]);
+    let gaps: Vec<i64> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(attempts.len() <= 16 && *gaps.last().unwrap() >= 3600, "{attempts:?}");
+    r.mock.set_node_silent(5, false);
+    r.report(5, r.t0 + 6 * 3600 * s);
+    step(&r.state, r.t0 + 6 * 3600 * s + s).await;
+    assert_eq!(r.health(5), Health::Ok);
+    r.mock.set_node_silent(5, true);
+    for t in (1..600).step_by(10) {
+        let at = r.t0 + (6 * 3600 + t) * s;
+        r.report(6, at);
+        step(&r.state, at).await;
+    }
+    assert_eq!(r.mock.restarts(), 2);
+}
+
+#[tokio::test]
+async fn a_new_episode_waits_the_min_gap_before_its_first_resubscribe() {
+    let r = rig();
+    let s = 1_000_000;
+    r.report(5, r.t0);
+    r.report(6, r.t0);
+    for t in (1..130).step_by(1) {
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert_eq!(r.health(5), Health::Silent);
+    let first = r.mock.resubscribes().len();
+    assert!(first >= 1);
+    r.report(5, r.t0 + 130 * s);
+    step(&r.state, r.t0 + 131 * s).await;
+    assert_eq!(r.health(5), Health::Ok);
+    let mut entered = None;
+    for t in 132..400 {
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+        if entered.is_none() && r.health(5) == Health::Silent {
+            entered = Some(t);
+        }
+        if let Some(e) = entered {
+            let late = r.mock.resubscribes().len() - first;
+            assert!(t - e >= 10 || late == 0, "resubscribed {} s after entering silent", t - e);
+        }
+    }
+    assert!(entered.is_some() && r.mock.resubscribes().len() > first);
+}
+
+#[tokio::test]
+async fn nodes_wait_out_the_grace_after_a_session_restart() {
+    let r = rig_with("restart_grace_s = 120");
+    let s = 1_000_000;
+    r.report(5, r.t0);
+    r.report(6, r.t0);
+    r.mock.set_node_silent(5, true);
+    let mut restart_at = None;
+    for t in 1..300 {
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+        if restart_at.is_none() && r.mock.restarts() == 1 {
+            restart_at = Some(t);
+            r.state.status.subscription(6, SubState::Lost, r.t0 + t * s);
+        }
+        if let Some(at) = restart_at.filter(|at| t > *at && t < at + 120) {
+            assert!(!r.mock.resubscribes().contains(&6) && r.mock.restarts() == 1, "ladder ran {} s after the restart", t - at);
+        }
+    }
+    assert!(restart_at.is_some());
 }
