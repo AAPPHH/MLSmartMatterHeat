@@ -1,6 +1,7 @@
 use crate::config::StaleSection;
 use crate::http::AppState;
 use crate::lake::{self, kind, Event};
+use crate::rules::Check;
 use crate::status::{NodeStatus, SubState};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -262,39 +263,61 @@ fn settle_alert(r: &mut Record, retries: u32, now_us: i64) -> Option<Value> {
 async fn verify(state: &AppState, node: u64, health: Health, now_us: i64) {
     let cfg = &state.config.node_health;
     let answering = health <= Health::Degraded && !state.failsafe.stopping();
-    let seen = state.commanded.lock().unwrap().mismatch(node, cfg.tolerance_c).filter(|_| answering);
+    let tolerance = cfg.tolerance_c.max(state.config.setpoint_deadband);
     let (verify_us, retries) = (min_us(cfg.verify_min), cfg.alert_retries);
+    let seen = answering.then(|| state.commanded.lock().unwrap().check(node, tolerance, now_us / 1000, verify_us / 1000));
     let (rewrite, change) = state.status.update_health(node, |r| {
         let s = &mut r.set;
+        let mut mismatch = None;
         match seen {
-            None => {
-                (s.target, s.device, s.mismatch_since_us, s.rewrites, s.failed_rewrites) = (None, None, None, 0, 0);
-            }
-            Some((target, device)) => {
+            None | Some(Check::Pending) => {}
+            Some(Check::Mismatch(target, device, written_ms)) => {
                 if s.target != Some(target) {
                     (s.mismatch_since_us, s.rewrites, s.failed_rewrites) = (None, 0, 0);
                 }
                 (s.target, s.device) = (Some(target), Some(device));
+                mismatch = Some((target, device, written_ms));
+            }
+            Some(check) => {
+                (s.target, s.device, s.rewrites, s.failed_rewrites) = (None, None, 0, 0);
+                if check == Check::Match {
+                    s.consecutive_failures = 0;
+                }
             }
         }
-        let since = seen.map(|_| *s.mismatch_since_us.get_or_insert(now_us));
-        let due = seen.filter(|_| since.is_some_and(|t| now_us - t >= verify_us) && now_us >= s.next_us);
+        match (mismatch, seen) {
+            (Some(_), _) => {
+                s.mismatch_since_us.get_or_insert(now_us);
+            }
+            (None, Some(Check::Pending)) => {}
+            (None, _) => s.mismatch_since_us = None,
+        }
+        let due = mismatch.filter(|_| s.mismatch_since_us.is_some_and(|t| now_us - t >= verify_us) && now_us >= s.next_us);
+        let mut rewrite = None;
         if due.is_some() {
             s.failed_rewrites = s.rewrites;
-            s.rewrites += 1;
-            s.rewrites_total += 1;
+            if s.rewrites < retries {
+                s.rewrites += 1;
+                s.rewrites_total += 1;
+                rewrite = due;
+            }
         }
         let change = settle_alert(r, retries, now_us);
-        (due, change)
+        (rewrite, change)
     });
     if let Some(detail) = change {
         emit(state, node, detail);
     }
-    let Some((target, device)) = rewrite else { return };
+    let Some((target, device, written_ms)) = rewrite else { return };
+    let now_ms = now_us / 1000;
+    let Some(prior) = state.commanded.lock().unwrap().claim_rewrite(node, target, written_ms, device, now_ms) else {
+        state.status.update_health(node, |r| (r.set.rewrites, r.set.rewrites_total) = (r.set.rewrites.saturating_sub(1), r.set.rewrites_total.saturating_sub(1)));
+        return;
+    };
     let outcome = crate::rules::send_setpoint(state, node, target).await;
     let error = outcome.as_ref().err().map(|e| e.to_string());
-    if outcome.is_ok() {
-        state.commanded.lock().unwrap().note_rewrite(node, target, device, now_us / 1000);
+    if error.is_some() {
+        state.commanded.lock().unwrap().release_rewrite(node, now_ms, prior);
     }
     let (rewrites, change) = state.status.update_health(node, |r| {
         match &error {

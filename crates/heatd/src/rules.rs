@@ -21,6 +21,15 @@ pub struct Sent {
     pub previous: Option<f64>,
     pub written_ms: i64,
     pub acked: Option<f64>,
+    pub stale: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Check {
+    Unknown,
+    Pending,
+    Match,
+    Mismatch(f64, f64, i64),
 }
 
 #[derive(Debug, Clone)]
@@ -120,13 +129,37 @@ impl Commands {
         self.sent.get(&node).map(|s| s.target)
     }
 
-    pub fn mismatch(&self, node: u64, tolerance: f64) -> Option<(f64, f64)> {
-        let (sent, device, at) = (self.sent.get(&node)?, self.device.get(&node)?, self.device_ms.get(&node)?);
-        (!self.holds.contains_key(&node) && sent.written_ms > 0 && *at >= sent.written_ms && (device - sent.target).abs() >= tolerance).then_some((sent.target, *device))
+    pub fn check(&self, node: u64, tolerance: f64, now_ms: i64, pending_ms: i64) -> Check {
+        let (Some(sent), Some(device), Some(at)) = (self.sent.get(&node), self.device.get(&node), self.device_ms.get(&node)) else { return Check::Unknown };
+        if self.holds.contains_key(&node) || sent.written_ms <= 0 {
+            return Check::Unknown;
+        }
+        if *at < sent.written_ms {
+            return if sent.stale.is_some() && now_ms - sent.written_ms >= pending_ms { Check::Mismatch(sent.target, *device, sent.written_ms) } else { Check::Pending };
+        }
+        let near = |a: f64| (device - a).abs() < tolerance;
+        if near(sent.target) || sent.acked.is_some_and(near) {
+            Check::Match
+        } else {
+            Check::Mismatch(sent.target, *device, sent.written_ms)
+        }
     }
 
-    pub fn note_rewrite(&mut self, node: u64, target: f64, previous: f64, now_ms: i64) {
-        self.sent.insert(node, Sent { target, previous: Some(previous), written_ms: now_ms, acked: None });
+    pub fn claim_rewrite(&mut self, node: u64, target: f64, written_ms: i64, device: f64, now_ms: i64) -> Option<Sent> {
+        let current = self.sent.get(&node).filter(|s| s.target == target && s.written_ms == written_ms)?.clone();
+        self.sent.insert(node, Sent { target, previous: Some(device), written_ms: now_ms, acked: None, stale: Some(device) });
+        Some(current)
+    }
+
+    pub fn release_rewrite(&mut self, node: u64, claimed_ms: i64, prior: Sent) {
+        if self.sent.get(&node).is_some_and(|s| s.written_ms == claimed_ms) {
+            self.sent.insert(node, prior);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_sent(&mut self, node: u64, target: f64, previous: f64, written_ms: i64) {
+        self.sent.insert(node, Sent { target, previous: Some(previous), written_ms, acked: None, stale: None });
     }
 
     pub fn forget_desired_writes(&mut self) {
@@ -163,7 +196,7 @@ impl Commands {
             return None;
         }
         if let Some(hold) = self.holds.remove(&want.node) {
-            self.sent.insert(want.node, Sent { target: hold.value, previous: None, written_ms: 0, acked: None });
+            self.sent.insert(want.node, Sent { target: hold.value, previous: None, written_ms: 0, acked: None, stale: None });
         }
         Some(true)
     }
@@ -721,7 +754,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         log("decision", state.sink.append(decision.clone()));
         let sink = state.sink.clone();
         log("decision flush", tokio::task::spawn_blocking(move || sink.flush()).await.map_err(anyhow::Error::from).and_then(|r| r.map(|_| ())));
-        state.commanded.lock().unwrap().sent.insert(want.node, Sent { target: want.setpoint, previous: old, written_ms: now_ms, acked: None });
+        state.commanded.lock().unwrap().sent.insert(want.node, Sent { target: want.setpoint, previous: old, written_ms: now_ms, acked: None, stale: None });
         let outcome = send_setpoint(state, want.node, want.setpoint).await;
         let error = outcome.as_ref().err().map(|e| e.to_string());
         state.status.setpoint_write(want.node, error.clone());
@@ -759,10 +792,10 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     commands.device.insert(report.node, report.value);
     commands.device_ms.insert(report.node, now_ms);
     let Some(sent) = commands.sent.get_mut(&report.node) else {
-        commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None });
+        commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
         return None;
     };
-    if near(report.value, sent.target) || sent.acked.is_some_and(|a| near(a, report.value)) {
+    if near(report.value, sent.target) || [sent.acked, sent.stale].into_iter().flatten().any(|a| near(a, report.value)) {
         return None;
     }
     if now_ms - sent.written_ms < grace_ms {
@@ -775,7 +808,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
         return None;
     }
     let previous = sent.acked.unwrap_or(sent.target);
-    commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None });
+    commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
     commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms });
     Some(previous)
 }

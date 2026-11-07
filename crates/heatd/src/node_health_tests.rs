@@ -62,6 +62,10 @@ impl Rig {
         crate::rules::on_report(&self.state, &AttributeReport { node, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value }, true, at_us / 1000);
     }
 
+    fn push(&self, node: u64, value: f64, at_us: i64) {
+        crate::rules::on_report(&self.state, &AttributeReport { node, endpoint: 1, attribute: "occupied_heating_setpoint".into(), value }, false, at_us / 1000);
+    }
+
     fn events(&self) -> Vec<Value> {
         self.state.sink.flush().unwrap();
         string_column(self.dir.path(), "events", "kind").into_iter().zip(string_column(self.dir.path(), "events", "detail")).filter(|(k, _)| k == "node_health").map(|(_, d)| serde_json::from_str(&d).unwrap()).collect()
@@ -188,7 +192,7 @@ async fn a_setpoint_the_device_does_not_report_is_written_again_with_backoff_and
     let r = rig();
     let s = 1_000_000;
     let ms = r.t0 / 1000;
-    r.state.commanded.lock().unwrap().note_rewrite(5, 21.0, 19.0, ms);
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, ms);
     r.device(5, 19.0, r.t0 + s);
     for t in [1, 30, 100] {
         r.report(5, r.t0 + t * s);
@@ -216,7 +220,7 @@ async fn a_setpoint_the_device_does_not_report_is_written_again_with_backoff_and
 async fn a_setpoint_that_never_sticks_raises_an_alert_after_the_retries_and_clears_when_it_does() {
     let r = rig();
     let s = 1_000_000;
-    r.state.commanded.lock().unwrap().note_rewrite(5, 21.0, 19.0, r.t0 / 1000);
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, r.t0 / 1000);
     r.mock.set_writes_dropped(5, true);
     for t in (1..700).step_by(5) {
         r.report(5, r.t0 + t * s);
@@ -225,22 +229,22 @@ async fn a_setpoint_that_never_sticks_raises_an_alert_after_the_retries_and_clea
         step(&r.state, r.t0 + t * s).await;
     }
     let writes = r.mock.setpoint_writes().len();
-    assert!(writes >= 3, "{writes}");
+    assert_eq!(writes, 2);
     let alerts = alerts(&r.state);
     assert_eq!(alerts.len(), 1);
     let text = alerts[0]["text"].as_str().unwrap();
     assert!(alerts[0]["id"].as_str().unwrap().starts_with("setpoint_not_applied:5@") && text.contains("21.0") && text.contains("19.0"), "{text}");
     assert!(r.events().iter().any(|e| e["aspect"] == "setpoint" && e["alert"] == true));
+    assert_eq!(r.mock.setpoint_writes().len(), writes);
     r.mock.set_writes_dropped(5, false);
     for t in (700..1000).step_by(5) {
         r.report(5, r.t0 + t * s);
         r.report(6, r.t0 + t * s);
-        let device = r.mock.read_thermostat(5).await.unwrap().occupied_heating_setpoint_c.unwrap();
-        r.device(5, device, r.t0 + t * s);
+        r.device(5, 21.0, r.t0 + t * s);
         step(&r.state, r.t0 + t * s).await;
     }
     assert!(alerts_empty(&r.state));
-    assert_eq!(r.mock.read_thermostat(5).await.unwrap().occupied_heating_setpoint_c, Some(21.0));
+    assert_eq!(r.mock.setpoint_writes().len(), writes);
     assert!(r.events().iter().any(|e| e["aspect"] == "setpoint" && e["alert"] == false));
 }
 
@@ -356,4 +360,81 @@ async fn nodes_wait_out_the_grace_after_a_session_restart() {
         }
     }
     assert!(restart_at.is_some());
+}
+
+#[tokio::test]
+async fn a_device_within_the_control_deadband_or_at_its_acknowledged_value_is_not_rewritten() {
+    let r = rig();
+    let s = 1_000_000;
+    r.state.commanded.lock().unwrap().test_sent(5, 20.0, 18.0, r.t0 / 1000);
+    r.device(5, 19.8, r.t0 + s);
+    r.state.commanded.lock().unwrap().test_sent(6, 21.0, 19.0, r.t0 / 1000);
+    r.device(6, 20.0, r.t0 + s);
+    for t in (1..400).step_by(5) {
+        r.report(5, r.t0 + t * s);
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert!(r.mock.setpoint_writes().is_empty(), "{:?}", r.mock.setpoint_writes());
+    assert!(alerts_empty(&r.state));
+}
+
+#[tokio::test]
+async fn a_late_priming_report_with_the_old_value_after_a_rewrite_is_no_manual_change() {
+    let r = rig();
+    let s = 1_000_000;
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, r.t0 / 1000);
+    r.device(5, 19.0, r.t0 + s);
+    r.mock.set_writes_dropped(5, true);
+    for t in (1..140).step_by(5) {
+        r.report(5, r.t0 + t * s);
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert_eq!(r.mock.setpoint_writes().len(), 1);
+    r.push(5, 19.0, r.t0 + 600 * s);
+    assert!(r.state.commanded.lock().unwrap().hold(5).is_none());
+    r.push(5, 17.0, r.t0 + 700 * s);
+    assert!(r.state.commanded.lock().unwrap().hold(5).is_some());
+}
+
+#[test]
+fn a_rewrite_claim_fails_when_a_newer_control_write_replaced_the_target() {
+    let mut commands = crate::rules::Commands::default();
+    commands.test_sent(5, 21.0, 19.0, 1000);
+    commands.test_sent(5, 22.0, 19.0, 2000);
+    assert!(commands.claim_rewrite(5, 21.0, 1000, 19.0, 3000).is_none());
+    let prior = commands.claim_rewrite(5, 22.0, 2000, 19.0, 3000).unwrap();
+    commands.test_sent(5, 23.0, 19.0, 4000);
+    commands.release_rewrite(5, 3000, prior);
+    assert_eq!(commands.target(5), Some(23.0));
+}
+
+#[tokio::test]
+async fn the_setpoint_alert_survives_silence_and_failed_writes_clear_when_the_device_matches() {
+    let r = rig();
+    let s = 1_000_000;
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, r.t0 / 1000);
+    r.mock.set_writes_dropped(5, true);
+    for t in (1..700).step_by(5) {
+        r.report(5, r.t0 + t * s);
+        r.report(6, r.t0 + t * s);
+        r.device(5, 19.0, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert!(alerts(&r.state).iter().any(|a| a["id"].as_str().unwrap().starts_with("setpoint_not_applied:5@")));
+    for t in (700..1200).step_by(5) {
+        r.report(6, r.t0 + t * s);
+        step(&r.state, r.t0 + t * s).await;
+    }
+    assert_eq!(r.health(5), Health::Unreachable);
+    let ids: Vec<String> = alerts(&r.state).iter().map(|a| a["id"].as_str().unwrap().split(':').next().unwrap().to_string()).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&"setpoint_not_applied".to_string()) && ids.contains(&"node_unreachable".to_string()));
+    r.state.commanded.lock().unwrap().test_sent(6, 20.0, 19.0, (r.t0 + 1300 * s) / 1000);
+    r.state.status.setpoint_write(6, Some("no write status".into()));
+    r.device(6, 20.0, r.t0 + 1301 * s);
+    r.report(6, r.t0 + 1301 * s);
+    step(&r.state, r.t0 + 1302 * s).await;
+    assert_eq!(r.state.status.node_snapshot(6).unwrap().health.set.consecutive_failures, 0);
 }
