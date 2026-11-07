@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
@@ -85,6 +85,7 @@ class Series:
         self.rad = np.nan_to_num(grid.shared["rad"], nan=0.0)
         self.hour = grid.local_hour
         self.resume = self.since_resume()
+        self.u_cmd = self.u
         self.u = self.u * ramp(self.resume, c["ramp_tau_min"])
         self.scenario = self.scenarios(dsp, sp)
 
@@ -125,6 +126,48 @@ class Series:
                 "since_resume": float(self.resume[s]), "vm60": float(self.u[max(s - 60, 0):s].sum()), "vm180": float(self.u[max(s - 180, 0):s].sum()), "hour": float(self.hour[s])}
 
 
+def closure_points(s, cycles, cfg):
+    c = cfg
+    gap = s.setpoint - s.temp
+    ok = np.isfinite(gap) & ~s.bad & ~s.outage & s.valid_valve & (s.resume >= c["resume_cap_min"])
+    for cy in cycles:
+        ok[cy["start_idx"]:cy["start_idx"] + c["closure_excl_min"]] = False
+    ok &= (gap > -c["closure_gap"][0]) & (gap < c["closure_gap"][1])
+    return gap[ok], s.u_cmd[ok]
+
+
+def fit_closure(g, u, cfg):
+    c = cfg
+    kp = np.geomspace(*c["closure_kp"], 40)
+    best = (np.inf, None, None)
+    for g0 in np.linspace(0.0, c["closure_gap0_max"], 31):
+        err = ((np.clip(kp[:, None] * (g[None, :] - g0), 0.0, 1.0) - u[None, :]) ** 2).mean(axis=1)
+        i = int(np.argmin(err))
+        best = min(best, (float(err[i]), float(kp[i]), float(g0)))
+    return {"kp": round(best[1], 5), "gap0": round(best[2], 4), "n": int(len(g)), "rmse": round(float(np.sqrt(best[0])), 4)}
+
+
+def closed_loop(theta, a, delta, t0, tout, hist, doses, setpoint, pi, ramp_factor, length, shape):
+    th = np.atleast_2d(theta)
+    horizon = len(ramp_factor)
+    doses = np.asarray(doses, float)
+    h = kernels(np.exp(th[:, 1]), length, shape)[:, ::-1]
+    g = np.exp(th[:, 0])
+    ring = np.zeros((len(doses), len(th), length + horizon))
+    ring[:, :, :length] = hist
+    ref = np.broadcast_to(np.asarray(tout, float), (horizon,)) + delta
+    boost = np.clip(doses[:, None] - np.arange(horizon)[None, :], 0.0, 1.0)
+    cur = np.full((len(doses), len(th)), float(t0))
+    peak = cur.copy()
+    for t in range(horizon):
+        if t:
+            cur = (1.0 - a) * cur + a * ref[t - 1] + g * np.einsum("dsl,sl->ds", ring[:, :, t:t + length], h)
+            peak = np.maximum(peak, cur)
+        thermostat = np.clip(pi["kp"] * (setpoint - cur - pi["gap0"]), 0.0, 1.0)
+        ring[:, :, length + t] = np.where(boost[:, t, None] > 0, boost[:, t, None], thermostat) * ramp_factor[t]
+    return peak
+
+
 def feature_row(ctx):
     h = 2 * np.pi * ctx["hour"] / 24.0
     return [ctx["out"], ctx["wind"], ctx["rad"], ctx["start_temp"], ctx["gap"], ctx["supply_ok"], ctx["since_resume"], ctx["vm60"], ctx["vm180"], ctx["since_open"], float(np.sin(h)), float(np.cos(h))]
@@ -134,9 +177,12 @@ class Episodes:
     def __init__(self, grid, cfg, boost_cycles):
         self.cfg, self.rooms = cfg, grid.rooms
         self.series = {r: Series(grid, r, cfg) for r in grid.rooms}
-        self.pulses, self.windows = [], {r: [] for r in grid.rooms}
+        self.pulses, self.windows, self.cycles, self.pas = [], {r: [] for r in grid.rooms}, boost_cycles, {}
         for r in grid.rooms:
             self.extract(r, boost_cycles.get(r, []))
+        pts = {r: closure_points(self.series[r], boost_cycles.get(r, []), cfg) for r in grid.rooms}
+        pooled = fit_closure(np.concatenate([p[0] for p in pts.values()]), np.concatenate([p[1] for p in pts.values()]), cfg) if sum(len(p[0]) for p in pts.values()) >= cfg["closure_min_points"] else dict(cfg["closure_default"], n=0, rmse=None)
+        self.closure = {r: fit_closure(*pts[r], cfg) if (pts[r][0] > cfg["closure_active_gap"]).sum() >= cfg["closure_min_active"] else dict(pooled, pooled=True) for r in grid.rooms}
 
     def extract(self, room, cycles):
         c, s = self.cfg, self.series[room]
@@ -151,8 +197,9 @@ class Episodes:
             if ok and dose >= c["min_dose"]:
                 ctx = s.vector(x, (boost or {}).get("target"))
                 ctx["since_open"] = float(min(x - prev_end, c["since_open_cap_min"]))
-                known_ok = boost is None or boost["overshoot_c"] is None or boost["overshoot_c"] <= c["known_overshoot_k"]
-                p = {"room": room, "start": int(x), "end": int(y), "dose": dose, "ctx": ctx, "scenario": (boost or {}).get("scenario") or str(s.scenario[x]), "boost": boost is not None, "known_ok": known_ok}
+                if boost and boost["dose"] is not None:
+                    dose = float(boost["dose"])
+                p = {"room": room, "start": int(x), "end": int(y), "dose": dose, "ctx": ctx, "scenario": (boost or {}).get("scenario") or str(s.scenario[x]), "boost": boost is not None, "overshoot_c": (boost or {}).get("overshoot_c")}
                 self.pulses.append(p)
                 spans.append(p)
             prev_end = y
@@ -189,8 +236,22 @@ class Episodes:
                 self.windows[room].append(w)
         for p in spans:
             p.setdefault("clean", False)
+            p["known_ok"] = self.did_not_overshoot(p)
+
+    def did_not_overshoot(self, p):
+        c = self.cfg
+        if not p["clean"] or not np.isfinite(p["rise"]) or p["hi"] - p["end"] < c["known_post_min"]:
+            return False
+        if p["boost"] and (p["overshoot_c"] is None or p["overshoot_c"] > c["known_overshoot_k"]):
+            return False
+        return p["rise"] - p["ctx"]["gap"] <= c["known_overshoot_k"]
 
     def passive(self, room):
+        if room not in self.pas:
+            self.pas[room] = self.fit_passive(room)
+        return self.pas[room]
+
+    def fit_passive(self, room):
         c, s = self.cfg, self.series[room]
         step, L = c["passive_step_min"], c["kernel_len_min"]
         cum = np.concatenate([[0.0], np.cumsum(s.u)])
@@ -216,12 +277,12 @@ class Posterior:
         self.prior_mu = np.array([np.log(cfg["gain_prior"][0]), np.log(cfg["delay_prior"][0])])
         self.prior_sd = np.array([cfg["gain_prior"][1], cfg["delay_prior"][1]])
         self.mu, self.tau = self.prior_mu.copy(), self.prior_sd.copy()
+        self.lo = np.array([np.log(cfg["gain_bounds"][0]), np.log(cfg["delay_bounds"][0])])
+        self.hi = np.array([np.log(cfg["gain_bounds"][1]), np.log(cfg["delay_bounds"][1])])
         self.room = {}
 
     def resid_fn(self, wins, a, delta, sigma, mu, tau):
-        c = self.cfg
-        lo = np.array([np.log(c["gain_bounds"][0]), np.log(c["delay_bounds"][0])])
-        hi = np.array([np.log(c["gain_bounds"][1]), np.log(c["delay_bounds"][1])])
+        c, lo, hi = self.cfg, self.lo, self.hi
 
         def parts(x):
             out = []
@@ -255,10 +316,10 @@ class Posterior:
             sigma = max(c["sigma_floor"], mad) * min(autocorr_factor([np.clip(r, -lim, lim) for r in res]), c["kappa_max"])
         return {"theta": x, "cov": cov, "sigma": float(sigma), "a": a, "delta": delta, "n_win": len(wins), "n_pulse": int(sum(len(w["pulses"]) for w in wins))}
 
-    def fit(self, eps):
+    def fit(self, eps, drop=None):
         c = self.cfg
         pas = {r: eps.passive(r) for r in eps.rooms}
-        wins = eps.windows
+        wins = {r: [w for w in eps.windows[r] if w is not drop] for r in eps.rooms}
         for _ in range(c["eb_iter"]):
             fits = {r: self.fit_room(wins[r], pas[r][0], pas[r][1], self.mu, self.tau) for r in eps.rooms}
             used = [r for r in eps.rooms if fits[r]["n_win"] >= c["hyper_min_windows"]]
@@ -274,13 +335,10 @@ class Posterior:
             f["passive_points"] = pas[r][2]
         return self
 
-    def refit_room(self, eps, room, drop):
-        wins = [w for w in eps.windows[room] if w is not drop]
-        f = self.room[room]
-        return self.fit_room(wins, f["a"], f["delta"], self.mu, self.tau)
-
     def samples(self, fit, n, rng):
-        return rng.multivariate_normal(fit["theta"], fit["cov"], size=n)
+        x = rng.multivariate_normal(fit["theta"], fit["cov"], size=4 * n)
+        inside = x[np.all((x >= self.lo) & (x <= self.hi), axis=1)]
+        return np.vstack([inside, np.clip(x, self.lo, self.hi)])[:n]
 
 
 class Trust:
@@ -297,107 +355,43 @@ class Trust:
         self.dose = np.array([e["dose"] for e in table], float)
         self.radius = self.pair_radius()
 
-    def dist(self, z, room, scenario):
-        d2 = ((self.z - z) ** 2 * self.w).sum(1) + np.where(self.scn != scenario, self.cfg["scenario_penalty"] ** 2, 0.0) + np.where(self.rooms != room, self.cfg["room_penalty"] ** 2, 0.0)
-        return np.sqrt(d2)
+    def dist(self, z, scenario):
+        return np.sqrt(((self.z - z) ** 2 * self.w).sum(1) + np.where(self.scn != scenario, self.cfg["scenario_penalty"] ** 2, 0.0))
 
     def pair_radius(self):
         n = len(self.z)
-        if n < 3:
-            return self.cfg["radius_default"]
-        d = np.array([self.dist(self.z[i], self.rooms[i], self.scn[i]) for i in range(n)])
-        iu = np.triu_indices(n, 1)
-        same = (self.rooms[:, None] == self.rooms[None, :])[iu]
-        v = d[iu][same] if same.sum() >= 10 else d[iu]
-        return float(np.quantile(v, self.cfg["radius_quantile"]))
-
-    def known(self, ctx, room, scenario, radius=None, skip=None):
         c = self.cfg
-        if not len(self.table):
+        if n < 3:
+            return c["radius_default"]
+        d = np.array([self.dist(self.z[i], self.scn[i]) for i in range(n)])
+        iu = np.triu_indices(n, 1)
+        v = d[iu][(self.rooms[:, None] == self.rooms[None, :])[iu]]
+        return max(float(np.quantile(v, c["radius_quantile"])), c["radius_floor"]) if len(v) >= 10 else c["radius_default"]
+
+    def known(self, ctx, room, scenario, radius=None):
+        own = self.rooms == room
+        if not own.any():
             return {"dose": None, "n_similar": 0, "neighbors": []}
         z = (np.array(feature_row(ctx), float) - self.mean) / self.std
-        d = self.dist(z, room, scenario)
-        weighted = self.dose * np.where(self.rooms == room, 1.0, c["other_room_weight"])
-        ok = d <= (self.radius if radius is None else radius)
-        if skip is not None:
-            ok[skip] = False
-        idx = np.flatnonzero(ok)
-        idx = idx[np.argsort(d[idx])][:c["knn_k"]]
-        near = int(np.argmin(d))
+        d = np.where(own, self.dist(z, scenario), np.inf)
+        idx = np.flatnonzero(d <= (self.radius if radius is None else radius))
+        idx = idx[np.argsort(d[idx], kind="stable")]
         if not len(idx):
-            return {"dose": None, "n_similar": 0, "neighbors": [], "nearest_dist": round(float(d[near]), 3), "nearest_dose": round(float(weighted[near]), 3)}
-        return {"dose": float(weighted[idx].max()), "n_similar": int(len(idx)), "neighbors": [{"i": int(i), "dist": round(float(d[i]), 3), "room": str(self.rooms[i]), "dose": round(float(weighted[i]), 3)} for i in idx]}
+            near = int(np.argmin(d))
+            return {"dose": None, "n_similar": 0, "neighbors": [], "nearest_dist": round(float(d[near]), 3), "nearest_dose": round(float(self.dose[near]), 3)}
+        return {"dose": float(self.dose[idx].max()), "n_similar": int(len(idx)), "neighbors": [{"i": int(i), "dist": round(float(d[i]), 3), "dose": round(float(self.dose[i]), 3)} for i in idx[:self.cfg["knn_k"]]]}
 
     def export(self):
         c = self.cfg
-        return {"features": FEATURES, "mean": self.mean.round(6).tolist(), "std": self.std.round(6).tolist(), "weights": self.w.tolist(), "scenario_penalty": c["scenario_penalty"], "room_penalty": c["room_penalty"],
-                "other_room_weight": c["other_room_weight"], "k": c["knn_k"], "radius": round(self.radius, 4), "growth": c["growth"],
+        return {"features": FEATURES, "mean": self.mean.round(6).tolist(), "std": self.std.round(6).tolist(), "weights": self.w.tolist(), "scenario_penalty": c["scenario_penalty"],
+                "k": c["knn_k"], "radius": round(self.radius, 4), "growth": c["growth"],
                 "episodes": [{"room": e["room"], "scenario": e["scenario"], "x": [round(v, 4) for v in feature_row(e["ctx"])], "dose": round(e["dose"], 4), "boost": e["boost"]} for e in self.table]}
-
-
-class Dosing:
-    def __init__(self, bundle):
-        self.b = bundle
-        c = bundle["dose"]
-        self.cand = np.arange(c["min_min"], c["max_min"] + 1e-9, c["step_min"])
-        self.trust = None
-
-    def samples(self, room):
-        return np.array(self.b["rooms"][room]["samples"], float)
-
-    def peaks(self, room, ctx, valve_hist=None):
-        b = self.b
-        r, L, H = b["rooms"][room], b["kernel"]["len_min"], b["horizon_min"]
-        hist = np.zeros(L) if valve_hist is None else np.asarray(valve_hist, float)[-L:]
-        if valve_hist is None and ctx.get("vm60", 0) > 0:
-            hist[-60:] = ctx["vm60"] / 60.0
-        hist = np.concatenate([np.zeros(L - len(hist)), hist])
-        th = self.samples(room)
-        out = np.empty((len(self.cand), len(th)))
-        for i, d in enumerate(self.cand):
-            u = np.zeros(H)
-            full = int(np.floor(d))
-            u[:full] = 1.0
-            if full < H and d > full:
-                u[full] = d - full
-            u *= ramp(ctx["since_resume"] + np.arange(H), b["ramp_tau_min"])
-            T = rollout(th, r["a"], r["delta"], ctx["start_temp"], ctx["out"], np.concatenate([hist, u]), L, b["kernel"]["shape"])
-            out[i] = T.max(axis=1)
-        return out
-
-    def risk(self, room, ctx, target, valve_hist=None):
-        pk = self.peaks(room, ctx, valve_hist)
-        limit = min(target + self.b["risk"]["margin_k"], self.b["abort_c"])
-        return norm.sf((limit - pk) / self.b["risk"]["peak_sigma_k"]).mean(axis=1), pk
-
-    def decide(self, room, ctx, scenario, target, valve_hist=None, draw=0):
-        b = self.b
-        p, pk = self.risk(room, ctx, target, valve_hist)
-        feasible = np.flatnonzero(p <= b["risk"]["p_max"])
-        d_safe = float(self.cand[feasible.max()]) if len(feasible) else 0.0
-        t = self.trust or Trust.from_bundle(b)
-        self.trust = t
-        full = dict(ctx)
-        full.setdefault("since_open", b["since_open_cap_min"])
-        kn = t.known(full, room, scenario)
-        dmin = b["dose"]["min_min"]
-        cap = min(d_safe, dmin) if kn["dose"] is None else min(d_safe, b["trust"]["growth"] * kn["dose"])
-        allowed = float(np.floor(cap * 10) / 10) if cap >= dmin and ctx["supply_ok"] > 0 else 0.0
-        chosen = 0.0
-        if allowed > 0:
-            j = np.random.default_rng(b["seed"] + 7919 * draw + len(b["trust"]["episodes"])).integers(pk.shape[1])
-            lim = target + b["risk"]["thompson_margin_k"]
-            ok = np.flatnonzero((self.cand <= allowed + 1e-9) & (pk[:, j] <= lim))
-            chosen = float(self.cand[ok.max()]) if len(ok) else dmin
-            chosen = min(chosen, allowed)
-        i = int(np.argmin(np.abs(self.cand - (chosen or dmin))))
-        return {"nearest_dist": kn.get("nearest_dist"), "nearest_dose": kn.get("nearest_dose"), "d_safe": d_safe, "known": kn["dose"], "n_similar": kn["n_similar"], "allowed": allowed, "chosen": chosen, "p_overshoot": float(p[i]), "p_at_allowed": float(p[int(np.argmin(np.abs(self.cand - (allowed or dmin))))])}
 
 
 def _from_bundle(cls, b):
     t = Trust.__new__(Trust)
     tr = b["trust"]
-    t.cfg = {"scenario_penalty": tr["scenario_penalty"], "room_penalty": tr["room_penalty"], "other_room_weight": tr["other_room_weight"], "knn_k": tr["k"]}
+    t.cfg = {"scenario_penalty": tr["scenario_penalty"], "knn_k": tr["k"]}
     t.table = tr["episodes"]
     t.mean, t.std, t.w = np.array(tr["mean"]), np.array(tr["std"]), np.array(tr["weights"])
     x = np.array([e["x"] for e in tr["episodes"]], float).reshape(-1, len(FEATURES))
@@ -412,6 +406,61 @@ def _from_bundle(cls, b):
 Trust.from_bundle = classmethod(_from_bundle)
 
 
+class Dosing:
+    def __init__(self, bundle):
+        self.b = bundle
+        c = bundle["dose"]
+        self.cand = np.arange(c["min_min"], c["max_min"] + 1e-9, c["step_min"])
+        self.trust = None
+
+    def samples(self, room):
+        return np.array(self.b["rooms"][room]["samples"], float)
+
+    def peaks(self, room, ctx, target, valve_hist=None, doses=None):
+        b = self.b
+        r, L, H = b["rooms"][room], b["kernel"]["len_min"], b["horizon_min"]
+        hist = np.zeros(L) if valve_hist is None else np.asarray(valve_hist, float)[-L:]
+        if valve_hist is None and ctx.get("vm60", 0) > 0:
+            hist[-60:] = ctx["vm60"] / 60.0
+        hist = np.concatenate([np.zeros(L - len(hist)), hist])
+        doses = self.cand if doses is None else np.sort(np.asarray(doses, float))
+        pk = closed_loop(self.samples(room), r["a"], r["delta"], ctx["start_temp"], ctx["out"], hist, doses, target, r["pi"], ramp(ctx["since_resume"] + np.arange(H), b["ramp_tau_min"]), L, b["kernel"]["shape"])
+        return np.maximum.accumulate(pk, axis=0)
+
+    def exceed(self, room, pk, target):
+        limit = min(target + self.b["risk"]["margin_k"], self.b["abort_c"])
+        return norm.sf((limit - pk) / self.b["rooms"][room].get("peak_sigma_k", self.b["risk"]["peak_sigma_k"])).mean(axis=1)
+
+    def risk(self, room, ctx, target, valve_hist=None):
+        pk = self.peaks(room, ctx, target, valve_hist)
+        return self.exceed(room, pk, target), pk
+
+    def decide(self, room, ctx, scenario, target, valve_hist=None, draw=0):
+        b = self.b
+        dmin = b["dose"]["min_min"]
+        p, pk = self.risk(room, ctx, target, valve_hist)
+        feasible = np.flatnonzero(p <= b["risk"]["p_max"])
+        d_safe = float(self.cand[feasible.max()]) if len(feasible) else 0.0
+        t = self.trust or Trust.from_bundle(b)
+        self.trust = t
+        full = dict(ctx)
+        full.setdefault("since_open", b["since_open_cap_min"])
+        kn = t.known(full, room, scenario)
+        cap = min(d_safe, dmin if kn["dose"] is None else max(dmin, b["trust"]["growth"] * kn["dose"]))
+        allowed = cap if scenario in b["scenarios"] and ctx["supply_ok"] > 0 and cap >= dmin - 1e-9 else 0.0
+        chosen, p_chosen, p_allowed = 0.0, float(p[0]), float(p[0])
+        if allowed > 0:
+            n = int(np.searchsorted(self.cand, allowed + 1e-9))
+            top = np.maximum(self.peaks(room, ctx, target, valve_hist, [allowed]), pk[n - 1:n])
+            doses, grid = np.append(self.cand[:n], allowed), np.vstack([pk[:n], top])
+            j = np.random.default_rng(b["seed"] + 7919 * draw + len(b["trust"]["episodes"])).integers(grid.shape[1])
+            ok = np.flatnonzero(grid[:, j] <= target + b["risk"]["thompson_margin_k"])
+            k = int(ok.max()) if len(ok) else 0
+            chosen = float(doses[k])
+            p_chosen, p_allowed = (float(v) for v in self.exceed(room, grid[[k, -1]], target))
+        return {"nearest_dist": kn.get("nearest_dist"), "nearest_dose": kn.get("nearest_dose"), "d_safe": d_safe, "known": kn["dose"], "n_similar": kn["n_similar"], "allowed": allowed, "chosen": chosen, "p_overshoot": p_chosen, "p_at_allowed": p_allowed, "p_no_boost": float(self.exceed(room, self.peaks(room, ctx, target, valve_hist, [0.0]), target)[0])}
+
+
 class BoostLearn:
     def __init__(self, config, lake):
         wcfg = dict(config["window"])
@@ -421,32 +470,100 @@ class BoostLearn:
         self.cycles = boost_cycles(lake, self.grid, self.cfg)
         self.eps = Episodes(self.grid, self.cfg, self.cycles)
         self.post = Posterior(self.cfg).fit(self.eps)
-        self.table = [p for p in self.eps.pulses if p["clean"] and p["known_ok"] and np.isfinite(p["rise"])]
+        self.tune_closure()
+        self.table = [p for p in self.eps.pulses if p["known_ok"]]
         self.trust = Trust(self.table, self.cfg)
+        self.cal = None
 
     def bundle(self, version):
         c, rng = self.cfg, np.random.default_rng(self.cfg["seed"])
-        peak_sigma = max(c["peak_sigma_floor"], self.peak_rmse())
+        cal = self.calibration()
         rooms = {}
         for r, f in self.post.room.items():
             s = self.post.samples(f, c["n_samples"], rng)
-            rooms[r] = {"node": c["nodes"][r], "a": round(f["a"], 6), "delta": round(f["delta"], 4), "sigma": round(f["sigma"], 4), "windows": f["n_win"], "pulses": f["n_pulse"],
+            rooms[r] = {"node": c["nodes"][r], "a": round(f["a"], 6), "delta": round(f["delta"], 4), "sigma": round(f["sigma"], 4), "windows": f["n_win"], "pulses": f["n_pulse"], "pi": self.eps.closure[r], "peak_sigma_k": cal["sigma"][r],
                         "theta": f["theta"].round(5).tolist(), "cov": f["cov"].round(6).tolist(), "samples": s.round(5).tolist()}
         return {"version": version, "kind": "boost_learn", "seed": c["seed"], "horizon_min": c["horizon_min"], "ramp_tau_min": c["ramp_tau_min"], "dead_zone": c["dead_zone"], "pulse_cap_min": c["pulse_cap_min"], "open_gap_merge_min": c["merge_gap_min"], "kernel": {"shape": c["kernel_shape"], "len_min": c["kernel_len_min"]},
                 "dose": {"min_min": c["dose_min"], "max_min": c["dose_max"], "step_min": c["dose_step"]}, "boost_setpoint_c": c["boost_setpoint"], "abort_c": c["abort_c"], "raise_budget_per_room_hour": 1,
-                "risk": {"p_max": c["p_max"], "margin_k": c["margin_k"], "peak_sigma_k": round(peak_sigma, 4), "thompson_margin_k": c["thompson_margin_k"]}, "scenarios": ["morning", "homecoming"],
+                "risk": {"p_max": c["p_max"], "margin_k": c["margin_k"], "peak_sigma_k": cal["sigma"]["all"], "thompson_margin_k": c["thompson_margin_k"]}, "scenarios": ["morning", "homecoming"],
                 "since_open_cap_min": c["since_open_cap_min"], "hyper": {"mu": self.post.mu.round(4).tolist(), "tau": self.post.tau.round(4).tolist()}, "rooms": rooms, "trust": self.trust.export()}
 
-    def peak_rmse(self):
-        errs = []
-        for r, f in self.post.room.items():
+    def calibration(self):
+        if self.cal is None:
+            self.cal = self.calibrate()
+        return self.cal
+
+    def tune_closure(self):
+        c, rooms = self.cfg, self.eps.rooms
+        err = {r: np.zeros((len(c["closure_scales"]), 0)) for r in rooms}
+        for r in rooms:
+            f, base = self.post.room[r], self.eps.closure[r]
+            rows = []
+            for p in self.eps.pulses:
+                y = self.eps.series[r].temp[p["start"]:p["hi"] + 1] if p["room"] == r and p["clean"] else []
+                if np.isfinite(y).any():
+                    rows.append([abs(float(np.nanmax(y)) - float(self.pulse_forecast(r, f, f["theta"], p, dict(base, kp=base["kp"] * k)).max())) for k in c["closure_scales"]])
+            err[r] = np.array(rows, float).reshape(-1, len(c["closure_scales"]))
+        pooled = np.concatenate(list(err.values()))
+        for r in rooms:
+            e = err[r] if len(err[r]) >= c["closure_min_pulses"] else pooled
+            loss = e.mean(axis=0) if len(e) else np.zeros(len(c["closure_scales"]))
+            k = int(np.flatnonzero(loss <= loss.min() * (1.0 + c["closure_tol"]) + 1e-9).max())
+            base = self.eps.closure[r]
+            self.eps.closure[r] = dict(base, kp=round(base["kp"] * c["closure_scales"][k], 5), scale=c["closure_scales"][k], forecast_mae_k=round(float(loss[k]), 3), forecast_mae_untuned_k=round(float(loss[-1]), 3), tuned_on=int(len(e)))
+
+    def pulse_forecast(self, room, f, th, p, pi=None):
+        c, s = self.cfg, self.eps.series[room]
+        L, x = c["kernel_len_min"], p["start"]
+        n = p["hi"] - x + 1
+        hist = np.zeros(L)
+        h = s.u[max(x - L, 0):x]
+        hist[L - len(h):] = h
+        tout = s.out[x:x + n]
+        tout = np.concatenate([tout, np.full(n - len(tout), tout[-1])])
+        target = p["ctx"]["start_temp"] + p["ctx"]["gap"]
+        return closed_loop(th, f["a"], f["delta"], p["ctx"]["start_temp"], tout, hist, [p["dose"]], target, pi or self.eps.closure[room], ramp(p["ctx"]["since_resume"] + np.arange(n), c["ramp_tau_min"]), L, c["kernel_shape"])[0]
+
+    def calibrate(self):
+        c = self.cfg
+        rng = np.random.default_rng(c["seed"] + 2)
+        recs = {r: [] for r in self.eps.rooms}
+        for r in self.eps.rooms:
+            s = self.eps.series[r]
             for w in self.eps.windows[r]:
-                T = response(f["theta"], w["U"], w["tout"] + f["delta"], f["a"], w["t0"], self.cfg["kernel_len_min"], self.cfg["kernel_shape"])[0]
+                post = Posterior(c).fit(self.eps, drop=w)
+                f = post.room[r]
+                th = post.samples(f, c["n_samples"], rng)
                 for p in w["pulses"]:
-                    lo, hi = p["start"] - w["ws"], p["hi"] - w["ws"] + 1
-                    if np.isfinite(w["y"][lo:hi]).any():
-                        errs.append(float(np.nanmax(w["y"][lo:hi]) - T[lo:hi].max()))
-        return float(np.sqrt(np.mean(np.square(errs)))) if errs else 0.0
+                    y = s.temp[p["start"]:p["hi"] + 1]
+                    if np.isfinite(y).any():
+                        recs[r].append({"w": id(w), "obs": float(np.nanmax(y)), "rise": p["rise"], "pk": self.pulse_forecast(r, f, th, p), "z": rng.standard_normal(len(th)), "strong": p["dose"] >= c["strong_dose"]})
+        pool = [x for v in recs.values() for x in v]
+        pooled = self.sigma([x for x in pool if x["strong"]] or pool)
+        sigma = {"all": pooled}
+        for r, v in recs.items():
+            strong = [x for x in v if x["strong"]]
+            sigma[r] = self.sigma(strong) if len(strong) >= c["loeo_min_strong"] else pooled
+        return {"sigma": sigma, "report": {r: self.report(r, v, sigma[r]) for r, v in recs.items()}}
+
+    def interval(self, x, sigma):
+        return np.quantile(x["pk"] + sigma * x["z"], [0.05, 0.5, 0.95])
+
+    def sigma(self, recs):
+        c = self.cfg
+        for sg in np.arange(c["peak_sigma_floor"], c["sigma_max"] + 1e-9, c["sigma_step"]):
+            if not recs or np.mean([self.interval(x, sg)[0] <= x["obs"] <= self.interval(x, sg)[2] for x in recs]) >= c["coverage_target"]:
+                return round(float(sg), 4)
+        return round(float(c["sigma_max"]), 4)
+
+    def report(self, room, recs, sigma):
+        if not recs:
+            return {"n": 0, "sigma_k": sigma}
+        q = [self.interval(x, sigma) for x in recs]
+        stats = lambda idx: {"n": len(idx), "mae_k": round(float(np.mean([abs(recs[i]["obs"] - q[i][1]) for i in idx])), 3), "baseline_mae_k": round(float(np.mean([abs(recs[i]["rise"] - np.mean([x["rise"] for x in recs if x["w"] != recs[i]["w"]] or [0.0])) for i in idx])), 3),
+                             "coverage90": round(float(np.mean([q[i][0] <= recs[i]["obs"] <= q[i][2] for i in idx])), 3), "interval_width_k": round(float(np.mean([q[i][2] - q[i][0] for i in idx])), 3), "bias_k": round(float(np.mean([recs[i]["obs"] - q[i][1] for i in idx])), 3)}
+        strong = [i for i, x in enumerate(recs) if x["strong"]]
+        return dict(stats(range(len(recs))), sigma_k=sigma, strong=stats(strong) if strong else None)
 
     def contexts(self, room):
         c = self.cfg
@@ -463,51 +580,20 @@ class BoostLearn:
             s = self.post.samples(f, 2000, np.random.default_rng(self.cfg["seed"] + 1))
             g, m = np.exp(s[:, 0]), np.exp(s[:, 1])
             res[r] = {"windows": f["n_win"], "pulses": f["n_pulse"], "gain_k_per_valve_min": [round(float(np.median(g)), 4), round(float(np.quantile(g, 0.05)), 4), round(float(np.quantile(g, 0.95)), 4)],
-                      "delay_mean_min": [round(float(np.median(m)), 1), round(float(np.quantile(m, 0.05)), 1), round(float(np.quantile(m, 0.95)), 1)], "cooling_per_min": round(f["a"], 5), "noise_sigma_k": round(f["sigma"], 3)}
+                      "delay_mean_min": [round(float(np.median(m)), 1), round(float(np.quantile(m, 0.05)), 1), round(float(np.quantile(m, 0.95)), 1)], "cooling_per_min": round(f["a"], 5), "noise_sigma_k": round(f["sigma"], 3), "thermostat": self.eps.closure[r], "peak_sigma_k": bundle["rooms"][r]["peak_sigma_k"]}
             for name, (ctx, scn, target) in self.contexts(r).items():
                 dec = dosing.decide(r, ctx, scn, target)
                 res[r][name] = {k: (None if v is None else round(v, 3) if isinstance(v, float) else v) for k, v in dec.items()}
         return res
 
     def validate(self, bundle):
-        return {"loeo": self.loeo(bundle["risk"]["peak_sigma_k"]), "monotone": self.monotone(bundle), "bounds": self.bounds(bundle)}
+        return {"loeo": self.calibration()["report"], "monotone": self.monotone(bundle), "bounds": self.bounds(bundle)}
 
-    def loeo(self, peak_sigma):
-        c = self.cfg
-        rng = np.random.default_rng(c["seed"] + 2)
-        res = {}
-        for r in self.eps.rooms:
-            err, base, cover, width, strong = [], [], [], [], []
-            rises = [(p["rise"], id(w)) for w in self.eps.windows[r] for p in w["pulses"]]
-            for w in self.eps.windows[r]:
-                f = self.post.refit_room(self.eps, r, w)
-                s = self.post.samples(f, c["n_samples"], rng)
-                T = response(s, w["U"], w["tout"] + f["delta"], f["a"], w["t0"], c["kernel_len_min"], c["kernel_shape"])
-                for p in w["pulses"]:
-                    lo, hi = p["start"] - w["ws"], p["hi"] - w["ws"] + 1
-                    y = w["y"][lo:hi]
-                    if not np.isfinite(y).any():
-                        continue
-                    obs = float(np.nanmax(y))
-                    pk = T[:, lo:hi].max(axis=1) + rng.normal(0, peak_sigma, len(s))
-                    q = np.quantile(pk, [0.05, 0.5, 0.95])
-                    others = [x for x, i in rises if i != id(w)]
-                    base.append(abs((obs - p["ctx"]["start_temp"]) - (np.mean(others) if others else 0.0)))
-                    err.append(obs - q[1])
-                    if p["dose"] >= c["strong_dose"]:
-                        strong.append((abs(obs - q[1]), base[-1], q[0] <= obs <= q[2]))
-                    cover.append(q[0] <= obs <= q[2])
-                    width.append(q[2] - q[0])
-            res[r] = {"n": len(err), "mae_k": round(float(np.mean(np.abs(err))), 3) if err else None, "baseline_mae_k": round(float(np.mean(base)), 3) if base else None,
-                      "coverage90": round(float(np.mean(cover)), 3) if cover else None, "interval_width_k": round(float(np.mean(width)), 3) if width else None, "bias_k": round(float(np.mean(err)), 3) if err else None,
-                      "strong": {"n": len(strong), "mae_k": round(float(np.mean([x[0] for x in strong])), 3), "baseline_mae_k": round(float(np.mean([x[1] for x in strong])), 3), "coverage90": round(float(np.mean([x[2] for x in strong])), 3)} if strong else None}
-        return res
-
-    def monotone(self, bundle, trials=300):
+    def monotone(self, bundle):
         c, rng = self.cfg, np.random.default_rng(self.cfg["seed"] + 3)
         L, H, worst, worst_dose = c["kernel_len_min"], c["horizon_min"], 0.0, 0.0
         dosing = Dosing(bundle)
-        for _ in range(trials):
+        for _ in range(c["monotone_trials"]):
             r = rng.choice(self.eps.rooms)
             f = self.post.room[r]
             s = self.post.samples(f, 8, rng)
@@ -518,16 +604,16 @@ class BoostLearn:
             b = rollout(s, f["a"], f["delta"], t0, tout, u2, L, c["kernel_shape"])
             worst = max(worst, float((a - b).max()))
             ctx = {"out": tout, "wind": 3.0, "rad": 0.0, "start_temp": t0, "gap": 2.0, "supply_ok": 1.0, "since_resume": 60.0, "vm60": 0.0, "vm180": 0.0, "since_open": 360.0, "hour": 7.0}
-            pk = dosing.peaks(r, ctx)
+            pk = dosing.peaks(r, ctx, t0 + 2.0)
             worst_dose = max(worst_dose, float((pk[:-1] - pk[1:]).max()))
-        return {"trials": trials, "max_violation_state_k": round(worst, 9), "max_violation_dose_k": round(worst_dose, 9)}
+        return {"trials": c["monotone_trials"], "max_violation_state_k": round(worst, 9), "max_violation_dose_k": round(worst_dose, 9)}
 
-    def bounds(self, bundle, trials=300):
-        rng = np.random.default_rng(self.cfg["seed"] + 4)
+    def bounds(self, bundle):
+        c, rng = self.cfg, np.random.default_rng(self.cfg["seed"] + 4)
         dosing = Dosing(bundle)
         t = Trust.from_bundle(bundle)
-        bad, zero, growth = 0, 0, bundle["trust"]["growth"]
-        for _ in range(trials):
+        bad, zero, growth, dmin = 0, 0, bundle["trust"]["growth"], bundle["dose"]["min_min"]
+        for _ in range(c["bounds_trials"]):
             e = t.table[rng.integers(len(t.table))] if len(t.table) else None
             room = str(rng.choice(self.eps.rooms))
             x = np.array(e["x"], float) if e else np.array([5, 3, 0, 18, 2, 1, 60, 0, 0, 360, 0, 1], float)
@@ -536,11 +622,13 @@ class BoostLearn:
             ctx["hour"] = float(rng.uniform(0, 24))
             ctx["supply_ok"], ctx["start_temp"] = float(rng.integers(2)), float(np.clip(ctx["start_temp"], 8, 22))
             target = ctx["start_temp"] + float(rng.uniform(0.5, 7))
-            d = dosing.decide(room, ctx, str(rng.choice(["morning", "homecoming"])), target)
-            cap = min(d["d_safe"], bundle["dose"]["min_min"]) if d["known"] is None else min(d["d_safe"], growth * d["known"])
-            bad += d["allowed"] > cap + 1e-9 or d["chosen"] > d["allowed"] + 1e-9 or (0 < d["allowed"] < bundle["dose"]["min_min"])
+            scenario = str(rng.choice(["morning", "homecoming", "room_change", "other"]))
+            d = dosing.decide(room, ctx, scenario, target)
+            cap = min(d["d_safe"], dmin) if d["known"] is None else min(d["d_safe"], max(dmin, growth * d["known"]))
+            own = t.dose[t.rooms == room]
+            bad += d["allowed"] > cap + 1e-9 or d["chosen"] > d["allowed"] + 1e-9 or (0 < d["allowed"] < dmin) or (d["allowed"] > 0 and scenario not in bundle["scenarios"]) or (d["known"] is not None and d["known"] not in own)
             zero += d["allowed"] == 0
-        return {"trials": trials, "violations": int(bad), "no_boost_share": round(zero / trials, 3), "episodes": len(t.table), "radius": t.radius, "k": t.cfg["knn_k"]}
+        return {"trials": c["bounds_trials"], "violations": int(bad), "no_boost_share": round(zero / c["bounds_trials"], 3), "episodes": len(t.table), "radius": t.radius, "k": t.cfg["knn_k"]}
 
 
 def boost_cycles(lake, grid, cfg):
@@ -551,7 +639,7 @@ def boost_cycles(lake, grid, cfg):
         r = det.get("room")
         if r in grid.rooms and det.get("start_ts_ms"):
             idx = grid.minute(utc(det["start_ts_ms"] / 1000.0).isoformat())
-            out.setdefault(r, []).append({"start_idx": idx, "target": det.get("target"), "overshoot_c": det.get("overshoot_c"), "scenario": det.get("scenario") if det.get("scenario") in ("morning", "homecoming") else None})
+            out.setdefault(r, []).append({"start_idx": idx, "target": det.get("target"), "overshoot_c": det.get("overshoot_c"), "dose": det.get("boost_min", det.get("applied_t_off_min")), "scenario": det.get("scenario") if det.get("scenario") in ("morning", "homecoming") else None})
     return out
 
 
@@ -627,5 +715,33 @@ def boostlearn(config, lake, models_dir, validate=False, version=None):
     return out, bundle, meta
 
 
-def boostcheck(config, lake, models_dir):
+def retry_path(models_dir):
+    return Path(models_dir) / "boost" / "retry.json"
+
+
+def read_retry(models_dir):
+    try:
+        return json.loads(retry_path(models_dir).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def boostmark(config, models_dir, ok, now=None):
+    path, now = retry_path(models_dir), now or datetime.now(timezone.utc)
+    if ok:
+        path.unlink(missing_ok=True)
+        return None
+    c = config["boost"]["retry"]
+    fails = (read_retry(models_dir) or {}).get("fails", 0) + 1
+    delay = min(c["base_min"] * 2 ** (fails - 1), c["max_min"])
+    state = {"fails": fails, "delay_min": delay, "next_try": (now + timedelta(minutes=delay)).isoformat(timespec="seconds")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state))
+    return state
+
+
+def boostcheck(config, lake, models_dir, now=None):
+    r = read_retry(models_dir)
+    if r and (now or datetime.now(timezone.utc)) < datetime.fromisoformat(r["next_try"]):
+        return 0
     return 10 if needs_retrain(lake, models_dir) else 0

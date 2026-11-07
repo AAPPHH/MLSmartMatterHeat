@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 from heattrain.boiler import boiler
-from heattrain.boostlearn import boostcheck, boostlearn
+from heattrain.boostlearn import boostcheck, boostlearn, boostmark
 from heattrain.thermal import thermal
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
@@ -72,8 +72,10 @@ CONFIG = {
         "passive_step_min": 10, "passive_min_points": 200, "passive_a_bounds": [1e-4, 0.02], "passive_delta_bounds": [0.0, 15.0], "passive_default": {"a": 0.003, "delta": 5.0},
         "gain_prior": [0.3, 1.0], "delay_prior": [12.0, 0.7], "gain_bounds": [1e-3, 5.0], "delay_bounds": [2.0, 80.0], "sigma0": 0.3, "sigma_floor": 0.2, "boost_weight": 2.0,
         "eb_iter": 3, "hyper_min_windows": 2, "hyper_shrink": 2.0, "tau_floor": 0.15, "n_samples": 64, "peak_sigma_floor": 0.3,
-        "dose_min": 5.0, "dose_max": 20.0, "dose_step": 1.0, "p_max": 0.10, "margin_k": 0.5, "thompson_margin_k": 0.25, "boost_setpoint": 24.0, "abort_c": 24.0, "growth": 1.1,
-        "knn_k": 5, "radius_quantile": 0.25, "radius_default": 2.5, "other_room_weight": 0.5, "scenario_penalty": 2.0, "room_penalty": 1.0,
+        "dose_min": 5.0, "dose_max": 20.0, "dose_step": 0.1, "p_max": 0.10, "margin_k": 0.5, "thompson_margin_k": 0.25, "boost_setpoint": 24.0, "abort_c": 24.0, "growth": 1.1,
+        "knn_k": 5, "radius_quantile": 0.25, "radius_default": 2.5, "radius_floor": 0.5, "scenario_penalty": 2.0, "known_post_min": 20,
+        "closure_excl_min": 90, "closure_gap": [2.0, 6.0], "closure_min_points": 300, "closure_kp": [0.2, 10.0], "closure_gap0_max": 3.0, "closure_active_gap": 1.0, "closure_min_active": 100, "closure_scales": [0.0, 0.03, 0.06, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0], "closure_tol": 0.03, "closure_min_pulses": 20, "closure_default": {"kp": 1.0, "gap0": 1.0},
+        "loeo_min_strong": 6, "sigma_max": 4.0, "sigma_step": 0.05, "coverage_target": 0.9, "bounds_trials": 100, "monotone_trials": 100, "retry": {"base_min": 10, "max_min": 360},
         "feature_weight": {"out": 1.0, "wind": 0.5, "rad": 0.5, "start_temp": 1.0, "gap": 1.0, "supply_ok": 1.0, "since_resume": 0.5, "vm60": 0.5, "vm180": 0.5, "since_open": 0.5, "hour_sin": 0.5, "hour_cos": 0.5},
         "typical": {"morning": {"scenario": "morning", "start": 18.0, "target": 20.0, "out": 5.0, "wind": 3.0, "rad": 0.0, "resume": 60.0, "hour": 6.5},
                     "homecoming": {"scenario": "homecoming", "start": 14.0, "target": 20.0, "out": 5.0, "wind": 3.0, "rad": 0.0, "resume": 180.0, "hour": 17.5}},
@@ -137,7 +139,11 @@ def run_boostcheck(config, src, models_dir):
     sys.exit(boostcheck(config, src, models_dir))
 
 
-COMMANDS = {"boostlearn": run_boost, "boostcheck": run_boostcheck, "window": run_window_export, "windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
+def run_boostmark(config, models_dir, status):
+    print(boostmark(config, models_dir, status == "ok"))
+
+
+COMMANDS = {"boostmark": run_boostmark, "boostlearn": run_boost, "boostcheck": run_boostcheck, "window": run_window_export, "windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
 
 
 def main(argv):
@@ -148,7 +154,7 @@ def main(argv):
     if len(argv) == 5 and argv[1] == "boostlearn":
         return run_boost(CONFIG, argv[2], argv[3], argv[4] == "validate")
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | boostmark <models_dir> ok|fail | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 
