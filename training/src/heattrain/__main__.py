@@ -43,7 +43,7 @@ CONFIG = {
         "parity_rows": 400, "parity_tol": 1e-4, "parity_nan_frac": 0.05,
     },
     "window": {
-        "lake": "/home/user/AppData/Local/Temp/claude/ebd84cbf4dbe962a/349be985-dace-4f4a-be42-5da1745ce8a6/scratchpad/lake",
+        "lake": "/home/user/AppData/Local/Temp/claude/ebd84cbf4dbe962a/349be985-dace-4f4a-be42-5da1745ce8a6/scratchpad/lake2",
         "rooms": ["wohnzimmer", "schlafzimmer", "bad", "kueche"], "nodes": {"wohnzimmer": 5, "schlafzimmer": 6, "bad": 7, "kueche": 8},
         "utc_offset_min": 60, "valid": {"temp": [0.0, 45.0], "valve": [0.0, 100.0]}, "ffill_min": {"temp": 10, "valve": 30, "setpoint": 360}, "weather_max_age_min": 180,
         "open_valve_pct": 10.0, "v1_open_cap_min": 40, "frost_max_c": 8.5, "frost_cap_min": 360,
@@ -52,6 +52,15 @@ CONFIG = {
                       "gt_channels": ["house", "wohnzimmer", "kueche", "bad"], "rate": 0.5, "report_rate": 3.0, "merge_min": 30, "top_k": 3, "list_n": 15, "max_candidates": 1500},
         "phys": {"horizon": 20, "taus": [4.0, 12.0, 40.0], "ridge": 1.0, "trim": 0.03, "min_rows": 500, "sigma_floor": 0.15, "since_open_cap": 90.0, "valve_guard_min": 120,
                  "veto_pad_min": 60, "weights": {"wohnzimmer": 1.0, "kueche": 1.0, "bad": 1.0, "schlafzimmer": 0.3}, "clip": 6.0},
+        "presence": {"age_cap_min": 240, "sleep_room": "schlafzimmer", "asleep_age_min": 45, "in_room_min": 10, "home_min": 60},
+        "room": {
+            "gt": [{"id": "A", "open_utc": "2026-11-07T08:05:00+00:00", "hit_min": 20, "channels": ["house", "bad"], "exclude_utc": ["2026-11-07T07:30:00+00:00", "2026-11-07T10:00:00+00:00"]},
+                   {"id": "B", "open_utc": "2026-11-07T17:27:00+00:00", "hit_min": 20, "channels": ["wohnzimmer"], "exclude_utc": ["2026-11-07T17:20:00+00:00", "2026-11-07T18:30:00+00:00"]}],
+            "margin": 0.9, "ratio_quantile": 0.995, "merge_min": 30, "house_clip": 6.0, "sigma_trim": 0.03, "sigma_floor": 0.15, "list_n": 60,
+            "boiler": {"enabled": True, "open_pct": 30.0, "closed_pct": 10.0, "closed_z": 1.5},
+            "feat": {"dose": [10, 20, 30, 90], "slope": [5, 10, 20], "floor_window": 180, "floor_settled": 20, "age_cap": 240, "step_k": 0.25, "dv_min": 5},
+            "xgb": {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8, "colsample_bytree": 0.7, "min_child_weight": 30, "reg_lambda": 5.0, "trim": 0.03, "pooled": True},
+        },
     },
     "boiler": {
         "timezone": "Europe/Berlin", "dt_s": 60.0, "temp_valid": [0.0, 95.0], "max_gap_s": 900.0, "invalid_wants_k": 1.0, "night_hours": [21, 6],

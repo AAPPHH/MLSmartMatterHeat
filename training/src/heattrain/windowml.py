@@ -1,3 +1,4 @@
+import copy
 import importlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -5,20 +6,35 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import lfilter
 from sklearn.linear_model import Ridge
+from xgboost import XGBRegressor
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.ipc as ipc
 from numpy.lib.stride_tricks import sliding_window_view
 from heattrain.thermal import read_arrows
 
 ATTRS = {0: "temp", 8: "valve", 18: "setpoint"}
 
 
+def fill(t, columns):
+    return pa.table({c: t.column(c) if c in t.column_names else pa.nulls(t.num_rows) for c in columns})
+
+
+def raw_tables(root, table):
+    out = []
+    for f in sorted((root / "raw" / table).glob("*.arrows")):
+        try:
+            with open(f, "rb") as fh:
+                out.append(ipc.open_stream(fh).read_all())
+        except (pa.ArrowInvalid, OSError):
+            continue
+    return out
+
+
 def tables(lake, table, columns):
     root = Path(lake)
-    out = [pq.read_table(f, columns=columns) for f in sorted((root / "parquet" / table).glob("**/part.parquet"))]
-    raw = read_arrows(root, table)
-    if raw is not None:
-        out.append(raw.select(columns))
+    out = [fill(pq.read_table(f), columns) for f in sorted((root / "parquet" / table).glob("**/part.parquet"))]
+    out += [fill(t, columns) for t in raw_tables(root, table)]
     return out
 
 
@@ -75,6 +91,7 @@ def lag(x, k):
 class Grid:
     def __init__(self, t, rooms, room, shared, cfg):
         self.t, self.rooms, self.room, self.shared, self.cfg = t, rooms, room, shared, cfg
+        self.cache = {}
         local = t + cfg["utc_offset_min"] * 60
         self.local_hour = (local % 86400) / 3600.0
         u, inv = np.unique(local // 86400, return_inverse=True)
@@ -122,7 +139,34 @@ class Grid:
         cls.mark_events(ev, t, rooms, room, shared, cfg)
         dec = rows(lake, "decisions", ["ts", "room", "rule", "setpoint_new", "applied"], lambda d: (d["ts"], d["room"], d["rule"], d["setpoint_new"], d["applied"]))
         cls.mark_decisions(dec, t, rooms, room, cfg)
+        cls.presence(lake, t, rooms, room, shared, cfg)
         return cls(t, rooms, room, shared, cfg)
+
+    @staticmethod
+    def ages(ts, t, cap):
+        if len(ts) == 0:
+            return np.full(len(t), float(cap))
+        i = np.searchsorted(ts, t, side="right") - 1
+        return np.where(i >= 0, np.minimum((t - ts[np.maximum(i, 0)]) / 60.0, cap), float(cap))
+
+    @classmethod
+    def presence(cls, lake, t, rooms, room, shared, cfg):
+        c = cfg["presence"]
+        cap = c["age_cap_min"]
+        wi = rows(lake, "watch_inference", ["ts", "result_room", "abstained", "state"], lambda d: (d["ts"], d["result_room"], d["state"]))
+        lb = rows(lake, "labels", ["ts", "room", "source"], lambda d: (d["ts"], d["room"], d["source"]))
+        ev = [(epoch(d["ts"]), d["result_room"], d["state"]) for d in wi if not d["abstained"] and d["result_room"]]
+        ev += [(epoch(d["ts"]), d["room"], None) for d in lb if d["source"] == "watch" and d["room"]]
+        ev.sort(key=lambda e: e[0])
+        pick = lambda f: np.array([e[0] for e in ev if f(e)], float)
+        for r in rooms:
+            room[r]["in_room_age"] = cls.ages(pick(lambda e: e[1] == r), t, cap)
+        any_room = cls.ages(pick(lambda e: e[1] != "keiner"), t, cap)
+        away = cls.ages(pick(lambda e: e[1] == "keiner"), t, cap)
+        sleep = cls.ages(pick(lambda e: e[1] == c["sleep_room"] and e[2] == "rest"), t, cap)
+        other = cls.ages(pick(lambda e: not (e[1] == c["sleep_room"] and e[2] == "rest")), t, cap)
+        shared["home_age"] = np.where(away < any_room, float(cap), any_room)
+        shared["asleep"] = ((sleep <= c["asleep_age_min"]) & (sleep <= other)).astype(float)
 
     @staticmethod
     def weather(lake, t, max_age_min):
