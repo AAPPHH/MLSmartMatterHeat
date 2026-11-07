@@ -86,7 +86,7 @@ fn sample_lake(root: &Path) {
     for (minute, k, detail) in [(300, kind::WINDOW_OPEN, "{\"room\":\"a\",\"source\":\"auto\"}"), (320, kind::WINDOW_CLOSE, "{\"room\":\"a\",\"reason\":\"recovery\",\"open_minutes\":18.0}"), (330, kind::WINDOW_SUPPRESSED, "{\"room\":\"a\",\"reason\":\"outdoor\"}")] {
         sink.append(Event { detail: Some(detail.into()), ..event(minute, k, None) }).unwrap();
     }
-    for (minute, detail) in [(340, "{\"detector\":\"v1\",\"room\":\"a\",\"duration_min\":20.0,\"probe_count\":1,\"probe_valve_min\":5.0,\"below_min\":12.0,\"label\":\"yes\",\"latency_min\":2.0}"), (341, "{\"detector\":\"v2\",\"room\":\"a\",\"duration_min\":14.0,\"probe_count\":0,\"probe_valve_min\":0.0,\"below_min\":4.0,\"label\":\"none\",\"latency_min\":null}")] {
+    for (minute, detail) in [(340, "{\"detector\":\"v3\",\"room\":\"a\",\"source\":\"auto\",\"duration_min\":20.0,\"house\":9.0,\"label\":\"yes\",\"latency_min\":2.0}"), (341, "{\"detector\":\"v3\",\"room\":\"b\",\"source\":\"auto\",\"duration_min\":14.0,\"house\":8.0,\"label\":\"none\",\"latency_min\":null}")] {
         sink.append(Event { detail: Some(detail.into()), ..event(minute, kind::WINDOW_EPISODE, None) }).unwrap();
     }
     for (room, source, n) in [("a", "watch", 2), ("b", "watch", 1), ("a", "override", 1)] {
@@ -246,9 +246,9 @@ fn daily_report_covers_all_sections() {
     assert!(md.contains("23 of 24 observation hours present, missing 1: 05:00"), "weather\n{md}");
     assert!(md.contains("1 started, 1 ended, 1 aborted"), "experiments\n{md}");
     assert!(md.contains("| a | 1 | 1 | 2 | 50 |"), "filter\n{md}");
-    assert!(md.contains("| a | 1 | 0 | 1 | 1 | 18 | recovery |"), "window section
+    assert!(md.contains("| a | 1 | 1 | 1 | 18 | recovery |"), "window section
 {md}");
-    assert!(md.contains("| v1 | 1 | 20 | 1 | 5.0 | 12 | 1 | 0 | 0 | 2.0 |") && md.contains("| v2 | 1 | 14 | 0 | 0.0 | 4 | 0 | 0 | 1 | - |"), "episode comparison
+    assert!(md.contains("| auto | 2 | 34 | 8.5 | 1 | 0 | 1 | 2.0 |"), "episode comparison
 {md}");
     assert!(md.contains("experiment_start node 1 x1"), "{md}");
     assert!(md.contains("| attribute_reports | 1 |") && !md.contains("NOT ROLLED"), "roll status\n{md}");

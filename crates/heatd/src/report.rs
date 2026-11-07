@@ -378,41 +378,36 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
     let windows = rows(
         c,
         &format!(
-            "WITH e AS (SELECT kind, json_extract_string(detail, '$.room') AS room, json_extract_string(detail, '$.reason') AS reason, json_extract(detail, '$.open_minutes')::DOUBLE AS minutes FROM events WHERE kind IN ('window_open', 'window_close', 'window_reopen', 'window_suppressed') AND {day})
-             SELECT room, count(*) FILTER (WHERE kind = 'window_open'), count(*) FILTER (WHERE kind = 'window_reopen'), count(*) FILTER (WHERE kind = 'window_suppressed'),
+            "WITH e AS (SELECT kind, json_extract_string(detail, '$.room') AS room, json_extract_string(detail, '$.reason') AS reason, json_extract(detail, '$.open_minutes')::DOUBLE AS minutes FROM events WHERE kind IN ('window_open', 'window_close', 'window_suppressed') AND {day})
+             SELECT room, count(*) FILTER (WHERE kind = 'window_open'), count(*) FILTER (WHERE kind = 'window_suppressed'),
                     count(*) FILTER (WHERE kind = 'window_close'), coalesce(sum(minutes) FILTER (WHERE kind = 'window_close'), 0),
                     coalesce(string_agg(DISTINCT reason, ', ') FILTER (WHERE kind = 'window_close'), '-') FROM e GROUP BY room ORDER BY room"
         ),
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, f64>(5)?, r.get::<_, String>(6)?)),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, f64>(4)?, r.get::<_, String>(5)?)),
     )?;
     if windows.is_empty() {
         md.push_str("Keine Fensterereignisse.\n");
     } else {
-        md.push_str("| Raum | geoeffnet | wieder geoeffnet | unterdrueckt | geschlossen | offene Minuten | Gruende |\n|---|---|---|---|---|---|---|\n");
-        for (room, opened, reopened, suppressed, closed, minutes, reasons) in windows {
-            let _ = writeln!(md, "| {room} | {opened} | {reopened} | {suppressed} | {closed} | {minutes:.0} | {reasons} |");
+        md.push_str("| Raum | geoeffnet | unterdrueckt | geschlossen | offene Minuten | Gruende |\n|---|---|---|---|---|---|\n");
+        for (room, opened, suppressed, closed, minutes, reasons) in windows {
+            let _ = writeln!(md, "| {room} | {opened} | {suppressed} | {closed} | {minutes:.0} | {reasons} |");
         }
     }
 
     let episodes = rows(
         c,
         &format!(
-            "SELECT json_extract_string(detail, '$.detector') AS d, count(*), coalesce(sum(json_extract(detail, '$.duration_min')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.probe_count')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.probe_valve_min')::DOUBLE), 0), coalesce(sum(json_extract(detail, '$.below_min')::DOUBLE), 0),
+            "SELECT coalesce(json_extract_string(detail, '$.source'), 'auto') AS s, count(*), coalesce(sum(json_extract(detail, '$.duration_min')::DOUBLE), 0), coalesce(avg(json_extract(detail, '$.house')::DOUBLE), 0),
                     count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'yes'), count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'no'), count(*) FILTER (WHERE json_extract_string(detail, '$.label') = 'none'),
-                    avg(json_extract(detail, '$.latency_min')::DOUBLE) FROM events WHERE kind = 'window_episode' AND coalesce(json_extract_string(detail, '$.source'), 'auto') <> 'manual' AND {day} GROUP BY d ORDER BY d"
+                    avg(json_extract(detail, '$.latency_min')::DOUBLE) FROM events WHERE kind = 'window_episode' AND {day} GROUP BY s ORDER BY s"
         ),
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?, r.get::<_, f64>(4)?, r.get::<_, f64>(5)?, r.get::<_, i64>(6)?, r.get::<_, i64>(7)?, r.get::<_, i64>(8)?, r.get::<_, Option<f64>>(9)?)),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?, r.get::<_, Option<f64>>(7)?)),
     )?;
     if !episodes.is_empty() {
-        md.push_str("
-Detektor-Vergleich (v1 live, v2 Shadow ohne Schreibzugriff; Episoden werden 25 min nach Ende gemeldet, Label = Antwort auf die Fensterfrage der Uhr):
-
-| Detektor | Episoden | offene Minuten | Proben | Proben-Ventilminuten | Minuten unter Soll-0.5 | Label ja | nein | keins | Latenz vs. manuell (min) |
-|---|---|---|---|---|---|---|---|---|---|
-");
-        for (detector, count, minutes, probes, valve, below, yes, no, none, latency) in episodes {
+        md.push_str("\nFensterepisoden (Detektor v3, Physik-Residuum; werden 25 min nach Ende gemeldet, Label = Antwort auf die Fensterfrage der Uhr):\n\n| Quelle | Episoden | offene Minuten | mittlerer Score | Label ja | nein | keins | Latenz vs. manuell (min) |\n|---|---|---|---|---|---|---|---|\n");
+        for (source, count, minutes, house, yes, no, none, latency) in episodes {
             let latency = latency.map_or_else(|| "-".to_string(), |l| format!("{l:.1}"));
-            let _ = writeln!(md, "| {detector} | {count} | {minutes:.0} | {probes:.0} | {valve:.1} | {below:.0} | {yes} | {no} | {none} | {latency} |");
+            let _ = writeln!(md, "| {source} | {count} | {minutes:.0} | {house:.1} | {yes} | {no} | {none} | {latency} |");
         }
     }
 

@@ -618,13 +618,10 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         eprintln!("presence: {e}");
         None
     });
-    let outdoor = state.status.outdoor(lake::now_us());
-    let found = state.windows.lock().unwrap().step(&state.config, now_ms, outdoor);
+    let found = state.windows.lock().unwrap().step(&state.config, now_ms, |age_min| state.status.weather_within(lake::now_us(), (age_min * 60e6) as i64));
     found.into_iter().for_each(|e| window_event(state, e));
-    let (windows, window_busy) = {
-        let w = state.windows.lock().unwrap();
-        (w.open_rooms(), w.active_rooms())
-    };
+    let windows = state.windows.lock().unwrap().open_rooms();
+    let window_busy = &windows;
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
@@ -648,23 +645,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     }
     let readings = state.latest.all();
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
-    boost_step(state, &mut wants, &readings, now, now_ms, &window_busy, away, &exploring);
-    supply_step(state, &mut wants, &readings, now_ms, &window_busy, &exploring);
-    let normal = desired(now, &state.config, presence.as_ref(), &step.held, &HashSet::new(), &exploring);
-    let contexts: Vec<(String, crate::window_v2::RoomCtx)> = state
-        .config
-        .rooms
-        .iter()
-        .map(|r| {
-            let ctx = crate::window_v2::RoomCtx {
-                target: normal.iter().find(|w| w.room == r.name).map(|w| w.setpoint),
-                hold: state.commanded.lock().unwrap().holding(&r.nodes),
-                boost: wants.iter().any(|w| w.room == r.name && matches!(w.reason, "boost" | "boost_off")),
-                away,
-            };
-            (r.name.clone(), ctx)
-        })
-        .collect();
+    boost_step(state, &mut wants, &readings, now, now_ms, window_busy, away, &exploring);
+    supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
+    let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().holding(&r.nodes), away })).collect();
     state.windows.lock().unwrap().set_context(contexts);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
@@ -773,8 +756,10 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
 
 pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
     state.windows.lock().unwrap().touch(&state.config, report.node, now_ms);
-    if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND].contains(&report.attribute.as_str()) {
+    if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND, crate::window::OCCUPIED_SETPOINT].contains(&report.attribute.as_str()) {
         state.windows.lock().unwrap().observe(&state.config, report.node, &report.attribute, report.value, now_ms);
+    }
+    if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND].contains(&report.attribute.as_str()) {
         state.boost.observe(report.node, &report.attribute, report.value, now_ms);
         return;
     }

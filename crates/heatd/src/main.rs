@@ -37,9 +37,9 @@ mod window;
 mod supply_tests;
 #[cfg(test)]
 mod window_tests;
-mod window_v2;
+mod window_model;
 #[cfg(test)]
-mod window_v2_tests;
+mod window_model_tests;
 
 use anyhow::{anyhow, bail, Context, Result};
 use config::{Config, ControllerKind};
@@ -49,7 +49,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | export --view step_responses|room_delta|room_delta_daily|radiator_summary|radiator_pairs [--room <room>] [--from <date>] [--to <date>] [--out <path>] | report [date] | window-replay <csv> | thread form <serial-port> | thread dataset <serial-port>";
+const USAGE: &str = "usage: heatd [serve] | commission <node-id> <pairing-code> | read <node> | set <node> <celsius> | inventory <node> | migrate | export --room <room> --from <date> --to <date> [--out <path>] | export --view step_responses|room_delta|room_delta_daily|radiator_summary|radiator_pairs [--room <room>] [--from <date>] [--to <date>] [--out <path>] | report [date]| thread form <serial-port> | thread dataset <serial-port>";
 const OT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OT_LEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -205,6 +205,9 @@ async fn serve(config: Config) -> Result<()> {
     let sink = lake::Sink::open(lake::LakeConfig::new(&config.data_dir))?;
     sink.append(lake::Event::now(lake::kind::STARTUP, "heatd").with_detail(serde_json::json!({"commit": lake::COMMIT, "schema_version": lake::SCHEMA_VERSION})))?;
     let mut windows = window::Windows::default();
+    if let Some(bundle) = window_model::try_load(&config.window.model_dir) {
+        windows.set_model(bundle);
+    }
     let replayed = windows.rebuild(&config, Path::new(&config.data_dir), lake::now_us() / 1000);
     println!("window history: {replayed} readings");
     lake::spawn_background(sink.clone());
@@ -216,6 +219,8 @@ async fn serve(config: Config) -> Result<()> {
     context::spawn_background(sink.clone(), status.clone(), config.clone(), context::Io::live(&config));
     let watchmatch = watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone());
     watchmatch.spawn_background();
+    let windows = Arc::new(std::sync::Mutex::new(windows));
+    window_model::spawn_reload(windows.clone(), config.window.model_dir.clone(), Duration::from_secs_f64(config.window.reload_min.max(0.1) * 60.0));
     let state = http::AppState {
         watchmatch,
         boost: boost.clone(),
@@ -226,7 +231,7 @@ async fn serve(config: Config) -> Result<()> {
         storage: Arc::new(storage::Storage::open(&config.db_path)?),
         model,
         controller,
-        windows: Arc::new(std::sync::Mutex::new(windows)),
+        windows,
         commanded: Default::default(),
         explorer: Arc::new(std::sync::Mutex::new(explore::Explorer::new(config.exploration_seed.unwrap_or_else(|| lake::now_us() as u64)))),
         tracker: Default::default(),
@@ -337,12 +342,6 @@ fn run(args: Vec<String>) -> Result<()> {
         }
         ["migrate"] => migrate::run(&config),
         ["export", rest @ ..] => export_command(&config, rest),
-        ["window-replay", path] => {
-            let text = std::fs::read_to_string(std::env::var("HEATD_CONFIG").unwrap_or_else(|_| "heatd.toml".into())).unwrap_or_default();
-            let rows = window_v2::parse_csv(&std::fs::read_to_string(path).with_context(|| format!("read {path}"))?)?;
-            println!("{}", window_v2::replay(&text, &rows, None)?);
-            Ok(())
-        }
         ["report"] => report::report_command(Path::new(&config.data_dir), None).map(|p| println!("{}", p.display())),
         ["report", date] => report::report_command(Path::new(&config.data_dir), Some(date)).map(|p| println!("{}", p.display())),
         ["commission" | "read" | "set" | "inventory", ..] => runtime()?.block_on(controller_command(config, &args)),

@@ -152,6 +152,13 @@ impl Status {
         self.0.lock().unwrap().radiation.filter(|o| now_us - o.0 <= OUTDOOR_MAX_AGE_US).map(|o| o.1)
     }
 
+    pub fn weather_within(&self, now_us: i64, max_age_us: i64) -> [f64; 3] {
+        let inner = self.0.lock().unwrap();
+        let fresh = |ts: i64| now_us - ts <= max_age_us;
+        let out = inner.outdoor.filter(|o| fresh(o.0));
+        [out.map_or(f64::NAN, |o| o.1), out.and_then(|o| o.2).unwrap_or(f64::NAN), inner.radiation.filter(|o| fresh(o.0)).map_or(f64::NAN, |o| o.1)]
+    }
+
     pub fn outdoor(&self, now_us: i64) -> Option<(f64, Option<f64>)> {
         self.0.lock().unwrap().outdoor.filter(|o| now_us - o.0 <= OUTDOOR_MAX_AGE_US).map(|o| (o.1, o.2))
     }

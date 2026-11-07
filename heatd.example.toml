@@ -140,36 +140,18 @@ exterior = ["front_door"]
 
 [window]
 enabled = true
-window_slope_min = 6.0
-open_drop_k = 1.0
-open_window_min = 10.0
-open_slope_k_per_h = -4.0
-open_sustain_min = 4.0
+model_dir = "/models/window"
+reload_min = 10.0
+hold_min = 20.0
+rearm_min = 30.0
+room_z = 1.0
 setpoint_guard_min = 20.0
-min_outdoor_delta_k = 5.0
-cooldown_grace_min = 30.0
-expected_cooldown_factor = 1.5
-fallback_cooldown_k_per_h = 20.0
-valve_low_pct = 10.0
-radiator_cold_min = 45.0
 manual_max_min = 720.0
-wind_ms = 6.0
-wind_relax = 0.2
-min_open_min = 5.0
-close_rise_k = 0.3
-close_window_min = 10.0
-max_open_min = 20.0
-max_timeout_min = 60.0
-probe_min = 10.0
-probe_drop_k = 0.5
-max_events_per_hour = 4
-min_open_hold_min = 15.0
-rearm_min = 20.0
-probe_cooldown_min = 30.0
-close_debounce_min = 3.0
-
-[window.v2]
-enabled = false
+label_grace_min = 25.0
+prompt_expire_min = 20.0
+prompt_gap_min = 10.0
+prompt_global_gap_min = 30.0
+prompt_max_per_day = 6
 
 [failsafe]
 setpoint = 18.0
