@@ -448,17 +448,17 @@ class Dosing:
         kn = t.known(full, room, scenario)
         cap = min(d_safe, dmin if kn["dose"] is None else max(dmin, b["trust"]["growth"] * kn["dose"]))
         allowed = cap if scenario in b["scenarios"] and ctx["supply_ok"] > 0 and cap >= dmin - 1e-9 else 0.0
-        chosen, p_chosen, p_allowed = 0.0, float(p[0]), float(p[0])
+        chosen, p_chosen, p_allowed, j = 0.0, float(p[0]), float(p[0]), None
         if allowed > 0:
             n = int(np.searchsorted(self.cand, allowed + 1e-9))
             top = np.maximum(self.peaks(room, ctx, target, valve_hist, [allowed]), pk[n - 1:n])
             doses, grid = np.append(self.cand[:n], allowed), np.vstack([pk[:n], top])
-            j = np.random.default_rng(b["seed"] + 7919 * draw + len(b["trust"]["episodes"])).integers(grid.shape[1])
+            j = int(np.random.default_rng(b["seed"] + 7919 * draw + len(b["trust"]["episodes"])).integers(grid.shape[1]))
             ok = np.flatnonzero(grid[:, j] <= target + b["risk"]["thompson_margin_k"])
             k = int(ok.max()) if len(ok) else 0
             chosen = float(doses[k])
             p_chosen, p_allowed = (float(v) for v in self.exceed(room, grid[[k, -1]], target))
-        return {"nearest_dist": kn.get("nearest_dist"), "nearest_dose": kn.get("nearest_dose"), "d_safe": d_safe, "known": kn["dose"], "n_similar": kn["n_similar"], "allowed": allowed, "chosen": chosen, "p_overshoot": p_chosen, "p_at_allowed": p_allowed, "p_no_boost": float(self.exceed(room, self.peaks(room, ctx, target, valve_hist, [0.0]), target)[0])}
+        return {"nearest_dist": kn.get("nearest_dist"), "nearest_dose": kn.get("nearest_dose"), "d_safe": d_safe, "known": kn["dose"], "n_similar": kn["n_similar"], "allowed": allowed, "chosen": chosen, "p_overshoot": p_chosen, "p_at_allowed": p_allowed, "j": j, "p_no_boost": float(self.exceed(room, self.peaks(room, ctx, target, valve_hist, [0.0]), target)[0])}
 
 
 class BoostLearn:

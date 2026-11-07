@@ -2,6 +2,7 @@
 #[path = "../tests/acceptance.rs"]
 mod acceptance;
 mod boost;
+mod boostlearn;
 mod br_watchdog;
 #[cfg(test)]
 mod br_watchdog_tests;

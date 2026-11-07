@@ -7,6 +7,7 @@ autotests = false
 [dependencies]
 matter-controller = { path = "../matter-controller" }
 anyhow = "1"
+libm = "0.2"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 duckdb = { version = "1", features = ["bundled", "parquet", "json"] }
