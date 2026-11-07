@@ -40,6 +40,8 @@ mod window;
 #[cfg(test)]
 mod supply_tests;
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod window_tests;
 mod window_model;
 #[cfg(test)]

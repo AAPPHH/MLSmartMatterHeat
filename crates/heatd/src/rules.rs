@@ -14,6 +14,75 @@ pub const MIN_CHANGE_C: f64 = 0.5;
 pub const MANUAL_TOLERANCE_C: f64 = 0.05;
 const DESIRED_EPS_C: f64 = 0.01;
 const GRACE_FACTOR: i64 = 2;
+const BUDGET_WINDOW_MS: i64 = 3_600_000;
+
+type Series<'a> = (&'a str, &'a str, &'a str, &'a dyn Fn(&Room) -> f64);
+
+#[derive(Debug, Default)]
+pub struct RaiseBudget {
+    raises: HashMap<String, Vec<(i64, bool)>>,
+    held: HashMap<u64, f64>,
+    deferred_total: HashMap<String, u64>,
+}
+
+impl RaiseBudget {
+    fn live(&self, room: &str, now_ms: i64) -> Vec<(i64, bool)> {
+        self.raises.get(room).into_iter().flatten().copied().filter(|(t, _)| now_ms - t < BUDGET_WINDOW_MS).collect()
+    }
+
+    pub fn allows(&self, room: &str, now_ms: i64, limit: u32, priority: bool) -> bool {
+        let live = self.live(room, now_ms);
+        limit == 0 || live.iter().any(|(t, _)| *t == now_ms) || live.iter().filter(|(_, p)| *p || !priority).count() < limit as usize
+    }
+
+    fn record(&mut self, room: &str, now_ms: i64, priority: bool) {
+        let entries = self.raises.entry(room.into()).or_default();
+        entries.retain(|(t, _)| now_ms - t < BUDGET_WINDOW_MS);
+        entries.push((now_ms, priority));
+    }
+
+    pub fn used(&self, room: &str, now_ms: i64) -> usize {
+        self.live(room, now_ms).len()
+    }
+
+    pub fn next_free_ms(&self, room: &str, now_ms: i64, limit: u32) -> Option<i64> {
+        let live = self.live(room, now_ms);
+        (limit > 0 && live.len() >= limit as usize).then(|| live[live.len() - limit as usize].0 + BUDGET_WINDOW_MS)
+    }
+
+    fn defer(&mut self, room: &str, node: u64, setpoint: f64) -> bool {
+        let fresh = self.held.insert(node, setpoint).is_none_or(|d| (d - setpoint).abs() >= DESIRED_EPS_C);
+        if fresh {
+            *self.deferred_total.entry(room.into()).or_default() += 1;
+        }
+        fresh
+    }
+
+    pub fn deferred(&self, nodes: &[u64]) -> Option<f64> {
+        nodes.iter().find_map(|n| self.held.get(n).copied())
+    }
+
+    pub fn view(&self, room: &Room, now_ms: i64, limit: u32) -> serde_json::Value {
+        json!({"limit": limit, "used": self.used(&room.name, now_ms), "next_free_ts": self.next_free_ms(&room.name, now_ms, limit), "deferred_setpoint": self.deferred(&room.nodes)})
+    }
+
+    pub fn metrics(&self, rooms: &[Room], now_ms: i64, limit: u32) -> String {
+        let series: [Series; 5] = [
+            ("heatd_raise_budget_limit", "gauge", "setpoint raises allowed per room and hour (0 = unlimited)", &|_| f64::from(limit)),
+            ("heatd_raise_budget_used", "gauge", "setpoint raises of the room in the last 60 minutes", &|r| self.used(&r.name, now_ms) as f64),
+            ("heatd_raise_next_free_seconds", "gauge", "seconds until the room may raise again, 0 when it may now", &|r| self.next_free_ms(&r.name, now_ms, limit).map_or(0.0, |t| ((t - now_ms) as f64 / 1000.0).max(0.0))),
+            ("heatd_raise_deferred", "gauge", "1 while a raise of the room waits for budget", &|r| f64::from(u8::from(self.deferred(&r.nodes).is_some()))),
+            ("heatd_raises_deferred_total", "counter", "raises deferred by the budget since start", &|r| self.deferred_total.get(&r.name).copied().unwrap_or(0) as f64),
+        ];
+        series
+            .iter()
+            .map(|(name, kind, help, value)| format!("# HELP {name} {help}
+# TYPE {name} {kind}
+{}", rooms.iter().map(|r| format!("{name}{{room=\"{}\"}} {}
+", r.name, value(r))).collect::<String>()))
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Sent {
@@ -110,6 +179,8 @@ pub struct Commands {
     holds: HashMap<u64, Hold>,
     last_write: HashMap<u64, (i64, &'static str)>,
     deferred: HashMap<u64, f64>,
+    pub budget: RaiseBudget,
+    restored: HashSet<u64>,
     resets: HashMap<u64, i64>,
     last_reset: HashMap<u64, i64>,
     occ: Occ,
@@ -168,6 +239,8 @@ impl Commands {
         self.device_ms.clear();
         self.last_write.clear();
         self.deferred.clear();
+        self.budget.held.clear();
+        self.restored.clear();
         self.resets.clear();
     }
 
@@ -510,8 +583,42 @@ fn proposal(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, rea
 
 fn deferred_row(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, readings: &[Reading], presence: Option<&Presence>, why: &str) -> Decision {
     let mut row = proposal(state, want, now_ms, old, readings, presence);
-    row.inputs.extra = Some(json!({"phase": "proposal", "reason": why, "wanted": want.reason, "source": want.source, "sleep": want.sleep}).to_string());
+    row.inputs.extra = Some(json!({"phase": "proposal", "reason": why, "wanted": want.reason, "source": want.source, "sleep": want.sleep, "deferred": true}).to_string());
     row
+}
+
+fn tag_budget(row: &mut Decision, budget: &str) {
+    let mut extra: serde_json::Value = row.inputs.extra.as_deref().and_then(|e| serde_json::from_str(e).ok()).unwrap_or_else(|| json!({}));
+    extra["budget"] = json!(budget);
+    row.inputs.extra = Some(extra.to_string());
+}
+
+fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Option<f64>, last_write: Option<(i64, &'static str)>, now_ms: i64) -> Verdict {
+    let limit = state.config.raise_budget_per_hour;
+    if limit == 0 || !old.is_some_and(|o| want.setpoint > o) {
+        return Verdict::Free;
+    }
+    let levels = [state.config.failsafe.setpoint, state.config.br_watchdog.setpoint_c];
+    if !commands.restored.contains(&want.node) && old.is_some_and(|o| levels.iter().any(|l| (o - l).abs() < MANUAL_TOLERANCE_C)) {
+        return Verdict::Exempt("restore");
+    }
+    if want.reason == "no_supply" {
+        return Verdict::Exempt("supply_cap");
+    }
+    let priority = last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset"));
+    if commands.budget.allows(&want.room, now_ms, limit, priority) {
+        Verdict::Raise { priority }
+    } else {
+        Verdict::Deferred
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Verdict {
+    Free,
+    Exempt(&'static str),
+    Raise { priority: bool },
+    Deferred,
 }
 
 fn result_row(proposal: &Decision, reason: &str, error: Option<String>) -> Decision {
@@ -630,7 +737,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
             } else {
                 None
             };
-            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked })
+            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour, false) })
         })
         .collect();
     let now_us = lake::now_us();
@@ -686,7 +793,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
         let base = |room: &Room| base_setpoint(room, &state.config, now);
         let mut explorer = state.explorer.lock().unwrap();
-        let lifecycle = explorer.tick(now, &Inputs { config: &state.config, blocked: &blocked, base: &base });
+        let no_raise = |room: &str| !state.commanded.lock().unwrap().budget.allows(room, now_ms, state.config.raise_budget_per_hour, false);
+        let lifecycle = explorer.tick(now, &Inputs { config: &state.config, blocked: &blocked, no_raise: &no_raise, base: &base });
         let active = explorer.active().clone();
         drop(explorer);
         lifecycle.into_iter().for_each(|life| lifecycle_event(state, life));
@@ -725,7 +833,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let interval_ms = minutes(state.config.min_write_interval_min);
     let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
     for want in wants {
-        let (old, prior) = {
+        let (old, prior, verdict) = {
             let mut commands = state.commanded.lock().unwrap();
             let Some(hold_ended) = commands.release_due(&want, now_ms, hold_ms) else {
                 continue;
@@ -735,6 +843,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
             let drifted = commands.drifted(want.node, grace_ms);
             if (!drifted && last.is_some_and(|l| (l - want.setpoint).abs() < MIN_CHANGE_C)) || old.is_some_and(|o| (o - want.setpoint).abs() < state.config.setpoint_deadband) {
                 commands.deferred.remove(&want.node);
+                commands.budget.held.remove(&want.node);
                 continue;
             }
             let last_write = commands.last_write.get(&want.node).copied();
@@ -748,9 +857,22 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                 }
                 continue;
             }
-            (old, commands.sent.get(&want.node).cloned())
+            let verdict = raise_verdict(state, &commands, &want, old, last_write, now_ms);
+            if verdict == Verdict::Deferred {
+                if commands.budget.defer(&want.room, want.node, want.setpoint) {
+                    drop(commands);
+                    log("decision", state.sink.append(deferred_row(state, &want, now_ms, old, &readings, presence.as_ref(), "raise_budget")));
+                }
+                continue;
+            }
+            (old, commands.sent.get(&want.node).cloned(), verdict)
         };
-        let decision = proposal(state, &want, now_ms, old, &readings, presence.as_ref());
+        let mut decision = proposal(state, &want, now_ms, old, &readings, presence.as_ref());
+        match verdict {
+            Verdict::Exempt(why) => tag_budget(&mut decision, &format!("exempt_{why}")),
+            Verdict::Raise { .. } => tag_budget(&mut decision, "raise"),
+            _ => {}
+        }
         log("decision", state.sink.append(decision.clone()));
         let sink = state.sink.clone();
         log("decision flush", tokio::task::spawn_blocking(move || sink.flush()).await.map_err(anyhow::Error::from).and_then(|r| r.map(|_| ())));
@@ -765,6 +887,11 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                     let mut commands = state.commanded.lock().unwrap();
                     commands.last_write.insert(want.node, (now_ms, want.reason));
                     commands.deferred.remove(&want.node);
+                    commands.budget.held.remove(&want.node);
+                    commands.restored.insert(want.node);
+                    if let Verdict::Raise { priority } = verdict {
+                        commands.budget.record(&want.room, now_ms, priority);
+                    }
                 }
                 if !matches!(want.reason, "window_open" | "no_supply" | "pi_reset") && old.is_some_and(|o| want.setpoint < o) {
                     state.windows.lock().unwrap().note_decrease(&want.room, now_ms);

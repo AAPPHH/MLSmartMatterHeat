@@ -257,7 +257,7 @@ fn patched_bundles(patch: impl Fn(&mut Value)) -> tempfile::TempDir {
 }
 
 fn step_in(ts: i64, setpoint: f64, blocked: Option<&'static str>) -> StepIn<'static> {
-    let rooms: &'static [RoomIn] = Box::leak(Box::new([RoomIn { room: ROOM.into(), setpoint, blocked }]));
+    let rooms: &'static [RoomIn] = Box::leak(Box::new([RoomIn { room: ROOM.into(), setpoint, blocked, no_raise: false }]));
     StepIn { now_ms: ts, hour: 7.0, outdoor: Some((4.0, Some(2.0))), radiation: Some(0.0), rooms }
 }
 
@@ -421,11 +421,32 @@ fn live_boost_aborts_on_blockers_and_target_decrease() {
 }
 
 #[test]
+fn exhausted_raise_budget_blocks_a_new_cycle_but_not_a_running_one() {
+    let step = |boost: &Boost, m: i64, setpoint: f64, no_raise: bool| {
+        let ts = m * 60_000;
+        boost.observe(5, PI_HEATING_DEMAND, 80.0, ts);
+        boost.observe(5, LOCAL_TEMPERATURE, rise(m), ts);
+        let rooms = [RoomIn { room: ROOM.into(), setpoint, blocked: None, no_raise }];
+        boost.step(&StepIn { now_ms: ts, hour: 7.0, outdoor: Some((4.0, Some(2.0))), radiation: Some(0.0), rooms: &rooms })
+    };
+    for no_raise in [false, true] {
+        let boost = Boost::new(&config("live_rooms_override = ['wohnzimmer']
+seed = 3"));
+        drive(&boost, 0, 5, 18.0, None, |_| 19.0);
+        let started: Vec<StepOut> = (5..10).map(|m| step(&boost, m, 21.0, no_raise)).collect();
+        assert_eq!(matches!(started.last().unwrap().directives.get(ROOM), Some(Directive::Boost { .. })), !no_raise, "{no_raise}");
+        if !no_raise {
+            assert!(matches!(step(&boost, 10, 21.0, true).directives.get(ROOM), Some(Directive::Boost { .. })));
+        }
+    }
+}
+
+#[test]
 fn no_cycle_without_bundle_room_or_for_small_rises() {
     let other = Config::parse(&format!("[boost]\nmodel_dir = '{BUNDLES}'\n[[rooms]]\nname = 'x'\nnodes = [9]\n")).unwrap();
     let boost = Boost::new(&other);
     boost.observe(9, LOCAL_TEMPERATURE, 19.0, 0);
-    let out = boost.step(&StepIn { now_ms: 60_000, hour: 7.0, outdoor: None, radiation: None, rooms: &[RoomIn { room: "x".into(), setpoint: 18.0, blocked: None }] });
+    let out = boost.step(&StepIn { now_ms: 60_000, hour: 7.0, outdoor: None, radiation: None, rooms: &[RoomIn { room: "x".into(), setpoint: 18.0, blocked: None, no_raise: false }] });
     assert!(out.events.is_empty() && boost.view("x")["cycle"].is_null());
     let small = Boost::new(&config(""));
     drive(&small, 0, 5, 20.0, None, |_| 19.0);

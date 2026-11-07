@@ -85,6 +85,7 @@ pub struct RoomIn {
     pub room: String,
     pub setpoint: f64,
     pub blocked: Option<&'static str>,
+    pub no_raise: bool,
 }
 
 pub struct StepIn<'a> {
@@ -436,7 +437,7 @@ impl Inner {
                 }
             }
         }
-        if self.rooms[idx].cycle.is_none() && want.blocked.is_none() && rise.is_some_and(|r| r >= self.cfg.min_rise_k - 1e-9) {
+        if self.rooms[idx].cycle.is_none() && want.blocked.is_none() && !want.no_raise && rise.is_some_and(|r| r >= self.cfg.min_rise_k - 1e-9) {
             self.open(idx, want, input, rise.unwrap_or_default());
         }
         let Some(start_ms) = self.rooms[idx].cycle.as_ref().map(|c| c.start_ms) else { return };

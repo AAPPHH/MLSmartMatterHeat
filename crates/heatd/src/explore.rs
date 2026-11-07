@@ -78,6 +78,7 @@ pub enum Lifecycle {
 pub struct Inputs<'a> {
     pub config: &'a Config,
     pub blocked: &'a dyn Fn(&str) -> Option<&'static str>,
+    pub no_raise: &'a dyn Fn(&str) -> bool,
     pub base: &'a dyn Fn(&Room) -> f64,
 }
 
@@ -177,7 +178,7 @@ impl Explorer {
             let Some(plans) = self.plans.get_mut(&room.name) else { continue };
             plans.retain(|p| now < p.start + Duration::minutes(START_GRACE_MIN));
             let Some(i) = plans.iter().position(|p| p.start <= now) else { continue };
-            if (inputs.blocked)(&room.name).is_some() {
+            if (inputs.blocked)(&room.name).is_some() || (inputs.no_raise)(&room.name) {
                 continue;
             }
             let plan = plans.remove(i);
@@ -239,7 +240,7 @@ nodes = [3]
         let start = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap();
         let blocked = |_: &str| windows.then_some("window_open");
         let base = |_: &Room| 18.0;
-        let inputs = Inputs { config: &config, blocked: &blocked, base: &base };
+        let inputs = Inputs { config: &config, blocked: &blocked, no_raise: &|_| false, base: &base };
         let mut out = Vec::new();
         for m in 0..1440 + 240 {
             let now = start + Duration::minutes(m);
@@ -314,7 +315,7 @@ nodes = [3]
         let blocked = std::cell::Cell::new(false);
         let gate = |_: &str| blocked.get().then_some("window_open");
         let base = |_: &Room| 18.0;
-        let inputs = Inputs { config: &config, blocked: &gate, base: &base };
+        let inputs = Inputs { config: &config, blocked: &gate, no_raise: &|_| false, base: &base };
         let start = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap();
         let mut now = start;
         while explorer.active().is_empty() {
@@ -326,6 +327,33 @@ nodes = [3]
         let out = explorer.tick(now, &inputs);
         assert!(out.iter().any(|l| matches!(l, Lifecycle::Aborted(_, "window_open"))));
         assert!(explorer.active().is_empty());
+    }
+
+    #[test]
+    fn exhausted_raise_budget_blocks_starts_but_not_running_experiments() {
+        let config = Config::parse(CFG).unwrap();
+        let blocked = |_: &str| None;
+        let base = |_: &Room| 18.0;
+        let exhausted = std::cell::Cell::new(true);
+        let no_raise = |_: &str| exhausted.get();
+        let inputs = Inputs { config: &config, blocked: &blocked, no_raise: &no_raise, base: &base };
+        let start = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let mut explorer = Explorer::new(3);
+        let mut now = start;
+        for _ in 0..1000 {
+            explorer.tick(now, &inputs);
+            now += Duration::minutes(1);
+        }
+        assert!(explorer.active().is_empty());
+        exhausted.set(false);
+        while explorer.active().is_empty() {
+            explorer.tick(now, &inputs);
+            now += Duration::minutes(1);
+            assert!(now < start + Duration::days(1));
+        }
+        exhausted.set(true);
+        assert!(explorer.tick(now, &inputs).iter().all(|l| !matches!(l, Lifecycle::Aborted(..))));
+        assert!(!explorer.active().is_empty());
     }
 
     #[test]
