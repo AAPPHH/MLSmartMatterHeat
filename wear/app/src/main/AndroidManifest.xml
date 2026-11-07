@@ -77,6 +77,9 @@
             android:name=".LabelReceiver"
             android:exported="false" />
         <receiver
+            android:name=".WindowReceiver"
+            android:exported="false" />
+        <receiver
             android:name=".TickReceiver"
             android:exported="false" />
         <service

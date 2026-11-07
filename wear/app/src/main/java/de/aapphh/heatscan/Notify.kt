@@ -95,7 +95,7 @@ object WindowPrompter {
 
     fun cancel(c: Context) = nm(c).cancel(ID)
 
-    private fun post(c: Context, entry: (Store, Long) -> org.json.JSONObject, done: () -> Unit) {
+    private fun post(c: Context, flush: Boolean, entry: (Store, Long) -> org.json.JSONObject, done: () -> Unit) {
         val app = c.applicationContext
         try {
             io.execute {
@@ -105,7 +105,7 @@ object WindowPrompter {
                     val e = entry(store, now)
                     ScanQueue.get(app).add(e, now)
                     Trace.i("window_label", "room" to e.getString("room"), "open" to e.getBoolean("open"), "answer" to e.optString("answer", "-"), "via" to e.optString("via", "-"), "prompt" to e.opt("prompt_id"))
-                    ScanService.instance?.flush("window")
+                    if (flush) ScanService.instance?.flush("window")
                     done()
                 } catch (ex: Exception) {
                     Trace.w("window_label_failed", ex)
@@ -124,20 +124,21 @@ object WindowPrompter {
         if (ask == null) return done(null)
         cancel(app)
         val labelId = LabelEvent.newId()
-        post(app, { s, now -> WindowEvent.answerEntry(s.device, now, ask, answer, via, labelId) }) { done(labelId) }
+        post(app, true, { s, now -> WindowEvent.answerEntry(s.device, now, ask, answer, via, labelId) }) { done(labelId) }
     }
 
     fun selfReport(c: Context, room: String, open: Boolean, done: (String) -> Unit = {}) {
         val app = c.applicationContext
         val labelId = LabelEvent.newId()
-        post(app, { s, now -> WindowEvent.entry(s.device, now, room, open, null, labelId, via = "self") }) { done(labelId) }
+        post(app, true, { s, now -> WindowEvent.entry(s.device, now, room, open, null, labelId, via = "self") }) { done(labelId) }
     }
 
     fun lapse(c: Context, ask: WindowAsk?, now: Long) {
         if (ask == null) return
         val app = c.applicationContext
         val via = if (WindowEvent.expired(ask, now)) "expiry" else "replaced"
-        post(app, { s, _ -> WindowEvent.answerEntry(s.device, WindowEvent.lapseTs(ask, now), ask, WindowAnswer.TIMEOUT, via) }) {}
+        cancel(app)
+        post(app, false, { s, _ -> WindowEvent.answerEntry(s.device, WindowEvent.lapseTs(ask, now), ask, WindowAnswer.TIMEOUT, via) }) {}
     }
 
     fun sweep(c: Context) {
