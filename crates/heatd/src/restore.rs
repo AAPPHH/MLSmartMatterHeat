@@ -60,11 +60,11 @@ fn stays(root: &Path, from_ms: i64, now_ms: i64) -> Result<Vec<(i64, String, Sta
     let mut out = Vec::new();
     let mut voided = HashSet::new();
     let rows = records(root, Table::Labels, now_ms - LABEL_LOOKBACK_MS.max(now_ms - from_ms), now_ms, &["source", "device", "room", "label_id", "voided_label_id"], &[], &["heat"])?;
-    voided.extend(rows.iter().filter_map(|r| r.text[4].clone()));
+    voided.extend(rows.iter().filter_map(|r| r.text[1].clone().zip(r.text[4].clone())));
     for r in rows {
         let [source, Some(device), room, id, None] = &r.text[..] else { continue };
         let at = r.to.unwrap_or(r.ts).min(r.ts);
-        if source.as_deref() == Some("watch") && r.flag[0] != Some(false) && at >= from_ms && !id.as_ref().is_some_and(|i| voided.contains(i)) {
+        if source.as_deref() == Some("watch") && r.flag[0] != Some(false) && at >= from_ms && !id.as_ref().is_some_and(|i| voided.contains(&(device.clone(), i.clone()))) {
             out.push((at, device.clone(), Stay::Label { room: room.clone().unwrap_or_default(), id: id.clone() }));
         }
     }

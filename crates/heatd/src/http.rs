@@ -2395,12 +2395,14 @@ nodes = [5]
         assert!(fresh.watchmatch.stay().is_none());
         call(&h.state, "POST", "/watch/label", Some(label("gone", now - 600_000, now - 300_000))).await;
         call(&h.state, "POST", "/watch/label", Some(label("kept", now - 900_000, now - 800_000))).await;
+        call(&h.state, "POST", "/watch/label", Some(label("foreign", now - 700_000, now - 500_000))).await;
         call(&h.state, "POST", "/watch/label/void", Some(json!({"device": "pixel-watch", "label_id": "gone", "ts": now - 400_000}).to_string())).await;
+        call(&h.state, "POST", "/watch/label/void", Some(json!({"device": "other-watch", "label_id": "foreign", "ts": now - 300_000}).to_string())).await;
         let fresh = restarted(&h);
         crate::restore::restore(&fresh, now_ms()).unwrap();
         let stay = fresh.watchmatch.stay().unwrap();
-        assert_eq!(stay.2, now - 800_000);
-        assert_eq!(fresh.watchmatch.void_stay("pixel-watch", "kept"), true);
+        assert_eq!(stay.2, now - 500_000);
+        assert_eq!(fresh.watchmatch.void_stay("pixel-watch", "foreign"), true);
     }
 
     #[tokio::test]
