@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::window::*;
-use crate::window_model_tests::toy_bundle;
+use crate::window_model_tests::{toy_bundle, toy_bundle_with};
 use serde_json::json;
 
 const MIN: i64 = 60_000;
@@ -363,4 +363,45 @@ fn stale_node_data_never_triggers_a_pi_reset() {
     w.overshoot_due(&s.c.supply, 5, 20.0, t, 900_000);
     assert!(w.overshoot_due(&s.c.supply, 5, 20.0, t + 16 * MIN, 900_000).is_none());
     assert!(w.local_temp(5, t + 16 * MIN, 900_000).is_none() && w.local_temp(5, t + MIN, 900_000) == Some(22.0));
+}
+
+fn channel_sim(thresholds: &[(&str, f64)]) -> Sim {
+    let mut s = Sim::house("");
+    s.w.set_model(toy_bundle_with(&[("wohnzimmer", 5, 1.0), ("schlafzimmer", 6, 0.3), ("kueche", 8, 1.0)], thresholds));
+    s.run(flat(20.0, 30));
+    s
+}
+
+#[test]
+fn a_room_channel_alarm_opens_only_that_room_with_its_reason_in_event_and_prompt() {
+    let mut s = channel_sim(&[("house", 100.0), ("wohnzimmer", 3.0)]);
+    s.drops([0.3, 0.0, 0.0], 12);
+    assert_eq!(s.open(), vec!["wohnzimmer"], "{:?}", s.events);
+    let opens = s.of("window_open");
+    assert_eq!(opens.len(), 1);
+    let d = &opens[0].detail;
+    assert_eq!((d["channel"].as_str(), d["threshold"].as_f64(), d["rooms"].clone()), (Some("wohnzimmer"), Some(3.0), json!(["wohnzimmer"])));
+    let reason = d["reason"].as_str().unwrap();
+    assert!(reason.starts_with("wohnzimmer ") && reason.contains("K below forecast") && reason.contains("% open"), "{reason}");
+    let prompt = s.w.prompt(&s.c.window, s.t).unwrap();
+    assert_eq!((prompt["room"].as_str(), prompt["reason"].as_str()), (Some("wohnzimmer"), Some(reason)));
+}
+
+#[test]
+fn a_house_alarm_gives_every_opened_room_its_own_reason_and_the_top_room_the_prompt() {
+    let mut s = Sim::warm("");
+    s.drops([0.3, 0.0, 0.3], 6);
+    let opens = s.of("window_open");
+    assert_eq!(opens.len(), 2);
+    assert!(opens.iter().all(|e| e.detail["channel"] == "house" && e.detail["reason"].as_str().unwrap().starts_with("house score ") && e.detail["reason"].as_str().unwrap().contains(e.room.as_str())));
+    let prompt = s.w.prompt(&s.c.window, s.t).unwrap();
+    assert!(opens.iter().any(|e| e.detail["reason"] == prompt["reason"]));
+}
+
+#[test]
+fn a_room_alarm_respects_the_vetoes_of_that_room() {
+    let mut s = channel_sim(&[("house", 100.0), ("wohnzimmer", 3.0)]);
+    s.w.note_decrease("wohnzimmer", s.t);
+    s.drops([0.3, 0.0, 0.0], 12);
+    assert!(s.open().is_empty() && s.of("window_suppressed").iter().any(|e| e.room == "wohnzimmer" && e.detail["reason"] == "setpoint"), "{:?}", s.events);
 }

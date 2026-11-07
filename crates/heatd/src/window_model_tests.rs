@@ -9,12 +9,20 @@ const MIN: i64 = 60_000;
 const T0: i64 = 1_800_000_000_000 - 1_800_000_000_000 % MIN;
 
 pub fn toy_json(rooms: &[(&str, u64, f64)], threshold: f64, guard: usize) -> Value {
+    let mut thresholds: Map<String, Value> = rooms.iter().map(|(n, _, _)| (n.to_string(), json!(50.0))).collect();
+    thresholds.insert("house".into(), json!(threshold));
     let rooms: Map<String, Value> = rooms.iter().map(|(n, node, w)| (n.to_string(), json!({"node": node, "weight": w, "coef": vec![0.0; 16], "intercept": 0.0, "sigma": 1.0}))).collect();
-    json!({"version": "toy", "kind": "window_physics_residual", "horizon_min": 20, "taus": [4.0, 12.0, 40.0], "since_open_cap": 90.0, "open_valve_pct": 10.0, "valve_guard_min": guard, "clip": 6.0, "veto_pad_min": 60, "threshold": threshold, "merge_min": 30, "ffill_min": {"temp": 10, "valve": 30, "setpoint": 360}, "valid": {"temp": [0.0, 45.0], "valve": [0.0, 100.0]}, "weather_max_age_min": 180.0, "rooms": rooms})
+    json!({"version": "toy", "kind": "window_room_channels", "horizon_min": 20, "taus": [4.0, 12.0, 40.0], "since_open_cap": 90.0, "open_valve_pct": 10.0, "valve_guard_min": guard, "house_clip": 6.0, "veto_pad_min": 60, "thresholds": thresholds, "merge_min": 30, "ffill_min": {"temp": 10, "valve": 30, "setpoint": 360}, "valid": {"temp": [0.0, 45.0], "valve": [0.0, 100.0]}, "weather_max_age_min": 180.0, "rooms": rooms})
 }
 
 pub fn toy_bundle(rooms: &[(&str, u64, f64)], threshold: f64) -> Bundle {
     Bundle::parse(&toy_json(rooms, threshold, 0).to_string()).unwrap()
+}
+
+pub fn toy_bundle_with(rooms: &[(&str, u64, f64)], thresholds: &[(&str, f64)]) -> Bundle {
+    let mut v = toy_json(rooms, 3.0, 0);
+    thresholds.iter().for_each(|(k, t)| v["thresholds"][k] = json!(t));
+    Bundle::parse(&v.to_string()).unwrap()
 }
 
 fn cell(text: &str) -> f64 {
@@ -35,7 +43,7 @@ fn rust_scorer_reproduces_the_python_stream_on_the_real_slice() {
     let rooms: Vec<String> = header.iter().filter_map(|h| h.strip_prefix("z_")).filter(|r| *r != "house").map(String::from).collect();
     assert_eq!(rooms.len(), 4);
     let mut scorer = Scorer::new(bundle.clone());
-    let (mut scored, mut alarms, mut vetoed, mut rows) = (0, 0, 0, 0);
+    let (mut scored, mut alarms, mut room_alarms, mut vetoed, mut rows) = (0, 0, 0, 0, 0);
     for line in lines {
         let f: Vec<&str> = line.split(',').collect();
         let shared = Shared { supply: f[col("supply")] == "1", out: cell(f[col("out")]), wind: cell(f[col("wind")]), rad: cell(f[col("rad")]) };
@@ -49,11 +57,14 @@ fn rust_scorer_reproduces_the_python_stream_on_the_real_slice() {
         assert!(same(out.house, cell(f[col("house")])), "{ts} house {} vs {}", out.house, f[col("house")]);
         assert_eq!(out.veto, f[col("veto")] == "1", "{ts} veto");
         scored += out.house.is_finite() as usize;
-        alarms += out.alarm(bundle.threshold) as usize;
+        let hit = out.alarms(&bundle);
+        alarms += hit.contains(&Channel::House) as usize;
+        room_alarms += hit.iter().filter(|c| matches!(c, Channel::Room(_))).count();
+        assert!(hit.iter().all(|c| match c { Channel::House => out.house > bundle.threshold("house"), Channel::Room(r) => out.z[r] > bundle.threshold(r) }) && (!out.veto || hit.is_empty()));
         vetoed += out.veto as usize;
         rows += 1;
     }
-    assert!(rows >= 400 && scored > 100 && alarms > 0 && vetoed > 0, "{rows} {scored} {alarms} {vetoed}");
+    assert!(rows >= 400 && scored > 100 && alarms > 0 && room_alarms > 0 && vetoed > 0, "{rows} {scored} {alarms} {room_alarms} {vetoed}");
 }
 
 #[test]
@@ -66,11 +77,30 @@ fn bundle_validation_rejects_broken_files() {
         Bundle::parse(&v.to_string()).is_err()
     };
     assert!(edit(&|v| v["kind"] = json!("other")));
+    assert!(edit(&|v| drop(v["thresholds"].as_object_mut().unwrap().remove("house"))));
+    assert!(edit(&|v| v["thresholds"]["a"] = json!(0.0)));
+    assert!(edit(&|v| v["house_clip"] = json!(0.0)));
     assert!(edit(&|v| v["rooms"]["a"]["coef"] = json!(vec![0.0; 15])));
     assert!(edit(&|v| v["rooms"]["a"]["sigma"] = json!(0.0)));
     assert!(edit(&|v| v["taus"] = json!([4.0, 12.0])));
     assert!(edit(&|v| v["rooms"] = json!({})));
     assert!(Bundle::parse("{").is_err());
+}
+
+#[test]
+fn an_old_bundle_kind_is_rejected_with_a_reason_and_the_next_valid_version_is_used() {
+    let old = json!({"version": "old", "kind": "window_physics_residual", "threshold": 3.0, "clip": 6.0});
+    let err = format!("{:#}", Bundle::parse(&old.to_string()).unwrap_err());
+    assert!(err.contains("window_physics_residual") && err.contains("window_room_channels"), "{err}");
+    let dir = tempfile::tempdir().unwrap();
+    for (v, body) in [("20261101T030000Z", toy_json(&[("a", 5, 1.0)], 3.0, 0)), ("20261102T030000Z", old)] {
+        std::fs::create_dir_all(dir.path().join(v)).unwrap();
+        std::fs::write(dir.path().join(v).join("bundle.json"), body.to_string()).unwrap();
+    }
+    assert_eq!(bundle_candidates(dir.path()).remove(0).0, "20261102T030000Z");
+    assert_eq!(try_load(dir.path().to_str().unwrap()).unwrap().version, "toy");
+    std::fs::remove_dir_all(dir.path().join("20261101T030000Z")).unwrap();
+    assert!(try_load(dir.path().to_str().unwrap()).is_none());
 }
 
 #[test]

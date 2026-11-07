@@ -1,6 +1,6 @@
 use crate::config::{Config, SupplySection, WindowSection};
 use crate::lake::{self, Table};
-use crate::window_model::{Detector, Scored};
+use crate::window_model::{Channel, Detector, Scored};
 use arrow::array::{Array, Float64Array, Int64Array, TimestampMicrosecondArray, UInt32Array, UInt64Array};
 use chrono::{Local, TimeZone, Timelike};
 use serde_json::{json, Value};
@@ -113,6 +113,7 @@ struct Prompt {
     id: String,
     room: String,
     question: &'static str,
+    reason: Option<String>,
     created_ms: i64,
 }
 
@@ -303,7 +304,7 @@ impl Windows {
         self.ctx = ctx.into_iter().collect();
     }
 
-    fn raise(&mut self, cfg: &WindowSection, room: &str, question: &'static str, now: i64) {
+    fn raise(&mut self, cfg: &WindowSection, room: &str, question: &'static str, reason: Option<String>, now: i64) {
         if self.prompt_at.get(room).is_some_and(|t| now - t < mins(cfg.prompt_gap_min)) {
             return;
         }
@@ -311,13 +312,13 @@ impl Windows {
         while self.prompt_times.front().is_some_and(|t| now - t >= day) {
             self.prompt_times.pop_front();
         }
-        if self.prompt_times.len() >= cfg.prompt_max_per_day || self.prompt_times.back().is_some_and(|t| now - t < mins(cfg.prompt_global_gap_min)) {
+        if self.prompt_times.len() >= cfg.prompt_max_per_day || self.prompt_times.back().is_some_and(|t| *t != now && now - t < mins(cfg.prompt_global_gap_min)) {
             return;
         }
         self.prompt_times.push_back(now);
         self.prompt_at.insert(room.into(), now);
         self.prompt_seq += 1;
-        let prompt = Prompt { id: format!("w{now}-{}", self.prompt_seq), room: room.into(), question, created_ms: now };
+        let prompt = Prompt { id: format!("w{now}-{}", self.prompt_seq), room: room.into(), question, reason, created_ms: now };
         self.prompts.push_back(prompt.clone());
         while self.prompts.len() > 20 {
             self.prompts.pop_front();
@@ -327,11 +328,11 @@ impl Windows {
 
     #[cfg(test)]
     pub fn test_prompt(&mut self, cfg: &WindowSection, room: &str, question: &'static str, now: i64) {
-        self.raise(cfg, room, question, now);
+        self.raise(cfg, room, question, None, now);
     }
 
     pub fn prompt(&self, cfg: &WindowSection, now: i64) -> Option<Value> {
-        self.prompt.as_ref().filter(|p| now - p.created_ms < mins(cfg.prompt_expire_min)).map(|p| json!({"id": p.id, "room": p.room, "question": p.question}))
+        self.prompt.as_ref().filter(|p| now - p.created_ms < mins(cfg.prompt_expire_min)).map(|p| json!({"id": p.id, "room": p.room, "question": p.question, "reason": p.reason}))
     }
 
     pub fn label(&mut self, room: &str, ts: i64, open: bool, prompt_id: Option<&str>, label_id: Option<&str>, now: i64) -> Option<WinEvent> {
@@ -519,8 +520,9 @@ impl Windows {
             for (name, z) in &minute.z {
                 self.rooms.entry(name.clone()).or_default().z = Some(*z).filter(|z| z.is_finite());
             }
-            if self.det.bundle().is_some_and(|b| minute.alarm(b.threshold)) {
-                events.extend(self.alarm(config, &minute, now));
+            let channels = self.det.bundle().map(|b| minute.alarms(b)).unwrap_or_default();
+            if !channels.is_empty() {
+                events.extend(self.alarm(config, &minute, &channels, now));
             }
             self.last = Some(minute);
         }
@@ -528,15 +530,29 @@ impl Windows {
         events
     }
 
-    fn alarm(&mut self, config: &Config, m: &Scored, now: i64) -> Vec<WinEvent> {
+    fn alarm(&mut self, config: &Config, m: &Scored, channels: &[Channel], now: i64) -> Vec<WinEvent> {
         let cfg = &config.window;
-        let Some((threshold, version)) = self.det.bundle().map(|b| (b.threshold, b.version.clone())) else { return Vec::new() };
-        let ground: Vec<&crate::config::Room> = config.rooms.iter().filter(|r| !r.nodes.is_empty() && !config.building.roof_rooms.contains(&r.name)).collect();
+        let Some(bundle) = self.det.bundle().cloned() else { return Vec::new() };
+        let thermostat = |r: &&crate::config::Room| !r.nodes.is_empty();
+        let ground: Vec<&crate::config::Room> = config.rooms.iter().filter(thermostat).filter(|r| !config.building.roof_rooms.contains(&r.name)).collect();
         let z = |r: &crate::config::Room| m.z.get(&r.name).copied().filter(|v| v.is_finite());
-        let hot: Vec<&crate::config::Room> = ground.iter().copied().filter(|r| z(r).is_some_and(|v| v >= cfg.room_z)).collect();
-        let targets = if hot.is_empty() { ground } else { hot };
+        let mut targets: Vec<(&crate::config::Room, &Channel)> = Vec::new();
+        for channel in channels {
+            let rooms: Vec<&crate::config::Room> = match channel {
+                Channel::Room(name) => config.rooms.iter().filter(thermostat).filter(|r| &r.name == name).collect(),
+                Channel::House => {
+                    let hot: Vec<&crate::config::Room> = ground.iter().copied().filter(|r| z(r).is_some_and(|v| v >= cfg.room_z)).collect();
+                    if hot.is_empty() { ground.clone() } else { hot }
+                }
+            };
+            for r in rooms {
+                if !targets.iter().any(|t| t.0.name == r.name) {
+                    targets.push((r, channel));
+                }
+            }
+        }
         let (mut free, mut events) = (Vec::new(), Vec::new());
-        for room in targets {
+        for (room, channel) in targets {
             let ctx = self.ctx.get(&room.name).cloned().unwrap_or_default();
             let w = self.rooms.entry(room.name.clone()).or_default();
             if w.active.is_some() {
@@ -553,8 +569,9 @@ impl Windows {
             } else {
                 None
             };
+            let threshold = bundle.threshold(match channel { Channel::House => "house", Channel::Room(name) => name });
             let Some(why) = why else {
-                free.push(room.name.clone());
+                free.push((room.name.clone(), channel, threshold));
                 continue;
             };
             if w.logged.get(why).is_some_and(|t| now - t < SUPPRESS_LOG_MS) {
@@ -565,16 +582,19 @@ impl Windows {
             events.push(WinEvent { kind: lake::kind::WINDOW_SUPPRESSED, room: room.name.clone(), detail: json!({"room": room.name, "detector": DETECTOR, "reason": why, "house": m.house, "threshold": threshold}) });
         }
         let zs: BTreeMap<&String, Option<f64>> = m.z.iter().map(|(k, v)| (k, v.is_finite().then_some(*v))).collect();
-        for name in &free {
+        let names: Vec<&String> = free.iter().map(|f| &f.0).collect();
+        for (name, channel, threshold) in &free {
             let w = self.rooms.entry(name.clone()).or_default();
             let own = zs.get(name).copied().flatten().unwrap_or(f64::NAN);
             w.active = Some(Active { source: "auto", first_ms: now, since_ms: now, score: Some((m.house, own)) });
             w.auto_opens += 1;
-            events.push(WinEvent { kind: lake::kind::WINDOW_OPEN, room: name.clone(), detail: json!({"room": name, "source": "auto", "detector": DETECTOR, "rooms": free, "z": zs, "house": m.house, "threshold": threshold, "bundle": version, "scored_ms": m.ts_ms}) });
+            let channel_name = match channel { Channel::House => "house", Channel::Room(room) => room };
+            events.push(WinEvent { kind: lake::kind::WINDOW_OPEN, room: name.clone(), detail: json!({"room": name, "source": "auto", "detector": DETECTOR, "channel": channel_name, "reason": m.reason(&bundle, name, channel), "rooms": names, "z": zs, "house": m.house, "threshold": threshold, "bundle": bundle.version, "scored_ms": m.ts_ms}) });
         }
-        let top = free.iter().max_by(|a, b| zs.get(a).copied().flatten().unwrap_or(f64::MIN).total_cmp(&zs.get(b).copied().flatten().unwrap_or(f64::MIN)));
-        if let Some(top) = top.cloned() {
-            self.raise(cfg, &top, "open", now);
+        let mut by_z: Vec<&(String, &Channel, f64)> = free.iter().collect();
+        by_z.sort_by(|a, b| zs.get(&a.0).copied().flatten().unwrap_or(f64::MIN).total_cmp(&zs.get(&b.0).copied().flatten().unwrap_or(f64::MIN)));
+        for (name, channel, _) in by_z {
+            self.raise(cfg, name, "open", Some(m.reason(&bundle, name, channel)), now);
         }
         events
     }

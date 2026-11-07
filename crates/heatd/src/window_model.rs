@@ -9,7 +9,8 @@ const MIN_MS: i64 = 60_000;
 const FEATURES: usize = 16;
 const TAUS: usize = 3;
 const MAX_GAP_MIN: i64 = 2880;
-const KIND: &str = "window_physics_residual";
+const KIND: &str = "window_room_channels";
+const HOUSE: &str = "house";
 const TEMP_RANGE: [f64; 2] = [0.0, 45.0];
 const VALVE_RANGE: [f64; 2] = [0.0, 100.0];
 
@@ -38,15 +39,14 @@ struct Valid {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Bundle {
     pub version: String,
-    kind: String,
     pub horizon_min: usize,
     pub taus: Vec<f64>,
     pub since_open_cap: f64,
     pub open_valve_pct: f64,
     pub valve_guard_min: usize,
-    pub clip: f64,
+    pub house_clip: f64,
     pub veto_pad_min: i64,
-    pub threshold: f64,
+    pub thresholds: BTreeMap<String, f64>,
     ffill_min: Ffill,
     valid: Valid,
     pub weather_max_age_min: f64,
@@ -55,13 +55,20 @@ pub struct Bundle {
 
 impl Bundle {
     pub fn parse(text: &str) -> Result<Self> {
-        let b: Self = serde_json::from_str(text).context("window bundle")?;
-        if b.kind != KIND {
-            bail!("window bundle kind {} is not {KIND}", b.kind);
+        let raw: serde_json::Value = serde_json::from_str(text).context("window bundle")?;
+        let kind = raw.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
+        if kind != KIND {
+            bail!("window bundle {} has kind {kind}, expected {KIND}", raw.get("version").and_then(|v| v.as_str()).unwrap_or("?"));
         }
-        let positive = [b.since_open_cap, b.clip, b.threshold, b.weather_max_age_min, b.ffill_min.temp, b.ffill_min.valve, b.ffill_min.setpoint, b.open_valve_pct + 1.0];
+        let b: Self = serde_json::from_value(raw).context("window bundle")?;
+        let positive = [b.since_open_cap, b.house_clip, b.weather_max_age_min, b.ffill_min.temp, b.ffill_min.valve, b.ffill_min.setpoint, b.open_valve_pct + 1.0];
         if b.taus.len() != TAUS || b.taus.iter().chain(&positive).any(|v| !v.is_finite() || *v <= 0.0) || b.horizon_min == 0 || b.rooms.is_empty() || b.veto_pad_min < 0 {
             bail!("window bundle {}: invalid parameters", b.version);
+        }
+        for channel in b.rooms.keys().map(String::as_str).chain([HOUSE]) {
+            if !b.thresholds.get(channel).is_some_and(|t| t.is_finite() && *t > 0.0) {
+                bail!("window bundle {}: no valid threshold for {channel}", b.version);
+            }
         }
         for (name, r) in &b.rooms {
             if r.coef.len() != FEATURES || r.coef.iter().chain([&r.intercept, &r.weight]).any(|v| !v.is_finite()) || !r.sigma.is_finite() || r.sigma <= 0.0 {
@@ -73,6 +80,10 @@ impl Bundle {
 
     pub fn load(dir: &Path) -> Result<Self> {
         Self::parse(&std::fs::read_to_string(dir.join("bundle.json")).with_context(|| format!("read {}", dir.join("bundle.json").display()))?)
+    }
+
+    pub fn threshold(&self, channel: &str) -> f64 {
+        self.thresholds.get(channel).copied().unwrap_or(f64::INFINITY)
     }
 
     fn same_shape(&self, o: &Self) -> bool {
@@ -99,17 +110,42 @@ pub struct Shared {
     pub rad: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Channel {
+    House,
+    Room(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Scored {
     pub ts_ms: i64,
     pub z: BTreeMap<String, f64>,
+    pub valve: BTreeMap<String, f64>,
+    pub out: f64,
     pub house: f64,
     pub veto: bool,
 }
 
 impl Scored {
-    pub fn alarm(&self, threshold: f64) -> bool {
-        !self.veto && self.house > threshold
+    pub fn alarms(&self, bundle: &Bundle) -> Vec<Channel> {
+        if self.veto {
+            return Vec::new();
+        }
+        let mut out: Vec<Channel> = self.z.iter().filter(|(name, z)| **z > bundle.threshold(name)).map(|(name, _)| Channel::Room(name.clone())).collect();
+        if self.house > bundle.threshold(HOUSE) {
+            out.insert(0, Channel::House);
+        }
+        out
+    }
+
+    pub fn reason(&self, bundle: &Bundle, room: &str, channel: &Channel) -> String {
+        let z = self.z.get(room).copied().unwrap_or(f64::NAN);
+        let k = z * bundle.rooms.get(room).map_or(f64::NAN, |m| m.sigma);
+        let valve = self.valve.get(room).copied().unwrap_or(f64::NAN);
+        let valve = if !valve.is_finite() { "valve unknown".to_string() } else if valve <= bundle.open_valve_pct { "valve closed".to_string() } else { format!("valve {valve:.0} % open") };
+        let lead = if *channel == Channel::House { format!("house score {:.1} over {:.1}: ", self.house, bundle.threshold(HOUSE)) } else { String::new() };
+        let dev = if k >= 0.0 { format!("{k:.1} K below") } else { format!("{:.1} K above", -k) };
+        format!("{lead}{room} {dev} forecast, {valve}, outdoor {:.1} C", self.out)
     }
 }
 
@@ -154,17 +190,18 @@ impl Scorer {
         self.t += 1;
         self.since_supply = if shared.supply { Some(0) } else { self.since_supply.map(|s| s + 1) };
         let veto = shared.supply || self.since_supply.is_some_and(|s| s <= b.veto_pad_min);
-        let mut z = BTreeMap::new();
+        let (mut z, mut valves) = (BTreeMap::new(), BTreeMap::new());
         let mut house: Option<f64> = None;
         for (name, model) in &b.rooms {
             let [temp, valve, sp] = inputs.get(name).copied().unwrap_or([f64::NAN; 3]);
             let value = self.room(&b, name, model, self.t, [temp, valve, sp], shared);
             if value.is_finite() {
-                house = Some(house.unwrap_or(0.0) + value.max(0.0) * model.weight);
+                house = Some(house.unwrap_or(0.0) + value.max(0.0).min(b.house_clip) * model.weight);
             }
             z.insert(name.clone(), value);
+            valves.insert(name.clone(), valve);
         }
-        Scored { ts_ms, z, house: house.unwrap_or(f64::NAN), veto }
+        Scored { ts_ms, z, valve: valves, out: shared.out, house: house.unwrap_or(f64::NAN), veto }
     }
 
     fn room(&mut self, b: &Bundle, name: &str, model: &RoomModel, t: i64, [temp, valve, sp]: [f64; 3], shared: &Shared) -> f64 {
@@ -203,7 +240,7 @@ impl Scorer {
             return f64::NAN;
         }
         let predicted: f64 = x.iter().zip(&model.coef).map(|(a, c)| a * c).sum::<f64>() + model.intercept;
-        (-((temp - s0) - predicted) / model.sigma).min(b.clip)
+        -((temp - s0) - predicted) / model.sigma
     }
 }
 
@@ -344,7 +381,7 @@ pub fn spawn_reload(windows: Arc<Mutex<crate::window::Windows>>, dir: String, ev
             match loaded {
                 Ok(Ok(Some(bundle))) => {
                     last_error.clear();
-                    eprintln!("window: loaded bundle {} (threshold {:.2})", bundle.version, bundle.threshold);
+                    eprintln!("window: loaded bundle {} (house threshold {:.2})", bundle.version, bundle.threshold(HOUSE));
                     windows.lock().unwrap().set_model(bundle);
                 }
                 Ok(Err(e)) if last_error != format!("{e:#}") => {
