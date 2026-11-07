@@ -814,9 +814,22 @@ class StreamScorer:
         self.run = dict.fromkeys(self.rooms, 0)
         self.last_open = dict.fromkeys(self.rooms)
         self.win = {r: [] for r in self.rooms}
+        self.valves = {r: [] for r in self.rooms}
         self.t = -1
         self.since_supply = None
         self.H = H
+
+    def boiler(self, z, valve):
+        b = self.b.get("boiler")
+        if not b or not b["enabled"]:
+            return False
+        vm = {}
+        for r in self.rooms:
+            v = self.valves[r][-self.H:]
+            vm[r] = float(np.mean(v)) if len(v) == self.H and np.isfinite(v).all() else np.nan
+        opened = any(vm[r] > b["open_pct"] and z[r] > b["open_z"] for r in self.rooms)
+        closed = [r for r in self.rooms if vm[r] <= b["closed_pct"] and np.isfinite(z[r])]
+        return bool(opened and closed and not any(z[r] > b["closed_z"] for r in closed))
 
     def step(self, shared, inputs):
         b, H = self.b, self.H
@@ -830,6 +843,8 @@ class StreamScorer:
             good = np.isfinite(valve)
             v = valve / 100.0 if good else np.nan
             vz = v if good else 0.0
+            self.valves[r].append(valve)
+            del self.valves[r][:-H]
             self.run[r] = self.run[r] + 1 if good else 0
             if good and valve > b["open_valve_pct"]:
                 self.last_open[r] = self.t
@@ -855,29 +870,34 @@ class StreamScorer:
             x = np.array(f, float)
             if self.run[r] < H + b["valve_guard_min"] + 1 or not np.isfinite(x).all() or not np.isfinite(temp):
                 continue
-            z[r] = min(-((temp - s0) - (float(np.dot(x, m["coef"])) + m["intercept"])) / m["sigma"], b["clip"])
-        zs = [max(z[r], 0.0) * b["rooms"][r]["weight"] for r in self.rooms if np.isfinite(z[r])]
+            z[r] = -((temp - s0) - (float(np.dot(x, m["coef"])) + m["intercept"])) / m["sigma"]
+        veto = veto or self.boiler(z, inputs)
+        hc = b.get("house_clip", b["clip"])
+        zs = [min(max(z[r], 0.0), hc) * b["rooms"][r]["weight"] for r in self.rooms if np.isfinite(z[r])]
         house = sum(zs) if zs else np.nan
-        return z, house, veto
+        return {r: min(v, b["clip"]) for r, v in z.items()}, house, veto
 
 
 def window_bundle(config, lake, models_dir, version=None):
     cfg = config["window"]
     grid = Grid.load(lake, cfg)
-    oof = loo_scores(grid, PhysicsResidual, cfg)
-    res = Evaluator(grid, cfg).run({"house": oof["house"]})
+    rc = cfg["room"]
+    mc = copy.deepcopy(cfg)
+    mc["room"]["react"]["enabled"] = False
+    res = evaluate_room(grid, PhysicsResidual, mc)
     ap = PhysicsResidual(cfg).fit(grid, grid.days)
     c = ap.c
     ground = [r for r in cfg["floor"]["ground"] if r in ap.model]
-    if not res["pass"] or len(ground) < 2:
-        raise SystemExit(f"window bundle not validated: pass={res['pass']} detected={res['detected']} alarms_in_supply={res['alarms_in_supply']} ground_rooms={ground}")
+    if not res["detected_all"] or len(ground) < 2:
+        raise SystemExit(f"window bundle not validated: detected={ {k: d['detected'] for k, d in res['detection'].items()} } ground_rooms={ground}")
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    bundle = {"version": version, "kind": "window_physics_residual", "horizon_min": c["horizon"], "taus": c["taus"], "feature_names": FEATURE_NAMES, "since_open_cap": c["since_open_cap"], "open_valve_pct": cfg["open_valve_pct"],
-              "valve_guard_min": c["valve_guard_min"], "clip": c["clip"], "veto_pad_min": c["veto_pad_min"], "threshold": res["threshold"], "merge_min": cfg["criterion"]["merge_min"],
-              "ffill_min": cfg["ffill_min"], "valid": cfg["valid"], "weather_max_age_min": cfg["weather_max_age_min"],
-              "rooms": {r: {"node": cfg["nodes"][r], "weight": c["weights"][r], "coef": coef.tolist(), "intercept": icpt, "sigma": sig} for r, (coef, icpt, sig) in ap.model.items()}}
+    bundle = {"version": version, "kind": "window_room_channels", "horizon_min": c["horizon"], "taus": c["taus"], "feature_names": FEATURE_NAMES, "since_open_cap": c["since_open_cap"], "open_valve_pct": cfg["open_valve_pct"],
+              "valve_guard_min": c["valve_guard_min"], "clip": 1e9, "house_clip": rc["house_clip"], "veto_pad_min": c["veto_pad_min"], "threshold": res["threshold"]["house"], "thresholds": res["threshold"], "merge_min": rc["merge_min"],
+              "boiler": rc["boiler"], "ffill_min": cfg["ffill_min"], "valid": cfg["valid"], "weather_max_age_min": cfg["weather_max_age_min"],
+              "rooms": {r: {"node": cfg["nodes"][r], "weight": 1.0 if r in ground else 0.0, "coef": coef.tolist(), "intercept": icpt, "sigma": res["sigma"][r]} for r, (coef, icpt, _) in ap.model.items()}}
     meta = {"version": version, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "train_from": utc(grid.t[0]).isoformat(), "train_to": utc(grid.t[-1]).isoformat(), "days": len(grid.days), "minutes": len(grid.t), "rows": ap.rows,
-            "eval": {k: res[k] for k in ("pass", "detected", "latency_min", "threshold", "alarms", "alarms_per_day", "gt_rank", "alarms_in_supply")}, "alarms": [{k: e[k] for k in ("start_utc", "minutes", "peak", "rooms", "gt")} for e in res["episodes"]]}
+            "eval": {"detection": res["detection"], "latency_sum": res["latency_sum"], "thresholds": res["threshold"], "non_gt_alarms": res["extra"], "alarms_per_day": res["alarms_per_day"]},
+            "alarms": [{"start_local": a["local"], "minutes": int(a["end"] - a["start"]), "channels": a["channels"], "gt": a["gt"], "in_event": a["in_event"], "reason": a["reason"]} for a in res["alarms"]]}
     out = Path(models_dir) / "window" / version
     out.mkdir(parents=True, exist_ok=True)
     (out / "bundle.json").write_text(json.dumps(bundle, indent=1))

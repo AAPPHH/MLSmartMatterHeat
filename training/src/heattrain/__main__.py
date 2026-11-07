@@ -56,7 +56,7 @@ CONFIG = {
         "room": {
             "gt": [{"id": "A", "open_utc": "2026-11-07T08:05:00+00:00", "hit_min": 20, "channels": ["house", "bad"], "exclude_utc": ["2026-11-07T07:30:00+00:00", "2026-11-07T10:00:00+00:00"]},
                    {"id": "B", "open_utc": "2026-11-07T17:27:00+00:00", "hit_min": 20, "channels": ["wohnzimmer"], "exclude_utc": ["2026-11-07T17:20:00+00:00", "2026-11-07T18:30:00+00:00"]}],
-            "margin": 0.9, "ratio_quantile": 0.995, "merge_min": 30, "house_clip": 6.0, "sigma_trim": 0.03, "sigma_floor": 0.15, "list_n": 60,
+            "margin": 0.9, "ratio_quantile": 0.995, "merge_min": 30, "house_clip": 6.0, "sigma_trim": 0.03, "sigma_floor": 0.15, "list_n": 1000,
             "models": {"ridge": ["PhysicsResidual", False], "xgb": ["XgbResidual", False], "ridge_react": ["PhysicsResidual", True], "xgb_react": ["XgbResidual", True]},
             "react": {"enabled": False, "horizon": 5, "sp_hold": 30, "sigma_floor": 5.0, "trim": 0.03},
             "boiler": {"enabled": True, "open_pct": 30.0, "open_z": 1.0, "closed_pct": 10.0, "closed_z": 1.5},

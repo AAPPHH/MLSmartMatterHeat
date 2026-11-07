@@ -5,6 +5,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
+from heattrain import windowml
 from heattrain.__main__ import CONFIG
 from heattrain.windowml import Approach, Evaluator, Grid, PhysicsResidual, RoomEvaluator, StreamScorer, V1Like, UnheatedFloor, XgbResidual, budget_threshold, dilate, episodes, evaluate, evaluate_room, floor_dist, last_step, parity_csv, peak_last, rank_key, room_channels, since_open, since_true, stream_run, utc, valve_reaction, window_bundle
 
@@ -225,21 +226,56 @@ def test_stream_matches_vectorized_with_gaps_and_veto():
     assert n_fin > 3000 and any(r[3] for r in rec)
 
 
+def fake_room_result(detected):
+    det = {"A": {"detected": detected, "latency_min": 14, "channel": "house"}}
+    return {"detected_all": detected, "detection": det, "latency_sum": 14, "threshold": {"house": 7.5, "wohnzimmer": 1.7, "bad": 9.0, "schlafzimmer": 2.0}, "extra": 1, "alarms_per_day": 0.1,
+            "sigma": {"wohnzimmer": 0.25, "bad": 0.15, "schlafzimmer": 0.3}, "alarms": [{"local": "11-07 09:19", "start": 3, "end": 9, "channels": ["house"], "gt": True, "in_event": False, "reason": "r"}]}
+
+
 def test_export_requires_validation_and_writes_bundle(tmp_path, monkeypatch):
     g, cfg = phys_grid()
     monkeypatch.setattr(Grid, "load", classmethod(lambda cls, lake, c: g))
     config = {"window": cfg}
+    monkeypatch.setattr(windowml, "evaluate_room", lambda grid, cls, c: fake_room_result(False))
     with pytest.raises(SystemExit):
         window_bundle(config, "x", tmp_path)
-    ok = {"pass": True, "detected": True, "latency_min": 25, "threshold": 7.5, "alarms": 1, "alarms_per_day": 0.1, "gt_rank": 1, "alarms_in_supply": 0, "episodes": []}
-    monkeypatch.setattr(Evaluator, "run", lambda self, sc: ok)
+    monkeypatch.setattr(windowml, "evaluate_room", lambda grid, cls, c: fake_room_result(True))
     out, bundle, meta, ap, _ = window_bundle(config, "x", tmp_path, version="v1")
     b = json.loads((out / "bundle.json").read_text())
-    assert out == tmp_path / "window" / "v1" and b["threshold"] == 7.5 and set(b["rooms"]) == {"wohnzimmer", "bad", "schlafzimmer"}
+    assert out == tmp_path / "window" / "v1" and b["threshold"] == 7.5 and b["thresholds"]["wohnzimmer"] == 1.7 and set(b["rooms"]) == {"wohnzimmer", "bad", "schlafzimmer"}
+    assert b["rooms"]["bad"]["sigma"] == 0.15 and b["rooms"]["schlafzimmer"]["weight"] == 0.0 and b["rooms"]["bad"]["weight"] == 1.0 and b["clip"] > 1e6 and b["house_clip"] == 6.0
     assert all(len(m["coef"]) == len(b["feature_names"]) == 16 for m in b["rooms"].values())
-    assert json.loads((out / "meta.json").read_text())["eval"]["pass"]
+    assert json.loads((out / "meta.json").read_text())["eval"]["latency_sum"] == 14
     csv = parity_csv(b, g, slice(0, 600)).splitlines()
-    assert csv[0].startswith("ts,supply,out,wind,rad,wohnzimmer_temp") and len(csv) == 601 and csv[-1].split(",")[-1] == "0"
+    assert csv[0].startswith("ts,supply,out,wind,rad,wohnzimmer_temp") and len(csv) == 601 and csv[-1].split(",")[-1] in ("0", "1")
+
+
+def test_room_bundle_stream_matches_room_channels_including_boiler_logic():
+    g, cfg = phys_grid(n=3000)
+    rng = np.random.default_rng(3)
+    g.room["schlafzimmer"]["valve"][:] = 0.0
+    g.room["wohnzimmer"]["valve"][:] = 70.0
+    g.room["wohnzimmer"]["temp"][1500:] -= 1.5 * rng.uniform(0.5, 1.0, 1500)
+    g.room["wohnzimmer"]["since_open"] = since_open(g.room["wohnzimmer"]["valve"], 10.0)
+    g.room["schlafzimmer"]["since_open"] = since_open(g.room["schlafzimmer"]["valve"], 10.0)
+    g.cache = {}
+    ap = PhysicsResidual(cfg).fit(g, g.days)
+    pred = ap.predict(g)
+    S, res, sig, flag = room_channels(g, pred, cfg)
+    assert flag.any() and not flag.all()
+    ground = ["wohnzimmer", "bad"]
+    b = {"horizon_min": 20, "taus": cfg["phys"]["taus"], "since_open_cap": 90.0, "open_valve_pct": 10.0, "valve_guard_min": 120, "clip": 1e9, "house_clip": 6.0, "veto_pad_min": 60, "boiler": cfg["room"]["boiler"],
+         "rooms": {r: {"weight": 1.0 if r in ground else 0.0, "coef": c.tolist(), "intercept": i, "sigma": sig[r]} for r, (c, i, _) in ap.model.items()}}
+    sub, rec = stream_run(b, g, slice(0, len(g.t)))
+    n_fin = 0
+    for i, (sh, z, house, veto) in enumerate(rec):
+        for r in g.rooms:
+            want, got = S[r][i], np.nan if veto else z[r]
+            assert np.isnan(want) == np.isnan(got) and (np.isnan(want) or want == pytest.approx(got, abs=1e-9))
+            n_fin += np.isfinite(want)
+        want, got = S["house"][i], np.nan if veto else house
+        assert np.isnan(want) == np.isnan(got) and (np.isnan(want) or want == pytest.approx(got, abs=1e-9))
+    assert n_fin > 3000 and sum(r[3] for r in rec) == flag.sum()
 
 
 def with_presence(g):
