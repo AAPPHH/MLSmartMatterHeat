@@ -87,6 +87,34 @@ fn newest_bundle_is_the_latest_version_directory_with_a_bundle() {
     assert!(newest_bundle(&dir.path().join("missing")).is_none() && try_load(dir.path().join("missing").to_str().unwrap()).is_none());
 }
 
+#[test]
+fn newest_bundle_ignores_foreign_dirs_and_load_falls_back_to_the_next_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |v: &str, body: String| {
+        std::fs::create_dir_all(dir.path().join(v)).unwrap();
+        std::fs::write(dir.path().join(v).join("bundle.json"), body).unwrap();
+    };
+    write("20261101T030000Z", toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string());
+    write("parity", toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string());
+    write("20261105", toy_json(&[("a", 5, 1.0)], 3.0, 0).to_string());
+    assert_eq!(newest_bundle(dir.path()).unwrap().0, "20261101T030000Z");
+    write("20261103T030000Z", "{".into());
+    assert_eq!(newest_bundle(dir.path()).unwrap().0, "20261103T030000Z");
+    assert_eq!(bundle_candidates(dir.path()).len(), 2);
+    assert!(try_load(dir.path().to_str().unwrap()).is_some());
+    write("20261101T030000Z", "{".into());
+    assert!(try_load(dir.path().to_str().unwrap()).is_none());
+}
+
+#[test]
+fn disabled_detector_does_not_accumulate_feed_history() {
+    let mut d = Detector::default();
+    for i in 0..(5 * 24 * 60) {
+        d.push(5, LOCAL_TEMPERATURE, T0 + i * MIN, 20.0);
+    }
+    assert!(d.feed_len(5) <= 2882, "{}", d.feed_len(5));
+}
+
 struct Feed {
     d: Detector,
     c: Config,

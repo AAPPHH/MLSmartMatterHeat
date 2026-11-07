@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -80,14 +80,19 @@ impl Bundle {
     }
 }
 
+pub fn bundle_candidates(base: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(dir) = std::fs::read_dir(base) else { return Vec::new() };
+    let mut found: Vec<(String, PathBuf)> = dir.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path())).filter(|(name, path)| chrono::NaiveDateTime::parse_from_str(name, "%Y%m%dT%H%M%SZ").is_ok() && path.join("bundle.json").is_file()).collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found
+}
+
 pub fn newest_bundle(base: &Path) -> Option<(String, PathBuf)> {
-    let mut found: Vec<(String, PathBuf)> = std::fs::read_dir(base).ok()?.flatten().filter(|e| e.path().join("bundle.json").is_file()).map(|e| (e.file_name().to_string_lossy().into_owned(), e.path())).collect();
-    found.sort();
-    found.pop()
+    bundle_candidates(base).into_iter().next()
 }
 
 pub fn try_load(base: &str) -> Option<Bundle> {
-    newest_bundle(Path::new(base)).and_then(|(_, path)| Bundle::load(&path).ok())
+    bundle_candidates(Path::new(base)).into_iter().find_map(|(_, path)| Bundle::load(&path).ok())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -251,6 +256,11 @@ impl Detector {
         }
     }
 
+    #[cfg(test)]
+    pub fn feed_len(&self, node: u64) -> usize {
+        self.feeds.get(&node).map_or(0, |f| f.temp.len())
+    }
+
     pub fn push(&mut self, node: u64, attribute: &str, ts_ms: i64, value: f64) {
         let (temp, valve) = self.valid.unwrap_or((TEMP_RANGE, VALVE_RANGE));
         let in_range = |r: [f64; 2]| value.is_finite() && value >= r[0] && value <= r[1];
@@ -263,6 +273,9 @@ impl Detector {
         };
         if ok && q.back().is_none_or(|l| l.0 <= ts_ms) {
             q.push_back((ts_ms, value));
+            while q.len() >= 2 && q[1].0 < ts_ms - MAX_GAP_MIN * MIN_MS {
+                q.pop_front();
+            }
         }
     }
 
@@ -312,11 +325,21 @@ pub fn spawn_reload(windows: Arc<Mutex<crate::window::Windows>>, dir: String, ev
             let current = windows.lock().unwrap().model_version();
             let base = dir.clone();
             let loaded = tokio::task::spawn_blocking(move || -> Result<Option<Bundle>> {
-                let (name, path) = newest_bundle(Path::new(&base)).ok_or_else(|| anyhow!("no window bundle in {base}, detection off until one appears"))?;
-                if current.as_deref() == Some(name.as_str()) {
-                    return Ok(None);
+                let candidates = bundle_candidates(Path::new(&base));
+                if candidates.is_empty() {
+                    bail!("no window bundle in {base}, detection off until one appears");
                 }
-                Bundle::load(&path).map(Some)
+                let mut failures = Vec::new();
+                for (name, path) in candidates {
+                    if current.as_deref() == Some(name.as_str()) {
+                        return Ok(None);
+                    }
+                    match Bundle::load(&path) {
+                        Ok(bundle) => return Ok(Some(bundle)),
+                        Err(e) => failures.push(format!("{name}: {e:#}")),
+                    }
+                }
+                bail!("no loadable window bundle in {base}, keeping the current model ({})", failures.join("; "))
             })
             .await;
             match loaded {
