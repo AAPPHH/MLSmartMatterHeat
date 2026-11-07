@@ -562,7 +562,7 @@ class XgbResidual(PhysicsResidual):
         sup = np.nan_to_num(sh["supply_event"]).astype(bool)
         add("supply", sup.astype(float))
         add("since_resume", since_true(sup, 600))
-        others = [np.nan_to_num(grid.room[o]["valve"]) > grid.cfg["room"]["boiler"]["open_pct"] for o in grid.rooms if o != r]
+        others = [np.nan_to_num(grid.room[o]["valve"]) > grid.cfg["room"]["other_open_pct"] for o in grid.rooms if o != r]
         add("others_open", np.sum(others, axis=0).astype(float) if others else np.zeros(n))
         add("in_room_age", d["in_room_age"])
         add("in_room", (d["in_room_age"] <= pc["in_room_min"]).astype(float))
@@ -626,11 +626,6 @@ def oof_predictions(grid, cls, cfg):
     return out
 
 
-def mean_valve(grid, r, k):
-    v = grid.room[r]["valve"]
-    return np.where(wsum(np.isfinite(v).astype(float), k) >= k, wsum(np.nan_to_num(v), k) / k, np.nan)
-
-
 def valve_reaction(grid, r, c, use, z):
     d = grid.room[r]
     dv = d["valve"] - lag(d["valve"], c["horizon"])
@@ -653,21 +648,12 @@ def room_channels(grid, pred, cfg, spared=None):
         f = f[np.abs(f) <= np.quantile(np.abs(f), 1 - c["sigma_trim"])]
         sig[r] = max(float(np.sqrt(np.mean(f ** 2))), c["sigma_floor"]) if len(f) else c["sigma_floor"]
         z[r] = -res[r] / sig[r]
-    b = c["boiler"]
-    flag = np.zeros(len(grid.t), bool)
-    if b["enabled"]:
-        vm = {r: mean_valve(grid, r, cfg["phys"]["horizon"]) for r in grid.rooms}
-        opened = np.any([(vm[r] > b["open_pct"]) & (z[r] > b["open_z"]) for r in grid.rooms], axis=0)
-        closed = [(vm[r] <= b["closed_pct"]) & np.isfinite(z[r]) for r in grid.rooms]
-        cold_closed = np.any([m & (z[r] > b["closed_z"]) for m, r in zip(closed, grid.rooms)], axis=0)
-        flag = opened & np.any(closed, axis=0) & ~cold_closed
     ev = {r: valve_reaction(grid, r, c["react"], keep & ~veto, z[r]) for r in grid.rooms} if c["react"]["enabled"] else z
     ground = [r for r in cfg["floor"]["ground"] if r in z]
     zs = np.array([np.minimum(np.maximum(z[r], 0.0), c["house_clip"]) for r in ground])
     S = dict(ev)
     S["house"] = np.where(np.isfinite(zs).any(axis=0), np.nansum(zs, axis=0), np.nan)
-    mute = veto | flag
-    return {k: np.where(mute, np.nan, v) for k, v in S.items()}, res, sig, flag
+    return {k: np.where(veto, np.nan, v) for k, v in S.items()}, res, sig
 
 
 class RoomEvaluator:
@@ -753,18 +739,19 @@ class Reasoner:
         vt = "valve unknown" if not np.isfinite(v) else (f"valve closed {so:.0f} min" if v <= c["open_valve_pct"] and np.isfinite(so) else f"valve {v:.0f} % open")
         age = d["in_room_age"][i]
         ut = f"user in room {age:.0f} min ago" if age <= pc["in_room_min"] else ("user asleep" if sh["asleep"][i] else ("user elsewhere in the house" if sh["home_age"][i] <= pc["home_min"] else "no watch sighting"))
-        n_open = sum(np.nan_to_num(g.room[o]["valve"][i]) > c["room"]["boiler"]["open_pct"] for o in g.rooms if o != r)
+        n_open = sum(np.nan_to_num(g.room[o]["valve"][i]) > c["room"]["other_open_pct"] for o in g.rooms if o != r)
         k = -self.res[r][i]
+        dev = f"{abs(k):.1f} K {'below' if k >= 0 else 'above'} forecast"
         pre = f"house score {S['house'][i]:.1f}: " if ch == "house" else ""
-        return f"{pre}{r} {k:.1f} K below forecast, {vt}, {ut}, outdoor {sh['out'][i]:.1f} C, {n_open} other rooms heating"
+        return f"{pre}{r} {dev}, {vt}, {ut}, outdoor {sh['out'][i]:.1f} C, {n_open} other rooms heating"
 
 
 def evaluate_room(grid, cls, cfg):
     pred = oof_predictions(grid, cls, cfg)
     ev = RoomEvaluator(grid, cfg)
-    S, res, sig, flag = room_channels(grid, pred, cfg, ev.excl)
+    S, res, sig = room_channels(grid, pred, cfg, ev.excl)
     out = ev.run(S, res, sig, Reasoner(grid, res))
-    out.update({"S": S, "pred": pred, "res": res, "flag": flag, "evaluator": ev})
+    out.update({"S": S, "pred": pred, "res": res, "evaluator": ev})
     return out
 
 
@@ -774,7 +761,7 @@ def format_room(name, r, list_n):
     for a in r["alarms"]:
         if not a["gt"] and not a["in_event"]:
             per[a["channel"]] = per.get(a["channel"], 0) + 1
-    ext = f" by_channel={per} muted_by_boiler_logic={int(r['flag'].sum())}min"
+    ext = f" by_channel={per}"
     head = " ".join(f"{k}:{'-' if not d['detected'] else str(d['latency_min']) + 'min/' + d['channel']}" for k, d in r["detection"].items())
     thr = " ".join(f"{k}={v:.2f}" for k, v in r["threshold"].items())
     lines = [f"{name}: detect {head} latency_sum={r['latency_sum']} non_gt_alarms={r['extra']} per_day={r['alarms_per_day']:.2f} days={r['days']:.1f} thr[{thr}] ratio_med={r['ratio_median']:.2f}{ext}"]
@@ -814,22 +801,9 @@ class StreamScorer:
         self.run = dict.fromkeys(self.rooms, 0)
         self.last_open = dict.fromkeys(self.rooms)
         self.win = {r: [] for r in self.rooms}
-        self.valves = {r: [] for r in self.rooms}
         self.t = -1
         self.since_supply = None
         self.H = H
-
-    def boiler(self, z, valve):
-        b = self.b.get("boiler")
-        if not b or not b["enabled"]:
-            return False
-        vm = {}
-        for r in self.rooms:
-            v = self.valves[r][-self.H:]
-            vm[r] = float(np.mean(v)) if len(v) == self.H and np.isfinite(v).all() else np.nan
-        opened = any(vm[r] > b["open_pct"] and z[r] > b["open_z"] for r in self.rooms)
-        closed = [r for r in self.rooms if vm[r] <= b["closed_pct"] and np.isfinite(z[r])]
-        return bool(opened and closed and not any(z[r] > b["closed_z"] for r in closed))
 
     def step(self, shared, inputs):
         b, H = self.b, self.H
@@ -843,8 +817,6 @@ class StreamScorer:
             good = np.isfinite(valve)
             v = valve / 100.0 if good else np.nan
             vz = v if good else 0.0
-            self.valves[r].append(valve)
-            del self.valves[r][:-H]
             self.run[r] = self.run[r] + 1 if good else 0
             if good and valve > b["open_valve_pct"]:
                 self.last_open[r] = self.t
@@ -871,7 +843,6 @@ class StreamScorer:
             if self.run[r] < H + b["valve_guard_min"] + 1 or not np.isfinite(x).all() or not np.isfinite(temp):
                 continue
             z[r] = -((temp - s0) - (float(np.dot(x, m["coef"])) + m["intercept"])) / m["sigma"]
-        veto = veto or self.boiler(z, inputs)
         hc = b.get("house_clip", b["clip"])
         zs = [min(max(z[r], 0.0), hc) * b["rooms"][r]["weight"] for r in self.rooms if np.isfinite(z[r])]
         house = sum(zs) if zs else np.nan
@@ -893,7 +864,7 @@ def window_bundle(config, lake, models_dir, version=None):
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bundle = {"version": version, "kind": "window_room_channels", "horizon_min": c["horizon"], "taus": c["taus"], "feature_names": FEATURE_NAMES, "since_open_cap": c["since_open_cap"], "open_valve_pct": cfg["open_valve_pct"],
               "valve_guard_min": c["valve_guard_min"], "clip": 1e9, "house_clip": rc["house_clip"], "veto_pad_min": c["veto_pad_min"], "threshold": res["threshold"]["house"], "thresholds": res["threshold"], "merge_min": rc["merge_min"],
-              "boiler": rc["boiler"], "ffill_min": cfg["ffill_min"], "valid": cfg["valid"], "weather_max_age_min": cfg["weather_max_age_min"],
+              "ffill_min": cfg["ffill_min"], "valid": cfg["valid"], "weather_max_age_min": cfg["weather_max_age_min"],
               "rooms": {r: {"node": cfg["nodes"][r], "weight": 1.0 if r in ground else 0.0, "coef": coef.tolist(), "intercept": icpt, "sigma": res["sigma"][r]} for r, (coef, icpt, _) in ap.model.items()}}
     meta = {"version": version, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "train_from": utc(grid.t[0]).isoformat(), "train_to": utc(grid.t[-1]).isoformat(), "days": len(grid.days), "minutes": len(grid.t), "rows": ap.rows,
             "eval": {"detection": res["detection"], "latency_sum": res["latency_sum"], "thresholds": res["threshold"], "non_gt_alarms": res["extra"], "alarms_per_day": res["alarms_per_day"]},

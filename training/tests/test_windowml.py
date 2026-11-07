@@ -250,7 +250,7 @@ def test_export_requires_validation_and_writes_bundle(tmp_path, monkeypatch):
     assert csv[0].startswith("ts,supply,out,wind,rad,wohnzimmer_temp") and len(csv) == 601 and csv[-1].split(",")[-1] in ("0", "1")
 
 
-def test_room_bundle_stream_matches_room_channels_including_boiler_logic():
+def test_room_bundle_stream_matches_room_channels_including_the_supply_veto():
     g, cfg = phys_grid(n=3000)
     rng = np.random.default_rng(3)
     g.room["schlafzimmer"]["valve"][:] = 0.0
@@ -261,10 +261,9 @@ def test_room_bundle_stream_matches_room_channels_including_boiler_logic():
     g.cache = {}
     ap = PhysicsResidual(cfg).fit(g, g.days)
     pred = ap.predict(g)
-    S, res, sig, flag = room_channels(g, pred, cfg)
-    assert flag.any() and not flag.all()
+    S, res, sig = room_channels(g, pred, cfg)
     ground = ["wohnzimmer", "bad"]
-    b = {"horizon_min": 20, "taus": cfg["phys"]["taus"], "since_open_cap": 90.0, "open_valve_pct": 10.0, "valve_guard_min": 120, "clip": 1e9, "house_clip": 6.0, "veto_pad_min": 60, "boiler": cfg["room"]["boiler"],
+    b = {"horizon_min": 20, "taus": cfg["phys"]["taus"], "since_open_cap": 90.0, "open_valve_pct": 10.0, "valve_guard_min": 120, "clip": 1e9, "house_clip": 6.0, "veto_pad_min": 60,
          "rooms": {r: {"weight": 1.0 if r in ground else 0.0, "coef": c.tolist(), "intercept": i, "sigma": sig[r]} for r, (c, i, _) in ap.model.items()}}
     sub, rec = stream_run(b, g, slice(0, len(g.t)))
     n_fin = 0
@@ -275,7 +274,7 @@ def test_room_bundle_stream_matches_room_channels_including_boiler_logic():
             n_fin += np.isfinite(want)
         want, got = S["house"][i], np.nan if veto else house
         assert np.isnan(want) == np.isnan(got) and (np.isnan(want) or want == pytest.approx(got, abs=1e-9))
-    assert n_fin > 3000 and sum(r[3] for r in rec) == flag.sum()
+    assert n_fin > 3000
 
 
 def with_presence(g):
@@ -377,25 +376,16 @@ def test_valve_reaction_needs_a_quiet_setpoint():
     assert out[1003] == 0.0 and out[2003] > 5.0 and out[2010] == 0.0
 
 
-def test_boiler_logic_mutes_only_when_a_closed_room_is_fine_and_none_is_cold():
+def test_no_boiler_mute_a_cold_heated_room_next_to_closed_rooms_keeps_its_evidence():
     g, cfg = phys_grid()
     n = len(g.t)
     for r, v in (("wohnzimmer", 60.0), ("bad", 0.0), ("schlafzimmer", 0.0)):
         g.room[r]["valve"] = np.full(n, v)
     rng = np.random.default_rng(0)
-
-    def pred(cold_room=None, cold_woh=True):
-        p = {r: (np.zeros(n), 0.2 * rng.standard_normal(n)) for r in g.rooms}
-        for r in ([cold_room] if cold_room else []) + (["wohnzimmer"] if cold_woh else []):
-            p[r][1][1000:2000] += 2.0
-        return p
-    S, res, sig, flag = room_channels(g, pred(), cfg)
-    assert flag[1100:1900].mean() > 0.7 and np.isnan(S["house"][1100:1900][flag[1100:1900]]).all() and not flag[:900].any()
-    S, res, sig, flag = room_channels(g, pred("bad"), cfg)
-    assert flag[1100:1900].mean() < 0.05
-    for r in g.rooms:
-        g.room[r]["valve"] = np.full(n, 60.0)
-    assert not room_channels(g, pred(), cfg)[3].any()
+    p = {r: (np.zeros(n), 0.2 * rng.standard_normal(n)) for r in g.rooms}
+    p["wohnzimmer"][1][1000:2000] += 2.0
+    S, res, sig = room_channels(g, p, cfg)
+    assert np.isfinite(S["house"][1100:1900]).all() and S["house"][1100:1900].mean() > 2.0
 
 
 def test_rank_key_orders_detection_then_latency_then_alarm_rate():

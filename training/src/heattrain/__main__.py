@@ -59,7 +59,7 @@ CONFIG = {
             "margin": 0.9, "ratio_quantile": 0.995, "merge_min": 30, "house_clip": 6.0, "sigma_trim": 0.03, "sigma_floor": 0.15, "list_n": 1000,
             "models": {"ridge": ["PhysicsResidual", False], "xgb": ["XgbResidual", False], "ridge_react": ["PhysicsResidual", True], "xgb_react": ["XgbResidual", True]},
             "react": {"enabled": False, "horizon": 5, "sp_hold": 30, "sigma_floor": 5.0, "trim": 0.03},
-            "boiler": {"enabled": True, "open_pct": 30.0, "open_z": 1.0, "closed_pct": 10.0, "closed_z": 1.5},
+            "other_open_pct": 30.0,
             "feat": {"dose": [10, 20, 30, 90], "slope": [5, 10, 20], "floor_window": 180, "floor_settled": 20, "age_cap": 240, "step_k": 0.25, "dv_min": 5},
             "xgb": {"n_estimators": 300, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8, "colsample_bytree": 0.7, "min_child_weight": 30, "reg_lambda": 5.0, "trim": 0.03, "pooled": True},
         },
