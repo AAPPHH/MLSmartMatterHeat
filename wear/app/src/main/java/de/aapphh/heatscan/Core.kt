@@ -83,7 +83,9 @@ class OneShot {
     }
 }
 
-data class WindowAsk(val id: String, val room: String, val open: Boolean, val at: Long = 0L)
+data class WindowAsk(val id: String, val room: String, val open: Boolean, val at: Long = 0L, val reason: String = "")
+
+enum class WindowAnswer(val wire: String) { YES("yes"), NO("no"), UNKNOWN("unknown"), TIMEOUT("timeout") }
 
 object WindowEvent {
     const val KIND = "window"
@@ -93,7 +95,10 @@ object WindowEvent {
     const val CHIP = "Fenster"
     const val YES = "Ja"
     const val NO = "Nein"
-    const val DISMISS = "Später"
+    const val UNKNOWN = "Weiß nicht"
+    const val QUESTION = "Fenster offen?"
+    const val SELF_ON = "Fenster auf"
+    const val SELF_OFF = "Fenster zu"
     const val OPEN = "auf"
     const val CLOSED = "zu"
     private const val SEEN_MAX = 20
@@ -104,12 +109,23 @@ object WindowEvent {
 
     fun title(a: WindowAsk) = "Ist das Fenster ${PLACES[a.room] ?: "im ${Defaults.CAPTIONS[a.room] ?: a.room}"} offen?"
 
+    fun caption(room: String) = Defaults.CAPTIONS[room] ?: room
+
+    fun text(a: WindowAsk) = caption(a.room) + (if (a.reason.isNotEmpty()) ": " + a.reason else "")
+
+    fun open(a: WindowAsk, answer: WindowAnswer): Boolean = when (answer) {
+        WindowAnswer.YES -> a.open
+        WindowAnswer.NO -> !a.open
+        else -> true
+    }
+
     fun parse(o: JSONObject?, now: Long): WindowAsk? = try {
         o?.let {
             val id = it.optString("id").takeIf { s -> s.isNotEmpty() }
             val room = it.optString("room").takeIf { r -> r in Defaults.ROOMS }
             val q = it.optString("question").takeIf { s -> s == "open" || s == "closed" }
-            if (id == null || room == null || q == null) null else WindowAsk(id, room, q == "open", now)
+            val reason = if (it.isNull("reason")) "" else it.optString("reason")
+            if (id == null || room == null || q == null) null else WindowAsk(id, room, q == "open", now, reason)
         }
     } catch (e: Exception) { null }
 
@@ -123,18 +139,28 @@ object WindowEvent {
         return Pair(incoming.copy(at = now), (seen + incoming.id).takeLast(SEEN_MAX))
     }
 
-    fun entry(device: String, ts: Long, room: String, open: Boolean, promptId: String?, id: String = LabelEvent.newId()): JSONObject =
+    fun lapsed(pending: WindowAsk?, seen: List<String>, incoming: WindowAsk?, now: Long): WindowAsk? =
+        pending?.takeIf { expired(it, now) || (incoming != null && incoming.id != it.id && incoming.id !in seen) }
+
+    fun lapseTs(a: WindowAsk, now: Long) = minOf(now, a.at + EXPIRY_MS)
+
+    fun entry(device: String, ts: Long, room: String, open: Boolean, promptId: String?, id: String = LabelEvent.newId(), answer: WindowAnswer? = null, via: String? = null): JSONObject =
         JSONObject().put("ts", ts).put("kind", KIND).put("device", device).put("room", room).put("open", open).put("prompt_id", promptId ?: JSONObject.NULL).put("label_id", id)
+            .also { e -> answer?.let { e.put("answer", it.wire) }; via?.let { e.put("via", it) } }
+
+    fun answerEntry(device: String, ts: Long, a: WindowAsk, answer: WindowAnswer, via: String, id: String = LabelEvent.newId()): JSONObject =
+        entry(device, ts, a.room, open(a, answer), a.id, id, answer, via)
 
     fun isWindow(o: JSONObject) = o.optString("kind") == KIND
 
     fun body(o: JSONObject): String = JSONObject().put("device", o.getString("device")).put("ts", o.getLong("ts")).put("room", o.getString("room")).put("open", o.getBoolean("open"))
-        .put("prompt_id", if (o.isNull("prompt_id")) JSONObject.NULL else o.getString("prompt_id")).put("label_id", o.getString("label_id")).toString()
+        .put("prompt_id", if (o.isNull("prompt_id")) JSONObject.NULL else o.getString("prompt_id")).put("label_id", o.getString("label_id"))
+        .also { b -> o.optString("answer").takeIf { it.isNotEmpty() }?.let { b.put("answer", it) }; o.optString("via").takeIf { it.isNotEmpty() }?.let { b.put("via", it) } }.toString()
 
-    fun json(a: WindowAsk?): String? = a?.let { JSONObject().put("id", it.id).put("room", it.room).put("open", it.open).put("at", it.at).toString() }
+    fun json(a: WindowAsk?): String? = a?.let { JSONObject().put("id", it.id).put("room", it.room).put("open", it.open).put("at", it.at).put("reason", it.reason).toString() }
 
     fun fromJson(text: String?): WindowAsk? = try {
-        text?.let { JSONObject(it).let { o -> WindowAsk(o.getString("id"), o.getString("room"), o.getBoolean("open"), o.getLong("at")) } }
+        text?.let { JSONObject(it).let { o -> WindowAsk(o.getString("id"), o.getString("room"), o.getBoolean("open"), o.getLong("at"), o.optString("reason", "")) } }
     } catch (e: Exception) { null }
 }
 
@@ -589,6 +615,13 @@ object Quarters {
 
     fun labelR(room: String): Float = LABEL_R + (LABEL_SHIFT[room] ?: 0f)
 
+    const val LABEL_H_DP = 44f
+
+    fun labelDp(room: String, dDp: Float): Float {
+        val r = labelR(room) * dDp
+        return if (room == "kueche") minOf(r, NONE_TOP * dDp - LABEL_H_DP / 2f) else r
+    }
+
     fun mid(room: String): Float = WEDGES.indexOf(room) * SPAN
 
     fun room(dx: Float, dy: Float, d: Float): String {
@@ -611,7 +644,7 @@ data class Match(val room: String?, val p: Float, val abstained: Boolean, val re
 
 data class Alert(val id: String, val title: String, val text: String)
 
-class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true, val match: Match? = null, val alert: Alert? = null, val window: JSONObject? = null)
+class Reply(val probability: Float?, val rooms: List<RoomP>, val aps: List<Ap>, val hasRooms: Boolean = true, val match: Match? = null, val alert: Alert? = null, val window: JSONObject? = null, val alerts: List<Alert> = listOfNotNull(alert))
 
 object MatchView {
     private val REASONS = mapOf(
@@ -683,13 +716,15 @@ object ReplyJson {
         if (title.isEmpty() && text.isEmpty()) null else Alert(it.optString("id", title + text), title, text)
     }
 
+    fun alerts(o: JSONObject): List<Alert> = list(o.optJSONArray("alerts")?.toString()) { alert(it) }.filterNotNull().ifEmpty { listOfNotNull(alert(o.optJSONObject("alert"))) }
+
     fun matchOf(text: String?): Match? = try { match(text?.let { JSONObject(it) }) } catch (e: Exception) { null }
 
     fun parse(text: String): Reply = try {
         val o = JSONObject(text)
         Reply(
             if (o.isNull("probability")) null else o.optDouble("probability").toFloat().takeIf { !it.isNaN() },
-            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms"), match(o.optJSONObject("match")), alert(o.optJSONObject("alert")), o.optJSONObject("window_prompt")
+            rooms(o.optJSONArray("rooms")?.toString()), aps(o.optJSONArray("aps")?.toString()), o.has("rooms"), match(o.optJSONObject("match")), alert(o.optJSONObject("alert")), o.optJSONObject("window_prompt"), alerts(o)
         )
     } catch (e: Exception) { Reply(null, emptyList(), emptyList(), false) }
 
@@ -869,22 +904,6 @@ object Home {
         val wanted = home.map(::norm).filter { it.isNotEmpty() }.toSet()
         return wanted.isEmpty() || seen.any { norm(it) in wanted }
     }
-}
-
-object TileClick {
-    const val PREFIX = "room:"
-
-    fun id(room: String, nonce: Long) = "$PREFIX$room:$nonce"
-
-    fun room(id: String, nonce: Long): String? {
-        if (!id.startsWith(PREFIX)) return null
-        val parts = id.removePrefix(PREFIX).split(':')
-        if (parts.size != 2 || parts[1] != nonce.toString()) return null
-        return parts[0].takeIf { it in Defaults.LABELS }
-    }
-
-    fun statusLine(running: Boolean, mode: String, status: String): String =
-        (if (running && mode.isNotEmpty()) "$mode | " else if (!running) "Scan aus | " else "") + status
 }
 
 object Trace {
@@ -1233,6 +1252,12 @@ class Store(private val ctx: Context) {
         get() = (sp.getString("windowSeen", "") ?: "").split(",").filter { it.isNotEmpty() }
         set(v) = sp.edit().putString("windowSeen", v.joinToString(",")).apply()
     fun homeKnown(now: Long = System.currentTimeMillis()) = Presence.known(atHome, homeAt, now)
+    fun lapseWindow(incoming: WindowAsk?, now: Long): WindowAsk? = synchronized(Store::class.java) {
+        WindowEvent.lapsed(windowPending, windowSeen, incoming, now)?.also { windowPending = null }
+    }
+    fun takeWindow(id: String): WindowAsk? = synchronized(Store::class.java) {
+        windowPending?.takeIf { it.id == id }?.also { windowPending = null }
+    }
     fun admitWindow(incoming: WindowAsk?, now: Long): WindowAsk? = synchronized(Store::class.java) {
         if (!homeKnown(now)) return null
         val before = windowPending
@@ -1241,9 +1266,15 @@ class Store(private val ctx: Context) {
         if (p != before) windowPending = p
         p?.takeIf { it.id != before?.id }
     }
-    var alertId: String?
-        get() = sp.getString("alertId", null)
-        set(v) = sp.edit().also { if (v == null) it.remove("alertId") else it.putString("alertId", v) }.apply()
+    var alertSeen: List<String>
+        get() = (sp.getString("alertSeen", "") ?: "").split(AlertList.SEP).filter { it.isNotEmpty() }
+        set(v) = sp.edit().putString("alertSeen", v.joinToString(AlertList.SEP)).apply()
+    var alerts: List<Alert>
+        get() = AlertList.fromJson(sp.getString("alerts", null))
+        set(v) = sp.edit().putString("alerts", AlertList.json(v)).apply()
+    var glance: Glance
+        get() = Glance.fromJson(sp.getString("glance", null))
+        set(v) = sp.edit().putString("glance", v.json()).apply()
     var lastPromptAlertAt: Long
         get() = sp.getLong("lastPromptAlertAt", 0L)
         set(v) = sp.edit().putLong("lastPromptAlertAt", v).apply()
