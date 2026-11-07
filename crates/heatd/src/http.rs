@@ -126,7 +126,7 @@ impl WindowAnswer {
     }
 }
 
-const WINDOW_VIA: [&str; 6] = ["notification", "page", "self", "swipe", "expiry", "replaced"];
+const WINDOW_VIA: [&str; 7] = ["notification", "page", "self", "swipe", "expiry", "replaced", "undo"];
 
 #[derive(Deserialize)]
 struct LabelBody {
@@ -844,7 +844,7 @@ async fn window_label(State(state): State<AppState>, Json(body): Json<WindowLabe
     }
     let answer = WindowAnswer::resolve(body.answer, body.open)?;
     if body.via.as_deref().is_some_and(|v| !WINDOW_VIA.contains(&v)) {
-        return Err(ApiError::bad("via must be notification, page, self, swipe, expiry or replaced"));
+        return Err(ApiError::bad("via must be notification, page, self, swipe, expiry, replaced or undo"));
     }
     if answer == WindowAnswer::Voided && body.prompt_id.is_none() && body.label_id.is_none() {
         return Err(ApiError::bad("a voided answer needs prompt_id or label_id"));
@@ -2508,7 +2508,7 @@ nodes = [5]
         let id = prompt_id(&h);
         call(&h.state, "POST", "/watch/window_label", answer_body(Some("yes"), None, &id, "first", Some("notification"))).await;
         assert_eq!(h.state.windows.lock().unwrap().test_label_count(), 1);
-        let (status, body) = call(&h.state, "POST", "/watch/window_label", answer_body(Some("voided"), None, &id, "second", Some("replaced"))).await;
+        let (status, body) = call(&h.state, "POST", "/watch/window_label", answer_body(Some("voided"), None, &id, "second", Some("undo"))).await;
         assert_eq!((status, body["answer"].clone()), (StatusCode::OK, json!("voided")));
         assert_eq!(h.state.windows.lock().unwrap().test_label_count(), 0);
         let labels = lake_rows(&h, "labels");
