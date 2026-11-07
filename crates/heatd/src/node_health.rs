@@ -332,7 +332,7 @@ async fn verify(state: &AppState, node: u64, health: Health, now_us: i64) {
         (r.set.rewrites, settle_alert(r, retries, now_us))
     });
     eprintln!("node {node}: setpoint {target} not applied (device reports {device}), rewrite {rewrites}{}", error.as_ref().map(|e| format!(" failed: {e}")).unwrap_or_default());
-    emit(state, node, json!({"aspect": "setpoint", "action": "rewrite", "target": target, "device": device, "rewrites": rewrites, "error": error}));
+    emit(state, node, json!({"aspect": "setpoint", "action": "rewrite", "target": target, "device": device, "rewrites": rewrites, "error": error, "budget": "exempt_verification"}));
     if let Some(detail) = change {
         emit(state, node, detail);
     }

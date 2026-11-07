@@ -178,7 +178,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 ");
     state.latest.all().iter().for_each(|r| ages.push_str(&format!("heatd_reading_age_seconds{{node=\"{}\",attribute=\"{}\"}} {}
 ", r.node, r.attribute, ((now - r.ts) as f64 / 1000.0).max(0.0))));
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{ages}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics()))
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{ages}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour)))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -666,7 +666,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                     })
                 })
                 .collect();
-            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "nodes": nodes})
+            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
     Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
@@ -1787,6 +1787,40 @@ max_c = 25.0
         assert_eq!(extras(&h, "rate_limited"), 1);
         control_step(&h.state, at(15), t0 + 15 * 60_000).await.unwrap();
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0)]);
+    }
+
+    #[tokio::test]
+    async fn deferred_raise_is_logged_once_and_exposed_in_state_and_metrics() {
+        let h = harness_with(false, "raise_budget_per_hour = 1
+min_write_interval_min = 0
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+[[rooms.schedules]]
+days = ['weekdays']
+from = '12:05'
+to = '12:20'
+setpoint = 20.0
+[[rooms.schedules]]
+days = ['weekdays']
+from = '12:20'
+to = '23:00'
+setpoint = 21.0
+");
+        let at = |m: u32| NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, m, 0).unwrap();
+        let t0 = now_ms();
+        for m in 0..30 {
+            control_step(&h.state, at(m), t0 + m as i64 * 60_000).await.unwrap();
+        }
+        assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 20.0)]);
+        assert_eq!(extras(&h, "raise_budget"), 1);
+        assert!(some(&column(&lake_rows(&h, "decisions"), "inputs.extra")).iter().any(|e| e.contains("\"reason\":\"raise_budget\"") && e.contains("\"deferred\":true")));
+        let (_, state) = call(&h.state, "GET", "/api/state", None).await;
+        let budget = &state["rooms"][0]["raise_budget"];
+        assert_eq!((budget["limit"].clone(), budget["used"].clone(), budget["deferred_setpoint"].clone()), (1.into(), 1.into(), 21.0.into()));
+        assert!(budget["next_free_ts"].as_i64().is_some());
+        let metrics = h.state.commanded.lock().unwrap().budget.metrics(&h.state.config.rooms, now_ms(), 1);
+        assert!(metrics.contains("heatd_raise_deferred{room=\"wohnzimmer\"} 1") && metrics.contains("heatd_raises_deferred_total{room=\"wohnzimmer\"} 1"), "{metrics}");
     }
 
     #[tokio::test]

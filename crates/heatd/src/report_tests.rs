@@ -77,7 +77,7 @@ fn sample_lake(root: &Path) {
     sink.append(decision(150, true, Some(19.5), None)).unwrap();
     sink.append(decision(300, false, None, Some(true))).unwrap();
     sink.append(decision(330, false, None, Some(false))).unwrap();
-    for (minute, applied, why) in [(400, true, "occupied"), (410, false, "rate_limited"), (420, false, "debounce"), (430, false, "debounce")] {
+    for (minute, applied, why) in [(400, true, "occupied"), (410, false, "rate_limited"), (420, false, "debounce"), (430, false, "debounce"), (440, false, "raise_budget")] {
         sink.append(Decision { proposed: true, inputs: DecisionInputs { extra: Some(format!("{{\"reason\":\"{why}\"}}")), ..Default::default() }, ..decision(minute, applied, Some(21.0), None) }).unwrap();
     }
     for (minute, minutes) in [(500, 30), (700, 20)] {
@@ -249,6 +249,7 @@ fn daily_report_covers_all_sections() {
     assert!(md.contains("23 of 24 observation hours present, missing 1: 05:00"), "weather\n{md}");
     assert!(md.contains("1 started, 1 ended, 1 aborted"), "experiments\n{md}");
     assert!(md.contains("| a | 1 | 1 | 2 | 50 |"), "filter\n{md}");
+    assert!(md.contains("| a | 0 | 1 | 0 |"), "raise budget\n{md}");
     assert!(md.contains("| a | 1 | 1 | 1 | 18 | recovery |"), "window section
 {md}");
     assert!(md.contains("| auto | 2 | 34 | 8.5 | 1 | 0 | 1 | 2.0 |"), "episode comparison

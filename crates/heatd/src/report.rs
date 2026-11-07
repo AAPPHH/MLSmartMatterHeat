@@ -374,6 +374,24 @@ pub fn build(root: &Path, date: NaiveDate) -> Result<(String, DaySummary)> {
         }
     }
 
+    md.push_str("\n## Anhebungs-Budget je Raum\n\n");
+    let budget = rows(
+        c,
+        &format!(
+            "WITH d AS (SELECT room, json_extract_string(inputs.extra, '$.budget') AS bud, json_extract_string(inputs.extra, '$.reason') AS why FROM decisions WHERE proposed AND {day})
+             SELECT room, count(*) FILTER (WHERE bud = 'raise'), count(*) FILTER (WHERE why = 'raise_budget'), count(*) FILTER (WHERE bud LIKE 'exempt%') FROM d GROUP BY room HAVING count(*) FILTER (WHERE bud IS NOT NULL OR why = 'raise_budget') > 0 ORDER BY room"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)),
+    )?;
+    if budget.is_empty() {
+        md.push_str("Keine Anhebung verbraucht Budget, keine aufgeschoben.\n");
+    } else {
+        md.push_str("| Raum | Anhebungen (Budget verbraucht) | aufgeschoben (raise_budget) | frei (exempt) |\n|---|---|---|---|\n");
+        for (room, raises, deferred, exempt) in budget {
+            let _ = writeln!(md, "| {room} | {raises} | {deferred} | {exempt} |");
+        }
+    }
+
     md.push_str("\n## Fenster-offen-Erkennung\n\n");
     let windows = rows(
         c,
