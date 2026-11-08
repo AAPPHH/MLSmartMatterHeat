@@ -14,7 +14,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
@@ -417,7 +416,7 @@ internal fun palette(): Palette = MaterialTheme.colorScheme.let {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: String? = null, onLong: (String) -> Unit = {}, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: String? = null, onBadge: () -> Unit = {}, onLong: (String) -> Unit = {}, onTap: (String) -> Unit) {
     val pal = palette()
     val current = LocalDensity.current
     CompositionLocalProvider(LocalDensity provides Density(current.density, minOf(current.fontScale, Quarters.MAX_FONT))) {
@@ -426,7 +425,7 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             Box(Modifier.align(Alignment.Center).size(d)) {
                 Wheel(hot, ringed, locked, learn, glance, onLong, onTap)
                 badge?.let {
-                    Box(Modifier.align(Alignment.Center).offset((Quarters.BADGE_X * d.value).dp, (Quarters.BADGE_Y * d.value).dp).size(Quarters.BADGE_DP.dp).clip(CircleShape).background(pal.alert).clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+                    Box(Modifier.align(Alignment.Center).offset((Quarters.BADGE_X * d.value).dp, (Quarters.BADGE_Y * d.value).dp).size(Quarters.BADGE_DP.dp).clip(CircleShape).background(pal.alert).clickable(onClickLabel = "Hinweise") { onBadge() }.semantics { contentDescription = "Hinweise öffnen" }, contentAlignment = Alignment.Center) {
                         Text(it, fontSize = 10.sp, lineHeight = 12.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError)
                     }
                 }

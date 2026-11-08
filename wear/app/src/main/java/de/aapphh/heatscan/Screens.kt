@@ -1,5 +1,8 @@
 package de.aapphh.heatscan
 
+import androidx.compose.foundation.focusable
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -170,7 +173,7 @@ internal fun RoomsScreen(
                 item {
                     Box(Modifier.fillMaxWidth().height(full - PEEK)) {
                         Box(Modifier.fillMaxWidth().wrapContentHeight(Alignment.Top, unbounded = true).requiredHeight(full)) {
-                            RoomsPage(hot, ringed, locked, learn, glance, RoomView.badge(alerts, ask).takeIf { showBadge }, onDetail, onTap)
+                            RoomsPage(hot, ringed, locked, learn, glance, RoomView.badge(alerts, ask).takeIf { showBadge }, onAlerts, onDetail, onTap)
                         }
                     }
                 }
@@ -269,13 +272,15 @@ internal fun SavedPage(text: String, onUndo: () -> Unit, onDone: () -> Unit) {
     val haptic = LocalHapticFeedback.current
     var spent by remember { mutableStateOf(false) }
     val idle = remember { Idle() }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
     LaunchedEffect(Unit) {
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         idle.await(WindowEvent.UNDO_MS)
         onDone()
     }
     ScreenScaffold {
-        Column(Modifier.fillMaxSize().onTouch { idle.touch() }.onPreRotaryScrollEvent { idle.touch(); false }.padding(horizontal = 28.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+        Column(Modifier.fillMaxSize().onTouch { idle.touch() }.onPreRotaryScrollEvent { idle.touch(); false }.focusRequester(focus).focusable().padding(horizontal = 28.dp), Arrangement.Center, Alignment.CenterHorizontally) {
             Text(text, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold)
             FilledTonalButton({ if (!spent) { spent = true; onUndo() } }, Modifier.padding(top = GAP).defaultMinSize(minHeight = TARGET), enabled = !spent) { Text(Tap.UNDO, maxLines = 1) }
         }
