@@ -19,7 +19,7 @@ import java.util.UUID
 data class Ap(val bssid: String, val rssi: Int, val freq: Int)
 
 object Defaults {
-    const val SERVER = "http://192.168.178.29:8080"
+    const val SERVER = "http://192.168.178.29:8090"
     const val HOME = "FRITZ!Box 1234 AB"
     val ROOMS = listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur")
     const val NONE = "keiner"
