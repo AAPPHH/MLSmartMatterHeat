@@ -125,13 +125,57 @@ fn waking_up_outside_the_morning_hours_or_while_away_does_not_boost() {
 fn homecoming_boosts_rooms_rising_from_the_away_setpoint() {
     let rig = Rig { temp: 15.0, ..Rig::new() };
     assert!(!is_boost(&rig.tick(0.0, 17.5, (false, true), 18.0)));
-    let out = rig.tick(1.0, 17.5, (false, false), 21.0);
+    let out = rig.tick(60.0, 17.5, (false, false), 21.0);
     assert!(is_boost(&out));
     let v = rig.boost.view(ROOM);
     assert_eq!((v["scenario"].as_str(), v["source"].as_str()), (Some("homecoming"), Some("auto")));
     let other = Rig::new();
     other.tick(0.0, 17.5, (false, true), 18.0);
-    assert!(!is_boost(&other.tick(1.0, 17.5, (false, false), 18.4)));
+    assert!(!is_boost(&other.tick(60.0, 17.5, (false, false), 18.4)));
+}
+
+fn homecoming_after(away_min: f64, seeded_since: Option<f64>) -> (bool, String) {
+    let rig = Rig { temp: 15.0, ..Rig::new() };
+    if let Some(m) = seeded_since {
+        rig.boost.seed_away(at(m));
+    }
+    rig.tick(0.0, 17.5, (false, true), 18.0);
+    let out = rig.tick(away_min, 17.5, (false, false), 21.0);
+    (is_boost(&out), rig.boost.view(ROOM)["reason"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn homecoming_needs_at_least_sixty_minutes_away() {
+    let (boosted, reason) = homecoming_after(59.0, None);
+    assert!(!boosted && reason == "kein Boost: nur 59 min weg (< 60)", "{reason}");
+    assert!(homecoming_after(60.0, None).0);
+    assert!(homecoming_after(240.0, None).0);
+    let (boosted, reason) = homecoming_after(1.0, None);
+    assert!(!boosted && reason == "kein Boost: nur 1 min weg (< 60)", "{reason}");
+}
+
+#[test]
+fn a_restart_mid_away_keeps_the_true_away_start() {
+    assert!(homecoming_after(1.0, Some(-120.0)).0);
+    assert!(!homecoming_after(1.0, Some(-30.0)).0);
+    assert!(!homecoming_after(1.0, None).0);
+}
+
+#[test]
+fn homecoming_threshold_is_configurable_and_morning_ignores_it() {
+    let boost = Boost::new(&Config::parse("[boost]
+model_dir = '/nonexistent'
+seed = 3
+homecoming_min_away_min = 5.0
+[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+").unwrap());
+    boost.set_model(light_model());
+    let rig = Rig { boost, temp: 15.0 };
+    rig.tick(0.0, 17.5, (false, true), 18.0);
+    assert!(is_boost(&rig.tick(5.0, 17.5, (false, false), 21.0)));
+    assert!(is_boost(&Rig::new().morning()));
 }
 
 #[test]

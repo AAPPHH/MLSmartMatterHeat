@@ -8,7 +8,7 @@ import pyarrow.ipc as ipc
 import pytest
 from heattrain.__main__ import CONFIG
 from datetime import timedelta
-from heattrain.boostlearn import window_spans, Dosing, Posterior, Trust, boostcheck, boostlearn, boostmark, closed_loop, kernels, needs_retrain, ramp, rollout
+from heattrain.boostlearn import window_spans, Series, Dosing, Posterior, Trust, boostcheck, boostlearn, boostmark, closed_loop, kernels, needs_retrain, ramp, rollout
 
 T0 = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc).timestamp()
 DAYS = 6
@@ -287,6 +287,17 @@ def test_open_window_without_close_holds_by_source(lake):
     spans = window_spans(lake, grid, CFG["boost"])
     assert spans["wohnzimmer"][0][1] - spans["wohnzimmer"][0][0] == 60.0 * CFG["boost"]["window_manual_max_min"]
     assert spans["bad"][0][1] - spans["bad"][0][0] == 60.0 * CFG["boost"]["window_hold_min"]
+
+
+def test_homecoming_scenario_needs_an_hour_away():
+    c = CFG["boost"]
+    ser = object.__new__(Series)
+    ser.cfg, ser.hour = c, np.full(300, 17.0)
+    for away_min, kind in [(59, "other"), (60, "homecoming"), (200, "homecoming")]:
+        sp = np.full(300, 21.0)
+        sp[250 - away_min:250] = 17.0
+        dsp = np.nan_to_num(np.diff(sp, prepend=sp[0]))
+        assert ser.scenarios(dsp, sp)[250] == kind, away_min
 
 
 def test_ground_truth_windows_also_block(lake, tmp_path):

@@ -111,6 +111,7 @@ struct Trigger {
     scenario: &'static str,
     until_ms: i64,
     base: HashMap<String, f64>,
+    away_min: Option<f64>,
     done: HashSet<String>,
 }
 
@@ -132,6 +133,7 @@ struct Inner {
     env: Env,
     prev_sleep: Option<bool>,
     prev_away: Option<bool>,
+    away_since: Option<i64>,
     trigger: Option<Trigger>,
     pending: Vec<Event>,
     stale_ms: i64,
@@ -154,7 +156,7 @@ impl Boost {
         let cfg = config.boost.clone();
         let rooms = config.rooms.iter().map(|r| RoomState { name: r.name.clone(), nodes: r.nodes.clone(), sensor: VecDeque::new(), valve: VecDeque::new(), last_desired: None, last_in: None, was_no_supply: false, resume_ms: None, cycle: None, last: None, cycles_total: 0, refused_total: 0 }).collect();
         let seed = cfg.seed.or(config.exploration_seed).unwrap_or_else(|| crate::lake::now_us() as u64);
-        let inner = Inner { cfg, rooms, model: None, dir_name: None, rng: Rng::new(seed ^ 0xB005), env: Env::default(), prev_sleep: None, prev_away: None, trigger: None, pending: Vec::new(), stale_ms: config.stale.after_ms() };
+        let inner = Inner { cfg, rooms, model: None, dir_name: None, rng: Rng::new(seed ^ 0xB005), env: Env::default(), prev_sleep: None, prev_away: None, away_since: None, trigger: None, pending: Vec::new(), stale_ms: config.stale.after_ms() };
         let boost = Self { inner: Arc::new(Mutex::new(inner)), wake: Arc::new(tokio::sync::Notify::new()) };
         if config.boost.enabled {
             if let Err(e) = boost.reload() {
@@ -219,6 +221,11 @@ impl Boost {
                 q.pop_front();
             }
         }
+    }
+
+    pub fn seed_away(&self, since_ms: i64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.away_since = Some(inner.away_since.map_or(since_ms, |s| s.min(since_ms)));
     }
 
     pub fn wrote(&self, room: &str, reason: &str, now_ms: i64) {
@@ -328,6 +335,12 @@ impl Inner {
         if !input.presence_known {
             return;
         }
+        let away_min = self.away_since.map(|s| (input.now_ms - s).max(0) as f64 / MIN_MS as f64);
+        if input.away {
+            self.away_since.get_or_insert(input.now_ms);
+        } else {
+            self.away_since = None;
+        }
         let found = if self.prev_away == Some(true) && !input.away {
             Some(HOMECOMING)
         } else if self.prev_sleep == Some(true) && !input.sleep && !input.away && self.in_morning(input.hour) {
@@ -338,7 +351,7 @@ impl Inner {
         (self.prev_sleep, self.prev_away) = (Some(input.sleep), Some(input.away));
         if let Some(scenario) = found {
             let base = self.rooms.iter().filter_map(|r| r.last_desired.map(|d| (r.name.clone(), d))).collect();
-            self.trigger = Some(Trigger { scenario, until_ms: input.now_ms + (self.cfg.trigger_window_min * MIN_MS as f64) as i64, base, done: HashSet::new() });
+            self.trigger = Some(Trigger { scenario, until_ms: input.now_ms + (self.cfg.trigger_window_min * MIN_MS as f64) as i64, base, away_min, done: HashSet::new() });
         }
     }
 
@@ -407,6 +420,14 @@ impl Inner {
         let window_note = want.window_ago_min.filter(|a| *a <= self.cfg.after_window_min).map(|a| format!("Fenster war vor {a:.0} min offen (Masse noch warm)"));
         if let Some(note) = window_note.as_ref().filter(|_| !manual) {
             return Err(refuse(&format!("kein Boost: {note}")));
+        }
+        if !manual && scenario == HOMECOMING {
+            let min = self.cfg.homecoming_min_away_min;
+            match self.trigger.as_ref().and_then(|t| t.away_min) {
+                None => return Err(refuse("kein Boost: Abwesenheitsdauer unbekannt")),
+                Some(m) if m < min => return Err(refuse(&format!("kein Boost: nur {} min weg (< {min:.0})", m.floor()))),
+                _ => {}
+            }
         }
         if want.no_raise {
             return Err(refuse("Anhebungs-Budget des Raums in dieser Stunde verbraucht"));

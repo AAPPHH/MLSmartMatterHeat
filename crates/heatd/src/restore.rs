@@ -129,6 +129,9 @@ pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
             let _ = tracker.observe(&h.device, h.ts, h.away, h.motion, h.power);
         }
         drop(tracker.poll(now_ms, cfg.away_guard_minutes));
+        if let Some(since) = tracker.confirmed_since() {
+            state.boost.seed_away(since);
+        }
     }
     let statuses = state.storage.device_statuses()?;
     let watch = statuses.iter().filter(|s| !state.watchmatch.is_anchor(&s.device) && now_ms - s.state_ts <= timeout_ms).max_by_key(|s| s.state_ts);

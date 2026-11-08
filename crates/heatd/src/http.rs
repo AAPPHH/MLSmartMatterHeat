@@ -2688,6 +2688,35 @@ nodes = [5]
     }
 
     #[tokio::test]
+    async fn restart_mid_away_seeds_the_boost_with_the_true_away_start() {
+        for (home_after_min, boosted) in [(10, false), (30, true)] {
+            let h = late_harness();
+            let now = now_ms();
+            for (batch, ts, id, motion) in [(702, now - 40 * 60_000, "pixel-watch-000702", "moving"), (703, now - 5 * 60_000, "pixel-watch-000703", "still")] {
+                call(&h.state, "POST", "/watch/measurement", Some(scan_form(batch, ts, id, true, motion).to_string())).await;
+            }
+            let fresh = AppState { boost: crate::boost::Boost::new(&h.state.config), ..restarted(&h) };
+            crate::restore::restore(&fresh, now).unwrap();
+            fresh.boost.set_model(crate::boostlearn::tests::light_model());
+            let step = |after_min: i64, away: bool, setpoint: f64| {
+                let t = now + after_min * 60_000;
+                for (attribute, value) in [(crate::window::LOCAL_TEMPERATURE, 15.0), (crate::window::PI_HEATING_DEMAND, 10.0)] {
+                    fresh.boost.observe(5, attribute, value, t);
+                }
+                let rooms = [crate::boost::RoomIn { room: "wohnzimmer".into(), setpoint, blocked: None, no_raise: false, no_supply: false, window_ago_min: None }];
+                fresh.boost.step(&crate::boost::StepIn { now_ms: t, hour: 17.5, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep: false, away, rooms: &rooms });
+            };
+            step(0, true, 18.0);
+            step(home_after_min, false, 21.0);
+            let view = fresh.boost.view("wohnzimmer");
+            assert_eq!(view["state"] == "armed", boosted, "{view}");
+            if !boosted {
+                assert_eq!(view["reason"], "kein Boost: nur 50 min weg (< 60)");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn boost_api_refuses_without_a_bundle_and_reports_the_state() {
         let h = harness(false);
         let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "minutes": 5}).to_string())).await;

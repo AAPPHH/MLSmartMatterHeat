@@ -101,9 +101,13 @@ class Series:
         c = self.cfg
         out = np.full(len(dsp), "other", dtype=object)
         prev = np.roll(sp, 1)
+        away = np.nan_to_num(sp, nan=np.inf) <= c["away_max_c"]
+        idx = np.arange(len(sp))
+        away_min = idx - np.maximum.accumulate(np.where(away, -1, idx))
+        away_before = np.roll(away_min, 1)
         for i in np.flatnonzero(dsp >= c["morning_jump_k"]):
             h = self.hour[i]
-            kind = "morning" if c["morning_hours"][0] <= h < c["morning_hours"][1] else ("homecoming" if h >= c["home_hours"][0] and h < c["home_hours"][1] and dsp[i] >= c["home_jump_k"] and prev[i] <= c["away_max_c"] else None)
+            kind = "morning" if c["morning_hours"][0] <= h < c["morning_hours"][1] else ("homecoming" if h >= c["home_hours"][0] and h < c["home_hours"][1] and dsp[i] >= c["home_jump_k"] and prev[i] <= c["away_max_c"] and away_before[i] >= c["homecoming_min_away_min"] else None)
             if kind:
                 seg = out[max(i - c["scenario_pre_min"], 0):i + c["scenario_post_min"]]
                 seg[seg == "other"] = kind

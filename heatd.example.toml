@@ -162,6 +162,7 @@ min_rise_k = 1.0
 trigger_window_min = 3.0
 measure_min = 60.0
 after_window_min = 180.0
+homecoming_min_away_min = 60.0
 
 [failsafe]
 setpoint = 18.0

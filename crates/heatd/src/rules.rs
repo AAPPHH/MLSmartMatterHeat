@@ -448,6 +448,10 @@ impl Tracker {
         out
     }
 
+    pub fn confirmed_since(&self) -> Option<i64> {
+        self.devices.values().filter(|t| t.confirmed).filter_map(|t| t.away_since).min()
+    }
+
     pub fn confirmed(&self, device: &str) -> bool {
         self.devices.get(device).is_some_and(|t| t.confirmed)
     }
