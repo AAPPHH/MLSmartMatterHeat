@@ -683,13 +683,13 @@ def window_spans(lake, grid, cfg):
         if r not in spans:
             continue
         if kind == "window_open":
-            opened.setdefault(r, t)
+            opened.setdefault(r, (t, d.get("source")))
         elif kind == "window_close":
-            spans[r].append((opened.pop(r, t), t))
+            spans[r].append((opened.pop(r, (t, None))[0], t))
         elif d.get("start_ms") and d.get("end_ms"):
             spans[r].append((d["start_ms"] / 1000.0, d["end_ms"] / 1000.0))
-    for r, t in opened.items():
-        spans[r].append((t, t + 60.0 * cfg["window_hold_min"]))
+    for r, (t, source) in opened.items():
+        spans[r].append((t, t + 60.0 * cfg["window_manual_max_min" if source == "manual" else "window_hold_min"]))
     path = Path(lake) / "ground_truth" / "windows.jsonl"
     if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():

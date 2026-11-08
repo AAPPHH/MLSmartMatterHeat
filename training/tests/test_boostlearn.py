@@ -1,3 +1,4 @@
+import types
 import copy
 import json
 from datetime import datetime, timezone
@@ -7,7 +8,7 @@ import pyarrow.ipc as ipc
 import pytest
 from heattrain.__main__ import CONFIG
 from datetime import timedelta
-from heattrain.boostlearn import Dosing, Posterior, Trust, boostcheck, boostlearn, boostmark, closed_loop, kernels, needs_retrain, ramp, rollout
+from heattrain.boostlearn import window_spans, Dosing, Posterior, Trust, boostcheck, boostlearn, boostmark, closed_loop, kernels, needs_retrain, ramp, rollout
 
 T0 = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc).timestamp()
 DAYS = 6
@@ -277,6 +278,15 @@ def test_pulses_within_the_window_block_are_not_known_and_counted(lake, tmp_path
     assert meta["after_window_excluded"]["wohnzimmer"] >= 1 and meta["after_window_excluded"]["bad"] == 0
     none = bundle_from(lake, tmp_path / "b", after_window_min=0)[3]
     assert none["after_window_excluded"]["wohnzimmer"] < meta["after_window_excluded"]["wohnzimmer"]
+
+
+def test_open_window_without_close_holds_by_source(lake):
+    add_window(lake, "window_open", 100, source="manual")
+    add_window(lake, "window_open", 101, room="bad", source="auto")
+    grid = types.SimpleNamespace(rooms=["wohnzimmer", "bad"])
+    spans = window_spans(lake, grid, CFG["boost"])
+    assert spans["wohnzimmer"][0][1] - spans["wohnzimmer"][0][0] == 60.0 * CFG["boost"]["window_manual_max_min"]
+    assert spans["bad"][0][1] - spans["bad"][0][0] == 60.0 * CFG["boost"]["window_hold_min"]
 
 
 def test_ground_truth_windows_also_block(lake, tmp_path):
