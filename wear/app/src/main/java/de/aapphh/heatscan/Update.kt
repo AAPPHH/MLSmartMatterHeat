@@ -35,7 +35,23 @@ object UpdateRules {
             .takeIf { it.size > 0 && it.sha256.length == 64 }
     } catch (e: Exception) { null }
 
-    fun newer(info: UpdateInfo, installed: Long) = info.versionCode > installed
+    fun newer(info: UpdateInfo, installed: Long, bad: Long = 0L) = info.versionCode > installed && info.versionCode > bad
+
+    fun windowOver(now: Long, at: Long): Boolean {
+        val age = Span.ms(now, at)
+        return at == 0L || age < 0 || age >= GAP_MS
+    }
+
+    fun copyCapped(i: java.io.InputStream, o: java.io.OutputStream, limit: Long) {
+        val buf = ByteArray(65536)
+        var left = limit + 1
+        while (left > 0) {
+            val n = i.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+            if (n < 0) break
+            o.write(buf, 0, n)
+            left -= n
+        }
+    }
 
     fun digest(f: File): String = MessageDigest.getInstance("SHA-256").let { md ->
         f.inputStream().use { i ->
@@ -51,9 +67,12 @@ object UpdateRules {
 
     fun intact(f: File, info: UpdateInfo) = f.isFile && f.length() == info.size && digest(f) == info.sha256
 
-    fun due(now: Long, at: Long, failed: Boolean, retried: Boolean): Boolean {
-        val age = Span.ms(now, at)
-        return at == 0L || age < 0 || age >= GAP_MS || (failed && !retried)
+    fun due(now: Long, at: Long, failed: Boolean, retried: Boolean) = windowOver(now, at) || (failed && !retried)
+
+    fun verdict(status: Int, pending: Int) = when (status) {
+        PackageInstaller.STATUS_SUCCESS -> false
+        PackageInstaller.STATUS_PENDING_USER_ACTION -> pending >= 2
+        else -> true
     }
 }
 
@@ -67,7 +86,8 @@ object Updater {
     fun charging(c: Context): Boolean = (c.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
 
     fun onCharger(c: Context) {
-        Store(c.applicationContext).updateRetried = false
+        val store = Store(c.applicationContext)
+        if (UpdateRules.windowOver(System.currentTimeMillis(), store.updateAt)) store.updateRetried = false
         start(c)
     }
 
@@ -101,26 +121,28 @@ object Updater {
             }
         } finally { conn.disconnect() }
         val installed = app.packageManager.getPackageInfo(app.packageName, 0).longVersionCode
-        if (!UpdateRules.newer(info, installed)) return Trace.i("update_current", "installed" to installed, "offered" to info.versionCode)
+        if (!UpdateRules.newer(info, installed, store.updateBad)) return Trace.i("update_current", "installed" to installed, "offered" to info.versionCode, "bad" to store.updateBad)
         if (!charging(app)) return Trace.i("update_unplugged")
         try {
-            download(store.server, net, file)
+            download(store.server, net, file, info.size)
             if (!UpdateRules.intact(file, info)) throw IOException("apk_mismatch")
-            commit(app, file, info)
+            commit(app, store, file, info)
         } finally { file.delete() }
     }
 
-    private fun download(server: String, net: Network, file: File) {
+    private fun download(server: String, net: Network, file: File, limit: Long) {
         val conn = Poster.connect(server, UpdateRules.APK_PATH, net)
         try {
             conn.connectTimeout = 8000
             conn.readTimeout = 15000
             if (conn.responseCode != 200) throw IOException("apk_${conn.responseCode}")
-            conn.inputStream.use { i -> file.outputStream().use { i.copyTo(it) } }
+            conn.inputStream.use { i -> file.outputStream().use { UpdateRules.copyCapped(i, it, limit) } }
         } finally { conn.disconnect() }
     }
 
-    private fun commit(app: Context, file: File, info: UpdateInfo) {
+    private fun commit(app: Context, store: Store, file: File, info: UpdateInfo) {
+        if (store.updateTrying != info.versionCode) store.updatePending = 0
+        store.updateTrying = info.versionCode
         val installer = app.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
             setAppPackageName(app.packageName)
@@ -159,6 +181,9 @@ class UpdateStatusReceiver : BroadcastReceiver() {
         val status = i.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
         Trace.i("update_status", "status" to status, "message" to i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE))
         File(c.cacheDir, UpdateRules.CACHE).delete()
+        val store = Store(c.applicationContext)
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) store.updatePending += 1
+        if (UpdateRules.verdict(status, store.updatePending)) store.updateBad = maxOf(store.updateBad, store.updateTrying)
         if (status != PackageInstaller.STATUS_PENDING_USER_ACTION) return
         val confirm = if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java) else @Suppress("DEPRECATION") i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
         if (confirm != null) Updater.offer(c, confirm)

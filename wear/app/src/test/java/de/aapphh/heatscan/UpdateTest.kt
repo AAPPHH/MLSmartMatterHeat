@@ -65,4 +65,33 @@ class UpdateTest {
         assertFalse(UpdateRules.due(now, now - 1_000L, true, true))
         assertTrue(UpdateRules.due(now, now + 5_000L, false, false))
     }
+
+    @Test
+    fun failedVersionIsSkippedUntilHigherOne() {
+        val i = info(code = 33)
+        assertFalse(UpdateRules.newer(i, 32, 33))
+        assertTrue(UpdateRules.newer(info(code = 34), 32, 33))
+        assertTrue(UpdateRules.verdict(android.content.pm.PackageInstaller.STATUS_FAILURE, 0))
+        assertFalse(UpdateRules.verdict(android.content.pm.PackageInstaller.STATUS_SUCCESS, 5))
+        assertFalse(UpdateRules.verdict(android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION, 1))
+        assertTrue(UpdateRules.verdict(android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION, 2))
+    }
+
+    @Test
+    fun retryFlagResetsOnlyAfterTheWindow() {
+        val now = 100 * UpdateRules.GAP_MS
+        assertFalse(UpdateRules.windowOver(now, now - 1_000L))
+        assertTrue(UpdateRules.windowOver(now, now - UpdateRules.GAP_MS))
+        assertTrue(UpdateRules.windowOver(now, 0L))
+    }
+
+    @Test
+    fun downloadIsCappedAtDeclaredSize() {
+        val out = java.io.ByteArrayOutputStream()
+        UpdateRules.copyCapped(java.io.ByteArrayInputStream(ByteArray(1000)), out, 10)
+        assertEquals(11, out.size())
+        val small = java.io.ByteArrayOutputStream()
+        UpdateRules.copyCapped(java.io.ByteArrayInputStream(ByteArray(5)), small, 10)
+        assertEquals(5, small.size())
+    }
 }

@@ -1280,6 +1280,15 @@ class Store(private val ctx: Context) {
     var updateRetried: Boolean
         get() = sp.getBoolean("updateRetried", false)
         set(v) = sp.edit().putBoolean("updateRetried", v).apply()
+    var updateBad: Long
+        get() = sp.getLong("updateBad", 0L)
+        set(v) = sp.edit().putLong("updateBad", v).apply()
+    var updateTrying: Long
+        get() = sp.getLong("updateTrying", 0L)
+        set(v) = sp.edit().putLong("updateTrying", v).apply()
+    var updatePending: Int
+        get() = sp.getInt("updatePending", 0)
+        set(v) = sp.edit().putInt("updatePending", v).apply()
     var glanceTryAt: Long
         get() = sp.getLong("glanceTryAt", 0L)
         set(v) = sp.edit().putLong("glanceTryAt", v).apply()
