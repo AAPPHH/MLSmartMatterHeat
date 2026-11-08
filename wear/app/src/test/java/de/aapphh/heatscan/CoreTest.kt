@@ -2076,6 +2076,17 @@ class CoreTest {
     }
 
     @Test
+    fun pillBandKeepsTouchTargetGapAndRoundInset() {
+        listOf(96f, 102f, 113.5f).forEach { r ->
+            val inset = Quarters.pillInset(r)
+            assertTrue(inset >= 0f)
+            assertTrue(Quarters.bandDp(r) - inset - Quarters.PILL_TARGET_DP >= Quarters.PILL_GAP_DP)
+            val half = Quarters.PILL_W_DP / 2f
+            assertTrue(r - kotlin.math.sqrt(r * r - half * half) <= inset + 0.01f)
+        }
+    }
+
+    @Test
     fun glanceCarriesReasonAndBoostForRoomView() {
         val state = """{"rooms":[{"name":"kueche","window_open":false,"boost":{"state":"boosting","cycle":{"minutes":5.0,"written_ts":1000000}},"nodes":[{"local_temperature":20.0,"occupied_heating_setpoint":22.0,"reason":"boost"}]},{"name":"bad","window_open":false,"boost":{"state":"idle","cycle":null},"nodes":[{"local_temperature":21.0,"occupied_heating_setpoint":18.0,"reason":"away"}]},{"name":"flur","window_open":false,"nodes":[{"local_temperature":19.9,"occupied_heating_setpoint":20.0,"reason":"home"}]},{"name":"schlafzimmer","window_open":true,"nodes":[{"local_temperature":18.0,"occupied_heating_setpoint":20.0,"reason":"window_open"}]},{"name":"wohnzimmer","window_open":false,"nodes":[{"local_temperature":19.0,"occupied_heating_setpoint":21.0,"reason":"home"}]}]}"""
         val g = Glance.parse(state, 5L)!!
@@ -2087,7 +2098,7 @@ class CoreTest {
         assertEquals("Du bist weg – Sparmodus", RoomView.why(RoomView.glance(g, "bad")))
         assertEquals(RoomMark.AWAY, RoomView.mark(RoomView.glance(g, "bad")))
         assertEquals(RoomMark.NONE, RoomView.mark(RoomView.glance(g, "flur")))
-        assertEquals("Du bist hier – normale Temperatur", RoomView.why(RoomView.glance(g, "flur")))
+        assertEquals("Du bist zuhause – normale Temperatur", RoomView.why(RoomView.glance(g, "flur")))
         assertEquals(RoomMark.WINDOW, RoomView.mark(RoomView.glance(g, "schlafzimmer")))
         assertEquals("Fenster offen – Heizung pausiert", RoomView.why(RoomView.glance(g, "schlafzimmer")))
         assertEquals(RoomMark.HEATING, RoomView.mark(RoomView.glance(g, "wohnzimmer")))
@@ -2096,7 +2107,7 @@ class CoreTest {
         assertNull(RoomView.temp(null))
         assertNull(RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "mystery")))
         assertEquals("Aufheizen beendet", RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "boost_off")))
-        val said = mapOf("occupied" to "Du bist hier – normale Temperatur", "default" to "Niemand hier – Grundtemperatur", "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt", "sleep" to "Nachtruhe – Schlaftemperatur")
+        val said = mapOf("occupied" to "Du bist hier – normale Temperatur", "default" to "Niemand hier – Grundtemperatur", "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt", "sleep" to "Nachtruhe – Schlaftemperatur", "home" to "Du bist zuhause – normale Temperatur")
         said.forEach { (reason, text) -> assertEquals(text, RoomView.why(RoomGlance("bad", 20.0, 20.0, false, reason))) }
         listOf("home", "occupied", "sleep", "default", "away", "window_open", "boost", "boost_off", "no_supply", "pi_reset", "schedule", "exploration").forEach { assertNotNull(it, RoomView.REASONS[it]) }
         assertEquals("19,0° · heizt", RoomView.row(RoomView.glance(g, "wohnzimmer")))

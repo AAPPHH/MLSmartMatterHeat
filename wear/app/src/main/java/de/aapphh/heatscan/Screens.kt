@@ -25,6 +25,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -34,6 +36,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.wear.compose.foundation.lazy.TransformingLazyColumn
 import androidx.wear.compose.foundation.lazy.TransformingLazyColumnScope
@@ -72,6 +75,30 @@ internal fun HeatTheme(content: @Composable () -> Unit) {
 internal val TARGET = 48.dp
 private val GAP = 8.dp
 private const val LINES = 8
+
+internal class Idle {
+    private var at = System.currentTimeMillis()
+
+    fun touch() { at = System.currentTimeMillis() }
+
+    suspend fun await(ms: Long) {
+        touch()
+        while (true) {
+            val left = at + ms - System.currentTimeMillis()
+            if (left <= 0) return
+            delay(left)
+        }
+    }
+}
+
+internal fun Modifier.onTouch(touched: () -> Unit): Modifier = pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) {
+            awaitPointerEvent(PointerEventPass.Initial)
+            touched()
+        }
+    }
+}
 
 private fun onOff(on: Boolean) = if (on) "an" else "aus"
 
@@ -132,11 +159,11 @@ internal fun RoomsScreen(
     val state = rememberTransformingLazyColumnState()
     val spec = rememberTransformationSpec()
     val count = RoomView.count(alerts, ask)
-    ScreenScaffold(scrollState = state) {
+    ScreenScaffold(scrollState = state, timeText = {}) { padding ->
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val full = maxHeight
-            TransformingLazyColumn(state = state, contentPadding = PaddingValues(bottom = 24.dp)) {
-                item { Box(Modifier.fillMaxWidth().height(full)) { RoomsPage(hot, ringed, locked, learn, glance, RoomView.pill(alerts, ask).takeIf { showPill }, onDetail, onAlerts, onTap) } }
+            TransformingLazyColumn(state = state, contentPadding = PaddingValues(start = padding.calculateLeftPadding(LayoutDirection.Ltr), end = padding.calculateRightPadding(LayoutDirection.Ltr), bottom = padding.calculateBottomPadding())) {
+                item { Box(Modifier.fillMaxWidth().height(full).padding(horizontal = Quarters.EDGE_DP.dp)) { RoomsPage(hot, ringed, locked, learn, glance, RoomView.pill(alerts, ask).takeIf { showPill }, onDetail, onAlerts, 0.dp, onTap) } }
                 header(spec, "Räume", RoomView.LEGEND)
                 Defaults.ROOMS.forEach { room ->
                     val g = RoomView.glance(glance, room)
@@ -150,13 +177,13 @@ internal fun RoomsScreen(
 }
 
 @Composable
-internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?, busy: Boolean, canBoost: Boolean, onWindow: () -> Unit, onBoost: () -> Unit, saved: Boolean = false, onUndo: () -> Unit = {}) {
+internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?, busy: Boolean, canBoost: Boolean, onWindow: () -> Unit, onBoost: () -> Unit, saved: Boolean = false, applying: Boolean = saved, onUndo: () -> Unit = {}) {
     val colors = MaterialTheme.colorScheme
     val type = MaterialTheme.typography
     ListScreen { spec ->
-        header(spec, (if (saved) "✓ " else "") + WindowEvent.caption(room))
+        header(spec, (if (saved) "✓ Gespeichert: " else "") + WindowEvent.caption(room))
         note(spec, RoomView.temp(g) ?: "–", colors.onBackground, type.numeralSmall)
-        listOfNotNull(RoomView.target(g), RoomView.why(g)).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
+        listOfNotNull(RoomView.target(g), if (applying) RoomView.APPLYING else RoomView.why(g)).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
         if (canBoost) action(spec, if (busy) "…" else "Boost", tonal = false, enabled = !busy, icon = R.drawable.ic_mark_boost, onClick = onBoost)
         result?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
         action(spec, if (g?.open == true) "Fenster zu melden" else "Fenster offen melden", icon = R.drawable.ic_mark_window, onClick = onWindow)
@@ -230,13 +257,14 @@ internal fun AskScreen(ask: WindowAsk, onAnswer: (WindowAnswer) -> Unit) {
 internal fun SavedPage(text: String, onUndo: () -> Unit, onDone: () -> Unit) {
     val haptic = LocalHapticFeedback.current
     var spent by remember { mutableStateOf(false) }
+    val idle = remember { Idle() }
     LaunchedEffect(Unit) {
         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-        delay(WindowEvent.UNDO_MS)
+        idle.await(WindowEvent.UNDO_MS)
         onDone()
     }
     ScreenScaffold {
-        Column(Modifier.fillMaxSize().padding(horizontal = 28.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+        Column(Modifier.fillMaxSize().onTouch { idle.touch() }.padding(horizontal = 28.dp), Arrangement.Center, Alignment.CenterHorizontally) {
             Text(text, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold)
             FilledTonalButton({ if (!spent) { spent = true; onUndo() } }, Modifier.padding(top = GAP).defaultMinSize(minHeight = TARGET), enabled = !spent) { Text(Tap.UNDO, maxLines = 1) }
         }

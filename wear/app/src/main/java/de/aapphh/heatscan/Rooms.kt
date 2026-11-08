@@ -23,7 +23,7 @@ object RoomView {
     const val LAG_K = 0.3
 
     val REASONS = mapOf(
-        "home" to "Du bist hier – normale Temperatur", "occupied" to "Du bist hier – normale Temperatur", "away" to "Du bist weg – Sparmodus",
+        "home" to "Du bist zuhause – normale Temperatur", "occupied" to "Du bist hier – normale Temperatur", "away" to "Du bist weg – Sparmodus",
         "window_open" to "Fenster offen – Heizung pausiert", "sleep" to "Nachtruhe – Schlaftemperatur", "default" to "Niemand hier – Grundtemperatur",
         "schedule" to "Nach Zeitplan", "exploration" to "Probiert gerade eine andere Temperatur aus", "boost" to "Schnell aufheizen", "boost_off" to "Aufheizen beendet",
         "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt"
@@ -31,6 +31,7 @@ object RoomView {
     const val LEGEND = "Gefüllt: dort hast du dich gemeldet. Ring: dort vermutet dich die Uhr."
     const val NO_DATA = "keine Daten"
     const val CALM = "normal"
+    const val APPLYING = "Wird übernommen …"
 
     fun glance(g: Glance, room: String): RoomGlance? = g.rooms.firstOrNull { it.room == room }
 

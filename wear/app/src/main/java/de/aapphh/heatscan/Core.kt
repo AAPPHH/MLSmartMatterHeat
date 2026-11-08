@@ -241,6 +241,7 @@ object Tap {
     const val GAP_WAIT_S = 2
     const val SHOW_MS = 4_000L
     const val UNDO_MS = 10_000L
+    const val REFRESH_MS = 3_000L
     const val ACK_WAIT_MS = 15_000L
     const val WAIT = "wait"
     const val OK = "ok"
@@ -638,7 +639,15 @@ object Quarters {
     const val LABEL_H_DP = 34f
     const val WIDE = "kueche"
     const val MAX_FONT = 1.1f
-    const val BAND_DP = 22f
+    const val PILL_TARGET_DP = 48f
+    const val PILL_W_DP = 80f
+    const val PILL_GAP_DP = 8f
+    const val EDGE_DP = 10f
+    const val DESIGN_DP = 170f
+
+    fun pillInset(radiusDp: Float): Float = radiusDp - kotlin.math.sqrt(radiusDp * radiusDp - PILL_W_DP * PILL_W_DP / 4f)
+
+    fun bandDp(radiusDp: Float): Float = pillInset(radiusDp) + PILL_TARGET_DP + PILL_GAP_DP
 
     fun labelDp(room: String, dDp: Float): Float {
         val r = labelR(room) * dDp

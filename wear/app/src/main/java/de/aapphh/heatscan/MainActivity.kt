@@ -53,7 +53,9 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
@@ -70,6 +72,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.navigation.NavController
 import androidx.navigation.NavHostController
 import androidx.wear.compose.material3.AppScaffold
 import androidx.wear.compose.material3.FilledTonalButton
@@ -164,6 +167,12 @@ class MainActivity : ComponentActivity() {
         var detail by remember { mutableStateOf("") }
         var boostFirst by remember { mutableStateOf(false) }
         var external by remember { mutableStateOf(prompt || start != Routes.ROOMS) }
+        var route by remember { mutableStateOf(start) }
+        DisposableEffect(nav) {
+            val l = NavController.OnDestinationChangedListener { _, d, _ -> route = d.route.orEmpty() }
+            nav.addOnDestinationChangedListener(l)
+            onDispose { nav.removeOnDestinationChangedListener(l) }
+        }
         val leave = {
             if (external) finish() else nav.popBackStack(Routes.ROOMS, false)
             Unit
@@ -193,7 +202,7 @@ class MainActivity : ComponentActivity() {
         }
         SwipeDismissableNavHost(nav, startDestination = start) {
             composable(Routes.ROOMS) {
-                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, openDetail, report, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }) { if (prompt) finish() }
+                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, route != Routes.ROOMS, openDetail, report, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }) { if (prompt) finish() }
             }
             composable(Routes.DETAIL) { DetailRoute(store, detail, boostFirst, report, ui) }
             composable(Routes.ALERTS) { AlertsRoute(store) { nav.navigate(Routes.ASK) } }
@@ -298,7 +307,7 @@ private fun storeVersion(store: Store): Int {
 }
 
 @Composable
-private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, onDetail: (String, Boolean) -> Unit, report: (String, Boolean) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, finish: () -> Unit) {
+private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, covered: Boolean, onDetail: (String, Boolean) -> Unit, report: (String, Boolean) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, finish: () -> Unit) {
     val ctx = LocalContext.current
     val version = storeVersion(store)
     var tapped by remember { mutableStateOf<String?>(null) }
@@ -313,6 +322,7 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
     val learning = version.let { store.learnAt != 0L }
     val learnView = Learn.view(learning, version.let { store.progress })
     val pal = palette()
+    val idle = remember { Idle() }
     LaunchedEffect(Unit) { if (!prompt) Remote.refresh(ctx) }
     LaunchedEffect(version, tapped) {
         if (learnPrompt && tapped == null && choosing == null && store.learnPromptAt == 0L) finish()
@@ -341,16 +351,23 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
                 delay(250)
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
             }
-            if (prompt) {
-                delay(if (Tap.undoable(kind)) Tap.UNDO_MS else 2000)
-                finish()
-            } else {
-                delay(Tap.showMs(kind))
-                tapped = null
-            }
         }
     }
-    Box(Modifier.fillMaxSize()) {
+    LaunchedEffect(kind, covered) {
+        if (kind != null && kind != TapKind.WAIT && !covered) {
+            idle.await(if (prompt) (if (Tap.undoable(kind)) Tap.UNDO_MS else 2000) else Tap.showMs(kind))
+            if (prompt) finish() else tapped = null
+        }
+    }
+    val glanceNow = version.let { store.glance }
+    val stamp = remember(tapped) { glanceNow.at }
+    LaunchedEffect(tapped, kind) {
+        if (tapped != null && Tap.undoable(kind)) {
+            delay(Tap.REFRESH_MS)
+            Remote.refresh(ctx, true)
+        }
+    }
+    Box(Modifier.fillMaxSize().onTouch { idle.touch() }) {
         val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
         (hint ?: Prompt.title(change, learnPrompt).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = pal.text, maxLines = 1) }
         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
@@ -374,7 +391,7 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
         if (saved != null) {
             val g = RoomView.glance(glance, saved)
             Box(Modifier.fillMaxSize().background(Color.Black)) {
-                RoomDetailScreen(saved, g, null, false, Heat.heatable(saved, null), { report(saved, g?.open != true) }, { onDetail(saved, true) }, true) { LabelRecorder.undo(ctx) }
+                RoomDetailScreen(saved, g, null, false, Heat.heatable(saved, null), { report(saved, g?.open != true) }, { onDetail(saved, true) }, true, glance.at == stamp) { LabelRecorder.undo(ctx) }
             }
         } else view?.let {
             val (bg, ink) = tapColors(it.kind)
@@ -397,19 +414,29 @@ internal fun palette(): Palette = MaterialTheme.colorScheme.let {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, pill: String? = null, onLong: (String) -> Unit = {}, onBadge: () -> Unit = {}, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, pill: String? = null, onLong: (String) -> Unit = {}, onBadge: () -> Unit = {}, top: Dp = 0.dp, onTap: (String) -> Unit) {
     val pal = palette()
     val current = LocalDensity.current
     CompositionLocalProvider(LocalDensity provides Density(current.density, minOf(current.fontScale, Quarters.MAX_FONT))) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val band = if (pill != null) Quarters.BAND_DP.dp else 0.dp
-            Box(Modifier.align(Alignment.BottomCenter).size(minOf(maxWidth, maxHeight) - band)) { Wheel(hot, ringed, locked, learn, glance, onLong, onTap) }
+            val radius = LocalConfiguration.current.let { minOf(it.screenWidthDp, it.screenHeightDp) } / 2f
+            val band = if (pill != null) Quarters.bandDp(radius).dp else 0.dp
+            val side = minOf(maxWidth, maxHeight - band)
+            val fit = minOf(1f, side.value / Quarters.DESIGN_DP)
+            Box(Modifier.align(Alignment.BottomCenter).size(side)) {
+                CompositionLocalProvider(LocalDensity provides Density(LocalDensity.current.density * fit, LocalDensity.current.fontScale)) { Wheel(hot, ringed, locked, learn, glance, onLong, onTap) }
+            }
             pill?.let {
-                Text(
-                    it,
-                    Modifier.align(Alignment.TopCenter).padding(top = 3.dp).clip(RoundedCornerShape(50)).background(pal.alert).clickable(role = Role.Button, onClick = onBadge).padding(horizontal = 8.dp, vertical = 2.dp),
-                    fontSize = 11.sp, lineHeight = 13.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError
-                )
+                Box(
+                    Modifier.align(Alignment.TopCenter).padding(top = (Quarters.pillInset(radius).dp - top).coerceAtLeast(0.dp)).size(Quarters.PILL_W_DP.dp, Quarters.PILL_TARGET_DP.dp).clickable(role = Role.Button, onClick = onBadge),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        it,
+                        Modifier.clip(RoundedCornerShape(50)).background(pal.alert).padding(horizontal = 8.dp, vertical = 2.dp),
+                        fontSize = 11.sp, lineHeight = 13.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError
+                    )
+                }
             }
         }
     }
@@ -433,7 +460,7 @@ private fun Wheel(hot: String?, ringed: String?, locked: Boolean, learn: LearnVi
                     onTap = { o ->
                         val dx = o.x - size.width / 2f
                         val dy = o.y - size.height / 2f
-                        onTap(Quarters.room(dx, dy, minOf(size.width, size.height).toFloat()))
+                        if (kotlin.math.hypot(dx, dy) <= minOf(size.width, size.height) / 2f) onTap(Quarters.room(dx, dy, minOf(size.width, size.height).toFloat()))
                     }
                 )
             }

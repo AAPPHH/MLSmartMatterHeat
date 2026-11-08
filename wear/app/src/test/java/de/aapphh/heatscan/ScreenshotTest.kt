@@ -4,6 +4,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
+import androidx.wear.compose.material3.AppScaffold
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performTouchInput
@@ -22,9 +23,9 @@ import org.robolectric.annotation.GraphicsMode
 class ScreenshotTest {
     @get:Rule val rule = createComposeRule()
 
-    private fun shot(name: String, fontScale: Float = 1f, swipe: Boolean = false, content: @Composable () -> Unit) {
-        rule.setContent { val d = LocalDensity.current; CompositionLocalProvider(LocalDensity provides Density(d.density, fontScale)) { HeatTheme { content() } } }
-        if (swipe) rule.onRoot().performTouchInput { swipeUp() }
+    private fun shot(name: String, fontScale: Float = 1f, swipe: Int = 0, short: Boolean = false, content: @Composable () -> Unit) {
+        rule.setContent { val d = LocalDensity.current; CompositionLocalProvider(LocalDensity provides Density(d.density, fontScale)) { HeatTheme { AppScaffold { content() } } } }
+        repeat(swipe) { rule.onRoot().performTouchInput { if (short) swipeUp(startY = height * 0.8f, endY = height * 0.5f) else swipeUp() } }
         rule.onRoot().captureRoboImage("screenshots/$name.png")
     }
 
@@ -81,9 +82,19 @@ class ScreenshotTest {
 
     @Test fun rooms_screen() = shot("rooms_screen") { rooms() }
 
-    @Test fun rooms_list() = shot("rooms_list", swipe = true) { rooms() }
+    @Test fun rooms_list() = shot("rooms_list", swipe = 1) { rooms() }
 
-    @Test fun rooms_list_font_1_3() = shot("rooms_list_font_1_3", 1.3f, true) { rooms() }
+    @Test fun rooms_list_font_1_3() = shot("rooms_list_font_1_3", 1.3f, 1) { rooms() }
+
+    @Test fun rooms_list_header_font_1_3() = shot("rooms_list_header_font_1_3", 1.3f, 1, true) { rooms() }
+
+    @Test fun rooms_list_rows_font_1_3() = shot("rooms_list_rows_font_1_3", 1.3f, 4) { rooms() }
+
+    @Test fun tech_footer_font_1_3() = shot("tech_footer_font_1_3", 1.3f, 2) { TechScreen(TechState("Stopp", true, "WLAN 8 min", true, footer()), {}, {}, {}) }
+
+    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_pill_192() = shot("wheel_pill_192") { rooms() }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun wheel_pill_204() = shot("wheel_pill_204") { rooms() }
 
     @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun wheel_41mm() = shot("wheel_41mm") { rooms() }
 
@@ -107,9 +118,9 @@ class ScreenshotTest {
 
     @Test fun detail_away() = shot("detail_away") { detail("kueche", rg("kueche"), BoostResult(false, BoostText.plain("kein Boost: Fenster war vor 5 min offen"))) }
 
-    @Test fun detail_edge() = shot("detail_edge", swipe = true) { detail("bad", rg("bad")) }
+    @Test fun detail_edge() = shot("detail_edge", swipe = 1) { detail("bad", rg("bad")) }
 
-    @Test fun detail_edge_font_1_3() = shot("detail_edge_font_1_3", 1.3f, true) { detail("wohnzimmer", rg("wohnzimmer")) }
+    @Test fun detail_edge_font_1_3() = shot("detail_edge_font_1_3", 1.3f, 1) { detail("wohnzimmer", rg("wohnzimmer")) }
 
     @Test fun detail_font_1_3() = shot("detail_font_1_3", 1.3f) { detail("bad", rg("bad")) }
 
