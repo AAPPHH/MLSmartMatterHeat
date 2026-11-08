@@ -117,7 +117,7 @@ object Remote {
         try { io.execute(f) } catch (e: RejectedExecutionException) { Trace.i("remote_rejected") }
     }
 
-    private fun wifi(): Network? = ScanService.instance?.currentNetwork
+    fun wifi(): Network? = ScanService.instance?.currentNetwork
 
     fun refresh(c: Context, force: Boolean = false, done: () -> Unit = {}) {
         val app = c.applicationContext

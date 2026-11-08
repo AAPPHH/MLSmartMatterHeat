@@ -1271,6 +1271,15 @@ class Store(private val ctx: Context) {
     var answered: Pair<String, WindowAsk>?
         get() = try { sp.getString("answered", null)?.let { JSONObject(it) }?.let { Pair(it.getString("label"), WindowEvent.fromJson(it.getString("ask"))!!) } } catch (e: Exception) { null }
         set(v) = sp.edit().also { if (v == null) it.remove("answered") else it.putString("answered", JSONObject().put("label", v.first).put("ask", WindowEvent.json(v.second)).toString()) }.apply()
+    var updateAt: Long
+        get() = sp.getLong("updateAt", 0L)
+        set(v) = sp.edit().putLong("updateAt", v).apply()
+    var updateFailed: Boolean
+        get() = sp.getBoolean("updateFailed", false)
+        set(v) = sp.edit().putBoolean("updateFailed", v).apply()
+    var updateRetried: Boolean
+        get() = sp.getBoolean("updateRetried", false)
+        set(v) = sp.edit().putBoolean("updateRetried", v).apply()
     var glanceTryAt: Long
         get() = sp.getLong("glanceTryAt", 0L)
         set(v) = sp.edit().putLong("glanceTryAt", v).apply()
@@ -1451,9 +1460,13 @@ object Poster {
         return Reply(code, text)
     }
 
-    fun send(server: String, path: String, body: String, network: Network?): Reply {
+    fun connect(server: String, path: String, network: Network?): HttpURLConnection {
         val url = URL(server.trim().trimEnd('/') + path)
-        val conn = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        return (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+    }
+
+    fun send(server: String, path: String, body: String, network: Network?): Reply {
+        val conn = connect(server, path, network)
         try {
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
@@ -1470,8 +1483,7 @@ object Poster {
     }
 
     fun get(server: String, path: String, network: Network?): Reply {
-        val url = URL(server.trim().trimEnd('/') + path)
-        val conn = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        val conn = connect(server, path, network)
         try {
             conn.connectTimeout = 8000
             conn.readTimeout = 8000

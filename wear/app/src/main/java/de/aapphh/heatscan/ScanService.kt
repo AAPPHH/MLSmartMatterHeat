@@ -186,6 +186,7 @@ class ScanService : Service() {
                     sampler?.flushFifo()
                     sampler?.onPower()
                     flush("charger")
+                    Updater.onCharger(c)
                 }
                 Intent.ACTION_POWER_DISCONNECTED -> sampler?.onPower()
                 PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED, PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
