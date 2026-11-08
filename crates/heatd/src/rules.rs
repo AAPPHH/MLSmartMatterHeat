@@ -723,7 +723,10 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
         return;
     }
     let held = |room: &Room| state.commanded.lock().unwrap().holding(&room.nodes);
-    let no_supply = state.windows.lock().unwrap().no_supply_rooms();
+    let (no_supply, window_ago) = {
+        let w = state.windows.lock().unwrap();
+        (w.no_supply_rooms(), state.config.rooms.iter().map(|r| (r.name.clone(), w.open_ago_min(&r.name, now_ms))).collect::<HashMap<_, _>>())
+    };
     let rooms: Vec<crate::boost::RoomIn> = state
         .config
         .rooms
@@ -741,7 +744,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
             } else {
                 None
             };
-            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour), no_supply: no_supply.contains(&room.name) })
+            Some(crate::boost::RoomIn { room: room.name.clone(), setpoint: want.setpoint, blocked, no_raise: !state.commanded.lock().unwrap().budget.allows(&room.name, now_ms, state.config.raise_budget_per_hour), no_supply: no_supply.contains(&room.name), window_ago_min: window_ago.get(&room.name).copied().flatten() })
         })
         .collect();
     let now_us = lake::now_us();

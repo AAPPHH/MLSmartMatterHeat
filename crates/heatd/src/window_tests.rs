@@ -405,3 +405,22 @@ fn a_room_alarm_respects_the_vetoes_of_that_room() {
     s.drops([0.3, 0.0, 0.0], 12);
     assert!(s.open().is_empty() && s.of("window_suppressed").iter().any(|e| e.room == "wohnzimmer" && e.detail["reason"] == "setpoint"), "{:?}", s.events);
 }
+
+#[test]
+fn open_ago_covers_the_house_channel_close_and_a_restored_event() {
+    let mut s = Sim::warm("");
+    assert_eq!(s.w.open_ago_min("kueche", s.t), None);
+    s.drops([0.3, 0.0, 0.3], 6);
+    assert_eq!(s.w.open_ago_min("kueche", s.t), Some(0.0));
+    assert_eq!(s.w.open_ago_min("schlafzimmer", s.t), None);
+    for k in 7..=26 {
+        s.minute(&[20.0 - 0.3 * k as f64, 20.0, 20.0 - 0.3 * k as f64]);
+    }
+    assert!(s.open().is_empty());
+    let closed = s.t;
+    assert_eq!(s.w.open_ago_min("kueche", closed + 30 * MIN), Some(30.0));
+    s.w.note_open("schlafzimmer", closed - 10 * MIN);
+    assert_eq!(s.w.open_ago_min("schlafzimmer", closed), Some(10.0));
+    s.w.note_open("schlafzimmer", closed - 50 * MIN);
+    assert_eq!(s.w.open_ago_min("schlafzimmer", closed), Some(10.0));
+}

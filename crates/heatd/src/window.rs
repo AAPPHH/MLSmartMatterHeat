@@ -94,6 +94,7 @@ struct RoomWin {
     decrease_ms: Option<i64>,
     logged: HashMap<&'static str, i64>,
     last_close: Option<(&'static str, i64)>,
+    last_open_ms: Option<i64>,
     auto_opens: u64,
     suppressed: u64,
     nodes_seen: usize,
@@ -501,6 +502,17 @@ impl Windows {
         self.rooms.entry(room.into()).or_default().decrease_ms = Some(ts_ms);
     }
 
+    pub fn note_open(&mut self, room: &str, ts_ms: i64) {
+        let r = self.rooms.entry(room.into()).or_default();
+        r.last_open_ms = r.last_open_ms.max(Some(ts_ms));
+    }
+
+    pub fn open_ago_min(&self, room: &str, now: i64) -> Option<f64> {
+        let r = self.rooms.get(room)?;
+        let last = if r.active.is_some() { Some(now) } else { r.last_open_ms };
+        last.map(|t| ((now - t).max(0)) as f64 / MIN_MS as f64)
+    }
+
     pub fn open_rooms(&self) -> HashSet<String> {
         self.rooms.iter().filter(|(_, r)| r.active.is_some()).map(|(n, _)| n.clone()).collect()
     }
@@ -510,6 +522,7 @@ impl Windows {
         let a = r.active.take()?;
         r.manual_label = None;
         r.last_close = Some((reason, now));
+        r.last_open_ms = Some(now);
         self.finished.push(Episode { room: room.into(), start_ms: a.first_ms, end_ms: now, reason, source: a.source, score: a.score });
         Some(WinEvent { kind: lake::kind::WINDOW_CLOSE, room: room.into(), detail: json!({"room": room, "detector": DETECTOR, "reason": reason, "source": a.source, "open_minutes": (now - a.first_ms) as f64 / 60_000.0}) })
     }

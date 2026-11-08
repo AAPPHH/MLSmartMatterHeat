@@ -35,7 +35,7 @@ impl Rig {
     }
 
     fn room(setpoint: f64) -> RoomIn {
-        RoomIn { room: ROOM.into(), setpoint, blocked: None, no_raise: false, no_supply: false }
+        RoomIn { room: ROOM.into(), setpoint, blocked: None, no_raise: false, no_supply: false, window_ago_min: None }
     }
 
     fn tick_with(&self, min: f64, hour: f64, flags: (bool, bool), room: RoomIn) -> StepOut {
@@ -355,4 +355,47 @@ fn metrics_and_view_report_the_state() {
     let m = rig.boost.metrics();
     assert!(m.contains("heatd_boost_model_loaded 1") && m.contains("heatd_boost_active{room=\"wohnzimmer\"} 1") && m.contains("heatd_boost_active{room=\"bad\"} 0") && m.contains("heatd_boost_cycles_total{room=\"wohnzimmer\"} 1"), "{m}");
     assert!(Rig::bare().boost.metrics().contains("heatd_boost_model_loaded 0"));
+}
+
+fn after_window(ago: Option<f64>) -> RoomIn {
+    RoomIn { window_ago_min: ago, ..Rig::room(21.0) }
+}
+
+#[test]
+fn an_auto_boost_is_refused_within_the_window_block_and_allowed_after_it() {
+    for (ago, boosted) in [(Some(0.0), false), (Some(25.0), false), (Some(180.0), false), (Some(181.0), true), (None, true)] {
+        let rig = Rig::new();
+        rig.tick_with(0.0, 6.0, (true, false), RoomIn { window_ago_min: ago, ..Rig::room(18.0) });
+        let out = rig.tick_with(1.0, 6.0, (false, false), after_window(ago));
+        assert_eq!(is_boost(&out), boosted, "{ago:?}");
+        let view = rig.boost.view(ROOM);
+        assert_eq!(view["state"], if boosted { "armed" } else { "idle" }, "{ago:?}");
+        if !boosted {
+            let reason = view["reason"].as_str().unwrap();
+            assert!(reason.starts_with("kein Boost: Fenster war vor") && reason.contains("offen"), "{reason}");
+            assert!(detail(&out.events[0])["reason"].as_str().unwrap().contains("Fenster"));
+        }
+    }
+}
+
+#[test]
+fn a_manual_boost_after_a_window_is_allowed_and_notes_it() {
+    let rig = Rig::new();
+    rig.tick_with(0.0, 6.0, (false, false), after_window(Some(40.0)));
+    let reply = rig.boost.request(ROOM, None, at(0.5));
+    assert_eq!(reply["ok"], true, "{reply}");
+    let reason = reply["reason"].as_str().unwrap();
+    assert!(reason.contains("Hinweis: Fenster war vor 40 min offen"), "{reason}");
+    let other = Rig::new();
+    other.tick(0.0, 6.0, (false, false), 21.0);
+    assert!(!other.boost.request(ROOM, None, at(0.5))["reason"].as_str().unwrap().contains("Fenster"));
+}
+
+#[test]
+fn a_window_opening_aborts_an_armed_or_running_auto_boost() {
+    let rig = Rig::new();
+    rig.boosting();
+    let out = rig.tick_with(2.0, 6.0, (false, false), RoomIn { blocked: Some("window_open"), window_ago_min: Some(0.0), ..Rig::room(21.0) });
+    assert_eq!(detail(&out.events[0])["end"], "window_open");
+    assert_eq!(rig.boost.view(ROOM)["state"], "idle");
 }

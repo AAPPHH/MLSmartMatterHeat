@@ -81,6 +81,22 @@ fn stays(root: &Path, from_ms: i64, now_ms: i64) -> Result<Vec<(i64, String, Sta
     Ok(out)
 }
 
+pub fn restore_windows(state: &AppState, now_ms: i64) -> Result<usize> {
+    let from_ms = now_ms - (state.config.boost.after_window_min * MIN_MS as f64) as i64;
+    let mut found = 0;
+    for r in records(state.sink.root(), Table::Events, from_ms, now_ms, &["kind", "detail"], &[], &[])? {
+        let [Some(k), Some(detail)] = &r.text[..] else { continue };
+        if k != kind::WINDOW_OPEN && k != kind::WINDOW_CLOSE {
+            continue;
+        }
+        if let Some(room) = serde_json::from_str::<Value>(detail).ok().and_then(|d| d["room"].as_str().map(String::from)) {
+            state.windows.lock().unwrap().note_open(&room, r.ts);
+            found += 1;
+        }
+    }
+    Ok(found)
+}
+
 pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
     let cfg = &state.config;
     if !cfg.presence.restore {

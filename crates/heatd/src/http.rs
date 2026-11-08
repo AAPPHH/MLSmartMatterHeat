@@ -2582,6 +2582,25 @@ nodes = [5]
     }
 
     #[tokio::test]
+    async fn restart_keeps_the_recent_window_block() {
+        let h = late_harness();
+        let now = now_ms();
+        for (kind, minutes_ago) in [(kind::WINDOW_OPEN, 100), (kind::WINDOW_CLOSE, 90)] {
+            let mut e = lake::Event::now(kind, "heatd").with_detail(json!({"room": "wohnzimmer"}));
+            e.ts = (now - minutes_ago * 60_000) * 1000;
+            h.state.sink.append(e).unwrap();
+        }
+        let old = lake::Event { ts: (now - 400 * 60_000) * 1000, ..lake::Event::now(kind::WINDOW_CLOSE, "heatd").with_detail(json!({"room": "kueche"})) };
+        h.state.sink.append(old).unwrap();
+        let fresh = AppState { windows: Default::default(), ..restarted(&h) };
+        assert_eq!(fresh.windows.lock().unwrap().open_ago_min("wohnzimmer", now), None);
+        assert_eq!(crate::restore::restore_windows(&fresh, now).unwrap(), 2);
+        let ago = fresh.windows.lock().unwrap().open_ago_min("wohnzimmer", now).unwrap();
+        assert!((ago - 90.0).abs() < 0.01, "{ago}");
+        assert_eq!(fresh.windows.lock().unwrap().open_ago_min("kueche", now), None);
+    }
+
+    #[tokio::test]
     async fn restart_orders_stays_by_label_end_and_honours_late_voids() {
         let h = late_harness();
         let now = now_ms();
@@ -2660,7 +2679,7 @@ nodes = [5]
         for (attribute, value) in [(crate::window::LOCAL_TEMPERATURE, 16.0), (crate::window::PI_HEATING_DEMAND, 10.0)] {
             h.state.boost.observe(5, attribute, value, now);
         }
-        let rooms = [crate::boost::RoomIn { room: "wohnzimmer".into(), setpoint: 20.0, blocked: None, no_raise: false, no_supply: false }];
+        let rooms = [crate::boost::RoomIn { room: "wohnzimmer".into(), setpoint: 20.0, blocked: None, no_raise: false, no_supply: false, window_ago_min: None }];
         h.state.boost.step(&crate::boost::StepIn { now_ms: now, hour: 6.5, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep: false, away: false, rooms: &rooms });
         let (status, body) = call(&h.state, "POST", "/api/boost", Some(json!({"room": "wohnzimmer", "minutes": 3.0}).to_string())).await;
         assert_eq!((status, body["ok"].clone(), body["state"].as_str(), body["cycle"]["minutes"].as_f64(), body["source"].as_str()), (StatusCode::OK, true.into(), Some("armed"), Some(3.0), Some("manual")));

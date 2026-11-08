@@ -251,6 +251,10 @@ async fn serve(config: Config) -> Result<()> {
         Ok(summary) => println!("presence restore: {summary}"),
         Err(e) => eprintln!("presence restore: {e:#}"),
     }
+    match restore::restore_windows(&state, lake::now_us() / 1000) {
+        Ok(n) => println!("window restore: {n} events"),
+        Err(e) => eprintln!("window restore: {e:#}"),
+    }
     rules::spawn_background(state.clone());
     if state.config.br_watchdog.enabled {
         br_watchdog::spawn(state.clone());

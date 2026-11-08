@@ -36,6 +36,7 @@ pub struct RoomIn {
     pub blocked: Option<&'static str>,
     pub no_raise: bool,
     pub no_supply: bool,
+    pub window_ago_min: Option<f64>,
 }
 
 pub struct StepIn<'a> {
@@ -403,6 +404,10 @@ impl Inner {
         if let Some(b) = want.blocked {
             return Err((format!("Raum ist blockiert ({b})"), None));
         }
+        let window_note = want.window_ago_min.filter(|a| *a <= self.cfg.after_window_min).map(|a| format!("Fenster war vor {a:.0} min offen (Masse noch warm)"));
+        if let Some(note) = window_note.as_ref().filter(|_| !manual) {
+            return Err(refuse(&format!("kein Boost: {note}")));
+        }
         if want.no_raise {
             return Err(refuse("Anhebungs-Budget des Raums in dieser Stunde verbraucht"));
         }
@@ -445,6 +450,7 @@ impl Inner {
             decision.known.map_or("nichts".to_string(), |k| format!("{k:.1}")),
             decision.p_overshoot
         );
+        let reason = window_note.map_or(reason.clone(), |n| format!("{reason}, Hinweis: {n}"));
         let id = format!("boost-{}-{now_ms}", rs.name);
         let cycle = Cycle {
             id,

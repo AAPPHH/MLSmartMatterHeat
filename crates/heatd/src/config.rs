@@ -239,12 +239,13 @@ pub struct BoostSection {
     pub arm_timeout_min: f64,
     pub wind_default: f64,
     pub resume_cap_min: f64,
+    pub after_window_min: f64,
     pub seed: Option<u64>,
 }
 
 impl Default for BoostSection {
     fn default() -> Self {
-        Self { enabled: true, model_dir: "/models/boost".into(), reload_min: 5.0, morning_hours: [5.0, 11.0], min_rise_k: 1.0, trigger_window_min: 3.0, measure_min: 60.0, arm_timeout_min: 3.0, wind_default: 2.0, resume_cap_min: 180.0, seed: None }
+        Self { enabled: true, model_dir: "/models/boost".into(), reload_min: 5.0, morning_hours: [5.0, 11.0], min_rise_k: 1.0, trigger_window_min: 3.0, measure_min: 60.0, arm_timeout_min: 3.0, wind_default: 2.0, resume_cap_min: 180.0, after_window_min: 180.0, seed: None }
     }
 }
 
