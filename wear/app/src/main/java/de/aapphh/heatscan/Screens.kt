@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.requiredHeight
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
@@ -26,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -75,6 +78,7 @@ internal fun HeatTheme(content: @Composable () -> Unit) {
 internal val TARGET = 48.dp
 private val GAP = 8.dp
 private const val LINES = 8
+private val PEEK = 6.dp
 
 internal class Idle {
     private var at = System.currentTimeMillis()
@@ -153,7 +157,7 @@ private fun TransformingLazyColumnScope.note(spec: TransformationSpec, text: Str
 
 @Composable
 internal fun RoomsScreen(
-    hot: String?, ringed: String?, locked: Boolean, learn: LearnView?, glance: Glance, alerts: List<Alert>, ask: WindowAsk?, showPill: Boolean,
+    hot: String?, ringed: String?, locked: Boolean, learn: LearnView?, glance: Glance, alerts: List<Alert>, ask: WindowAsk?, showBadge: Boolean,
     onDetail: (String) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, onTap: (String) -> Unit
 ) {
     val state = rememberTransformingLazyColumnState()
@@ -163,13 +167,20 @@ internal fun RoomsScreen(
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val full = maxHeight
             TransformingLazyColumn(state = state, contentPadding = PaddingValues(start = padding.calculateLeftPadding(LayoutDirection.Ltr), end = padding.calculateRightPadding(LayoutDirection.Ltr), bottom = padding.calculateBottomPadding())) {
-                item { Box(Modifier.fillMaxWidth().height(full).padding(horizontal = Quarters.EDGE_DP.dp)) { RoomsPage(hot, ringed, locked, learn, glance, RoomView.pill(alerts, ask).takeIf { showPill }, onDetail, onAlerts, 0.dp, onTap) } }
+                item {
+                    Box(Modifier.fillMaxWidth().height(full - PEEK)) {
+                        Box(Modifier.fillMaxWidth().wrapContentHeight(Alignment.Top, unbounded = true).requiredHeight(full)) {
+                            RoomsPage(hot, ringed, locked, learn, glance, RoomView.badge(alerts, ask).takeIf { showBadge }, onDetail, onTap)
+                        }
+                    }
+                }
+                RoomView.pill(alerts, ask)?.let { label -> action(spec, label, tonal = false, onClick = onAlerts) }
                 header(spec, "Räume", RoomView.LEGEND)
                 Defaults.ROOMS.forEach { room ->
                     val g = RoomView.glance(glance, room)
                     action(spec, WindowEvent.caption(room), RoomView.row(g), icon = RoomView.mark(g).res) { onDetail(room) }
                 }
-                action(spec, "Hinweise ($count)", tonal = count == 0, onClick = onAlerts)
+                if (count == 0) action(spec, "Hinweise (0)", onClick = onAlerts)
                 action(spec, "Technik", onClick = onTech)
             }
         }
@@ -183,7 +194,7 @@ internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?
     ListScreen { spec ->
         header(spec, (if (saved) "✓ Gespeichert: " else "") + WindowEvent.caption(room))
         note(spec, RoomView.temp(g) ?: "–", colors.onBackground, type.numeralSmall)
-        listOfNotNull(RoomView.target(g), if (applying) RoomView.APPLYING else RoomView.why(g)).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
+        (if (applying) listOf(RoomView.APPLYING) else listOfNotNull(RoomView.target(g), RoomView.why(g))).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
         if (canBoost) action(spec, if (busy) "…" else "Boost", tonal = false, enabled = !busy, icon = R.drawable.ic_mark_boost, onClick = onBoost)
         result?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
         action(spec, if (g?.open == true) "Fenster zu melden" else "Fenster offen melden", icon = R.drawable.ic_mark_window, onClick = onWindow)
@@ -264,7 +275,7 @@ internal fun SavedPage(text: String, onUndo: () -> Unit, onDone: () -> Unit) {
         onDone()
     }
     ScreenScaffold {
-        Column(Modifier.fillMaxSize().onTouch { idle.touch() }.padding(horizontal = 28.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+        Column(Modifier.fillMaxSize().onTouch { idle.touch() }.onPreRotaryScrollEvent { idle.touch(); false }.padding(horizontal = 28.dp), Arrangement.Center, Alignment.CenterHorizontally) {
             Text(text, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center, fontWeight = FontWeight.Bold)
             FilledTonalButton({ if (!spent) { spent = true; onUndo() } }, Modifier.padding(top = GAP).defaultMinSize(minHeight = TARGET), enabled = !spent) { Text(Tap.UNDO, maxLines = 1) }
         }

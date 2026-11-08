@@ -2076,17 +2076,6 @@ class CoreTest {
     }
 
     @Test
-    fun pillBandKeepsTouchTargetGapAndRoundInset() {
-        listOf(96f, 102f, 113.5f).forEach { r ->
-            val inset = Quarters.pillInset(r)
-            assertTrue(inset >= 0f)
-            assertTrue(Quarters.bandDp(r) - inset - Quarters.PILL_TARGET_DP >= Quarters.PILL_GAP_DP)
-            val half = Quarters.PILL_W_DP / 2f
-            assertTrue(r - kotlin.math.sqrt(r * r - half * half) <= inset + 0.01f)
-        }
-    }
-
-    @Test
     fun glanceCarriesReasonAndBoostForRoomView() {
         val state = """{"rooms":[{"name":"kueche","window_open":false,"boost":{"state":"boosting","cycle":{"minutes":5.0,"written_ts":1000000}},"nodes":[{"local_temperature":20.0,"occupied_heating_setpoint":22.0,"reason":"boost"}]},{"name":"bad","window_open":false,"boost":{"state":"idle","cycle":null},"nodes":[{"local_temperature":21.0,"occupied_heating_setpoint":18.0,"reason":"away"}]},{"name":"flur","window_open":false,"nodes":[{"local_temperature":19.9,"occupied_heating_setpoint":20.0,"reason":"home"}]},{"name":"schlafzimmer","window_open":true,"nodes":[{"local_temperature":18.0,"occupied_heating_setpoint":20.0,"reason":"window_open"}]},{"name":"wohnzimmer","window_open":false,"nodes":[{"local_temperature":19.0,"occupied_heating_setpoint":21.0,"reason":"home"}]}]}"""
         val g = Glance.parse(state, 5L)!!
@@ -2121,6 +2110,12 @@ class CoreTest {
         assertEquals("2 Hinweise", RoomView.pill(one, ask))
         assertEquals("Fenster?", RoomView.pill(emptyList(), ask))
         assertNull(RoomView.pill(emptyList(), null))
+        assertEquals("2", RoomView.badge(one, ask))
+        assertEquals("?", RoomView.badge(emptyList(), ask))
+        assertNull(RoomView.badge(emptyList(), null))
+        assertTrue(RoomView.applying(10_000L, 10_000L))
+        assertTrue(RoomView.applying(12_000L, 10_000L))
+        assertFalse(RoomView.applying(12_001L, 10_000L))
         assertEquals(2, RoomView.count(one, ask))
     }
 

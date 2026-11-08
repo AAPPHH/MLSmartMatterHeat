@@ -5,6 +5,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.wear.compose.material3.AppScaffold
+import androidx.wear.compose.material3.ScreenScaffold
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performTouchInput
@@ -28,6 +29,8 @@ class ScreenshotTest {
         repeat(swipe) { rule.onRoot().performTouchInput { if (short) swipeUp(startY = height * 0.8f, endY = height * 0.5f) else swipeUp() } }
         rule.onRoot().captureRoboImage("screenshots/$name.png")
     }
+
+    @Composable private fun page(content: @Composable () -> Unit) = ScreenScaffold(timeText = {}) { content() }
 
     private fun footer() = Footer.line("12:34", true, 0)
 
@@ -54,27 +57,27 @@ class ScreenshotTest {
 
     private val tech = TechState("Lernen", false, "WLAN 10 min", false, footer())
 
-    @Test fun rooms_none() = shot("rooms_none") { RoomsPage(null, null) {} }
+    @Test fun rooms_none() = shot("rooms_none") { page { RoomsPage(null, null) {} } }
 
-    @Test fun rooms_guess_kueche() = shot("rooms_guess_kueche") { RoomsPage("kueche", null) {} }
+    @Test fun rooms_guess_kueche() = shot("rooms_guess_kueche") { page { RoomsPage("kueche", null) {} } }
 
-    @Test fun rooms_label_bad_guess_kueche() = shot("rooms_label_bad_guess_kueche") { RoomsPage("kueche", "bad") {} }
+    @Test fun rooms_label_bad_guess_kueche() = shot("rooms_label_bad_guess_kueche") { page { RoomsPage("kueche", "bad") {} } }
 
-    @Test fun rooms_label_keiner() = shot("rooms_label_keiner") { RoomsPage("keiner", null) {} }
+    @Test fun rooms_label_keiner() = shot("rooms_label_keiner") { page { RoomsPage("keiner", null) {} } }
 
-    @Test fun rooms_label_keiner_guess_flur() = shot("rooms_label_keiner_guess_flur") { RoomsPage("flur", "keiner") {} }
+    @Test fun rooms_label_keiner_guess_flur() = shot("rooms_label_keiner_guess_flur") { page { RoomsPage("flur", "keiner") {} } }
 
-    @Test fun wheel_normal() = shot("wheel_normal") { RoomsPage(null, null, glance = heating) {} }
+    @Test fun wheel_normal() = shot("wheel_normal") { page { RoomsPage(null, null, glance = heating) {} } }
 
-    @Test fun wheel_pill() = shot("wheel_pill") { RoomsPage(null, null, glance = glance, pill = "2 Hinweise") {} }
+    @Test fun wheel_badge() = shot("wheel_badge") { page { RoomsPage(null, null, glance = glance, badge = "2") {} } }
 
-    @Test fun wheel_guess() = shot("wheel_guess") { RoomsPage("kueche", null, glance = heating) {} }
+    @Test fun wheel_guess() = shot("wheel_guess") { page { RoomsPage("kueche", null, glance = heating) {} } }
 
-    @Test fun wheel_font_1_3() = shot("wheel_font_1_3", 1.3f) { RoomsPage("kueche", null, glance = heating, pill = "2 Hinweise") {} }
+    @Test fun wheel_font_1_3() = shot("wheel_font_1_3", 1.3f) { page { RoomsPage("kueche", null, glance = heating, badge = "2") {} } }
 
-    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_small() = shot("wheel_small") { RoomsPage("wohnzimmer", null, glance = glance, pill = "2 Hinweise") {} }
+    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_small() = shot("wheel_small") { page { RoomsPage("wohnzimmer", null, glance = glance, badge = "2") {} } }
 
-    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun wheel_45mm() = shot("wheel_45mm") { RoomsPage("kueche", "bad", glance = glance, pill = "2 Hinweise") {} }
+    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun wheel_45mm() = shot("wheel_45mm") { page { RoomsPage("kueche", "bad", glance = glance, badge = "2") {} } }
 
     private val two = listOf(alert, Alert("a@2", "Heizung", "Bad liefert keine Wärme."))
 
@@ -92,9 +95,7 @@ class ScreenshotTest {
 
     @Test fun tech_footer_font_1_3() = shot("tech_footer_font_1_3", 1.3f, 2) { TechScreen(TechState("Stopp", true, "WLAN 8 min", true, footer()), {}, {}, {}) }
 
-    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_pill_192() = shot("wheel_pill_192") { rooms() }
-
-    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun wheel_pill_204() = shot("wheel_pill_204") { rooms() }
+    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_rooms_192() = shot("wheel_rooms_192") { rooms() }
 
     @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun wheel_41mm() = shot("wheel_41mm") { rooms() }
 
@@ -157,5 +158,5 @@ class ScreenshotTest {
 
     @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun ask_45mm() = shot("ask_45mm") { AskScreen(ask) {} }
 
-    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun rooms_45mm() = shot("rooms_45mm") { RoomsPage("kueche", "bad") {} }
+    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun rooms_45mm() = shot("rooms_45mm") { page { RoomsPage("kueche", "bad") {} } }
 }

@@ -12,6 +12,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
@@ -360,14 +363,14 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
         }
     }
     val glanceNow = version.let { store.glance }
-    val stamp = remember(tapped) { glanceNow.at }
+    val tapAt = remember(tapped) { System.currentTimeMillis() }
     LaunchedEffect(tapped, kind) {
         if (tapped != null && Tap.undoable(kind)) {
             delay(Tap.REFRESH_MS)
             Remote.refresh(ctx, true)
         }
     }
-    Box(Modifier.fillMaxSize().onTouch { idle.touch() }) {
+    Box(Modifier.fillMaxSize().onTouch { idle.touch() }.onPreRotaryScrollEvent { idle.touch(); false }) {
         val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
         (hint ?: Prompt.title(change, learnPrompt).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = pal.text, maxLines = 1) }
         val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
@@ -391,7 +394,7 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
         if (saved != null) {
             val g = RoomView.glance(glance, saved)
             Box(Modifier.fillMaxSize().background(Color.Black)) {
-                RoomDetailScreen(saved, g, null, false, Heat.heatable(saved, null), { report(saved, g?.open != true) }, { onDetail(saved, true) }, true, glance.at == stamp) { LabelRecorder.undo(ctx) }
+                RoomDetailScreen(saved, g, null, false, Heat.heatable(saved, null), { report(saved, g?.open != true) }, { onDetail(saved, true) }, true, RoomView.applying(glanceNow.at, tapAt)) { LabelRecorder.undo(ctx) }
             }
         } else view?.let {
             val (bg, ink) = tapColors(it.kind)
@@ -414,28 +417,18 @@ internal fun palette(): Palette = MaterialTheme.colorScheme.let {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, pill: String? = null, onLong: (String) -> Unit = {}, onBadge: () -> Unit = {}, top: Dp = 0.dp, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: String? = null, onLong: (String) -> Unit = {}, onTap: (String) -> Unit) {
     val pal = palette()
     val current = LocalDensity.current
     CompositionLocalProvider(LocalDensity provides Density(current.density, minOf(current.fontScale, Quarters.MAX_FONT))) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val radius = LocalConfiguration.current.let { minOf(it.screenWidthDp, it.screenHeightDp) } / 2f
-            val band = if (pill != null) Quarters.bandDp(radius).dp else 0.dp
-            val side = minOf(maxWidth, maxHeight - band)
-            val fit = minOf(1f, side.value / Quarters.DESIGN_DP)
-            Box(Modifier.align(Alignment.BottomCenter).size(side)) {
-                CompositionLocalProvider(LocalDensity provides Density(LocalDensity.current.density * fit, LocalDensity.current.fontScale)) { Wheel(hot, ringed, locked, learn, glance, onLong, onTap) }
-            }
-            pill?.let {
-                Box(
-                    Modifier.align(Alignment.TopCenter).padding(top = (Quarters.pillInset(radius).dp - top).coerceAtLeast(0.dp)).size(Quarters.PILL_W_DP.dp, Quarters.PILL_TARGET_DP.dp).clickable(role = Role.Button, onClick = onBadge),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        it,
-                        Modifier.clip(RoundedCornerShape(50)).background(pal.alert).padding(horizontal = 8.dp, vertical = 2.dp),
-                        fontSize = 11.sp, lineHeight = 13.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError
-                    )
+            val d = minOf(maxWidth, maxHeight)
+            Box(Modifier.align(Alignment.Center).size(d)) {
+                Wheel(hot, ringed, locked, learn, glance, onLong, onTap)
+                badge?.let {
+                    Box(Modifier.align(Alignment.Center).offset((Quarters.BADGE_X * d.value).dp, (Quarters.BADGE_Y * d.value).dp).size(Quarters.BADGE_DP.dp).clip(CircleShape).background(pal.alert).clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+                        Text(it, fontSize = 10.sp, lineHeight = 12.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError)
+                    }
                 }
             }
         }

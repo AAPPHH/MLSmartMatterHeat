@@ -69,6 +69,16 @@ object RoomView {
         else -> "${count(alerts, ask)} " + if (count(alerts, ask) == 1) "Hinweis" else "Hinweise"
     }
 
+    fun badge(alerts: List<Alert>, ask: WindowAsk?): String? = when {
+        alerts.isEmpty() && ask != null -> "?"
+        alerts.isEmpty() -> null
+        else -> count(alerts, ask).toString()
+    }
+
+    const val APPLY_MS = 2_000L
+
+    fun applying(glanceAt: Long, tapAt: Long): Boolean = glanceAt <= tapAt + APPLY_MS
+
     fun tile(g: RoomGlance?): String = listOfNotNull(temp(g), mark(g).word.takeIf { it.isNotEmpty() }).joinToString(" · ")
 }
 
