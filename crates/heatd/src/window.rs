@@ -612,6 +612,7 @@ impl Windows {
                 free.push((room.name.clone(), channel, threshold));
                 continue;
             };
+            w.last_open_ms = w.last_open_ms.max(Some(now));
             if w.logged.get(why).is_some_and(|t| now - t < SUPPRESS_LOG_MS) {
                 continue;
             }

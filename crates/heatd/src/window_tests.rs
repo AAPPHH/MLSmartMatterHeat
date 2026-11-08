@@ -154,6 +154,23 @@ fn vetoes_keep_single_rooms_closed() {
     assert_eq!(s.of("window_suppressed").len(), 2);
 }
 
+#[test]
+fn suppressed_window_alarms_still_block_boosts() {
+    let mut s = Sim::warm("");
+    s.w.note_decrease("wohnzimmer", s.t);
+    s.drops([0.3, 0.0, 0.3], 6);
+    assert!(s.w.open_ago_min("wohnzimmer", s.t).is_some_and(|a| a < 1.0));
+    assert!(s.w.open_ago_min("kueche", s.t).is_some_and(|a| a < 1.0));
+    for ctx in [RoomCtx { hold: true, away: false }, RoomCtx { hold: false, away: true }] {
+        let mut s = Sim::warm("");
+        s.w.set_context(["wohnzimmer", "kueche"].map(|r| (r.to_string(), ctx.clone())));
+        s.drops([0.3, 0.0, 0.3], 6);
+        assert!(s.open().is_empty() && s.w.open_ago_min("wohnzimmer", s.t).is_some(), "{ctx:?}");
+    }
+    let quiet = Sim::warm("");
+    assert_eq!(quiet.w.open_ago_min("wohnzimmer", quiet.t), None);
+}
+
 fn supply_incident(extra: &str) -> Sim {
     let mut s = Sim::single(extra);
     s.w.set_model(toy_bundle(&[("a", 5, 1.0)], 3.0));
