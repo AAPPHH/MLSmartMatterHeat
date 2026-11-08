@@ -366,6 +366,18 @@ impl StaleSection {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct WatchSection {
+    pub update_dir: String,
+}
+
+impl Default for WatchSection {
+    fn default() -> Self {
+        Self { update_dir: "/data/watch_update".into() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub listen: String,
     pub db_path: String,
@@ -408,6 +420,7 @@ pub struct Config {
     pub boost: BoostSection,
     pub failsafe: FailsafeSection,
     pub stale: StaleSection,
+    pub watch: WatchSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
     pub node_health: crate::node_health::NodeHealthSection,
 }
@@ -456,6 +469,7 @@ impl Default for Config {
             boost: BoostSection::default(),
             failsafe: FailsafeSection::default(),
             stale: StaleSection::default(),
+            watch: WatchSection::default(),
             br_watchdog: Default::default(),
             node_health: Default::default(),
         }

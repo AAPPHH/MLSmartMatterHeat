@@ -66,6 +66,10 @@ Die Zeilen sind auf der Platte (Flush mit fsync), bevor der Schlüssel vorgemerk
 
 Sensorinventar beim Start und bei Änderung (Sensorliste oder `app_version`): `{"device","ts"?: ms,"app_version","sensors":[{"name"|"sensor_name","android_type"|"type","string_type","vendor","resolution","max_range"|"maxRange"}]}` (Tabelle `watch_sensors`). Die Uhr sendet zusätzlich `wake_up`, `min_delay_us`, `max_delay_us`, `fifo_max`, `reporting_mode`; heatd ignoriert sie bisher. Antwort `{"stored": n}` nach Flush auf Platte, `400` bei leerer Liste, `500` bei Speicherfehler.
 
+## `GET /watch/update` und `GET /watch/update.apk` (Uhr-App-Update)
+
+`/watch/update` liefert `200` mit `{"version_code": int, "version_name": str, "sha256": hex, "size": int}` oder `404`, wenn nichts veröffentlicht ist. `/watch/update.apk` liefert die APK-Bytes (`application/vnd.android.package-archive`, `Content-Length`). heatd liest nur: `update.json` und `update.apk` in `[watch] update_dir` (Standard `/data/watch_update`), bei jeder Anfrage neu; stimmen `sha256` oder `size` der Datei nicht mit `update.json` überein (oder ist `update.json` ungültig), antworten beide Pfade `404` und heatd loggt den Grund einmal. Veröffentlichen mit `deploy/watch-publish.sh`.
+
 ## `POST /watch/label`
 
 `{"device","ts","from","to","room","source":"watch"}` mit den Regeln von `/api/label` (`room` entspricht `label`). Die Uhr fällt bei `400/404/405/422` auf `/api/label` zurück.

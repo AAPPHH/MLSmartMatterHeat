@@ -185,3 +185,6 @@ restart_grace_s = 180.0
 verify_min = 10.0
 tolerance_c = 0.3
 alert_retries = 3
+
+[watch]
+update_dir = "/data/watch_update"
