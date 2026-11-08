@@ -15,17 +15,22 @@ object Plain {
 }
 
 enum class RoomMark(val res: Int?, val word: String) {
-    WINDOW(R.drawable.ic_mark_window, "Fenster offen"), BOOST(R.drawable.ic_mark_boost, "Boost"), AWAY(R.drawable.ic_mark_away, "Sparmodus"),
+    WINDOW(R.drawable.ic_mark_window, "Fenster offen"), BOOST(R.drawable.ic_mark_boost, "Boost"), AWAY(R.drawable.ic_mark_away, "weg"),
     HEATING(R.drawable.ic_mark_heating, "heizt"), NONE(null, "")
 }
 
 object RoomView {
     const val LAG_K = 0.3
 
-    private val REASONS = mapOf(
-        "home" to "Du bist zuhause", "away" to "Du bist weg – Sparmodus", "window_open" to "Fenster offen – Heizung pausiert",
-        "sleep" to "Nachtmodus", "default" to "Standard", "boost_off" to "Boost beendet"
+    val REASONS = mapOf(
+        "home" to "Du bist hier – normale Temperatur", "occupied" to "Du bist hier – normale Temperatur", "away" to "Du bist weg – Sparmodus",
+        "window_open" to "Fenster offen – Heizung pausiert", "sleep" to "Nachtruhe – Schlaftemperatur", "default" to "Niemand hier – Grundtemperatur",
+        "schedule" to "Nach Zeitplan", "exploration" to "Probiert gerade eine andere Temperatur aus", "boost" to "Schnell aufheizen", "boost_off" to "Aufheizen beendet",
+        "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt"
     )
+    const val LEGEND = "Gefüllt: dort hast du dich gemeldet. Ring: dort vermutet dich die Uhr."
+    const val NO_DATA = "keine Daten"
+    const val CALM = "normal"
 
     fun glance(g: Glance, room: String): RoomGlance? = g.rooms.firstOrNull { it.room == room }
 
@@ -51,9 +56,19 @@ object RoomView {
         else -> REASONS[g.reason]
     }
 
-    fun tile(g: RoomGlance?): String = listOfNotNull(temp(g), mark(g).word.takeIf { it.isNotEmpty() }).joinToString(" · ")
+    fun state(g: RoomGlance?): String = if (g == null) NO_DATA else mark(g).word.ifEmpty { CALM }
 
-    fun badge(alerts: List<Alert>, ask: WindowAsk?): Boolean = alerts.isNotEmpty() || ask != null
+    fun row(g: RoomGlance?): String = listOfNotNull(temp(g), state(g)).joinToString(" · ")
+
+    fun count(alerts: List<Alert>, ask: WindowAsk?): Int = alerts.size + if (ask != null) 1 else 0
+
+    fun pill(alerts: List<Alert>, ask: WindowAsk?): String? = when {
+        alerts.isEmpty() && ask != null -> "Fenster?"
+        alerts.isEmpty() -> null
+        else -> "${count(alerts, ask)} " + if (count(alerts, ask) == 1) "Hinweis" else "Hinweise"
+    }
+
+    fun tile(g: RoomGlance?): String = listOfNotNull(temp(g), mark(g).word.takeIf { it.isNotEmpty() }).joinToString(" · ")
 }
 
 object BoostText {

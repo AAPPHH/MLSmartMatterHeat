@@ -5,12 +5,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -24,6 +28,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -38,6 +43,7 @@ import androidx.wear.compose.material3.ColorScheme
 import androidx.wear.compose.material3.EdgeButton
 import androidx.wear.compose.material3.EdgeButtonSize
 import androidx.wear.compose.material3.FilledTonalButton
+import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.LocalContentColor
 import androidx.wear.compose.material3.MaterialTheme
@@ -65,6 +71,9 @@ internal fun HeatTheme(content: @Composable () -> Unit) {
 
 internal val TARGET = 48.dp
 private val GAP = 8.dp
+private const val LINES = 8
+
+private fun onOff(on: Boolean) = if (on) "an" else "aus"
 
 private fun Modifier.describe(text: String) = semantics { contentDescription = text }
 
@@ -84,15 +93,21 @@ internal fun EdgeAction(text: String, onClick: () -> Unit): @Composable BoxScope
     EdgeButton(onClick = onClick, buttonSize = EdgeButtonSize.Medium, modifier = Modifier.describe(text)) { Text(text, maxLines = 1) }
 }
 
-private fun TransformingLazyColumnScope.header(spec: TransformationSpec, text: String) = item {
-    ListHeader(Modifier.fillMaxWidth().transformedHeight(this, spec), transformation = SurfaceTransformation(spec)) { Text(text, maxLines = 2) }
+private fun TransformingLazyColumnScope.header(spec: TransformationSpec, text: String, sub: String? = null) = item {
+    ListHeader(Modifier.fillMaxWidth().transformedHeight(this, spec), transformation = SurfaceTransformation(spec)) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(text, textAlign = TextAlign.Center)
+            sub?.let { Text(it, Modifier.padding(top = 2.dp), style = MaterialTheme.typography.bodyExtraSmall, textAlign = TextAlign.Center) }
+        }
+    }
 }
 
-private fun TransformingLazyColumnScope.action(spec: TransformationSpec, label: String, secondary: String? = null, tonal: Boolean = true, enabled: Boolean = true, onClick: () -> Unit) = item {
+private fun TransformingLazyColumnScope.action(spec: TransformationSpec, label: String, secondary: String? = null, tonal: Boolean = true, enabled: Boolean = true, icon: Int? = null, onClick: () -> Unit) = item {
     val mod = Modifier.fillMaxWidth().defaultMinSize(minHeight = TARGET).transformedHeight(this, spec)
-    val second: (@Composable RowScope.() -> Unit)? = secondary?.let { { Text(it, maxLines = 2) } }
-    if (tonal) FilledTonalButton(onClick, mod, enabled = enabled, transformation = SurfaceTransformation(spec), secondaryLabel = second) { Text(label, maxLines = 2) }
-    else Button(onClick, mod, enabled = enabled, transformation = SurfaceTransformation(spec), secondaryLabel = second) { Text(label, maxLines = 2) }
+    val second: (@Composable RowScope.() -> Unit)? = secondary?.let { { Text(it, maxLines = LINES) } }
+    val glyph: (@Composable BoxScope.() -> Unit)? = icon?.let { { Icon(painterResource(it), null, Modifier.size(MARK_DP.dp)) } }
+    if (tonal) FilledTonalButton(onClick, mod, enabled = enabled, transformation = SurfaceTransformation(spec), icon = glyph, secondaryLabel = second) { Text(label, maxLines = LINES) }
+    else Button(onClick, mod, enabled = enabled, transformation = SurfaceTransformation(spec), icon = glyph, secondaryLabel = second) { Text(label, maxLines = LINES) }
 }
 
 private fun TransformingLazyColumnScope.pair(spec: TransformationSpec, first: String, firstTone: Boolean, second: String, secondTone: Boolean, describeFirst: String, describeSecond: String, onFirst: () -> Unit, onSecond: () -> Unit) = item {
@@ -110,19 +125,42 @@ private fun TransformingLazyColumnScope.note(spec: TransformationSpec, text: Str
 }
 
 @Composable
-internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?, busy: Boolean, canBoost: Boolean, onWindow: () -> Unit, onBoost: () -> Unit) {
+internal fun RoomsScreen(
+    hot: String?, ringed: String?, locked: Boolean, learn: LearnView?, glance: Glance, alerts: List<Alert>, ask: WindowAsk?, showPill: Boolean,
+    onDetail: (String) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, onTap: (String) -> Unit
+) {
+    val state = rememberTransformingLazyColumnState()
+    val spec = rememberTransformationSpec()
+    val count = RoomView.count(alerts, ask)
+    ScreenScaffold(scrollState = state) {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val full = maxHeight
+            TransformingLazyColumn(state = state, contentPadding = PaddingValues(bottom = 24.dp)) {
+                item { Box(Modifier.fillMaxWidth().height(full)) { RoomsPage(hot, ringed, locked, learn, glance, RoomView.pill(alerts, ask).takeIf { showPill }, onDetail, onAlerts, onTap) } }
+                header(spec, "Räume", RoomView.LEGEND)
+                Defaults.ROOMS.forEach { room ->
+                    val g = RoomView.glance(glance, room)
+                    action(spec, WindowEvent.caption(room), RoomView.row(g), icon = RoomView.mark(g).res) { onDetail(room) }
+                }
+                action(spec, "Hinweise ($count)", tonal = count == 0, onClick = onAlerts)
+                action(spec, "Technik", onClick = onTech)
+            }
+        }
+    }
+}
+
+@Composable
+internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?, busy: Boolean, canBoost: Boolean, onWindow: () -> Unit, onBoost: () -> Unit, saved: Boolean = false, onUndo: () -> Unit = {}) {
     val colors = MaterialTheme.colorScheme
     val type = MaterialTheme.typography
-    val edge: (@Composable BoxScope.() -> Unit)? = if (canBoost) {
-        { EdgeButton(onClick = onBoost, buttonSize = EdgeButtonSize.Medium, enabled = !busy, modifier = Modifier.describe("Boost " + WindowEvent.caption(room))) { Text(if (busy) "…" else "Boost", maxLines = 1) } }
-    } else null
-    ListScreen(edge = edge) { spec ->
-        header(spec, WindowEvent.caption(room))
-        note(spec, RoomView.temp(g) ?: "–", colors.onBackground, type.numeralMedium)
-        RoomView.target(g)?.let { note(spec, it, colors.onSurfaceVariant, type.bodyMedium) }
-        RoomView.why(g)?.let { note(spec, it, colors.onSurface, type.bodyMedium) }
+    ListScreen { spec ->
+        header(spec, (if (saved) "✓ " else "") + WindowEvent.caption(room))
+        note(spec, RoomView.temp(g) ?: "–", colors.onBackground, type.numeralSmall)
+        listOfNotNull(RoomView.target(g), RoomView.why(g)).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
+        if (canBoost) action(spec, if (busy) "…" else "Boost", tonal = false, enabled = !busy, icon = R.drawable.ic_mark_boost, onClick = onBoost)
         result?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
-        action(spec, if (g?.open == true) "Fenster ist zu" else "Fenster hier offen", onClick = onWindow)
+        action(spec, if (g?.open == true) "Fenster zu melden" else "Fenster offen melden", icon = R.drawable.ic_mark_window, onClick = onWindow)
+        if (saved) action(spec, Tap.UNDO, onClick = onUndo)
     }
 }
 
@@ -146,7 +184,7 @@ internal fun AlertsScreen(alerts: List<Alert>, ask: WindowAsk?, onAsk: () -> Uni
         ask?.let { action(spec, WindowEvent.question(it), WindowEvent.text(it), tonal = false, onClick = onAsk) }
         alerts.forEach { al ->
             item(key = al.id) {
-                TitleCard(onClick = {}, title = { Text(al.title, maxLines = 2) }, modifier = Modifier.fillMaxWidth().transformedHeight(this, spec), transformation = SurfaceTransformation(spec)) { Text(al.text, maxLines = 4) }
+                TitleCard(onClick = {}, title = { Text(al.title, maxLines = LINES) }, modifier = Modifier.fillMaxWidth().transformedHeight(this, spec), transformation = SurfaceTransformation(spec)) { Text(al.text, maxLines = LINES) }
             }
         }
         if (ask == null && alerts.isEmpty()) note(spec, "Alles in Ordnung", colors.onSurfaceVariant, type.bodyMedium)
@@ -163,10 +201,10 @@ internal fun TechScreen(s: TechState, onData: () -> Unit, onLearn: () -> Unit, o
         header(spec, "Technik")
         action(spec, "WLAN-Ringe", onClick = onData)
         item {
-            SwitchButton(s.learning, { onLearn() }, Modifier.fillMaxWidth().defaultMinSize(minHeight = TARGET).transformedHeight(this, spec), transformation = SurfaceTransformation(spec), label = { Text("Lernen: " + s.learnChip, maxLines = 1) })
+            SwitchButton(s.learning, { onLearn() }, Modifier.fillMaxWidth().defaultMinSize(minHeight = TARGET).transformedHeight(this, spec), transformation = SurfaceTransformation(spec), secondaryLabel = s.learnChip.takeIf { it == Learn.FINISHED }?.let { { Text(it) } }, label = { Text("Raum lernen: " + onOff(s.learning), maxLines = LINES) })
         }
         item {
-            SwitchButton(s.holdOn, { onHold() }, Modifier.fillMaxWidth().defaultMinSize(minHeight = TARGET).transformedHeight(this, spec), transformation = SurfaceTransformation(spec), label = { Text("WLAN: " + s.holdChip, maxLines = 1) })
+            SwitchButton(s.holdOn, { onHold() }, Modifier.fillMaxWidth().defaultMinSize(minHeight = TARGET).transformedHeight(this, spec), transformation = SurfaceTransformation(spec), secondaryLabel = { Text(s.holdChip, maxLines = LINES) }, label = { Text("WLAN halten: " + onOff(s.holdOn), maxLines = LINES) })
         }
         note(spec, s.footer, colors.onSurfaceVariant, type.bodyExtraSmall)
     }

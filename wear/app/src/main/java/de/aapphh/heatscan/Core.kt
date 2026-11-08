@@ -638,11 +638,7 @@ object Quarters {
     const val LABEL_H_DP = 34f
     const val WIDE = "kueche"
     const val MAX_FONT = 1.1f
-    const val BADGE_R = 5f
-    const val BADGE_AT = 26f
-    const val HOT_R = 24f
-
-    fun hot(dx: Float, dy: Float, density: Float): Boolean = kotlin.math.hypot(dx - HOT_R * density, dy + HOT_R * density) <= HOT_R * density
+    const val BAND_DP = 22f
 
     fun labelDp(room: String, dDp: Float): Float {
         val r = labelR(room) * dDp

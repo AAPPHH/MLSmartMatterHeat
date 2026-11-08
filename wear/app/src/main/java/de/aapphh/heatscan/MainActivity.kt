@@ -9,6 +9,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
@@ -159,6 +162,7 @@ class MainActivity : ComponentActivity() {
         val nav = rememberSwipeDismissableNavController()
         var saved by remember { mutableStateOf<Saved?>(null) }
         var detail by remember { mutableStateOf("") }
+        var boostFirst by remember { mutableStateOf(false) }
         var external by remember { mutableStateOf(prompt || start != Routes.ROOMS) }
         val leave = {
             if (external) finish() else nav.popBackStack(Routes.ROOMS, false)
@@ -178,11 +182,20 @@ class MainActivity : ComponentActivity() {
                 else nav.popBackStack(Routes.ROOMS, false)
             }
         }
+        val report = { room: String, open: Boolean ->
+            WindowPrompter.selfReport(this, room, open) { id -> ui { show("Fenster ${WindowEvent.caption(room)} ${if (open) "auf" else "zu"}", id) } }
+        }
+        val openDetail = { room: String, boost: Boolean ->
+            detail = room
+            boostFirst = boost
+            nav.navigate(Routes.DETAIL)
+            Unit
+        }
         SwipeDismissableNavHost(nav, startDestination = start) {
             composable(Routes.ROOMS) {
-                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, { room -> detail = room; nav.navigate(Routes.DETAIL) }, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }) { if (prompt) finish() }
+                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, openDetail, report, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }) { if (prompt) finish() }
             }
-            composable(Routes.DETAIL) { DetailRoute(store, detail, show, ui) }
+            composable(Routes.DETAIL) { DetailRoute(store, detail, boostFirst, report, ui) }
             composable(Routes.ALERTS) { AlertsRoute(store) { nav.navigate(Routes.ASK) } }
             composable(Routes.TECH) { TechRoute(store) { nav.navigate(Routes.DATA) } }
             composable(Routes.DATA) { DataRoute(store) }
@@ -196,21 +209,18 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun DetailRoute(store: Store, room: String, show: (String, String) -> Unit, ui: (() -> Unit) -> Unit) {
+    private fun DetailRoute(store: Store, room: String, boostFirst: Boolean, report: (String, Boolean) -> Unit, ui: (() -> Unit) -> Unit) {
         val version = storeVersion(store)
         val g = RoomView.glance(version.let { store.glance }, room)
         var result by remember { mutableStateOf<BoostResult?>(null) }
         var busy by remember { mutableStateOf(false) }
-        var confirm by remember { mutableStateOf(false) }
+        var confirm by remember { mutableStateOf(boostFirst) }
         if (confirm) return BoostConfirmScreen(room, {
             confirm = false
             busy = true
             Remote.boost(this, room) { r -> ui { result = r; busy = false; Remote.refresh(this, true) } }
         }) { confirm = false }
-        RoomDetailScreen(room, g, result, busy, Heat.heatable(room, null), {
-            val open = g?.open != true
-            WindowPrompter.selfReport(this, room, open) { id -> ui { show("Fenster ${WindowEvent.caption(room)} ${if (open) "auf" else "zu"}", id) } }
-        }) { confirm = true }
+        RoomDetailScreen(room, g, result, busy, Heat.heatable(room, null), { report(room, g?.open != true) }, { confirm = true })
     }
 
     @Composable
@@ -288,7 +298,7 @@ private fun storeVersion(store: Store): Int {
 }
 
 @Composable
-private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, onDetail: (String) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, finish: () -> Unit) {
+private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, onDetail: (String, Boolean) -> Unit, report: (String, Boolean) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, finish: () -> Unit) {
     val ctx = LocalContext.current
     val version = storeVersion(store)
     var tapped by remember { mutableStateOf<String?>(null) }
@@ -340,36 +350,44 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
             }
         }
     }
-    ScreenScaffold(timeText = {}) {
-        Box(Modifier.fillMaxSize()) {
-            val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
-            (hint ?: Prompt.title(change, learnPrompt).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = pal.text, maxLines = 1) }
-            val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
-            val glance = version.let { store.glance }
-            val badge = RoomView.badge(version.let { store.alerts }, WindowEvent.live(version.let { store.windowPending }, System.currentTimeMillis()))
-            RoomsPage(hot, ringed, locked, learnView, glance, badge, onDetail, onAlerts, onTech) {
-                if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
-                    if (Heat.heatable(it, store.progress)) choosing = it else pick(it, false)
-                }
+    Box(Modifier.fillMaxSize()) {
+        val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
+        (hint ?: Prompt.title(change, learnPrompt).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = pal.text, maxLines = 1) }
+        val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
+        val glance = version.let { store.glance }
+        val alerts = version.let { store.alerts }
+        val ask = WindowEvent.live(version.let { store.windowPending }, System.currentTimeMillis())
+        RoomsScreen(hot, ringed, locked, learnView, glance, alerts, ask, !prompt && hint == null, { onDetail(it, false) }, onAlerts, onTech) {
+            if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
+                if (Heat.heatable(it, store.progress)) choosing = it else pick(it, false)
             }
-            choosing?.let { room ->
-                Column(Modifier.fillMaxSize().background(Color.Black).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
-                    Text(Defaults.CAPTIONS.getValue(room), style = MaterialTheme.typography.titleSmall, color = pal.text, maxLines = 1)
-                    FilledTonalButton({ pick(room, true) }, Modifier.padding(top = 6.dp).fillMaxWidth().defaultMinSize(minHeight = TARGET)) { Text(Heat.YES, maxLines = 1) }
-                    FilledTonalButton({ pick(room, false) }, Modifier.padding(top = 8.dp).defaultMinSize(minHeight = TARGET)) { Text(Heat.NO, maxLines = 1) }
-                }
+        }
+        choosing?.let { room ->
+            Column(Modifier.fillMaxSize().background(Color.Black).padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+                Text(Defaults.CAPTIONS.getValue(room), style = MaterialTheme.typography.titleSmall, color = pal.text, maxLines = 1)
+                FilledTonalButton({ pick(room, true) }, Modifier.padding(top = 6.dp).fillMaxWidth().defaultMinSize(minHeight = TARGET)) { Text(Heat.YES, maxLines = 1) }
+                FilledTonalButton({ pick(room, false) }, Modifier.padding(top = 8.dp).defaultMinSize(minHeight = TARGET)) { Text(Heat.NO, maxLines = 1) }
             }
-            view?.let {
-                val (bg, ink) = tapColors(it.kind)
-                Column(Modifier.fillMaxSize().background(bg).pointerInput(Unit) { detectTapGestures { } }.padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
-                    Text(it.title, style = MaterialTheme.typography.titleMedium, color = ink, textAlign = TextAlign.Center)
-                    if (it.sub.isNotEmpty()) Text(it.sub, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall, color = ink, textAlign = TextAlign.Center)
-                    if (Tap.undoable(it.kind) && version.let { store.lastLabelId.isNotEmpty() }) FilledTonalButton({ LabelRecorder.undo(ctx) }, Modifier.padding(top = 10.dp).defaultMinSize(minHeight = TARGET)) { Text(Tap.UNDO, maxLines = 1) }
-                }
+        }
+        val undo = version.let { store.lastLabelId.isNotEmpty() }
+        val saved = tapped?.takeIf { it != Defaults.NONE && Tap.undoable(kind) && undo }
+        if (saved != null) {
+            val g = RoomView.glance(glance, saved)
+            Box(Modifier.fillMaxSize().background(Color.Black)) {
+                RoomDetailScreen(saved, g, null, false, Heat.heatable(saved, null), { report(saved, g?.open != true) }, { onDetail(saved, true) }, true) { LabelRecorder.undo(ctx) }
+            }
+        } else view?.let {
+            val (bg, ink) = tapColors(it.kind)
+            Column(Modifier.fillMaxSize().background(bg).pointerInput(Unit) { detectTapGestures { } }.padding(horizontal = 24.dp), Arrangement.Center, Alignment.CenterHorizontally) {
+                Text(it.title, style = MaterialTheme.typography.titleMedium, color = ink, textAlign = TextAlign.Center)
+                if (it.sub.isNotEmpty()) Text(it.sub, Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall, color = ink, textAlign = TextAlign.Center)
+                if (Tap.undoable(it.kind) && undo) FilledTonalButton({ LabelRecorder.undo(ctx) }, Modifier.padding(top = 10.dp).defaultMinSize(minHeight = TARGET)) { Text(Tap.UNDO, maxLines = 1) }
             }
         }
     }
 }
+
+internal const val MARK_DP = 16
 
 internal class Palette(val selected: Color, val ink: Color, val idle: Color, val low: Color, val done: Color, val track: Color, val caption: Color, val legend: Color, val text: Color, val alert: Color)
 
@@ -379,26 +397,43 @@ internal fun palette(): Palette = MaterialTheme.colorScheme.let {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: Boolean = false, onLong: (String) -> Unit = {}, onBadge: () -> Unit = {}, onTech: () -> Unit = {}, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, pill: String? = null, onLong: (String) -> Unit = {}, onBadge: () -> Unit = {}, onTap: (String) -> Unit) {
     val pal = palette()
-    val fill = { room: String -> if (room == hot) pal.selected else when (learn?.tones?.get(room)) { RoomTone.LOW -> pal.low; RoomTone.DONE -> pal.done; else -> pal.idle } }
     val current = LocalDensity.current
     CompositionLocalProvider(LocalDensity provides Density(current.density, minOf(current.fontScale, Quarters.MAX_FONT))) {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val band = if (pill != null) Quarters.BAND_DP.dp else 0.dp
+            Box(Modifier.align(Alignment.BottomCenter).size(minOf(maxWidth, maxHeight) - band)) { Wheel(hot, ringed, locked, learn, glance, onLong, onTap) }
+            pill?.let {
+                Text(
+                    it,
+                    Modifier.align(Alignment.TopCenter).padding(top = 3.dp).clip(RoundedCornerShape(50)).background(pal.alert).clickable(role = Role.Button, onClick = onBadge).padding(horizontal = 8.dp, vertical = 2.dp),
+                    fontSize = 11.sp, lineHeight = 13.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Wheel(hot: String?, ringed: String?, locked: Boolean, learn: LearnView?, glance: Glance, onLong: (String) -> Unit, onTap: (String) -> Unit) {
+    val pal = palette()
+    val fill = { room: String -> if (room == hot) pal.selected else when (learn?.tones?.get(room)) { RoomTone.LOW -> pal.low; RoomTone.DONE -> pal.done; else -> pal.idle } }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val dDp = minOf(maxWidth, maxHeight)
         Canvas(
-            Modifier.fillMaxSize().pointerInput(badge) {
+            Modifier.fillMaxSize().pointerInput(Unit) {
                 detectTapGestures(
                     onLongPress = { o ->
                         val dx = o.x - size.width / 2f
                         val dy = o.y - size.height / 2f
                         val room = Quarters.room(dx, dy, minOf(size.width, size.height).toFloat())
-                        if (Quarters.hot(dx, dy, density)) onTech() else if (room != Defaults.NONE) onLong(room)
+                        if (room != Defaults.NONE) onLong(room)
                     },
                     onTap = { o ->
                         val dx = o.x - size.width / 2f
                         val dy = o.y - size.height / 2f
-                        if (badge && Quarters.hot(dx, dy, density)) onBadge() else onTap(Quarters.room(dx, dy, minOf(size.width, size.height).toFloat()))
+                        onTap(Quarters.room(dx, dy, minOf(size.width, size.height).toFloat()))
                     }
                 )
             }
@@ -427,10 +462,6 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
             drawPath(centre, fill(Quarters.CENTER))
             if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, pal.text, style = Stroke(ring)) }
-            if (badge) {
-                drawCircle(Color.Black, (Quarters.BADGE_R + 2f).dp.toPx(), c + Offset(Quarters.BADGE_AT.dp.toPx(), -Quarters.BADGE_AT.dp.toPx()))
-                drawCircle(pal.alert, Quarters.BADGE_R.dp.toPx(), c + Offset(Quarters.BADGE_AT.dp.toPx(), -Quarters.BADGE_AT.dp.toPx()))
-            }
             val pillTopLeft = Offset(c.x - Quarters.NONE_HALF_W * d, c.y + Quarters.NONE_TOP * d)
             val pillSize = Size(2f * Quarters.NONE_HALF_W * d, Quarters.NONE_H * d)
             val corner = CornerRadius(pillSize.height / 2f)
@@ -438,13 +469,6 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             drawRoundRect(if (Defaults.NONE == hot) pal.selected else pal.idle, pillTopLeft, pillSize, corner)
             if (Defaults.NONE == ringed) drawRoundRect(pal.text, pillTopLeft, pillSize, corner, style = Stroke(2.dp.toPx()))
         }
-        if (badge) Box(
-            Modifier.align(Alignment.Center).offset(Quarters.HOT_R.dp, -Quarters.HOT_R.dp).size((2f * Quarters.HOT_R).dp).semantics {
-                role = Role.Button
-                contentDescription = "Hinweise"
-                onClick { onBadge(); true }
-            }
-        )
         Text(
             Prompt.caption(Defaults.NONE, null),
             Modifier.align(Alignment.Center).offset(y = ((Quarters.NONE_TOP + Quarters.NONE_H / 2f) * dDp.value).dp).semantics(mergeDescendants = true) {
@@ -468,12 +492,12 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
                 onClick { onTap(room); true }
                 customActions = listOf(CustomAccessibilityAction("Raumdetails") { onLong(room); true })
             }
-            val icon = @Composable { Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink) }
+            val icon = @Composable { Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 26 else 22).dp), tint = ink) }
             val info: @Composable ColumnScope.() -> Unit = {
                 Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, lineHeight = 11.sp, maxLines = 1, color = ink)
                 if (rg?.temp != null || mark.res != null) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     RoomView.temp(rg)?.let { Text(it, fontSize = 10.sp, lineHeight = 11.sp, maxLines = 1, color = ink) }
-                    mark.res?.let { Icon(painterResource(it), mark.word, Modifier.size(12.dp), tint = ink) }
+                    mark.res?.let { Icon(painterResource(it), mark.word, Modifier.size(MARK_DP.dp), tint = ink) }
                 }
                 learn?.badges?.get(room)?.let { Text(it, fontSize = 9.sp, lineHeight = 9.sp, maxLines = 1, color = ink) }
             }
@@ -485,7 +509,6 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
                 info()
             }
         }
-    }
     }
 }
 

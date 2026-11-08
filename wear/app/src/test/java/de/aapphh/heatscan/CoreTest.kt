@@ -5,6 +5,7 @@ import org.json.JSONObject
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -2086,7 +2087,7 @@ class CoreTest {
         assertEquals("Du bist weg – Sparmodus", RoomView.why(RoomView.glance(g, "bad")))
         assertEquals(RoomMark.AWAY, RoomView.mark(RoomView.glance(g, "bad")))
         assertEquals(RoomMark.NONE, RoomView.mark(RoomView.glance(g, "flur")))
-        assertEquals("Du bist zuhause", RoomView.why(RoomView.glance(g, "flur")))
+        assertEquals("Du bist hier – normale Temperatur", RoomView.why(RoomView.glance(g, "flur")))
         assertEquals(RoomMark.WINDOW, RoomView.mark(RoomView.glance(g, "schlafzimmer")))
         assertEquals("Fenster offen – Heizung pausiert", RoomView.why(RoomView.glance(g, "schlafzimmer")))
         assertEquals(RoomMark.HEATING, RoomView.mark(RoomView.glance(g, "wohnzimmer")))
@@ -2094,11 +2095,22 @@ class CoreTest {
         assertEquals("Ziel 22,0°", RoomView.target(k))
         assertNull(RoomView.temp(null))
         assertNull(RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "mystery")))
-        assertEquals("Boost beendet", RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "boost_off")))
+        assertEquals("Aufheizen beendet", RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "boost_off")))
+        val said = mapOf("occupied" to "Du bist hier – normale Temperatur", "default" to "Niemand hier – Grundtemperatur", "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt", "sleep" to "Nachtruhe – Schlaftemperatur")
+        said.forEach { (reason, text) -> assertEquals(text, RoomView.why(RoomGlance("bad", 20.0, 20.0, false, reason))) }
+        listOf("home", "occupied", "sleep", "default", "away", "window_open", "boost", "boost_off", "no_supply", "pi_reset", "schedule", "exploration").forEach { assertNotNull(it, RoomView.REASONS[it]) }
+        assertEquals("19,0° · heizt", RoomView.row(RoomView.glance(g, "wohnzimmer")))
+        assertEquals("19,9° · normal", RoomView.row(RoomView.glance(g, "flur")))
+        assertEquals("keine Daten", RoomView.row(null))
         assertEquals("Schnell aufheizen", RoomView.why(RoomGlance("bad", 20.0, 22.0, false, "boost", true)))
         assertEquals(g, Glance.fromJson(g.json()))
-        assertTrue(RoomView.badge(listOf(Alert("a", "t", "x")), null))
-        assertFalse(RoomView.badge(emptyList(), null))
+        val one = listOf(Alert("a", "t", "x"))
+        val ask = WindowAsk("w1", "kueche", true, 0L, "x")
+        assertEquals("1 Hinweis", RoomView.pill(one, null))
+        assertEquals("2 Hinweise", RoomView.pill(one, ask))
+        assertEquals("Fenster?", RoomView.pill(emptyList(), ask))
+        assertNull(RoomView.pill(emptyList(), null))
+        assertEquals(2, RoomView.count(one, ask))
     }
 
     @Test
@@ -2107,14 +2119,6 @@ class CoreTest {
         assertEquals("Bad antwortet nicht.", Plain.text("Bad (Node 5) antwortet nicht."))
         assertEquals("Sollwert wird nicht übernommen", Plain.text("Sollwert wird nicht uebernommen"))
         assertFalse(Plain.text("x heatd schreibt sie erneut").contains("heatd"))
-    }
-
-    @Test
-    fun centreHotZoneSitsUpperRightOfCentre() {
-        assertTrue(Quarters.hot(24f, -24f, 1f))
-        assertTrue(Quarters.hot(48f, -48f, 2f))
-        assertFalse(Quarters.hot(-24f, 24f, 1f))
-        assertFalse(Quarters.hot(0f, 0f, 3f))
     }
 
     @Test

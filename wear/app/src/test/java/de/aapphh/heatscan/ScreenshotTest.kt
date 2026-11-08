@@ -40,7 +40,7 @@ class ScreenshotTest {
 
     private val glance = Glance(
         1L, listOf(
-            RoomGlance("wohnzimmer", 21.5, 22.0, false, "home"), RoomGlance("schlafzimmer", 18.2, 19.0, true, "window_open"),
+            RoomGlance("wohnzimmer", 21.5, 22.0, false, "occupied"), RoomGlance("schlafzimmer", 18.2, 19.0, true, "window_open"),
             RoomGlance("bad", 22.0, 22.0, false, "boost", true, until), RoomGlance("kueche", 20.4, 21.0, false, "away"), RoomGlance("flur", 19.9, 20.0, false, "home")
         )
     )
@@ -65,15 +65,39 @@ class ScreenshotTest {
 
     @Test fun wheel_normal() = shot("wheel_normal") { RoomsPage(null, null, glance = heating) {} }
 
-    @Test fun wheel_badge() = shot("wheel_badge") { RoomsPage(null, null, glance = glance, badge = true) {} }
+    @Test fun wheel_pill() = shot("wheel_pill") { RoomsPage(null, null, glance = glance, pill = "2 Hinweise") {} }
 
     @Test fun wheel_guess() = shot("wheel_guess") { RoomsPage("kueche", null, glance = heating) {} }
 
-    @Test fun wheel_font_1_3() = shot("wheel_font_1_3", 1.3f) { RoomsPage("kueche", null, glance = heating, badge = true) {} }
+    @Test fun wheel_font_1_3() = shot("wheel_font_1_3", 1.3f) { RoomsPage("kueche", null, glance = heating, pill = "2 Hinweise") {} }
 
-    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_small() = shot("wheel_small") { RoomsPage("wohnzimmer", null, glance = glance, badge = true) {} }
+    @Test @Config(qualifiers = "w192dp-h192dp-round-xhdpi") fun wheel_small() = shot("wheel_small") { RoomsPage("wohnzimmer", null, glance = glance, pill = "2 Hinweise") {} }
 
-    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun wheel_45mm() = shot("wheel_45mm") { RoomsPage("kueche", "bad", glance = glance, badge = true) {} }
+    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun wheel_45mm() = shot("wheel_45mm") { RoomsPage("kueche", "bad", glance = glance, pill = "2 Hinweise") {} }
+
+    private val two = listOf(alert, Alert("a@2", "Heizung", "Bad liefert keine Wärme."))
+
+    @Composable private fun rooms(alerts: List<Alert> = two, ask: WindowAsk? = null) = RoomsScreen("kueche", "bad", false, null, glance, alerts, ask, true, {}, {}, {}) {}
+
+    @Test fun rooms_screen() = shot("rooms_screen") { rooms() }
+
+    @Test fun rooms_list() = shot("rooms_list", swipe = true) { rooms() }
+
+    @Test fun rooms_list_font_1_3() = shot("rooms_list_font_1_3", 1.3f, true) { rooms() }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun wheel_41mm() = shot("wheel_41mm") { rooms() }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun wheel_41mm_ask() = shot("wheel_41mm_ask") { rooms(emptyList(), ask) }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun detail_41mm() = shot("detail_41mm") { detail("wohnzimmer", rg("wohnzimmer")) }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun detail_saved_41mm() = shot("detail_saved_41mm") { RoomDetailScreen("kueche", rg("kueche"), null, false, true, {}, {}, true) {} }
+
+    @Test fun detail_saved() = shot("detail_saved") { RoomDetailScreen("kueche", rg("kueche"), null, false, true, {}, {}, true) {} }
+
+    @Test fun detail_saved_font_1_3() = shot("detail_saved_font_1_3", 1.3f) { RoomDetailScreen("kueche", rg("kueche"), null, false, true, {}, {}, true) {} }
+
+    @Test fun tech_font_1_3() = shot("tech_font_1_3", 1.3f) { TechScreen(TechState("Stopp", true, "WLAN 8 min", true, footer()), {}, {}, {}) }
 
     @Test fun detail_home() = shot("detail_home") { detail("wohnzimmer", rg("wohnzimmer")) }
 
