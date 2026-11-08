@@ -625,7 +625,6 @@ class CoreTest {
         assertEquals(Prompt.ORDER + "keiner", Prompt.rooms("keiner"))
         assertEquals("Keiner", Prompt.caption("keiner", "bad"))
         assertEquals("✓ Gespeichert: Kein Raum", Prompt.done("keiner"))
-        assertEquals("keiner", TileClick.room(TileClick.id("keiner", 3), 3))
         assertEquals("keiner", StayTracker.parse(StayTracker().also { it.confirm("keiner", 1000L) }.json()).label)
         assertEquals("● Bad", Prompt.caption("bad", "bad"))
         assertEquals("Küche", Prompt.caption("kueche", "bad"))
@@ -664,22 +663,6 @@ class CoreTest {
     @Test
     fun scansCarryNoStickyLabel() {
         assertTrue(Payload.build(1, "d", null, emptyList()).isNull("label"))
-    }
-
-    @Test
-    fun tileClickOnlyAcceptsCurrentNonce() {
-        assertEquals("bad", TileClick.room(TileClick.id("bad", 3), 3))
-        assertEquals(null, TileClick.room(TileClick.id("bad", 3), 4))
-        assertEquals(null, TileClick.room(TileClick.id("buero", 3), 3))
-        assertEquals(null, TileClick.room("open", 3))
-        assertEquals(null, TileClick.room("", 0))
-    }
-
-    @Test
-    fun tileStatusLine() {
-        assertEquals("Ruhe | 12:00:00 200", TileClick.statusLine(true, "Ruhe", "12:00:00 200"))
-        assertEquals("Scan aus | -", TileClick.statusLine(false, "Ruhe", "-"))
-        assertEquals("-", TileClick.statusLine(true, "", "-"))
     }
 
     private fun still(): ScanPolicy = ScanPolicy(true, 0).also {
@@ -1879,8 +1862,66 @@ class CoreTest {
         assertNull(WindowEvent.parse(null, 7L))
         assertEquals("Ist das Fenster im Wohnzimmer offen?", WindowEvent.title(WindowAsk("w1", "wohnzimmer", true)))
         assertEquals("Ist das Fenster im Schlafzimmer offen?", WindowEvent.title(WindowAsk("w1", "schlafzimmer", true)))
-        assertEquals("Ist das Fenster im Bad offen?", WindowEvent.title(WindowAsk("w1", "bad", false)))
+        assertEquals("Ist das Fenster im Bad zu?", WindowEvent.title(WindowAsk("w1", "bad", false)))
         assertEquals("Ist das Fenster in der Küche offen?", WindowEvent.title(WindowAsk("w1", "kueche", true)))
+    }
+
+    @Test
+    fun windowQuestionMatchesServerQuestionAndYesIsNotInverted() {
+        val open = WindowAsk("w1", "bad", true)
+        val closed = WindowAsk("w2", "bad", false)
+        assertEquals("Fenster offen?", WindowEvent.question(open))
+        assertEquals("Fenster zu?", WindowEvent.question(closed))
+        assertEquals("Ja, Fenster Bad ist offen", WindowEvent.yesDescription(open))
+        assertEquals("Ja, Fenster Bad ist zu", WindowEvent.yesDescription(closed))
+        assertEquals("Nein, Fenster Bad ist zu", WindowEvent.noDescription(open))
+        assertEquals("Nein, Fenster Bad ist offen", WindowEvent.noDescription(closed))
+        listOf(open, closed).forEach {
+            assertEquals(WindowEvent.yesDescription(it).endsWith("offen"), WindowEvent.open(it, WindowAnswer.YES))
+            assertEquals(WindowEvent.noDescription(it).endsWith("offen"), WindowEvent.open(it, WindowAnswer.NO))
+            assertEquals("Fenster " + (if (WindowEvent.open(it, WindowAnswer.YES)) "offen" else "zu"), WindowEvent.outcome(it, WindowAnswer.YES))
+        }
+        assertEquals("Fenster zu", WindowEvent.outcome(closed, WindowAnswer.YES))
+        assertEquals("Fenster offen", WindowEvent.outcome(closed, WindowAnswer.NO))
+        assertEquals(WindowEvent.UNKNOWN, WindowEvent.outcome(closed, WindowAnswer.UNKNOWN))
+    }
+
+    @Test
+    fun swipeIsUnknownWhileExpiredSwipeIsTimeout() {
+        val ask = WindowAsk("w1", "bad", true, 1_000L)
+        assertEquals(Pair(WindowAnswer.UNKNOWN, "swipe"), WindowEvent.resolve(ask, WindowAnswer.UNKNOWN, "swipe", 2_000L))
+        assertEquals(Pair(WindowAnswer.TIMEOUT, "expiry"), WindowEvent.resolve(ask, WindowAnswer.UNKNOWN, "swipe", 1_000L + WindowEvent.EXPIRY_MS))
+        assertEquals(Pair(WindowAnswer.YES, "page"), WindowEvent.resolve(ask, WindowAnswer.YES, "page", 1_000L + WindowEvent.EXPIRY_MS))
+        val e = WindowEvent.answerEntry("w", 5L, ask, WindowAnswer.UNKNOWN, "swipe")
+        assertEquals("unknown", e.getString("answer"))
+        assertEquals("swipe", e.getString("via"))
+    }
+
+    @Test
+    fun voidedEntryKeepsPromptRecord() {
+        val e = WindowEvent.voidedEntry("w", 5L, WindowAsk("w1", "bad", true))
+        assertEquals("voided", e.getString("answer"))
+        assertEquals("undo", e.getString("via"))
+        assertEquals("w1", e.getString("prompt_id"))
+        assertEquals("bad", e.getString("room"))
+        assertTrue(WindowEvent.isWindow(e))
+        assertEquals("voided", JSONObject(WindowEvent.body(e)).getString("answer"))
+    }
+
+    @Test
+    fun oldAlertIdMigratesIntoSeen() {
+        assertEquals(listOf("a", "b"), AlertList.migrate(listOf("a"), "b"))
+        assertEquals(listOf("a", "b"), AlertList.migrate(listOf("a", "b"), "b"))
+        assertEquals(listOf("a"), AlertList.migrate(listOf("a"), null))
+        assertEquals(listOf("a"), AlertList.migrate(listOf("a"), ""))
+        assertEquals(40, AlertList.migrate((1..40).map { "i$it" }, "n").size)
+        assertTrue(AlertList.fresh(listOf(Alert("b", "t", "x")), AlertList.migrate(emptyList(), "b")).isEmpty())
+    }
+
+    @Test
+    fun boostConfirmationQuestionNamesRoomAndMinutes() {
+        assertEquals("Küche 5 min aufheizen?", Boost.question("kueche"))
+        assertEquals("Kein WLAN", Boost.failed(Boost.NO_WIFI).line)
     }
 
     @Test
@@ -1936,5 +1977,111 @@ class CoreTest {
         assertEquals(WindowAsk("w1", "bad", true, 9L), WindowEvent.fromJson(WindowEvent.json(WindowAsk("w1", "bad", true, 9L))))
         assertNull(WindowEvent.fromJson("garbage"))
         assertEquals(listOf("wohnzimmer", "schlafzimmer", "bad", "kueche"), WindowEvent.rooms(null))
+    }
+
+    @Test
+    fun windowPromptCarriesReason() {
+        val o = JSONObject("""{"id":"w1","room":"kueche","question":"open","reason":"Temperatur faellt schnell"}""")
+        val a = WindowEvent.parse(o, 5L)!!
+        assertEquals("Temperatur faellt schnell", a.reason)
+        assertEquals("Küche: Temperatur faellt schnell", WindowEvent.text(a))
+        assertEquals("", WindowEvent.parse(JSONObject("""{"id":"w1","room":"kueche","question":"open","reason":null}"""), 5L)!!.reason)
+        assertEquals("Bad", WindowEvent.text(WindowAsk("w", "bad", true)))
+        assertEquals(a, WindowEvent.fromJson(WindowEvent.json(a)))
+    }
+
+    @Test
+    fun everyAnswerBecomesALabelWithExplicitField() {
+        val a = WindowAsk("w1", "bad", true, 1_000L, "r")
+        val expect = mapOf(WindowAnswer.YES to true, WindowAnswer.NO to false, WindowAnswer.UNKNOWN to true, WindowAnswer.TIMEOUT to true)
+        expect.forEach { (answer, open) ->
+            val b = JSONObject(WindowEvent.body(WindowEvent.answerEntry("watch", 5L, a, answer, "notification", "id-" + answer.wire)))
+            assertEquals(answer.wire, b.getString("answer"))
+            assertEquals(open, b.getBoolean("open"))
+            assertEquals("w1", b.getString("prompt_id"))
+            assertEquals("notification", b.getString("via"))
+            assertEquals("id-" + answer.wire, b.getString("label_id"))
+        }
+        assertEquals(listOf("yes", "no", "unknown", "timeout", "voided"), WindowAnswer.values().map { it.wire })
+        assertEquals(false, WindowEvent.open(WindowAsk("w", "bad", false), WindowAnswer.YES))
+        assertEquals(true, WindowEvent.open(WindowAsk("w", "bad", false), WindowAnswer.NO))
+        val self = JSONObject(WindowEvent.body(WindowEvent.entry("watch", 1L, "bad", true, null, "s1", via = "self")))
+        assertFalse(self.has("answer"))
+        assertEquals("self", self.getString("via"))
+        assertTrue(self.isNull("prompt_id"))
+        val back = JSONObject(WindowEvent.answerEntry("watch", 5L, a, WindowAnswer.UNKNOWN, "page", "i").toString())
+        assertEquals("unknown", JSONObject(WindowEvent.body(back)).getString("answer"))
+    }
+
+    @Test
+    fun unansweredPromptLapsesOnceByExpiryOrReplacement() {
+        val live = WindowAsk("w1", "bad", true, 1_000L)
+        val seen = listOf("w1")
+        assertNull(WindowEvent.lapsed(null, seen, null, 2_000L))
+        assertNull(WindowEvent.lapsed(live, seen, null, 2_000L))
+        assertEquals(live, WindowEvent.lapsed(live, seen, null, 1_000L + WindowEvent.EXPIRY_MS))
+        assertEquals(live, WindowEvent.lapsed(live, seen, WindowAsk("w2", "bad", true), 2_000L))
+        assertNull(WindowEvent.lapsed(live, seen, WindowAsk("w1", "bad", true), 2_000L))
+        assertNull(WindowEvent.lapsed(live, seen + "w2", WindowAsk("w2", "bad", true), 2_000L))
+        assertEquals(1_000L + WindowEvent.EXPIRY_MS, WindowEvent.lapseTs(live, 9_000_000L))
+        assertEquals(5_000L, WindowEvent.lapseTs(live, 5_000L))
+    }
+
+    @Test
+    fun alertsListDedupeAndNoRebuzz() {
+        val r = ReplyJson.parse("""{"stored":1,"alerts":[{"id":"a@1","title":"T1","text":"x"},{"id":"b@2","title":"T2","text":"y"}],"alert":{"id":"a@1","title":"T1","text":"x"}}""")
+        assertEquals(listOf("a@1", "b@2"), r.alerts.map { it.id })
+        assertEquals("a@1", r.alert!!.id)
+        assertEquals(listOf("only"), ReplyJson.parse("""{"alert":{"id":"only","title":"T","text":"x"}}""").alerts.map { it.id })
+        assertTrue(ReplyJson.parse("""{"stored":1}""").alerts.isEmpty())
+        val seen = AlertList.remember(emptyList(), r.alerts.take(1))
+        assertEquals(listOf("b@2"), AlertList.fresh(r.alerts, seen).map { it.id })
+        assertTrue(AlertList.fresh(r.alerts, AlertList.remember(seen, r.alerts)).isEmpty())
+        assertEquals(40, AlertList.remember(emptyList(), (1..60).map { Alert("i$it", "", "") }).size)
+        assertEquals(r.alerts, AlertList.fromJson(AlertList.json(r.alerts)))
+        assertEquals(AlertList.notificationId(r.alerts[0]), AlertList.notificationId(r.alerts[0].copy()))
+        assertTrue(AlertList.fromJson("garbage").isEmpty())
+    }
+
+    @Test
+    fun glanceParsesStateAndFormatsGerman() {
+        val state = """{"alerts":[],"rooms":[{"name":"wohnzimmer","window_open":true,"nodes":[{"local_temperature":21.54,"occupied_heating_setpoint":22.0,"commanded_setpoint":null}]},{"name":"bad","window_open":false,"nodes":[{"local_temperature":null,"occupied_heating_setpoint":19.0,"commanded_setpoint":20.5}]},{"name":"keller","nodes":[]}]}"""
+        val g = Glance.parse(state, 77L)!!
+        assertEquals(2, g.rooms.size)
+        assertEquals(RoomGlance("wohnzimmer", 21.54, 22.0, true), g.rooms[0])
+        assertEquals(RoomGlance("bad", null, 20.5, false), g.rooms[1])
+        assertEquals(listOf("wohnzimmer"), g.openRooms())
+        assertEquals("Wohnen 21,5/22,0", Glance.line(g.rooms[0]))
+        assertEquals("Bad -/20,5", Glance.line(g.rooms[1]))
+        assertEquals(g, Glance.fromJson(g.json()))
+        assertEquals(Glance.EMPTY, Glance.fromJson("garbage"))
+        assertNull(Glance.parse("garbage", 1L))
+        assertEquals(listOf("A"), Glance.alerts("""{"alerts":[{"id":"A","title":"t","text":"x"}]}""")!!.map { it.id })
+    }
+
+    @Test
+    fun boostResultShowsServerDecisionOrReason() {
+        JSONObject(Boost.body("bad")).let { assertEquals("bad", it.getString("room")); assertEquals(5, it.getInt("minutes")) }
+        val ok = Boost.result(200, """{"ok":true,"state":"armed","reason":"Szenario manual","cycle":{"minutes":5.0}}""")
+        assertTrue(ok.ok)
+        assertEquals("Boost 5 min: startet - Szenario manual", ok.line)
+        val no = Boost.result(409, """{"ok":false,"reason":"kein Boost-Modell geladen"}""")
+        assertFalse(no.ok)
+        assertEquals("kein Boost-Modell geladen", no.line)
+        assertEquals("Server nicht erreichbar", Boost.result(-1, "").line)
+        assertEquals("Antwort unlesbar (500)", Boost.result(500, "x").line)
+        val rooms = Boost.rooms("""{"summary":{},"rooms":[{"room":"bad","boost":{"state":"idle","reason":"kein Boost-Modell geladen"}},{"room":"kueche","boost":{"state":"boosting","reason":null}}]}""")!!
+        assertEquals(listOf(BoostRoom("bad", "idle", "kein Boost-Modell geladen"), BoostRoom("kueche", "boosting", "")), rooms)
+        assertNull(Boost.rooms("garbage"))
+    }
+
+    @Test
+    fun tileLinesSummariseRoomsWindowsAndAlerts() {
+        val g = Glance(1_000L, listOf(RoomGlance("bad", 20.0, 21.0, false), RoomGlance("kueche", 19.0, 20.0, true)))
+        val l = GlanceView.lines(g, listOf(Alert("a", "Heizung: Thermostat", "t")), 2_000L).map { it.text }
+        assertEquals(listOf("Bad 20,0/21,0", "Küche 19,0/20,0", "Offen: Küche", "! Heizung: Thermostat"), l.take(4))
+        assertTrue(l.last().startsWith("Stand "))
+        assertEquals(GlanceView.NONE, GlanceView.lines(Glance.EMPTY, emptyList(), 5L).first().text)
+        assertEquals(GlanceView.NONE, GlanceView.lines(g, emptyList(), 1_000L + Glance.STALE_MS + 1).first().text)
     }
 }
