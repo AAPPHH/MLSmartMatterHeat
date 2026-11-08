@@ -5,21 +5,24 @@ M=${MINIX:-aapphh@192.168.178.29}
 DEST=${WATCH_UPDATE_DIR:-/home/aapphh/MLSmartMatterHeat/data/watch_update}
 APK=${APK:-wear/app/build/outputs/apk/release/app-release.apk}
 [ -f "$APK" ] || { echo "APK fehlt: $APK" >&2; exit 1; }
-CODE=; NAME=
-if command -v aapt2 >/dev/null 2>&1; then
-  BADGING=$(aapt2 dump badging "$APK" 2>/dev/null | grep '^package:' || true)
-  CODE=$(sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" <<<"$BADGING")
-  NAME=$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<<"$BADGING")
-fi
-if [ -z "$CODE" ] || [ -z "$NAME" ] && command -v apkanalyzer >/dev/null 2>&1; then
-  CODE=$(apkanalyzer manifest version-code "$APK" 2>/dev/null || true)
-  NAME=$(apkanalyzer manifest version-name "$APK" 2>/dev/null || true)
-fi
-if [ -z "$CODE" ] || [ -z "$NAME" ]; then
-  CODE=$(sed -n 's/^[[:space:]]*versionCode = \([0-9]*\).*/\1/p' wear/app/build.gradle.kts | head -1)
-  NAME=$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' wear/app/build.gradle.kts | head -1)
-fi
-[ -n "$CODE" ] && [ -n "$NAME" ] || { echo "versionCode/versionName nicht ermittelbar" >&2; exit 1; }
+IMAGE=${WEAR_IMAGE:-ghcr.io/cirruslabs/android-sdk:36}
+FP=${FINGERPRINT:-secrets/wear-release.sha256}
+[ -s "$FP" ] || { echo "Fingerabdruck fehlt: $FP" >&2; exit 1; }
+APKDIR=$(cd "$(dirname "$APK")" && pwd)
+sdk() {
+  local tool=$1; shift
+  if command -v "$tool" >/dev/null 2>&1; then "$tool" "$@"; return; fi
+  MSYS_NO_PATHCONV=1 docker run --rm -v "$APKDIR:/apk:ro" "$IMAGE" sh -c 'exec "$(ls -d "$ANDROID_HOME"/build-tools/*/ | tail -1)$0" "$@"' "$tool" "$@"
+}
+APKIN=$(command -v aapt2 >/dev/null 2>&1 && echo "$APK" || echo "/apk/$(basename "$APK")")
+BADGING=$(sdk aapt2 dump badging "$APKIN" | grep '^package:') || BADGING=
+CODE=$(sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" <<<"$BADGING")
+NAME=$(sed -n "s/.*versionName='\([^']*\)'.*/\1/p" <<<"$BADGING")
+[ -n "$CODE" ] && [ -n "$NAME" ] || { echo "versionCode/versionName nicht aus der APK lesbar" >&2; exit 1; }
+APKSIGNIN=$(command -v apksigner >/dev/null 2>&1 && echo "$APK" || echo "/apk/$(basename "$APK")")
+CERTS=$(sdk apksigner verify --print-certs "$APKSIGNIN") || { echo "APK-Signatur ungueltig" >&2; exit 1; }
+DIGESTS=$(sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: //p' <<<"$CERTS" | tr 'A-F' 'a-f')
+[ "$(wc -l <<<"$DIGESTS")" -eq 1 ] && [ "$DIGESTS" = "$(tr -d '[:space:]' < "$FP" | tr 'A-F' 'a-f')" ] || { echo "APK ist nicht mit dem Release-Zertifikat signiert" >&2; exit 1; }
 SHA=$(sha256sum "$APK" | cut -d' ' -f1)
 SIZE=$(wc -c < "$APK" | tr -d ' ')
 T=$(mktemp -d)
