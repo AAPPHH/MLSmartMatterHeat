@@ -174,8 +174,8 @@ def feature_row(ctx):
 
 
 class Episodes:
-    def __init__(self, grid, cfg, boost_cycles):
-        self.cfg, self.rooms = cfg, grid.rooms
+    def __init__(self, grid, cfg, boost_cycles, window_spans=None):
+        self.cfg, self.rooms, self.grid, self.spans = cfg, grid.rooms, grid, window_spans or {}
         self.series = {r: Series(grid, r, cfg) for r in grid.rooms}
         self.pulses, self.windows, self.cycles, self.pas = [], {r: [] for r in grid.rooms}, boost_cycles, {}
         for r in grid.rooms:
@@ -237,7 +237,12 @@ class Episodes:
                 self.windows[room].append(w)
         for p in spans:
             p.setdefault("clean", False)
-            p["known_ok"] = self.did_not_overshoot(p)
+            p["after_window"] = self.after_window(room, p)
+            p["known_ok"] = not p["after_window"] and self.did_not_overshoot(p)
+
+    def after_window(self, room, p):
+        t, pad = self.grid.t[0] + 60.0 * p["start"], 60.0 * self.cfg["after_window_min"]
+        return any(a <= t <= b + pad for a, b in self.spans.get(room, []))
 
     def did_not_overshoot(self, p):
         c = self.cfg
@@ -470,7 +475,7 @@ class BoostLearn:
         wcfg["lake"] = lake
         self.grid = Grid.load(lake, wcfg)
         self.cycles = boost_cycles(lake, self.grid, self.cfg)
-        self.eps = Episodes(self.grid, self.cfg, self.cycles)
+        self.eps = Episodes(self.grid, self.cfg, self.cycles, window_spans(lake, self.grid, self.cfg))
         self.post = Posterior(self.cfg).fit(self.eps)
         self.tune_closure()
         self.table = [p for p in self.eps.pulses if p["known_ok"]]
@@ -645,19 +650,58 @@ def boost_cycles(lake, grid, cfg):
     return out
 
 
-def cycle_rows(lake):
+def event_rows(lake, kinds):
     cols = ["ts", "kind", "detail"]
     out = []
     root = Path(lake)
     for f in sorted((root / "parquet" / "events").glob("**/part.parquet")):
-        t = pq.read_table(f, columns=cols, filters=[("kind", "=", "boost_cycle")])
-        out += list(zip(t.column("ts").to_pylist(), t.column("detail").to_pylist()))
+        t = pq.read_table(f, columns=cols, filters=[("kind", "in", list(kinds))])
+        out += list(zip(t.column("ts").to_pylist(), t.column("kind").to_pylist(), t.column("detail").to_pylist()))
     raw = read_arrows(root, "events")
     if raw is not None:
-        k = raw.column("kind").to_pylist()
-        ts, dt = raw.column("ts").to_pylist(), raw.column("detail").to_pylist()
-        out += [(a, b) for a, b, c in zip(ts, dt, k) if c == "boost_cycle"]
+        out += [(a, c, b) for a, b, c in zip(raw.column("ts").to_pylist(), raw.column("detail").to_pylist(), raw.column("kind").to_pylist()) if c in kinds]
     return out
+
+
+def cycle_rows(lake):
+    return [(ts, det) for ts, _, det in event_rows(lake, ("boost_cycle",))]
+
+
+def epoch(ts):
+    return (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def window_spans(lake, grid, cfg):
+    spans, opened = {r: [] for r in grid.rooms}, {}
+    rows = sorted(event_rows(lake, ("window_open", "window_close", "window_episode")), key=lambda e: epoch(e[0]))
+    for ts, kind, det in rows:
+        try:
+            d = json.loads(det) if det else {}
+        except ValueError:
+            continue
+        r, t = d.get("room"), epoch(ts)
+        if r not in spans:
+            continue
+        if kind == "window_open":
+            opened.setdefault(r, t)
+        elif kind == "window_close":
+            spans[r].append((opened.pop(r, t), t))
+        elif d.get("start_ms") and d.get("end_ms"):
+            spans[r].append((d["start_ms"] / 1000.0, d["end_ms"] / 1000.0))
+    for r, t in opened.items():
+        spans[r].append((t, t + 60.0 * cfg["window_hold_min"]))
+    path = Path(lake) / "ground_truth" / "windows.jsonl"
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            w = json.loads(line) if line.strip() else None
+            if not w:
+                continue
+            a = epoch(datetime.fromisoformat(w["open_utc"]))
+            b = epoch(datetime.fromisoformat(w["close_utc"])) if w.get("close_utc") else a + 60.0 * cfg["window_hold_min"]
+            for r in w["rooms_open"]:
+                if r in spans:
+                    spans[r].append((a, b))
+    return spans
 
 
 def newest_cycles(lake):
@@ -702,7 +746,7 @@ def boostlearn(config, lake, models_dir, validate=False, version=None):
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bundle = bl.bundle(version)
     meta = {"version": version, "created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "train_from": utc(bl.grid.t[0]).isoformat(), "train_to": utc(bl.grid.t[-1]).isoformat(),
-            "boost_cycles": {r: len(v) for r, v in bl.cycles.items()}, "episodes": {r: sum(1 for e in bl.table if e["room"] == r) for r in bl.eps.rooms}, "radius": bundle["trust"]["radius"], "k": bundle["trust"]["k"],
+            "boost_cycles": {r: len(v) for r, v in bl.cycles.items()}, "episodes": {r: sum(1 for e in bl.table if e["room"] == r) for r in bl.eps.rooms}, "after_window_excluded": {r: sum(1 for p in bl.eps.pulses if p["room"] == r and p["after_window"]) for r in bl.eps.rooms}, "radius": bundle["trust"]["radius"], "k": bundle["trust"]["k"],
             "hyper": bundle["hyper"], "peak_sigma_k": bundle["risk"]["peak_sigma_k"], "first_boost": bl.justification(bundle)}
     if validate:
         meta["validation"] = bl.validate(bundle)

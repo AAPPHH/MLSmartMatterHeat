@@ -64,6 +64,11 @@ def add_cycle(lake, minute, room="wohnzimmer", **detail):
     write(lake, "events", [stamps([minute]), ["boost_cycle"], [5], [json.dumps(d)]], schema, f"c{minute}")
 
 
+def add_window(lake, kind, minute, room="wohnzimmer", **detail):
+    schema = pa.schema([("ts", pa.timestamp("us", "UTC")), ("kind", pa.string()), ("node", pa.uint64()), ("detail", pa.string())])
+    write(lake, "events", [stamps([minute]), [kind], [5], [json.dumps(dict({"room": room}, **detail))]], schema, f"w{kind}{minute}")
+
+
 def bundle_from(lake, tmp_path, **boost):
     cfg = copy.deepcopy(CFG)
     cfg["boost"].update(boost)
@@ -258,6 +263,33 @@ def test_boost_cycle_known_only_without_overshoot_and_dose_is_boost_minutes(lake
     boosts = [e for e in bundle["trust"]["episodes"] if e["boost"]]
     assert len(boosts) == 1 and boosts[0]["scenario"] == "morning" and boosts[0]["dose"] == 7.0
     assert len(bundle["trust"]["episodes"]) <= len([e for e in base["trust"]["episodes"] if not e["boost"]]) + 1
+
+
+def test_pulses_within_the_window_block_are_not_known_and_counted(lake, tmp_path):
+    at = 300 + 260 * 3
+    add_cycle(lake, at, overshoot_c=0.1, scenario="morning", target=30.0, boost_min=7.0)
+    add_cycle(lake, at + 260, overshoot_c=0.1, scenario="morning", target=30.0, boost_min=7.0)
+    add_window(lake, "window_open", at - 140)
+    add_window(lake, "window_close", at - 120)
+    _, _, bundle, meta = bundle_from(lake, tmp_path)
+    boosts = [e for e in bundle["trust"]["episodes"] if e["boost"]]
+    assert len(boosts) == 1
+    assert meta["after_window_excluded"]["wohnzimmer"] >= 1 and meta["after_window_excluded"]["bad"] == 0
+    none = bundle_from(lake, tmp_path / "b", after_window_min=0)[3]
+    assert none["after_window_excluded"]["wohnzimmer"] < meta["after_window_excluded"]["wohnzimmer"]
+
+
+def test_ground_truth_windows_also_block(lake, tmp_path):
+    at = 300 + 260 * 3
+    add_cycle(lake, at, overshoot_c=0.1, scenario="morning", target=30.0, boost_min=7.0)
+    gt = lake / "ground_truth"
+    gt.mkdir()
+    a = datetime.fromtimestamp(T0 + 60 * (at - 200), timezone.utc).isoformat()
+    b = datetime.fromtimestamp(T0 + 60 * (at - 100), timezone.utc).isoformat()
+    (gt / "windows.jsonl").write_text(json.dumps({"open_utc": a, "close_utc": b, "rooms_open": ["wohnzimmer"]}))
+    _, _, bundle, meta = bundle_from(lake, tmp_path)
+    assert not [e for e in bundle["trust"]["episodes"] if e["boost"]]
+    assert meta["after_window_excluded"]["wohnzimmer"] >= 1
 
 
 def test_measured_overshoot_excludes_episodes(lake, tmp_path):
