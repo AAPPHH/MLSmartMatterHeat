@@ -44,7 +44,7 @@ CONFIG = {
         "parity_rows": 400, "parity_tol": 1e-4, "parity_nan_frac": 0.05,
     },
     "window": {
-        "lake": "/home/user/AppData/Local/Temp/claude/ebd84cbf4dbe962a/349be985-dace-4f4a-be42-5da1745ce8a6/scratchpad/lake2",
+        "lake": "data/lake",
         "rooms": ["wohnzimmer", "schlafzimmer", "bad", "kueche"], "nodes": {"wohnzimmer": 5, "schlafzimmer": 6, "bad": 7, "kueche": 8},
         "utc_offset_min": 60, "valid": {"temp": [0.0, 45.0], "valve": [0.0, 100.0]}, "ffill_min": {"temp": 10, "valve": 30, "setpoint": 360}, "weather_max_age_min": 180,
         "open_valve_pct": 10.0, "v1_open_cap_min": 40, "frost_max_c": 8.5, "frost_cap_min": 360,

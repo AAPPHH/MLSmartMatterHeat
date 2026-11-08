@@ -10,7 +10,7 @@ from heattrain.thermal import RoomData, ThermalModel, build_rooms, fit_room, nig
 CFG = copy.deepcopy(CONFIG["thermal"])
 TRUE = {"a1": 8.0, "a2": 2.0, "b1": 0.6, "b2": 0.5, "b3": 0.04, "b4": 0.3, "w": 0.7, "ts": 55.0, "ts_night": 55.0}
 T0 = 1_790_000_000.0
-LAKE = Path(os.environ.get("HEAT_LAKE_TODAY", r"/home/user\AppData\Local\Temp\claude\c--clones-MLSmartMatterHeat\349be985-dace-4f4a-be42-5da1745ce8a6\scratchpad\lake_today"))
+LAKE = Path(os.environ.get("HEAT_LAKE_TODAY", "data/lake_today"))
 
 
 def simulate(hours=72, seed=0, report_p=0.25, invalid=0.03, noise=0.03):

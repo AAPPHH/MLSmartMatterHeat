@@ -3,7 +3,7 @@ name = "heatml"
 version = "0.1.0"
 description = "Add your description here"
 authors = [
-    { name = "AAPPHH", email = "147189916+AAPPHH@users.noreply.github.com" }
+    { name = "AAPPHH" }
 ]
 requires-python = ">=3.12"
 dependencies = [

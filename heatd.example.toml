@@ -60,8 +60,8 @@ sleep_hours = "23-7"
 
 [chip_tool]
 binary = "chip-tool"
-# storage_dir = "/home/aapphh/snap/chip-tool/common"
-paa_trust_store = "/home/aapphh/snap/chip-tool/common/paa-root-certs"
+# storage_dir = "/home/user/snap/chip-tool/common"
+paa_trust_store = "/home/user/snap/chip-tool/common/paa-root-certs"
 bypass_attestation = false
 endpoint = 1
 subscribe_min_s = 30
