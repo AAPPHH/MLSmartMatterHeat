@@ -317,6 +317,8 @@ heatd erkennt offene Fenster mit einem gelernten Physik-Residuum-Modell (Detekto
 | `GET` | `/api/state` | Räume, Temperaturen, Sollwerte, letzter Raum je Gerät |
 | `POST` | `/watch/measurement` | `{device, ts, measurements:[{sender, rssi, freq oder channel}]}` nach `watch_raw` |
 | `POST` | `/watch/label` | wie `/api/label`, nach `labels` |
+| `GET` | `/watch/update` | App-Update der Uhr: `{version_code, version_name, sha256, size}` oder 404 (nichts veröffentlicht oder Prüfsumme/Größe passt nicht) |
+| `GET` | `/watch/update.apk` | die APK dazu (`application/vnd.android.package-archive`); Dateien `update.json` + `update.apk` in `[watch] update_dir` (Standard `/data/watch_update`, im Docker-Mount `data/`), veröffentlicht mit `deploy/watch-publish.sh` auf dem PC |
 | `POST` | `/api/snapshot` | DuckDB-Snapshot für das Training |
 | `POST` | `/api/window` | `{room, open}` |
 | `POST` | `/api/boost` | `{room, minutes?}` manueller Boost (Szenario `manual`) über denselben Sicherheitsweg, 200 mit Entscheidung oder 409 mit `reason` |

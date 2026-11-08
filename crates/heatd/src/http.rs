@@ -11,7 +11,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use matter_controller::MatterController;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 
 use std::collections::HashMap;
@@ -207,6 +208,8 @@ pub fn router(state: AppState) -> Router {
         .route("/watch/label/void", post(label_void))
         .route("/api/ambient", post(ambient))
         .route("/api/usage", get(usage))
+        .route("/watch/update", get(update_manifest))
+        .route("/watch/update.apk", get(update_apk))
         .with_state(state)
 }
 
@@ -940,6 +943,95 @@ async fn usage(State(state): State<AppState>, axum::extract::Query(q): axum::ext
     Ok(Json(result))
 }
 
+#[derive(Serialize, Deserialize)]
+struct UpdateManifest {
+    version_code: i64,
+    version_name: String,
+    sha256: String,
+    size: u64,
+}
+
+static UPDATE_REJECT: Mutex<String> = Mutex::new(String::new());
+
+fn update_verdict(reason: Option<String>) {
+    let mut last = UPDATE_REJECT.lock().unwrap_or_else(|e| e.into_inner());
+    match reason {
+        Some(reason) if *last != reason => {
+            eprintln!("watch update rejected: {reason}");
+            *last = reason;
+        }
+        None => last.clear(),
+        _ => {}
+    }
+}
+
+fn check_update(json: &[u8], apk: &mut std::fs::File) -> Result<UpdateManifest, String> {
+    use std::io::Read;
+    let manifest: UpdateManifest = serde_json::from_slice(json).map_err(|e| format!("update.json: {e}"))?;
+    let size = apk.metadata().map_err(|e| e.to_string())?.len();
+    if size != manifest.size {
+        return Err(format!("size {size} differs from update.json {}", manifest.size));
+    }
+    let (mut hasher, mut buf) = (Sha256::new(), vec![0u8; 64 * 1024]);
+    loop {
+        match apk.read(&mut buf).map_err(|e| e.to_string())? {
+            0 => break,
+            n => hasher.update(&buf[..n]),
+        }
+    }
+    let digest: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if !digest.eq_ignore_ascii_case(&manifest.sha256) {
+        return Err(format!("sha256 {digest} differs from update.json {}", manifest.sha256));
+    }
+    Ok(manifest)
+}
+
+fn verified_update(dir: &std::path::Path) -> Option<UpdateManifest> {
+    let json = std::fs::read(dir.join("update.json")).ok()?;
+    let mut apk = std::fs::File::open(dir.join("update.apk")).ok()?;
+    let checked = check_update(&json, &mut apk);
+    update_verdict(checked.as_ref().err().cloned());
+    checked.ok()
+}
+
+async fn published_update(state: &AppState) -> Result<Option<UpdateManifest>, ApiError> {
+    let dir = std::path::PathBuf::from(&state.config.watch.update_dir);
+    Ok(tokio::task::spawn_blocking(move || verified_update(&dir)).await.map_err(anyhow::Error::from)?)
+}
+
+async fn update_manifest(State(state): State<AppState>) -> Response {
+    match published_update(&state).await {
+        Ok(Some(manifest)) => Json(manifest).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn update_apk(State(state): State<AppState>) -> Response {
+    let manifest = match published_update(&state).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return e.into_response(),
+    };
+    let Ok(file) = tokio::fs::File::open(std::path::Path::new(&state.config.watch.update_dir).join("update.apk")).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stream = futures_util::stream::unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(buf)), file))
+            }
+            Err(e) => Some((Err(e), file)),
+        }
+    });
+    let headers = [("content-type", "application/vnd.android.package-archive".to_string()), ("content-length", manifest.size.to_string())];
+    (headers, axum::body::Body::from_stream(stream)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,6 +1129,60 @@ mod tests {
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{CONTRACT}/{name}")).unwrap()
+    }
+
+    fn update_harness(files: &[(&str, &[u8])]) -> (Harness, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let head = format!("away_guard_minutes = 0\n[watch]\nupdate_dir = '{}'\n", dir.path().to_str().unwrap().replace('\\', "/"));
+        (harness_with(false, &head, "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n"), dir)
+    }
+
+    fn manifest_json(apk: &[u8], size: usize) -> String {
+        let sha: String = Sha256::digest(apk).iter().map(|b| format!("{b:02x}")).collect();
+        json!({"version_code": 30, "version_name": "4.0.1", "sha256": sha, "size": size}).to_string()
+    }
+
+    async fn get_bytes(state: &AppState, uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let response = router(state.clone()).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let (status, headers) = (response.status(), response.headers().clone());
+        (status, headers, response.into_body().collect().await.unwrap().to_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn watch_update_serves_manifest_and_streams_apk() {
+        let apk: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let manifest = manifest_json(&apk, apk.len());
+        let (h, _dir) = update_harness(&[("update.json", manifest.as_bytes()), ("update.apk", &apk)]);
+        let (status, value) = call(&h.state, "GET", "/watch/update", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((value["version_code"].as_i64(), value["version_name"].as_str(), value["size"].as_u64()), (Some(30), Some("4.0.1"), Some(apk.len() as u64)));
+        let (status, headers, body) = get_bytes(&h.state, "/watch/update.apk").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "application/vnd.android.package-archive");
+        assert_eq!(headers["content-length"], apk.len().to_string());
+        assert_eq!(body, apk);
+    }
+
+    #[tokio::test]
+    async fn watch_update_missing_is_404() {
+        let (h, _dir) = update_harness(&[]);
+        assert_eq!(call(&h.state, "GET", "/watch/update", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_bytes(&h.state, "/watch/update.apk").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn watch_update_rejects_mismatched_sha_and_size() {
+        let apk = b"apk bytes".to_vec();
+        let wrong_sha = manifest_json(b"other bytes", apk.len());
+        let (h, dir) = update_harness(&[("update.json", wrong_sha.as_bytes()), ("update.apk", &apk)]);
+        assert_eq!(call(&h.state, "GET", "/watch/update", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_bytes(&h.state, "/watch/update.apk").await.0, StatusCode::NOT_FOUND);
+        std::fs::write(dir.path().join("update.json"), manifest_json(&apk, apk.len() + 1)).unwrap();
+        assert_eq!(call(&h.state, "GET", "/watch/update", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get_bytes(&h.state, "/watch/update.apk").await.0, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
