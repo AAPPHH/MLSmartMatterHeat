@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -46,10 +49,14 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -104,9 +111,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun route(store: Store): String = when {
-        prompt -> Routes.ROOMS
-        windowIntent && WindowEvent.live(store.windowPending, System.currentTimeMillis()) != null -> Routes.ASK
-        else -> Routes.HOME
+        !prompt && windowIntent && WindowEvent.live(store.windowPending, System.currentTimeMillis()) != null -> Routes.ASK
+        else -> Routes.ROOMS
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -152,31 +158,35 @@ class MainActivity : ComponentActivity() {
     private fun Nav(store: Store, start: String) {
         val nav = rememberSwipeDismissableNavController()
         var saved by remember { mutableStateOf<Saved?>(null) }
-        var external by remember { mutableStateOf(start != Routes.HOME) }
+        var detail by remember { mutableStateOf("") }
+        var external by remember { mutableStateOf(prompt || start != Routes.ROOMS) }
         val leave = {
-            if (external) finish() else nav.popBackStack(Routes.HOME, false)
+            if (external) finish() else nav.popBackStack(Routes.ROOMS, false)
             Unit
         }
         val ui = { f: () -> Unit -> runOnUiThread(f) }
         val show = { text: String, id: String ->
             saved = Saved(text, id)
-            nav.navigate(Routes.SAVED) { popUpTo(Routes.HOME) }
+            nav.navigate(Routes.SAVED) { popUpTo(Routes.ROOMS) }
             Unit
         }
         LaunchedEffect(newIntents) {
             if (newIntents > 0) {
                 val r = route(store)
-                external = r != Routes.HOME
-                if (r != Routes.HOME) nav.navigate(r) { popUpTo(Routes.HOME); launchSingleTop = true }
+                external = prompt || r != Routes.ROOMS
+                if (r != Routes.ROOMS) nav.navigate(r) { popUpTo(Routes.ROOMS); launchSingleTop = true }
+                else nav.popBackStack(Routes.ROOMS, false)
             }
         }
-        SwipeDismissableNavHost(nav, startDestination = start, userSwipeEnabled = start != Routes.ROOMS) {
-            composable(Routes.HOME) { HomeRoute(store, nav, show, ui) }
-            composable(Routes.ROOMS) { RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt) { if (prompt) finish() } }
+        SwipeDismissableNavHost(nav, startDestination = start) {
+            composable(Routes.ROOMS) {
+                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, { room -> detail = room; nav.navigate(Routes.DETAIL) }, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }) { if (prompt) finish() }
+            }
+            composable(Routes.DETAIL) { DetailRoute(store, detail, show, ui) }
+            composable(Routes.ALERTS) { AlertsRoute(store) { nav.navigate(Routes.ASK) } }
+            composable(Routes.TECH) { TechRoute(store) { nav.navigate(Routes.DATA) } }
             composable(Routes.DATA) { DataRoute(store) }
             composable(Routes.ASK) { AskRoute(store, show, leave, ui) }
-            composable(Routes.WINDOWS) { WindowsRoute(store, show, ui) }
-            composable(Routes.BOOST) { BoostRoute() }
             composable(Routes.SAVED) {
                 val s = saved
                 if (s == null) LaunchedEffect(Unit) { leave() }
@@ -186,12 +196,35 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun HomeRoute(store: Store, nav: NavHostController, show: (String, String) -> Unit, ui: (() -> Unit) -> Unit) {
+    private fun DetailRoute(store: Store, room: String, show: (String, String) -> Unit, ui: (() -> Unit) -> Unit) {
+        val version = storeVersion(store)
+        val g = RoomView.glance(version.let { store.glance }, room)
+        var result by remember { mutableStateOf<BoostResult?>(null) }
+        var busy by remember { mutableStateOf(false) }
+        var confirm by remember { mutableStateOf(false) }
+        if (confirm) return BoostConfirmScreen(room, {
+            confirm = false
+            busy = true
+            Remote.boost(this, room) { r -> ui { result = r; busy = false; Remote.refresh(this, true) } }
+        }) { confirm = false }
+        RoomDetailScreen(room, g, result, busy, Heat.heatable(room, null), {
+            val open = g?.open != true
+            WindowPrompter.selfReport(this, room, open) { id -> ui { show("Fenster ${WindowEvent.caption(room)} ${if (open) "auf" else "zu"}", id) } }
+        }) { confirm = true }
+    }
+
+    @Composable
+    private fun AlertsRoute(store: Store, onAsk: () -> Unit) {
+        val version = storeVersion(store)
+        AlertsScreen(version.let { store.alerts }, WindowEvent.live(version.let { store.windowPending }, System.currentTimeMillis()), onAsk)
+    }
+
+    @Composable
+    private fun TechRoute(store: Store, onData: () -> Unit) {
         val version = storeVersion(store)
         var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
         val holdUntil = version.let { store.wifiHoldUntil }
         val holdOn = WifiHold.active(holdUntil, now)
-        LaunchedEffect(Unit) { Remote.refresh(this@MainActivity) }
         LaunchedEffect(holdOn) {
             while (holdOn) {
                 now = System.currentTimeMillis()
@@ -199,22 +232,11 @@ class MainActivity : ComponentActivity() {
             }
         }
         val learning = version.let { store.learnAt != 0L }
-        val room = (store.stayLabel() ?: store.guess)?.takeIf { it in Defaults.ROOMS }
-        val state = HomeState(
-            room, version.let { store.glance.openRooms() }, WindowEvent.live(version.let { store.windowPending }, now), version.let { store.alerts },
+        val state = TechState(
             Learn.chip(learning, store.progress), learning, WifiHold.chip(holdUntil, now), holdOn,
             Footer.line(store.postHm, store.postOk, ScanQueue.get(this).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected)
         )
-        HomeScreen(state, HomeActions(
-            onAsk = { nav.navigate(Routes.ASK) },
-            onWindow = { open -> room?.let { r -> WindowPrompter.selfReport(this, r, open) { id -> ui { show("Fenster ${WindowEvent.caption(r)} ${if (open) "auf" else "zu"}", id) } } } },
-            onRooms = { nav.navigate(Routes.ROOMS) },
-            onWindows = { nav.navigate(Routes.WINDOWS) },
-            onBoost = { nav.navigate(Routes.BOOST) },
-            onData = { nav.navigate(Routes.DATA) },
-            onLearn = { ScanService.instance?.setLearning(!learning) },
-            onHold = { ScanService.instance?.toggleWifiHold() }
-        ))
+        TechScreen(state, onData, { ScanService.instance?.setLearning(!learning) }, { ScanService.instance?.toggleWifiHold() })
     }
 
     @Composable
@@ -233,35 +255,6 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun WindowsRoute(store: Store, show: (String, String) -> Unit, ui: (() -> Unit) -> Unit) {
-        val version = storeVersion(store)
-        WindowsScreen(WindowEvent.rooms(version.let { store.progress }), version.let { store.glance.openRooms() }) { room, open ->
-            WindowPrompter.selfReport(this, room, open) { id -> ui { show("Fenster ${WindowEvent.caption(room)} ${if (open) "auf" else "zu"}", id) } }
-        }
-    }
-
-    @Composable
-    private fun BoostRoute() {
-        var rooms by remember { mutableStateOf<List<BoostRoom>?>(null) }
-        var result by remember { mutableStateOf<BoostResult?>(null) }
-        var busy by remember { mutableStateOf<String?>(null) }
-        val reload = { Remote.boostState(this) { r -> runOnUiThread { rooms = r } } }
-        LaunchedEffect(Unit) { reload() }
-        var confirm by remember { mutableStateOf<String?>(null) }
-        BoostScreen(rooms, result, busy, confirm, { confirm = it }) { room ->
-            confirm = null
-            busy = room
-            Remote.boost(this, room) { r ->
-                runOnUiThread {
-                    result = r
-                    busy = null
-                    reload()
-                }
-            }
-        }
-    }
-
-    @Composable
     private fun DataRoute(store: Store) {
         val version = storeVersion(store)
         ScreenScaffold(timeText = {}) {
@@ -274,12 +267,12 @@ class MainActivity : ComponentActivity() {
 }
 
 internal object Routes {
-    const val HOME = "home"
     const val ROOMS = "rooms"
+    const val DETAIL = "detail"
+    const val ALERTS = "alerts"
+    const val TECH = "tech"
     const val DATA = "data"
     const val ASK = "ask"
-    const val WINDOWS = "windows"
-    const val BOOST = "boost"
     const val SAVED = "saved"
 }
 
@@ -295,7 +288,7 @@ private fun storeVersion(store: Store): Int {
 }
 
 @Composable
-private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, finish: () -> Unit) {
+private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, onDetail: (String) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, finish: () -> Unit) {
     val ctx = LocalContext.current
     val version = storeVersion(store)
     var tapped by remember { mutableStateOf<String?>(null) }
@@ -310,6 +303,7 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
     val learning = version.let { store.learnAt != 0L }
     val learnView = Learn.view(learning, version.let { store.progress })
     val pal = palette()
+    LaunchedEffect(Unit) { if (!prompt) Remote.refresh(ctx) }
     LaunchedEffect(version, tapped) {
         if (learnPrompt && tapped == null && choosing == null && store.learnPromptAt == 0L) finish()
     }
@@ -351,7 +345,9 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
             val hint = if (locked && view == null && state == Tap.THROTTLED) "Warte ${Tap.remainingS(until, now)} s" else null
             (hint ?: Prompt.title(change, learnPrompt).takeIf { prompt })?.let { Text(it, Modifier.align(Alignment.TopCenter).padding(top = 14.dp), fontSize = 10.sp, color = pal.text, maxLines = 1) }
             val (hot, ringed) = Highlight.of(store.stayLabel(), store.guess)
-            RoomsPage(hot, ringed, locked, learnView) {
+            val glance = version.let { store.glance }
+            val badge = RoomView.badge(version.let { store.alerts }, WindowEvent.live(version.let { store.windowPending }, System.currentTimeMillis()))
+            RoomsPage(hot, ringed, locked, learnView, glance, badge, onDetail, onAlerts, onTech) {
                 if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
                     if (Heat.heatable(it, store.progress)) choosing = it else pick(it, false)
                 }
@@ -375,26 +371,36 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
     }
 }
 
-internal class Palette(val selected: Color, val ink: Color, val idle: Color, val low: Color, val done: Color, val track: Color, val caption: Color, val legend: Color, val text: Color)
+internal class Palette(val selected: Color, val ink: Color, val idle: Color, val low: Color, val done: Color, val track: Color, val caption: Color, val legend: Color, val text: Color, val alert: Color)
 
 @Composable
 internal fun palette(): Palette = MaterialTheme.colorScheme.let {
-    Palette(it.primary, it.onPrimary, it.surfaceContainer, it.tertiaryContainer, it.surfaceContainerLow, it.surfaceContainerLow, it.onSurfaceVariant, it.onSurface, it.onSurface)
+    Palette(it.primary, it.onPrimary, it.surfaceContainer, it.tertiaryContainer, it.surfaceContainerLow, it.surfaceContainerLow, it.onSurfaceVariant, it.onSurface, it.onSurface, it.error)
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: Boolean = false, onLong: (String) -> Unit = {}, onBadge: () -> Unit = {}, onTech: () -> Unit = {}, onTap: (String) -> Unit) {
     val pal = palette()
     val fill = { room: String -> if (room == hot) pal.selected else when (learn?.tones?.get(room)) { RoomTone.LOW -> pal.low; RoomTone.DONE -> pal.done; else -> pal.idle } }
+    val current = LocalDensity.current
+    CompositionLocalProvider(LocalDensity provides Density(current.density, minOf(current.fontScale, Quarters.MAX_FONT))) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val dDp = minOf(maxWidth, maxHeight)
         Canvas(
-            Modifier.fillMaxSize().pointerInput(Unit) {
-                detectTapGestures { o ->
-                    val d = minOf(size.width, size.height).toFloat()
-                    val room = Quarters.room(o.x - size.width / 2f, o.y - size.height / 2f, d)
-                    onTap(room)
-                }
+            Modifier.fillMaxSize().pointerInput(badge) {
+                detectTapGestures(
+                    onLongPress = { o ->
+                        val dx = o.x - size.width / 2f
+                        val dy = o.y - size.height / 2f
+                        val room = Quarters.room(dx, dy, minOf(size.width, size.height).toFloat())
+                        if (Quarters.hot(dx, dy, density)) onTech() else if (room != Defaults.NONE) onLong(room)
+                    },
+                    onTap = { o ->
+                        val dx = o.x - size.width / 2f
+                        val dy = o.y - size.height / 2f
+                        if (badge && Quarters.hot(dx, dy, density)) onBadge() else onTap(Quarters.room(dx, dy, minOf(size.width, size.height).toFloat()))
+                    }
+                )
             }
         ) {
             val d = minOf(size.width, size.height)
@@ -421,6 +427,10 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             val centre = Path().apply { addOval(Rect(c, Quarters.CENTER_R * d)) }
             drawPath(centre, fill(Quarters.CENTER))
             if (Quarters.CENTER == ringed) clipPath(centre) { drawPath(centre, pal.text, style = Stroke(ring)) }
+            if (badge) {
+                drawCircle(Color.Black, (Quarters.BADGE_R + 2f).dp.toPx(), c + Offset(Quarters.BADGE_AT.dp.toPx(), -Quarters.BADGE_AT.dp.toPx()))
+                drawCircle(pal.alert, Quarters.BADGE_R.dp.toPx(), c + Offset(Quarters.BADGE_AT.dp.toPx(), -Quarters.BADGE_AT.dp.toPx()))
+            }
             val pillTopLeft = Offset(c.x - Quarters.NONE_HALF_W * d, c.y + Quarters.NONE_TOP * d)
             val pillSize = Size(2f * Quarters.NONE_HALF_W * d, Quarters.NONE_H * d)
             val corner = CornerRadius(pillSize.height / 2f)
@@ -428,6 +438,13 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             drawRoundRect(if (Defaults.NONE == hot) pal.selected else pal.idle, pillTopLeft, pillSize, corner)
             if (Defaults.NONE == ringed) drawRoundRect(pal.text, pillTopLeft, pillSize, corner, style = Stroke(2.dp.toPx()))
         }
+        if (badge) Box(
+            Modifier.align(Alignment.Center).offset(Quarters.HOT_R.dp, -Quarters.HOT_R.dp).size((2f * Quarters.HOT_R).dp).semantics {
+                role = Role.Button
+                contentDescription = "Hinweise"
+                onClick { onBadge(); true }
+            }
+        )
         Text(
             Prompt.caption(Defaults.NONE, null),
             Modifier.align(Alignment.Center).offset(y = ((Quarters.NONE_TOP + Quarters.NONE_H / 2f) * dDp.value).dp).semantics(mergeDescendants = true) {
@@ -443,19 +460,32 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             val r = if (isCenter) 0f else Quarters.labelDp(room, dDp.value)
             val dim = locked || learn?.tones?.get(room) == RoomTone.DONE
             val ink = if (room == hot) pal.ink else if (dim) pal.caption else pal.text
-            Column(
-                Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp).semantics(mergeDescendants = true) {
-                    role = Role.Button
-                    contentDescription = "Raum " + Defaults.CAPTIONS.getValue(room)
-                    onClick { onTap(room); true }
-                },
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink)
-                Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, maxLines = 1, color = ink)
+            val rg = RoomView.glance(glance, room)
+            val mark = RoomView.mark(rg)
+            val mod = Modifier.align(Alignment.Center).offset((r * cos(a)).dp, (r * sin(a)).dp).semantics(mergeDescendants = true) {
+                role = Role.Button
+                contentDescription = listOfNotNull("Raum " + Defaults.CAPTIONS.getValue(room), RoomView.temp(rg)?.replace("°", " Grad"), mark.word.takeIf { it.isNotEmpty() }).joinToString(", ")
+                onClick { onTap(room); true }
+                customActions = listOf(CustomAccessibilityAction("Raumdetails") { onLong(room); true })
+            }
+            val icon = @Composable { Icon(painterResource(RoomIcons.RES.getValue(room)), room, Modifier.size((if (isCenter) 28 else 24).dp), tint = ink) }
+            val info: @Composable ColumnScope.() -> Unit = {
+                Text(Defaults.CAPTIONS.getValue(room), fontSize = (if (isCenter) 11 else 10).sp, lineHeight = 11.sp, maxLines = 1, color = ink)
+                if (rg?.temp != null || mark.res != null) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    RoomView.temp(rg)?.let { Text(it, fontSize = 10.sp, lineHeight = 11.sp, maxLines = 1, color = ink) }
+                    mark.res?.let { Icon(painterResource(it), mark.word, Modifier.size(12.dp), tint = ink) }
+                }
                 learn?.badges?.get(room)?.let { Text(it, fontSize = 9.sp, lineHeight = 9.sp, maxLines = 1, color = ink) }
             }
+            if (room == Quarters.WIDE) Row(mod, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                icon()
+                Column(horizontalAlignment = Alignment.CenterHorizontally, content = info)
+            } else Column(mod, horizontalAlignment = Alignment.CenterHorizontally) {
+                icon()
+                info()
+            }
         }
+    }
     }
 }
 

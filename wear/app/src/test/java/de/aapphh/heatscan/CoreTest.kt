@@ -1984,7 +1984,7 @@ class CoreTest {
         val o = JSONObject("""{"id":"w1","room":"kueche","question":"open","reason":"Temperatur faellt schnell"}""")
         val a = WindowEvent.parse(o, 5L)!!
         assertEquals("Temperatur faellt schnell", a.reason)
-        assertEquals("Küche: Temperatur faellt schnell", WindowEvent.text(a))
+        assertEquals("Küche: Temperatur fällt schnell", WindowEvent.text(a))
         assertEquals("", WindowEvent.parse(JSONObject("""{"id":"w1","room":"kueche","question":"open","reason":null}"""), 5L)!!.reason)
         assertEquals("Bad", WindowEvent.text(WindowAsk("w", "bad", true)))
         assertEquals(a, WindowEvent.fromJson(WindowEvent.json(a)))
@@ -2060,26 +2060,68 @@ class CoreTest {
     }
 
     @Test
-    fun boostResultShowsServerDecisionOrReason() {
+    fun boostResultShowsPlainWords() {
         JSONObject(Boost.body("bad")).let { assertEquals("bad", it.getString("room")); assertEquals(5, it.getInt("minutes")) }
         val ok = Boost.result(200, """{"ok":true,"state":"armed","reason":"Szenario manual","cycle":{"minutes":5.0}}""")
         assertTrue(ok.ok)
-        assertEquals("Boost 5 min: startet - Szenario manual", ok.line)
-        val no = Boost.result(409, """{"ok":false,"reason":"kein Boost-Modell geladen"}""")
-        assertFalse(no.ok)
-        assertEquals("kein Boost-Modell geladen", no.line)
+        assertEquals("Boost läuft: 5 min", ok.line)
+        assertEquals("Boost ist gerade nicht möglich", Boost.result(409, """{"ok":false,"reason":"kein Boost-Modell geladen"}""").line)
+        assertEquals("Gerade kein Boost: Fenster war offen", Boost.result(409, """{"ok":false,"reason":"kein Boost: Fenster war vor 5 min offen (Masse noch warm)"}""").line)
+        assertEquals("Boost nur morgens oder nach dem Heimkommen", BoostText.plain("Szenario manual ist kein Boost-Szenario, geboostet wird nur morgens und bei Heimkehr"))
+        assertEquals("Der Raum ist schon warm genug", BoostText.plain("Raum ist schon am Ziel"))
+        assertEquals(BoostText.FALLBACK, BoostText.plain("irgendwas"))
         assertEquals("Server nicht erreichbar", Boost.result(-1, "").line)
         assertEquals("Antwort unlesbar (500)", Boost.result(500, "x").line)
-        val rooms = Boost.rooms("""{"summary":{},"rooms":[{"room":"bad","boost":{"state":"idle","reason":"kein Boost-Modell geladen"}},{"room":"kueche","boost":{"state":"boosting","reason":null}}]}""")!!
-        assertEquals(listOf(BoostRoom("bad", "idle", "kein Boost-Modell geladen"), BoostRoom("kueche", "boosting", "")), rooms)
-        assertNull(Boost.rooms("garbage"))
+    }
+
+    @Test
+    fun glanceCarriesReasonAndBoostForRoomView() {
+        val state = """{"rooms":[{"name":"kueche","window_open":false,"boost":{"state":"boosting","cycle":{"minutes":5.0,"written_ts":1000000}},"nodes":[{"local_temperature":20.0,"occupied_heating_setpoint":22.0,"reason":"boost"}]},{"name":"bad","window_open":false,"boost":{"state":"idle","cycle":null},"nodes":[{"local_temperature":21.0,"occupied_heating_setpoint":18.0,"reason":"away"}]},{"name":"flur","window_open":false,"nodes":[{"local_temperature":19.9,"occupied_heating_setpoint":20.0,"reason":"home"}]},{"name":"schlafzimmer","window_open":true,"nodes":[{"local_temperature":18.0,"occupied_heating_setpoint":20.0,"reason":"window_open"}]},{"name":"wohnzimmer","window_open":false,"nodes":[{"local_temperature":19.0,"occupied_heating_setpoint":21.0,"reason":"home"}]}]}"""
+        val g = Glance.parse(state, 5L)!!
+        val k = RoomView.glance(g, "kueche")!!
+        assertTrue(k.boosting)
+        assertEquals(1_300_000L, k.boostUntil)
+        assertEquals("Schnell aufheizen bis " + RoomView.clock(1_300_000L), RoomView.why(k))
+        assertEquals(RoomMark.BOOST, RoomView.mark(k))
+        assertEquals("Du bist weg – Sparmodus", RoomView.why(RoomView.glance(g, "bad")))
+        assertEquals(RoomMark.AWAY, RoomView.mark(RoomView.glance(g, "bad")))
+        assertEquals(RoomMark.NONE, RoomView.mark(RoomView.glance(g, "flur")))
+        assertEquals("Du bist zuhause", RoomView.why(RoomView.glance(g, "flur")))
+        assertEquals(RoomMark.WINDOW, RoomView.mark(RoomView.glance(g, "schlafzimmer")))
+        assertEquals("Fenster offen – Heizung pausiert", RoomView.why(RoomView.glance(g, "schlafzimmer")))
+        assertEquals(RoomMark.HEATING, RoomView.mark(RoomView.glance(g, "wohnzimmer")))
+        assertEquals("19,0° · heizt", RoomView.tile(RoomView.glance(g, "wohnzimmer")))
+        assertEquals("Ziel 22,0°", RoomView.target(k))
+        assertNull(RoomView.temp(null))
+        assertNull(RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "mystery")))
+        assertEquals("Boost beendet", RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "boost_off")))
+        assertEquals("Schnell aufheizen", RoomView.why(RoomGlance("bad", 20.0, 22.0, false, "boost", true)))
+        assertEquals(g, Glance.fromJson(g.json()))
+        assertTrue(RoomView.badge(listOf(Alert("a", "t", "x")), null))
+        assertFalse(RoomView.badge(emptyList(), null))
+    }
+
+    @Test
+    fun plainTextHidesJargon() {
+        assertEquals("Thermostat", Plain.text("Heizung: Thermostat"))
+        assertEquals("Bad antwortet nicht.", Plain.text("Bad (Node 5) antwortet nicht."))
+        assertEquals("Sollwert wird nicht übernommen", Plain.text("Sollwert wird nicht uebernommen"))
+        assertFalse(Plain.text("x heatd schreibt sie erneut").contains("heatd"))
+    }
+
+    @Test
+    fun centreHotZoneSitsUpperRightOfCentre() {
+        assertTrue(Quarters.hot(24f, -24f, 1f))
+        assertTrue(Quarters.hot(48f, -48f, 2f))
+        assertFalse(Quarters.hot(-24f, 24f, 1f))
+        assertFalse(Quarters.hot(0f, 0f, 3f))
     }
 
     @Test
     fun tileLinesSummariseRoomsWindowsAndAlerts() {
         val g = Glance(1_000L, listOf(RoomGlance("bad", 20.0, 21.0, false), RoomGlance("kueche", 19.0, 20.0, true)))
-        val l = GlanceView.lines(g, listOf(Alert("a", "Heizung: Thermostat", "t")), 2_000L).map { it.text }
-        assertEquals(listOf("Bad 20,0/21,0", "Küche 19,0/20,0", "Offen: Küche", "! Heizung: Thermostat"), l.take(4))
+        val l = GlanceView.lines(g, listOf(Alert("a", "Thermostat", "t")), 2_000L, "kueche").map { it.text }
+        assertEquals(listOf("Küche 19,0° · Fenster offen", "Bad 20,0° · heizt", "Thermostat"), l.take(3))
         assertTrue(l.last().startsWith("Stand "))
         assertEquals(GlanceView.NONE, GlanceView.lines(Glance.EMPTY, emptyList(), 5L).first().text)
         assertEquals(GlanceView.NONE, GlanceView.lines(g, emptyList(), 1_000L + Glance.STALE_MS + 1).first().text)

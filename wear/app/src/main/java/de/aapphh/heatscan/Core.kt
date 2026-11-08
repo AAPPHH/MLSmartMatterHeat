@@ -129,7 +129,7 @@ object WindowEvent {
 
     fun caption(room: String) = Defaults.CAPTIONS[room] ?: room
 
-    fun text(a: WindowAsk) = caption(a.room) + (if (a.reason.isNotEmpty()) ": " + a.reason else "")
+    fun text(a: WindowAsk) = caption(a.room) + (if (a.reason.isNotEmpty()) ": " + Plain.text(a.reason) else "")
 
     fun open(a: WindowAsk, answer: WindowAnswer): Boolean = when (answer) {
         WindowAnswer.YES -> a.open
@@ -187,7 +187,7 @@ object WindowEvent {
 object Heat {
     const val CHOICE_MS = 8_000L
     const val YES = "Heizen"
-    const val NO = "nur Label"
+    const val NO = "Nur merken"
 
     fun default(learning: Boolean) = !learning
 
@@ -635,7 +635,14 @@ object Quarters {
 
     fun labelR(room: String): Float = LABEL_R + (LABEL_SHIFT[room] ?: 0f)
 
-    const val LABEL_H_DP = 44f
+    const val LABEL_H_DP = 34f
+    const val WIDE = "kueche"
+    const val MAX_FONT = 1.1f
+    const val BADGE_R = 5f
+    const val BADGE_AT = 26f
+    const val HOT_R = 24f
+
+    fun hot(dx: Float, dy: Float, density: Float): Boolean = kotlin.math.hypot(dx - HOT_R * density, dy + HOT_R * density) <= HOT_R * density
 
     fun labelDp(room: String, dDp: Float): Float {
         val r = labelR(room) * dDp
@@ -733,7 +740,7 @@ object ReplyJson {
     fun alert(o: JSONObject?): Alert? = o?.let {
         val title = it.optString("title")
         val text = it.optString("text")
-        if (title.isEmpty() && text.isEmpty()) null else Alert(it.optString("id", title + text), title, text)
+        if (title.isEmpty() && text.isEmpty()) null else Alert(it.optString("id", title + text), Plain.text(title), Plain.text(text))
     }
 
     fun alerts(o: JSONObject): List<Alert> = list(o.optJSONArray("alerts")?.toString()) { alert(it) }.filterNotNull().ifEmpty { listOfNotNull(alert(o.optJSONObject("alert"))) }

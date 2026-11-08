@@ -25,19 +25,20 @@ import java.util.Date
 import java.util.Locale
 
 object GlanceView {
-    const val NONE = "keine Daten"
+    const val NONE = "Noch keine Daten"
     const val MAX_ROOMS = 5
 
     class Line(val text: String, val tone: Tone)
 
     enum class Tone { NORMAL, WARN, DIM }
 
-    fun lines(g: Glance, alerts: List<Alert>, now: Long): List<Line> {
+    fun lines(g: Glance, alerts: List<Alert>, now: Long, here: String? = null): List<Line> {
         val out = mutableListOf<Line>()
         if (g.rooms.isEmpty() || Span.ms(now, g.at) > Glance.STALE_MS) out += Line(NONE, Tone.DIM)
-        else g.rooms.take(MAX_ROOMS).forEach { out += Line(Glance.line(it), if (it.open) Tone.WARN else Tone.NORMAL) }
-        g.openRooms().takeIf { it.isNotEmpty() && out.first().text != NONE }?.let { out += Line("Offen: " + it.joinToString { r -> WindowEvent.caption(r) }, Tone.WARN) }
-        alerts.firstOrNull()?.let { out += Line("! " + it.title.ifEmpty { it.text }, Tone.WARN) }
+        else g.rooms.sortedByDescending { it.room == here }.take(MAX_ROOMS).forEach {
+            out += Line(listOf(WindowEvent.caption(it.room), RoomView.tile(it)).filter { t -> t.isNotEmpty() }.joinToString(" "), if (RoomView.mark(it) == RoomMark.WINDOW) Tone.WARN else Tone.NORMAL)
+        }
+        alerts.firstOrNull()?.let { out += Line(it.title.ifEmpty { it.text }, Tone.WARN) }
         if (g.at > 0L) out += Line("Stand " + SimpleDateFormat("HH:mm", Locale.GERMANY).format(Date(g.at)), Tone.DIM)
         return out
     }
@@ -52,7 +53,7 @@ class HeatTileService : TileService() {
     override fun onTileRequest(requestParams: RequestBuilders.TileRequest): ListenableFuture<TileBuilders.Tile> {
         val store = Store(this)
         val layout = materialScope(this, requestParams.deviceConfiguration) {
-            val lines = GlanceView.lines(store.glance, store.alerts, System.currentTimeMillis())
+            val lines = GlanceView.lines(store.glance, store.alerts, System.currentTimeMillis(), (store.stayLabel() ?: store.guess)?.takeIf { it in Defaults.ROOMS })
             primaryLayout(mainSlot = { card(onClick = open(), content = { column(lines) }) }, onClick = open())
         }
         val tile = TileBuilders.Tile.Builder()
@@ -85,6 +86,6 @@ class HeatTileService : TileService() {
     }
 
     companion object {
-        private const val RES_VERSION = "6"
+        private const val RES_VERSION = "7"
     }
 }
