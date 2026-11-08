@@ -20,7 +20,7 @@ data class Ap(val bssid: String, val rssi: Int, val freq: Int)
 
 object Defaults {
     const val SERVER = "http://192.168.178.29:8090"
-    const val HOME = "FRITZ!Box 1234 AB"
+    val HOME: String = BuildConfig.HOME
     val ROOMS = listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur")
     const val NONE = "keiner"
     val LABELS = ROOMS + NONE

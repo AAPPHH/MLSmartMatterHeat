@@ -11,6 +11,11 @@ val keystoreProps = Properties().apply {
     if (f.exists()) f.reader().use { load(it) }
 }
 
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.reader().use { load(it) }
+}
+
 android {
     namespace = "de.aapphh.heatscan"
     compileSdk = 37
@@ -20,6 +25,8 @@ android {
         targetSdk = 37
         versionCode = 33
         versionName = "4.1.1"
+        val home = localProps.getProperty("heatscan.home", "HomeWiFi").replace("\\", "\\\\").replace("\"", "\\\"")
+        buildConfigField("String", "HOME", "\"$home\"")
     }
     signingConfigs {
         if (!keystoreProps.isEmpty) {
@@ -41,7 +48,7 @@ android {
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

@@ -30,3 +30,4 @@ wear/keystore.properties
 /chip-storage/
 /deploy/docker/.env
 /paa/
+/inventory/

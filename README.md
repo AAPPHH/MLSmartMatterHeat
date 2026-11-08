@@ -40,7 +40,7 @@ Das Skript baut zuerst das RCP-Image (`ot_rcp`, ESP32-H2), dann den Border Route
 **WLAN-Variante (aktiv):** Die Zugangsdaten stehen in `firmware/br/sdkconfig.wifi.local`; die Datei ist gitignored:
 
 ```
-CONFIG_EXAMPLE_WIFI_SSID="FRITZ!Box 1234 AB"
+CONFIG_EXAMPLE_WIFI_SSID="MyHomeWiFi"
 CONFIG_EXAMPLE_WIFI_PASSWORD="..."
 ```
 

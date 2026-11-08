@@ -261,9 +261,9 @@ class CoreTest {
     fun homeSsidMatching() {
         val home = Home.parse("FRITZ!Box 1234 AB, Other")
         assertEquals(listOf("FRITZ!Box 1234 AB", "Other"), home)
-        assertTrue(Home.isHome(listOf("x", "FRITZ!Box 1234 AB"), home))
+        assertTrue(Home.isHome(listOf("x", "fritz!box 1234 ab"), home))
         assertTrue(Home.isHome(listOf("\"Other\""), home))
-        assertFalse(Home.isHome(listOf("x", "", "FRITZ!Box 1234 AB"), home))
+        assertFalse(Home.isHome(listOf("x", "", "FRITZ!Box 1234"), home))
         assertFalse(Home.isHome(emptyList(), home))
         assertTrue(Home.isHome(listOf("x"), Home.parse(" , ")))
         assertEquals(listOf(Defaults.HOME), Home.parse(Defaults.HOME))

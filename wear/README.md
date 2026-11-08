@@ -20,4 +20,5 @@ adb shell pm install -r -i de.aapphh.heatscan /data/local/tmp/app-release.apk
 ```
 
 - Neue APKs muessen mit demselben Zertifikat signiert sein (`wear/keystore.properties`), sonst lehnt Android das Update ab.
+- Heim-WLAN: `heatscan.home=<SSID>` in `wear/local.properties` (gitignored) setzt den Standardwert fuer das Heim-WLAN; ohne Eintrag `HomeWiFi`.
 - Die Berechtigungen `REQUEST_INSTALL_PACKAGES` und `UPDATE_PACKAGES_WITHOUT_USER_ACTION` stehen im Manifest; auf der Uhr muss "Unbekannte Apps installieren" fuer HeatScan erlaubt sein.
