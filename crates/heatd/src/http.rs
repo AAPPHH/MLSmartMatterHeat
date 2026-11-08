@@ -986,36 +986,35 @@ fn check_update(json: &[u8], apk: &mut std::fs::File) -> Result<UpdateManifest, 
     Ok(manifest)
 }
 
-fn verified_update(dir: &std::path::Path) -> Option<UpdateManifest> {
+fn verified_update(dir: &std::path::Path) -> Option<(UpdateManifest, std::fs::File)> {
+    use std::io::Seek;
     let json = std::fs::read(dir.join("update.json")).ok()?;
     let mut apk = std::fs::File::open(dir.join("update.apk")).ok()?;
-    let checked = check_update(&json, &mut apk);
+    let checked = check_update(&json, &mut apk).and_then(|m| apk.rewind().map(|_| m).map_err(|e| e.to_string()));
     update_verdict(checked.as_ref().err().cloned());
-    checked.ok()
+    checked.ok().map(|m| (m, apk))
 }
 
-async fn published_update(state: &AppState) -> Result<Option<UpdateManifest>, ApiError> {
+async fn published_update(state: &AppState) -> Result<Option<(UpdateManifest, std::fs::File)>, ApiError> {
     let dir = std::path::PathBuf::from(&state.config.watch.update_dir);
     Ok(tokio::task::spawn_blocking(move || verified_update(&dir)).await.map_err(anyhow::Error::from)?)
 }
 
 async fn update_manifest(State(state): State<AppState>) -> Response {
     match published_update(&state).await {
-        Ok(Some(manifest)) => Json(manifest).into_response(),
+        Ok(Some((manifest, _))) => Json(manifest).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => e.into_response(),
     }
 }
 
 async fn update_apk(State(state): State<AppState>) -> Response {
-    let manifest = match published_update(&state).await {
-        Ok(Some(manifest)) => manifest,
+    let (manifest, file) = match published_update(&state).await {
+        Ok(Some(published)) => published,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return e.into_response(),
     };
-    let Ok(file) = tokio::fs::File::open(std::path::Path::new(&state.config.watch.update_dir).join("update.apk")).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let file = tokio::fs::File::from_std(file);
     let stream = futures_util::stream::unfold(file, |mut file| async move {
         use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 64 * 1024];
