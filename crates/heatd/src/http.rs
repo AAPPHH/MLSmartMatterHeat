@@ -2590,7 +2590,7 @@ nodes = [5]
             e.ts = (now - minutes_ago * 60_000) * 1000;
             h.state.sink.append(e).unwrap();
         }
-        let old = lake::Event { ts: (now - 400 * 60_000) * 1000, ..lake::Event::now(kind::WINDOW_CLOSE, "heatd").with_detail(json!({"room": "kueche"})) };
+        let old = lake::Event { ts: (now - 1000 * 60_000) * 1000, ..lake::Event::now(kind::WINDOW_CLOSE, "heatd").with_detail(json!({"room": "kueche"})) };
         h.state.sink.append(old).unwrap();
         let fresh = AppState { windows: Default::default(), ..restarted(&h) };
         assert_eq!(fresh.windows.lock().unwrap().open_ago_min("wohnzimmer", now), None);
@@ -2598,6 +2598,36 @@ nodes = [5]
         let ago = fresh.windows.lock().unwrap().open_ago_min("wohnzimmer", now).unwrap();
         assert!((ago - 90.0).abs() < 0.01, "{ago}");
         assert_eq!(fresh.windows.lock().unwrap().open_ago_min("kueche", now), None);
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_an_open_window_without_a_close_and_refuses_the_morning_boost() {
+        for (source, minutes_ago) in [("manual", 195), ("auto", 195), ("manual", 800)] {
+            let h = late_harness();
+            let now = now_ms();
+            let mut e = lake::Event::now(kind::WINDOW_OPEN, "heatd").with_detail(json!({"room": "wohnzimmer", "source": source}));
+            e.ts = (now - minutes_ago * 60_000) * 1000;
+            h.state.sink.append(e).unwrap();
+            let fresh = AppState { windows: Default::default(), boost: crate::boost::Boost::new(&h.state.config), ..restarted(&h) };
+            assert_eq!(crate::restore::restore_windows(&fresh, now).unwrap(), 1);
+            let still_open = fresh.windows.lock().unwrap().open_rooms().contains("wohnzimmer");
+            assert_eq!(still_open, source == "manual" && minutes_ago < 720, "{source} {minutes_ago}");
+            fresh.boost.set_model(crate::boostlearn::tests::light_model());
+            let step = |ago_ms: i64, sleep: bool| {
+                let t = now - ago_ms;
+                for (attribute, value) in [(crate::window::LOCAL_TEMPERATURE, 16.0), (crate::window::PI_HEATING_DEMAND, 10.0)] {
+                    fresh.boost.observe(5, attribute, value, t);
+                }
+                let window_ago_min = fresh.windows.lock().unwrap().open_ago_min("wohnzimmer", t);
+                let rooms = [crate::boost::RoomIn { room: "wohnzimmer".into(), setpoint: if sleep { 18.0 } else { 21.0 }, blocked: None, no_raise: false, no_supply: false, window_ago_min }];
+                fresh.boost.step(&crate::boost::StepIn { now_ms: t, hour: 6.5, outdoor: Some((5.0, None)), radiation: None, presence_known: true, sleep, away: false, rooms: &rooms });
+            };
+            step(60_000, true);
+            step(0, false);
+            let view = fresh.boost.view("wohnzimmer");
+            let reason = view["reason"].as_str().unwrap();
+            assert!(reason.starts_with("kein Boost: Fenster war vor"), "{source} {minutes_ago} {reason}");
+        }
     }
 
     #[tokio::test]

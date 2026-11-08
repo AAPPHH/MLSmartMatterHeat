@@ -13,6 +13,7 @@ use std::path::Path;
 
 const MIN_MS: i64 = 60_000;
 const LABEL_LOOKBACK_MS: i64 = 24 * 3_600_000;
+const EVENT_LOOKBACK_MAX_MS: i64 = 24 * 3_600_000;
 
 struct Rec {
     ts: i64,
@@ -82,17 +83,33 @@ fn stays(root: &Path, from_ms: i64, now_ms: i64) -> Result<Vec<(i64, String, Sta
 }
 
 pub fn restore_windows(state: &AppState, now_ms: i64) -> Result<usize> {
-    let from_ms = now_ms - (state.config.boost.after_window_min * MIN_MS as f64) as i64;
+    let (boost, window) = (&state.config.boost, &state.config.window);
+    let lookback_ms = ((boost.after_window_min + window.manual_max_min) * MIN_MS as f64) as i64;
+    anyhow::ensure!(lookback_ms <= EVENT_LOOKBACK_MAX_MS, "window restore lookback {lookback_ms} ms exceeds the two-date events read");
     let mut found = 0;
-    for r in records(state.sink.root(), Table::Events, from_ms, now_ms, &["kind", "detail"], &[], &[])? {
+    let mut open: BTreeMap<String, (i64, bool)> = BTreeMap::new();
+    for r in records(state.sink.root(), Table::Events, now_ms - lookback_ms, now_ms, &["kind", "detail"], &[], &[])? {
         let [Some(k), Some(detail)] = &r.text[..] else { continue };
         if k != kind::WINDOW_OPEN && k != kind::WINDOW_CLOSE {
             continue;
         }
-        if let Some(room) = serde_json::from_str::<Value>(detail).ok().and_then(|d| d["room"].as_str().map(String::from)) {
-            state.windows.lock().unwrap().note_open(&room, r.ts);
-            found += 1;
+        let Some(d) = serde_json::from_str::<Value>(detail).ok() else { continue };
+        let Some(room) = d["room"].as_str() else { continue };
+        state.windows.lock().unwrap().note_open(room, r.ts);
+        if k == kind::WINDOW_OPEN {
+            open.insert(room.to_string(), (r.ts, d["source"].as_str() == Some("manual")));
+        } else {
+            open.remove(room);
         }
+        found += 1;
+    }
+    let mut windows = state.windows.lock().unwrap();
+    for (room, (ts, manual)) in open {
+        let hold_end = ts + ((if manual { window.manual_max_min } else { window.hold_min }) * MIN_MS as f64) as i64;
+        if manual && hold_end > now_ms {
+            drop(windows.manual(&room, true, ts));
+        }
+        windows.note_open(&room, hold_end.min(now_ms));
     }
     Ok(found)
 }
