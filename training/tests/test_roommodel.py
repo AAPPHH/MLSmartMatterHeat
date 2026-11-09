@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.roomfit import fit_bundle, fit_shock, run_batch, shock_defaults
+from heattrain.roomfit import fit_bundle, fit_shock, run_batch, shock_defaults, tune_windows
 from heattrain.thermal import House, RoomData, RoomIn, RoomPar, build_rooms, kalman, plan
 from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
 from test_thermal import CFG, T0, simulate
@@ -183,15 +183,35 @@ def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
     config = copy.deepcopy(CONFIG)
     rm = config["roommodel"]
     rm["shock"].update(days=1, passes=1, grid={"q_calm": [0.01, 0.03], "p_jump": [1e-3], "q_jump": [0.3]})
+    rm["fit"].update(warm_min=120, max_nfev=40)
     bundle, report = fit_bundle(config, rooms, tmp_path, version="20261101T000000Z")
     assert bundle["kind"] == "room_model" and set(bundle["rooms"]) == {"wohnzimmer", "kueche"}
     s = bundle["shock"]
     assert 0 < s["p_jump"] < 1 and s["lambda_w"] > 1 and s["lambda_jump"] > s["lambda_w"]
     for r in bundle["rooms"].values():
-        assert set(r["params"]) == {"a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night"}
-        assert all(math.isfinite(v) for v in r["params"].values()) and r["sigma_u"] > 0
+        assert set(r["params"]) == {"a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night", "tau_v"}
+        assert all(math.isfinite(v) for v in r["params"].values()) and r["sigma_u"] > 0 and r["valve_obs"] is False
     json.dumps(bundle)
-    assert report["forecast_20min"]["wohnzimmer"]["n"] > 0
+    pooled = report["holdout"]["pooled"]
+    assert pooled["H20"]["n"] > 0 and pooled["H60"]["skill"] > 0.0
+    assert all(i["all"]["converged"] for i in report["fit"].values())
+
+
+def test_window_threshold_is_refused_without_hits_and_ties_prefer_fewer_false_alarms():
+    rc = copy.deepcopy(CONFIG["roommodel"])
+    rc["shock"].update(lambda_w_grid=[1.5, 2.0, 3.0], hit_min=20, pad_min=30, fa_weight=1.0)
+    g = type("G", (), {})()
+    g.names, g.dt = ["r"], 60.0
+    g.times = 1_790_000_000.0 + 60.0 * np.arange(600)
+    lam = np.ones(600)
+    rec = {"r": {"lam": lam, "lam_std": np.full(600, 0.01)}}
+    gt = [(g.times[300], g.times[340], ["r"])]
+    lw, lj, info = tune_windows(g, rec, rc, gt, [])
+    assert info["refused"] and lw == rc["shock"]["lambda_w"] and "warning" in info
+    lam[305:330] = 2.6
+    lam[100:110] = 1.8
+    lw, lj, info = tune_windows(g, rec, rc, gt, [])
+    assert not info["refused"] and lw == 2.0
 
 
 def test_parity_fixture_is_in_sync_with_the_model():
