@@ -110,7 +110,7 @@ impl DeviceConfig {
 
     pub fn subscription(&self) -> DeviceSubscription {
         let (default_min, default_max) = self.kind.primary();
-        let default_min = if self.kind == DeviceKind::Plug && self.role != "coffee" { default_min.max(CALM_PLUG_MIN_S) } else { default_min };
+        let default_min = if self.kind == DeviceKind::Plug && self.role != ROLE_COFFEE { default_min.max(CALM_PLUG_MIN_S) } else { default_min };
         let (min_s, max_s) = (self.min_s.unwrap_or(default_min), self.max_s.unwrap_or(default_max));
         match self.kind.fast_clusters() {
             [] => DeviceSubscription { min_s, max_s, fast: None, events: false },

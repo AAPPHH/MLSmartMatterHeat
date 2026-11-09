@@ -186,12 +186,13 @@ name = "Espressomaschine"
 wake_on = true
 wake_window = "06:00-09:00"
 
-# [[devices]]
-# node = 10
-# kind = "plug"
-# role = "charger"
-# room = "wohnzimmer"
-# name = "Ladegeraet"
+[[devices]]
+node = 10
+kind = "plug"
+role = "toothbrush"
+room = "bad"
+name = "Zahnbuerstenstation"
+min_s = 10
 
 [[devices]]
 node = 11

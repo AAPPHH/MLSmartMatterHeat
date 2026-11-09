@@ -66,13 +66,15 @@ fn on_offs(mock: &MockController) -> usize {
 
 #[test]
 fn shipped_configs_list_the_new_devices() {
-    for (file, count) in [("heatd.example.toml", 4), ("deploy/docker/heatd.docker.toml", 3)] {
+    for (file, count) in [("heatd.example.toml", 4), ("deploy/docker/heatd.docker.toml", 4)] {
         let config = Config::parse(&std::fs::read_to_string(format!("{}/../../{file}", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
         assert_eq!(config.devices.len(), count, "{file}");
         assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
         let coffee: Vec<&DeviceConfig> = config.devices.iter().filter(|d| d.wake_on).collect();
         assert_eq!((coffee.len(), coffee[0].node, coffee[0].role.as_str(), coffee[0].wake_window.as_str(), coffee[0].onoff_endpoint), (1, 9, "coffee", "06:00-09:00", 1));
         assert!(config.devices.iter().find(|d| d.node == 12).unwrap().room.is_none());
+        let brush = config.devices.iter().find(|d| d.node == 10).unwrap();
+        assert_eq!((brush.role.as_str(), brush.room.as_deref(), brush.subscription().fast.unwrap().min_s), ("toothbrush", Some("bad"), 10));
     }
     assert!(Config::default().devices.is_empty());
 }
@@ -499,4 +501,18 @@ fn storage_estimate_for_a_dense_power_stream() {
     let raw = size(dir.path().join("raw/device_readings"));
     let parquet = size(dir.path().join("parquet/device_readings/date=2026-11-10/node=9"));
     println!("rows {rows} raw {raw} B ({:.1} B/row) parquet {parquet} B ({:.2} B/row)", raw as f64 / rows as f64, parquet as f64 / rows as f64);
+}
+
+#[test]
+fn a_toothbrush_plug_is_a_calm_read_only_plug_with_the_configured_fast_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = "[[devices]]
+node = 10
+kind = 'plug'
+role = 'toothbrush'
+min_s = 10
+";
+    let config = config(dir.path(), cfg);
+    assert_eq!(config.devices[0].subscription().fast.unwrap().min_s, 10);
+    assert!(CoffeePlug::from_config(&config.devices[0]).is_none());
 }

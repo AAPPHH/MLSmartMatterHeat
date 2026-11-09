@@ -204,9 +204,10 @@ max_s = 60
 [[devices]]
 node = 10
 kind = "plug"
-role = "charger"
-room = "wohnzimmer"
-name = "Ladegeraet"
+role = "toothbrush"
+room = "bad"
+name = "Zahnbuerstenstation"
+min_s = 10
 
 [[devices]]
 node = 11
