@@ -173,3 +173,9 @@ restart_grace_s = 180.0
 verify_min = 10.0
 tolerance_c = 0.3
 alert_retries = 3
+
+[room_model]
+enabled = true
+model_dir = "/models/room_model"
+raise_cost_min = 15.0
+cold_cost_min = 1.0

@@ -178,3 +178,8 @@ def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
         assert all(math.isfinite(v) for v in r["params"].values()) and r["sigma_u"] > 0
     json.dumps(bundle)
     assert report["forecast_20min"]["wohnzimmer"]["n"] > 0
+
+
+def test_parity_fixture_is_in_sync_with_the_model():
+    from make_room_model_fixture import OUT, build
+    assert json.loads(OUT.read_text()) == json.loads(json.dumps(build(), separators=(",", ":")))

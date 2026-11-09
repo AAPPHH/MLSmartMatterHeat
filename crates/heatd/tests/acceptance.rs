@@ -107,6 +107,7 @@ async fn phase1_acceptance_simulated_day() {
     assert_eq!(post(&state, "/watch/sensors", sensors.to_string()).await, axum::http::StatusCode::OK);
     sink.append(lake::WatchInference { ts: midnight() + 12 * HOUR, matcher: "room".into(), template_id: "none".into(), abstained: true, reason: Some("no_model".into()), state: "rest".into(), features_hash: "0".into(), model_version: "none".into(), ..Default::default() }).unwrap();
     sink.append(lake::Ambient { ts: midnight() + 12 * HOUR, source: "minix".into(), sensor: "nvme_c".into(), value: 40.0, unit: "C".into() }).unwrap();
+    sink.append(lake::ShadowDecision { ts: midnight() + 12 * HOUR, room: "a".into(), why: "a: Modell passt".into(), kind: "live".into(), model_version: "v".into(), ..Default::default() }).unwrap();
     let before: Vec<(Table, i64)> = Table::ALL.into_iter().map(|t| (t, raw_rows(&sink, t))).collect();
     for (t, n) in &before {
         assert!(*n > 0, "{} empty", t.name());
