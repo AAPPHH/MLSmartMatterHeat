@@ -114,6 +114,29 @@ pub fn restore_windows(state: &AppState, now_ms: i64) -> Result<usize> {
     Ok(found)
 }
 
+pub fn restore_holds(state: &AppState, now_ms: i64) -> Result<usize> {
+    let lookback_ms = (crate::manual::MAX_HOLD_MIN * MIN_MS as f64) as i64;
+    let mut latest: BTreeMap<String, (i64, Value)> = BTreeMap::new();
+    for r in records(state.sink.root(), Table::Events, now_ms - lookback_ms, now_ms, &["kind", "detail"], &[], &[])? {
+        let [Some(k), Some(detail)] = &r.text[..] else { continue };
+        let Some(d) = serde_json::from_str::<Value>(detail).ok().filter(|_| k == kind::MANUAL_SETPOINT) else { continue };
+        if let Some(room) = d["room"].as_str() {
+            latest.insert(room.to_string(), (r.ts, d));
+        }
+    }
+    let mut commands = state.commanded.lock().unwrap();
+    let mut restored = 0;
+    for (room, (since, d)) in latest {
+        let (Some(target), Some(until), Some(source)) = (d["target"].as_f64(), d["until_ts"].as_i64(), d["source"].as_str().and_then(crate::rules::HoldSource::parse)) else { continue };
+        let Some(room) = state.config.rooms.iter().find(|r| r.name == room) else { continue };
+        if d["cleared"].as_bool() != Some(true) && until > now_ms {
+            commands.set_manual(&room.nodes, target, since, until, source);
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}
+
 pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
     let cfg = &state.config;
     if !cfg.presence.restore {

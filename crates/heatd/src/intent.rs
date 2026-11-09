@@ -8,6 +8,8 @@ pub enum Intent {
     Boost { room: String, minutes: Option<f64> },
     WindowOpen { room: String },
     WindowClose { room: String },
+    Setpoint { room: String, celsius: Option<f64>, hold_min: Option<f64>, source: Option<String> },
+    SetpointClear { room: String, source: Option<String> },
 }
 
 pub struct Reply {
@@ -28,6 +30,8 @@ pub fn apply(state: &AppState, intent: Intent) -> Reply {
             };
             Reply { status, body }
         }
+        Intent::Setpoint { room, celsius, hold_min, source } => crate::manual::set(state, &room, celsius, hold_min, source.as_deref(), now_ms()),
+        Intent::SetpointClear { room, source } => crate::manual::clear(state, &room, source.as_deref(), now_ms()),
         Intent::WindowOpen { room } => window(state, &room, true),
         Intent::WindowClose { room } => window(state, &room, false),
     }

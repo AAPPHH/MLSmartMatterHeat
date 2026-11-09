@@ -101,10 +101,50 @@ pub enum Check {
     Mismatch(f64, f64, i64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HoldSource {
+    Dial,
+    Api,
+    Watch,
+}
+
+impl HoldSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dial => "dial",
+            Self::Api => "api",
+            Self::Watch => "watch",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::Api, Self::Watch].into_iter().find(|s| s.name() == name)
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Watch => "manual_watch",
+            _ => "manual_api",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Hold {
     pub value: f64,
     pub since_ms: i64,
+    pub until_ms: i64,
+    pub source: HoldSource,
+}
+
+impl Hold {
+    fn explicit(&self) -> bool {
+        self.source != HoldSource::Dial
+    }
+
+    pub fn view(&self) -> serde_json::Value {
+        json!({"value": self.value, "target": self.value, "since_ts": self.since_ms, "until_ts": self.until_ms, "source": self.source.name()})
+    }
 }
 
 #[derive(Debug, Default)]
@@ -202,7 +242,7 @@ impl Commands {
 
     pub fn check(&self, node: u64, tolerance: f64, now_ms: i64, pending_ms: i64) -> Check {
         let (Some(sent), Some(device), Some(at)) = (self.sent.get(&node), self.device.get(&node), self.device_ms.get(&node)) else { return Check::Unknown };
-        if self.holds.contains_key(&node) || sent.written_ms <= 0 {
+        if self.dialed(&[node]) || sent.written_ms <= 0 {
             return Check::Unknown;
         }
         if *at < sent.written_ms {
@@ -246,31 +286,62 @@ impl Commands {
 
     #[cfg(test)]
     pub fn test_hold(&mut self, node: u64, value: f64) {
-        self.holds.insert(node, Hold { value, since_ms: 0 });
+        self.holds.insert(node, Hold { value, since_ms: 0, until_ms: i64::MAX, source: HoldSource::Dial });
     }
 
     pub fn holding(&self, nodes: &[u64]) -> bool {
         nodes.iter().any(|n| self.holds.contains_key(n))
     }
 
+    pub fn dialed(&self, nodes: &[u64]) -> bool {
+        nodes.iter().any(|n| self.holds.get(n).is_some_and(|h| !h.explicit()))
+    }
+
+    pub fn set_manual(&mut self, nodes: &[u64], value: f64, since_ms: i64, until_ms: i64, source: HoldSource) {
+        for &node in nodes {
+            self.holds.insert(node, Hold { value, since_ms, until_ms, source });
+        }
+    }
+
+    pub fn clear_holds(&mut self, nodes: &[u64]) -> bool {
+        nodes.iter().filter_map(|n| self.drop_hold(*n)).count() > 0
+    }
+
+    fn drop_hold(&mut self, node: u64) -> Option<Hold> {
+        let hold = self.holds.remove(&node)?;
+        self.sent.insert(node, Sent { target: hold.value, previous: None, written_ms: 0, acked: None, stale: None });
+        Some(hold)
+    }
+
+    fn apply_manual(&self, want: &mut Desired, now_ms: i64) -> bool {
+        let Some(hold) = self.holds.get(&want.node).filter(|h| h.explicit() && now_ms < h.until_ms) else { return false };
+        if want.reason == "window_open" {
+            return false;
+        }
+        (want.setpoint, want.reason, want.rule, want.experiment_id) = (hold.value, hold.source.reason(), "manual", None);
+        true
+    }
+
     fn drifted(&self, node: u64, grace_ms: i64) -> bool {
         let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
         let (Some(device), Some(at), Some(sent)) = (self.device.get(&node), self.device_ms.get(&node), self.sent.get(&node)) else { return false };
-        at - sent.written_ms >= grace_ms && !self.holds.contains_key(&node) && !near(*device, sent.target) && !sent.acked.is_some_and(|a| near(a, *device))
+        at - sent.written_ms >= grace_ms && !self.dialed(&[node]) && !near(*device, sent.target) && !sent.acked.is_some_and(|a| near(a, *device))
     }
 
     pub fn hold(&self, node: u64) -> Option<&Hold> {
         self.holds.get(&node)
     }
 
-    fn release_due(&mut self, want: &Desired, now_ms: i64, hold_ms: i64) -> Option<bool> {
+    fn release_due(&mut self, want: &Desired, now_ms: i64) -> Option<bool> {
         let Some(hold) = self.holds.get(&want.node) else { return Some(false) };
-        if now_ms - hold.since_ms < hold_ms && !matches!(want.reason, "window_open" | "away") {
+        let live = now_ms < hold.until_ms;
+        if live && hold.explicit() {
+            return Some(false);
+        }
+        if live && !matches!(want.reason, "window_open" | "away") {
             return None;
         }
-        if let Some(hold) = self.holds.remove(&want.node) {
-            self.sent.insert(want.node, Sent { target: hold.value, previous: None, written_ms: 0, acked: None, stale: None });
-        }
+        self.drop_hold(want.node);
         Some(true)
     }
 }
@@ -573,7 +644,7 @@ fn proposal(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, rea
             window_open: Some(want.window_open),
             away: Some(want.occupancy == "away"),
             system_mode: reading("system_mode").map(mode_name),
-            extra: Some(json!({"phase": "proposal", "reason": want.reason, "source": want.source, "sleep": want.sleep}).to_string()),
+            extra: Some(proposal_extra(state, want)),
             ..Default::default()
         },
         setpoint_old: old,
@@ -585,6 +656,19 @@ fn proposal(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, rea
         commit: lake::COMMIT.into(),
         ..Default::default()
     }
+}
+
+fn proposal_extra(state: &AppState, want: &Desired) -> String {
+    let mut extra = json!({"phase": "proposal", "reason": want.reason, "source": want.source, "sleep": want.sleep});
+    if let Some(note) = window_note(state, want) {
+        extra["note"] = json!(note);
+    }
+    extra.to_string()
+}
+
+fn window_note(state: &AppState, want: &Desired) -> Option<String> {
+    let hold = state.commanded.lock().unwrap().hold(want.node).filter(|h| h.explicit() && want.reason == "window_open").cloned()?;
+    Some(format!("Fenster offen -> {} °C trotz Vorgabe {} °C", crate::manual::celsius_text(want.setpoint), crate::manual::celsius_text(hold.value)))
 }
 
 fn deferred_row(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, readings: &[Reading], presence: Option<&Presence>, why: &str) -> Decision {
@@ -607,6 +691,9 @@ fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Opt
     let levels = [state.config.failsafe.setpoint, state.config.br_watchdog.setpoint_c];
     if want.reason != "boost" && !commands.restored.contains(&want.node) && old.is_some_and(|o| levels.iter().any(|l| (o - l).abs() < MANUAL_TOLERANCE_C)) {
         return Verdict::Exempt("restore");
+    }
+    if matches!(want.reason, "manual_api" | "manual_watch") {
+        return Verdict::Exempt("manual");
     }
     if want.reason == "no_supply" {
         return Verdict::Exempt("supply_cap");
@@ -815,7 +902,6 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         active
     };
     let mut written = Vec::new();
-    let hold_ms = (state.config.manual_hold_minutes * 60_000.0) as i64;
     let (detected, tap) = presence.as_ref().map_or((None, false), |p| (p.detected(&state.config), p.source == "stay_label"));
     let minutes = |m: f64| (m * 60_000.0) as i64;
     let step = state.commanded.lock().unwrap().occ.step(detected.as_deref(), tap, away, now_ms, minutes(state.config.occupancy_enter_min), minutes(state.config.occupancy_exit_min));
@@ -827,8 +913,13 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (presence.is_some(), away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
+    for want in wants.iter_mut() {
+        if state.commanded.lock().unwrap().apply_manual(want, now_ms) {
+            want.setpoint = clamp_boost(&readings, want.node, want.setpoint, state.failsafe.boost_max_c());
+        }
+    }
     state.boost.settle(&wants.iter().map(|w| (w.room.as_str(), w.reason)).collect::<Vec<_>>(), now_ms);
-    let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().holding(&r.nodes), away })).collect();
+    let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().dialed(&r.nodes), away })).collect();
     state.windows.lock().unwrap().set_context(contexts);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))
@@ -850,7 +941,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     for want in wants {
         let (old, prior, verdict) = {
             let mut commands = state.commanded.lock().unwrap();
-            let Some(hold_ended) = commands.release_due(&want, now_ms, hold_ms) else {
+            let Some(hold_ended) = commands.release_due(&want, now_ms) else {
                 continue;
             };
             let last = commands.target(want.node);
@@ -862,7 +953,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                 continue;
             }
             let last_write = commands.last_write.get(&want.node).copied();
-            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off" | "no_supply" | "pi_reset");
+            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off" | "no_supply" | "pi_reset" | "manual_api" | "manual_watch");
             let bypass = hold_ended || drifted || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
             if !bypass && last_write.is_some_and(|(t, _)| now_ms - t < interval_ms) {
                 if commands.deferred.get(&want.node).is_none_or(|d| (d - want.setpoint).abs() >= DESIRED_EPS_C) {
@@ -957,7 +1048,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     }
     let previous = sent.acked.unwrap_or(sent.target);
     commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
-    commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms });
+    commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, until_ms: now_ms + (state.config.manual_hold_minutes * 60_000.0) as i64, source: HoldSource::Dial });
     Some(previous)
 }
 

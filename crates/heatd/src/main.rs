@@ -31,6 +31,9 @@ mod report;
 mod report_tests;
 #[cfg(test)]
 mod dynamics_tests;
+mod manual;
+#[cfg(test)]
+mod manual_tests;
 mod restore;
 mod rules;
 mod status;
@@ -265,6 +268,10 @@ async fn serve(config: Config) -> Result<()> {
     match restore::restore_windows(&state, lake::now_us() / 1000) {
         Ok(n) => println!("window restore: {n} events"),
         Err(e) => eprintln!("window restore: {e:#}"),
+    }
+    match restore::restore_holds(&state, lake::now_us() / 1000) {
+        Ok(n) => println!("manual hold restore: {n} holds"),
+        Err(e) => eprintln!("manual hold restore: {e:#}"),
     }
     rules::spawn_background(state.clone());
     if state.config.br_watchdog.enabled {

@@ -198,6 +198,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
         .route("/api/boost", get(boost_state).post(boost))
+        .route("/api/setpoint", get(setpoint_state).post(setpoint).delete(setpoint_clear))
         .route("/api/label", post(label))
         .route("/api/label/void", post(label_void))
         .route("/api/labels/progress", get(labels_progress))
@@ -710,13 +711,13 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                         "stale": report_age.is_none_or(|a| a > state.config.stale.after_s as f64),
                         "commanded_setpoint": commands.target(node),
                         "health": state.status.node_health_view(node, now_us),
-                        "manual_hold": commands.hold(node).map(|h| json!({"value": h.value, "since_ts": h.since_ms})),
+                        "manual_hold": commands.hold(node).map(|h| h.view()),
                         "reason": setpoint.map(|s| s.reason.clone()),
                         "setpoint_ts": setpoint.map(|s| s.ts),
                     })
                 })
                 .collect();
-            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
+            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "manual": room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| h.view()), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
     Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
@@ -754,6 +755,45 @@ struct BoostBody {
 async fn boost(State(state): State<AppState>, Json(body): Json<BoostBody>) -> Response {
     let reply = crate::intent::apply(&state, crate::intent::Intent::Boost { room: body.room, minutes: body.minutes });
     (reply.status, Json(reply.body)).into_response()
+}
+
+#[derive(Deserialize)]
+struct SetpointBody {
+    room: String,
+    celsius: Option<f64>,
+    hold_min: Option<f64>,
+    #[serde(default)]
+    clear: bool,
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClearQuery {
+    room: String,
+    source: Option<String>,
+}
+
+async fn manual_reply(state: AppState, intent: crate::intent::Intent) -> Response {
+    let reply = crate::intent::apply(&state, intent);
+    let sink = state.sink.clone();
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || sink.flush().map(|_| ())).await {
+        eprintln!("setpoint flush: {e:#}");
+    }
+    state.boost.waker().notify_one();
+    (reply.status, Json(reply.body)).into_response()
+}
+
+async fn setpoint(State(state): State<AppState>, Json(body): Json<SetpointBody>) -> Response {
+    let intent = if body.clear { crate::intent::Intent::SetpointClear { room: body.room, source: body.source } } else { crate::intent::Intent::Setpoint { room: body.room, celsius: body.celsius, hold_min: body.hold_min, source: body.source } };
+    manual_reply(state, intent).await
+}
+
+async fn setpoint_clear(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<ClearQuery>) -> Response {
+    manual_reply(state, crate::intent::Intent::SetpointClear { room: q.room, source: q.source }).await
+}
+
+async fn setpoint_state(State(state): State<AppState>) -> Json<Value> {
+    Json(crate::manual::view(&state, now_ms()))
 }
 
 async fn boost_state(State(state): State<AppState>) -> Json<Value> {
