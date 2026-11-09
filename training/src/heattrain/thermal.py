@@ -86,12 +86,26 @@ def merge_rows(*parts):
     return out
 
 
+def raw_batches(directory, table):
+    root = Path(directory)
+    for f in sorted((root / "raw" / table).glob("*.arrows")) + sorted((root / table).glob("*.arrows")):
+        try:
+            with open(f, "rb") as fh:
+                reader = ipc.open_stream(fh)
+                while True:
+                    try:
+                        yield reader.read_next_batch()
+                    except StopIteration:
+                        break
+        except (pa.ArrowInvalid, OSError):
+            continue
+
+
 def load_events(path, kinds=("startup", "shutdown")):
     p = Path(path)
     out = []
-    t = read_arrows(p, "events")
-    if t is not None:
-        out += [(ts, k) for ts, k in zip(epoch(t.column("ts").to_pylist()), t.column("kind").to_pylist()) if k in kinds]
+    for b in raw_batches(p, "events"):
+        out += [(ts, k) for ts, k in zip(epoch(b.column("ts").to_pylist()), b.column("kind").to_pylist()) if k in kinds]
     base = p / "parquet" / "events"
     if base.is_dir() and any(base.rglob("part.parquet")):
         sql = f"SELECT epoch(ts), kind::VARCHAR FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true) WHERE kind::VARCHAR IN ({','.join(repr(k) for k in kinds)})"

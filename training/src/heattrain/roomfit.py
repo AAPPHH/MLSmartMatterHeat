@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import duckdb
 import numpy as np
-from heattrain.thermal import House, RoomIn, RoomPar, build_rooms, epoch, fit, fit_room, load_events, load_lake, norm_cdf, read_arrows
+from heattrain.thermal import House, RoomIn, RoomPar, build_rooms, epoch, fit, fit_room, load_events, load_lake, norm_cdf, raw_batches
 
 ROOM_KEYS = ("a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night")
 
@@ -12,10 +12,12 @@ ROOM_KEYS = ("a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night")
 def load_window_labels(path):
     p = Path(path)
     out = []
-    t = read_arrows(p, "labels")
-    if t is not None:
-        cols = [t.column(n).to_pylist() for n in ("room", "source", "window_open")]
-        out += [(ts, r, bool(o)) for ts, r, s, o in zip(epoch(t.column("ts").to_pylist()), *cols) if s == "window" and o is not None]
+    for b in raw_batches(p, "labels"):
+        names = b.schema.names
+        if not {"room", "source", "window_open", "ts"} <= set(names):
+            continue
+        cols = [b.column(n).to_pylist() for n in ("room", "source", "window_open")]
+        out += [(ts, r, bool(o)) for ts, r, s, o in zip(epoch(b.column("ts").to_pylist()), *cols) if s == "window" and o is not None]
     base = p / "parquet" / "labels"
     if base.is_dir() and any(base.rglob("part.parquet")):
         sql = f"SELECT epoch(ts), room::VARCHAR, window_open FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true) WHERE source::VARCHAR = 'window' AND window_open IS NOT NULL"
