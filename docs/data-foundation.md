@@ -12,7 +12,7 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 /data/raw/<table>/<file>.arrows.corrupt    quarantined file without a readable schema message (never deleted)
 /data/raw/.migrated_duckdb                 marker written by `heatd migrate`
 /data/parquet/<table>/date=<d>/part.parquet                tables without node column
-/data/parquet/<table>/date=<d>/node=<n>/part.parquet       attribute_reports, events, decisions (node=none for events without node)
+/data/parquet/<table>/date=<d>/node=<n>/part.parquet       attribute_reports, events, decisions, device_readings (node=none for events without node)
 /data/parquet/<table>/date=<d>/.rolled                     roll marker (JSON)
 /data/heatd.duckdb                         operational state only (see below)
 ```
@@ -23,9 +23,9 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 
 ## Schema metadata and versioning
 
-Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `6`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
+Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `7`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
 
-Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`; v4: `labels` columns `label_id`, `voided_label_id`; v5: `labels` column `window_open`; v6: `labels` columns `answer`, `via`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
+Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`; v4: `labels` columns `label_id`, `voided_label_id`; v5: `labels` column `window_open`; v6: `labels` columns `answer`, `via`; v7: new table `device_readings`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
 
 ## Hot path (raw Arrow IPC streams)
 
@@ -147,6 +147,8 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 | boost_cycle | Ende eines Boost-Zyklus (60 min nach dem Boost gemessen) oder verweigerter Boost; mode `live` = geschrieben und gemessen, `aborted` = vorgemerkt, nie geschrieben, `refused` = Szenario erkannt, aber kein Boost (`reason`); ts = Ende; node = erster Knoten des Raums; `experiment_id` = Zyklus-ID bei live; live-Zeilen werden in `step_responses` uebernommen und loesen das Nachtraining aus | heatd | no | room, variant (`boost_learn`), mode, scenario (morning, homecoming), source (auto, manual), cycle_id, start_ts_ms, target, setpoint_old, start_temp, boost_min, chosen_min, allowed_min, d_safe_min, known_min, p_overshoot, p_no_boost, context, decision, peak_c, overshoot_c, minutes_to_target_0_3, model_version, end (complete, sensor_limit, target_decrease, target_changed, sensor_stale, window_open, away, manual_hold, not_written), reason (refused) |
 | failsafe | Ausfallsicherung: action cap (MaxHeatSetpointLimit auf node geschrieben bzw. Fehler, nur bei Aenderung) oder shutdown_write (Ausfall-Sollwert beim Beenden von heatd auf alle Knoten, je Knoten ok/attempts/error); Watchdog-Ausloesungen stehen in data/failsafe/watchdog.json | heatd | cap: ja | action, max_heat_setpoint_limit, ok, error, setpoint, elapsed_s, nodes |
 | br_watchdog | Router-Watchdog (`docs/br-watchdog.md`): Zustandswechsel ok / br_http_down / thread_down / both, oder Aktion rewrite (Router meldete triggered, heatd schreibt die Sollwerte neu) | heatd | no | from, to, status_fail, heartbeat_fail, thermostats_silent, br_mode, br_triggered; bei rewrite: action, br_mode |
+| coffee_on | Wake-on der Kaffeemaschine (Plug mit Rolle coffee, `[[devices]] wake_on`): einmal je Ortszeit-Tag beim Ende des Schlafmodus der Uhr im Fenster `wake_window`; ein Eintrag je Versuch-Ergebnis (ok, retry, gave_up, skipped) | heatd | yes | day, local_time, window, reason (wake, retry, gave_up, away, window, already_today), attempt, ok, error |
+| device_link | Verbindung eines Zusatzgeraets (`[[devices]]`, nie ein Thermostat): subscription_lost / resubscribed / silent (niedrige Prioritaet, kein Alarm) | heatd | yes | role, kind, state, silent_s, resubscribes |
 | node_health | Thermostat-Gesundheit (`docs/node-health.md`): aspect link = Zustandswechsel ok / degraded / silent / unreachable; aspect setpoint = Neuschreiben eines nicht uebernommenen Sollwerts (action rewrite) oder Alarm an/aus | heatd | no | link: from, to, silent_s, episode_s, attempts, subscription, last_action, last_error; setpoint: target, device, rewrites, error bzw. alert, consecutive_failures, last_error |
 | supply | Kessel liefert nicht (`no_supply`): Ventil >= 90 % seit >= 45 min ohne Temperaturanstieg am Heizkoerper; Start/Ende je Raum | heatd | no | room, state (start / end), since_ms; bei end: duration_min |
 | pi_reset | Ueberschwing-Reset: Raumtemperatur >= Sollwert + 1 K bei Ventil >= 50 % seit >= 15 min, Sollwert kurz auf Frost gesetzt und danach wiederhergestellt | heatd | no | room, state (start / end), temp, setpoint, valve |
@@ -320,6 +322,28 @@ unit: dict<utf8>
 
 - `source`: `minix` or `br`. `sensor`: `nvme_c` (NVMe temperature), `pkg_w` (CPU package power, mean over the sample interval), `die_c` (ESP32-S3 die temperature, Border Router; see `docs/ambient-sources.md` for the firmware gap). `unit`: `C`, `W`. One row per reading; `ts` is the sample time sent by the collector.
 - `POST /api/ambient` body `{"source": "minix", "ts": <epoch ms>, "readings": [{"sensor": "nvme_c", "value": 41.0, "unit": "C"}]}` returns `{"stored": n}`. Rejected with 400: unknown `source`, empty `readings`, more than 32 readings, `sensor` not matching `^[a-z0-9_]{1,16}$`, `unit` not 1..8 ASCII alphanumeric characters, non-finite `value`, `ts` more than 1 day in the future or 30 days in the past.
+
+### device_readings
+
+Producer: `devices.rs` (config `[[devices]]`): every attribute report and event of the additional Matter devices (nodes outside all rooms: Zwischenstecker, Klima- und Luftsensoren), one row per report, recorded raw and uninterpreted, never read by heating control. Partitioned by date and node (`node=<n>`), like `attribute_reports`.
+
+```schema device_readings
+ts: timestamp[us,UTC]
+node: u64
+endpoint: u16
+cluster: u32
+attribute: u32
+kind: dict<utf8>
+name: dict<utf8>
+value: f64?
+raw: utf8
+source: dict<utf8>
+```
+
+- `ts` is the heatd receive time. `attribute` is the attribute id for `kind=attribute` and the event id for `kind=event`. `name` is the name chip-tool printed (`ActivePower`, `OnOff`, `MeasuredValue`; `Attribute0x...` if unnamed).
+- `value`: the number for int, float and bool (0/1) values, else null (lists, structs, strings, unnamed attributes). `raw`: the exact printed value text (chip-tool prints decoded values only, see "Abweichungen"), event rows carry the full printed event incl. number and priority.
+- `source`: `subscription` or `poll`. `value` of power attributes is in the unit the cluster defines (ActivePower mW, Voltage mV, ActiveCurrent mA; temperature 0.01 C, humidity 0.01 %, CO2 ppm and PM2.5 ug/m3 as floats).
+- Only reports that the device sends are rows (Matter subscriptions report changes and no row is created for an unchanged value); gaps are normal for quiet attributes.
 
 ## Abweichungen
 

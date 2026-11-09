@@ -85,6 +85,44 @@ fn schema_watch_sensors_and_inference() {
     check_schema(Table::WatchInference, WatchInference::to_batch(&[inference]).unwrap());
 }
 
+pub(crate) fn device_reading(node: u64, i: i64) -> DeviceReading {
+    DeviceReading { ts: i, node, endpoint: 2, cluster: 0x90, attribute: 8, kind: "attribute".into(), name: "ActivePower".into(), value: Some(i as f64), raw: format!("  ActivePower: {i}"), source: "subscription".into() }
+}
+
+#[test]
+fn schema_device_readings() {
+    check_schema(Table::DeviceReadings, DeviceReading::to_batch(&[device_reading(9, 1)]).unwrap());
+    assert!(Table::DeviceReadings.node_partitioned());
+    assert_eq!(SCHEMA_VERSION, 7);
+    assert!(Table::ALL.contains(&Table::DeviceReadings));
+}
+
+#[test]
+fn device_readings_roll_by_node_and_a_v6_lake_opens_unchanged() {
+    let env = Env::new("2026-11-10");
+    std::fs::create_dir_all(env.dir.path().join("raw/ambient")).unwrap();
+    let old = env.sink(10, 3600);
+    old.append_on(d("2026-11-08"), Ambient { ts: 1, source: "minix".into(), sensor: "nvme_c".into(), value: 40.0, unit: "C".into() }).unwrap();
+    old.close().unwrap();
+    assert!(!env.dir.path().join("raw/device_readings").read_dir().unwrap().any(|_| true));
+    let sink = env.sink(10, 3600);
+    for i in 0..5 {
+        sink.append_on(d("2026-11-09"), device_reading(9 + (i % 2) as u64 * 2, i)).unwrap();
+    }
+    sink.append_on(d("2026-11-09"), DeviceReading { kind: "event".into(), name: "CumulativeEnergyMeasured".into(), value: None, raw: "  Event number: 4".into(), ..device_reading(9, 6) }).unwrap();
+    sink.close().unwrap();
+    let rolls = sink.roll_pending().unwrap();
+    let rolled = rolls.iter().find(|r| r.table == Table::DeviceReadings && r.status == RollStatus::Rolled).unwrap();
+    assert_eq!((rolled.rows, rolled.partitions), (6, 2));
+    let dir = env.parquet(Table::DeviceReadings, "2026-11-09");
+    assert_eq!(parquet_rows(&dir.join("node=9/part.parquet")), 4);
+    assert_eq!(parquet_rows(&dir.join("node=11/part.parquet")), 2);
+    assert_eq!(parquet_rows(&env.parquet(Table::Ambient, "2026-11-08").join("part.parquet")), 1);
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(dir.join("node=11/part.parquet")).unwrap()).unwrap();
+    assert_eq!(builder.schema().metadata()["schema_version"], "7");
+    assert_eq!(builder.schema().fields().len(), Table::DeviceReadings.schema().fields().len());
+}
+
 #[test]
 fn watch_tables_roll_by_date_only() {
     let env = Env::new("2026-10-29");

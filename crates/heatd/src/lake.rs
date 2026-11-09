@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 pub const COMMIT: &str = env!("HEATD_COMMIT");
 pub const ROW_GROUP_ROWS: usize = 65_536;
 pub const EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
@@ -59,10 +59,12 @@ pub mod kind {
     pub const PI_RESET: &str = "pi_reset";
     pub const WINDOW_EPISODE: &str = "window_episode";
     pub const NODE_HEALTH: &str = "node_health";
-    pub const ALL: [&str; 29] = [
+    pub const COFFEE_ON: &str = "coffee_on";
+    pub const DEVICE_LINK: &str = "device_link";
+    pub const ALL: [&str; 31] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
         ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
-        WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED, BOOST_CYCLE, FAILSAFE, BR_WATCHDOG, SUPPLY, PI_RESET, WINDOW_EPISODE, NODE_HEALTH,
+        WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED, BOOST_CYCLE, FAILSAFE, BR_WATCHDOG, SUPPLY, PI_RESET, WINDOW_EPISODE, NODE_HEALTH, COFFEE_ON, DEVICE_LINK,
     ];
 }
 
@@ -91,10 +93,11 @@ pub enum Table {
     WatchSensors,
     WatchInference,
     Ambient,
+    DeviceReadings,
 }
 
 impl Table {
-    pub const ALL: [Table; 10] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference, Table::Ambient];
+    pub const ALL: [Table; 11] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference, Table::Ambient, Table::DeviceReadings];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -108,11 +111,12 @@ impl Table {
             Table::WatchSensors => "watch_sensors",
             Table::WatchInference => "watch_inference",
             Table::Ambient => "ambient",
+            Table::DeviceReadings => "device_readings",
         }
     }
 
     pub fn node_partitioned(self) -> bool {
-        matches!(self, Table::AttributeReports | Table::Events | Table::Decisions)
+        matches!(self, Table::AttributeReports | Table::Events | Table::Decisions | Table::DeviceReadings)
     }
 
     pub fn schema(self) -> SchemaRef {
@@ -162,6 +166,10 @@ impl Table {
                 fld("state", dict(), false), fld("features_hash", DataType::Utf8, false), fld("model_version", dict(), false),
             ],
             Table::Ambient => vec![tsf("ts", false), fld("source", dict(), false), fld("sensor", dict(), false), fld("value", DataType::Float64, false), fld("unit", dict(), false)],
+            Table::DeviceReadings => vec![
+                tsf("ts", false), fld("node", DataType::UInt64, false), fld("endpoint", DataType::UInt16, false), fld("cluster", DataType::UInt32, false), fld("attribute", DataType::UInt32, false),
+                fld("kind", dict(), false), fld("name", dict(), false), fld("value", DataType::Float64, true), fld("raw", DataType::Utf8, false), fld("source", dict(), false),
+            ],
         };
         let metadata = HashMap::from([("schema_version".to_string(), SCHEMA_VERSION.to_string()), ("heatd_commit".to_string(), COMMIT.to_string()), ("table".to_string(), self.name().to_string())]);
         Arc::new(Schema::new_with_metadata(fields, metadata))
@@ -538,6 +546,32 @@ impl Row for Ambient {
     const TABLE: Table = Table::Ambient;
     fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
         let cols = vec![ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.source)), dict_col(rows, |r| Some(&r.sensor)), prim::<Float64Type, _>(rows, |r| Some(r.value)), dict_col(rows, |r| Some(&r.unit))];
+        Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceReading {
+    pub ts: i64,
+    pub node: u64,
+    pub endpoint: u16,
+    pub cluster: u32,
+    pub attribute: u32,
+    pub kind: String,
+    pub name: String,
+    pub value: Option<f64>,
+    pub raw: String,
+    pub source: String,
+}
+
+impl Row for DeviceReading {
+    const TABLE: Table = Table::DeviceReadings;
+    fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
+        let cols = vec![
+            ts_col(rows, |r| Some(r.ts)), prim::<UInt64Type, _>(rows, |r| Some(r.node)), prim::<UInt16Type, _>(rows, |r| Some(r.endpoint)), prim::<UInt32Type, _>(rows, |r| Some(r.cluster)),
+            prim::<UInt32Type, _>(rows, |r| Some(r.attribute)), dict_col(rows, |r| Some(&r.kind)), dict_col(rows, |r| Some(&r.name)), prim::<Float64Type, _>(rows, |r| r.value),
+            str_col(rows, |r| Some(&r.raw)), dict_col(rows, |r| Some(&r.source)),
+        ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }
 }
