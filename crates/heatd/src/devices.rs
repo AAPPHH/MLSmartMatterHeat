@@ -36,6 +36,11 @@ const RISE_MARGIN_W: f64 = 1.0;
 const RISE_MARGIN_RATIO: f64 = 0.5;
 const DROP_RATIO: f64 = 0.4;
 const DROP_MIN_BASELINE_W: f64 = 0.3;
+const EDGE_GAP_US: i64 = 300_000_000;
+const RISE_MIN_IDLE_US: i64 = 20 * 60 * 1_000_000;
+const RISE_EXIT_RATIO: f64 = 0.5;
+const EDGE_DAY_US: i64 = 24 * 3600 * 1_000_000;
+const EDGES_PER_DAY: usize = 6;
 const MAX_RESUBSCRIBE_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 
 fn default_window() -> String {
@@ -144,11 +149,14 @@ struct EdgeDetector {
     state: Level,
     run: Option<(Level, u32, i64)>,
     last: BTreeMap<Edge, i64>,
+    prev: Option<i64>,
+    idle_since: Option<i64>,
+    emitted: VecDeque<i64>,
 }
 
 impl Default for EdgeDetector {
     fn default() -> Self {
-        Self { idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new() }
+        Self { idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new(), prev: None, idle_since: None, emitted: VecDeque::new() }
     }
 }
 
@@ -170,21 +178,45 @@ impl EdgeDetector {
         }
     }
 
-    fn push(&mut self, ts: i64, watts: f64) -> Option<(Edge, i64)> {
-        if self.idle.len() < EDGE_MIN_SAMPLES {
-            self.remember(ts, watts);
-            return None;
-        }
+    fn classify(&self, watts: f64) -> Level {
         let base = self.baseline();
-        let class = if watts > base + RISE_MARGIN_W.max(base * RISE_MARGIN_RATIO) {
+        let margin = RISE_MARGIN_W.max(base * RISE_MARGIN_RATIO);
+        let high_from = if self.state == Level::High { base + margin * RISE_EXIT_RATIO } else { base + margin };
+        if watts > high_from {
             Level::High
-        } else if base >= DROP_MIN_BASELINE_W && watts < base * DROP_RATIO {
+        } else if self.idle.len() >= BASELINE_MEDIAN_FROM && base >= DROP_MIN_BASELINE_W && watts < base * DROP_RATIO {
             Level::Low
         } else {
             Level::Idle
-        };
+        }
+    }
+
+    fn allowed(&mut self, edge: Edge, at: i64) -> bool {
+        while self.emitted.front().is_some_and(|t| at - t > EDGE_DAY_US) {
+            self.emitted.pop_front();
+        }
+        let quiet = self.last.get(&edge).is_none_or(|t| at - t >= EDGE_COOLDOWN_US);
+        let rested = edge != Edge::Rise || self.idle_since.is_some_and(|s| at - s >= RISE_MIN_IDLE_US);
+        quiet && rested && self.emitted.len() < EDGES_PER_DAY
+    }
+
+    fn push(&mut self, ts: i64, watts: f64) -> Option<(Edge, i64)> {
+        let gap = self.prev.is_some_and(|p| ts - p > EDGE_GAP_US);
+        self.prev = Some(ts);
+        if self.idle.len() < EDGE_MIN_SAMPLES {
+            self.remember(ts, watts);
+            self.idle_since.get_or_insert(ts);
+            return None;
+        }
+        let class = self.classify(watts);
         if class != Level::High {
             self.remember(ts, watts);
+        }
+        if gap {
+            self.run = None;
+            self.state = class;
+            self.idle_since = (class != Level::High).then_some(ts);
+            return None;
         }
         if class == self.state {
             self.run = None;
@@ -199,16 +231,29 @@ impl EdgeDetector {
             return None;
         }
         self.run = None;
+        let left_high = self.state == Level::High;
         self.state = class;
         let edge = match class {
             Level::High => Edge::Rise,
             Level::Low => Edge::Drop,
-            Level::Idle => return None,
+            Level::Idle => {
+                if left_high {
+                    self.idle_since = Some(first);
+                }
+                return None;
+            }
         };
-        if self.last.get(&edge).is_some_and(|t| first - t < EDGE_COOLDOWN_US) {
+        let allowed = self.allowed(edge, first);
+        if class == Level::High {
+            self.idle_since = None;
+        } else if left_high {
+            self.idle_since = Some(first);
+        }
+        if !allowed {
             return None;
         }
         self.last.insert(edge, first);
+        self.emitted.push_back(first);
         Some((edge, first))
     }
 }

@@ -614,7 +614,7 @@ fn an_edge_becomes_a_high_confidence_room_label_with_a_three_minute_window() {
     let devices = devices_of(dir.path(), BRUSH, &mock());
     let min = 60_000_000;
     let mut labels = Vec::new();
-    for i in 0..40 {
+    for i in 0..60 {
         labels.extend(devices.inner.lock().unwrap().edge_label(10, &power(i * min / 2, 800.0)));
     }
     assert!(labels.is_empty());
@@ -640,16 +640,16 @@ async fn a_toothbrush_edge_reaches_the_labels_table_and_the_device_report_has_on
     crate::context::write_meta(&sink, &cfg, base).unwrap();
     let devices = devices_of(dir.path(), BRUSH, &mock());
     let hour = 3_600_000_000;
-    for i in 0..40 {
+    for i in 0..90 {
         sink.append_on(date, power(base + 6 * hour + i * 30_000_000, 800.0)).unwrap();
         devices.inner.lock().unwrap().edge_label(10, &power(base + 6 * hour + i * 30_000_000, 800.0));
     }
-    let at = base + 7 * hour + 15 * 60_000_000;
+    let at = base + 6 * hour + 90 * 30_000_000;
     let label = (0..2).filter_map(|i| devices.inner.lock().unwrap().edge_label(10, &power(at + i * 10_000_000, 4500.0))).next().unwrap();
     sink.append_on(date, label).unwrap();
     sink.roll_day(date).unwrap();
     let md = report_section(dir.path(), date).unwrap();
-    assert!(md.contains("- Zahnbuerste um 07:15:00 UTC zurueckgestellt, Ladestart: Aufenthalt im Raum a als Label (Quelle toothbrush, Scans +-3 min)."), "{md}");
+    assert!(md.contains("- Zahnbuerste um 06:45:00 UTC zurueckgestellt, Ladestart: Aufenthalt im Raum a als Label (Quelle toothbrush, Scans +-3 min)."), "{md}");
 }
 
 #[test]
@@ -663,4 +663,51 @@ nodes = [5]
 {text}")).unwrap_err();
         assert!(err.to_string().contains("needs kind plug and a room"), "{err}");
     }
+}
+
+#[test]
+fn a_gap_between_samples_updates_the_state_quietly() {
+    let mut d = EdgeDetector::default();
+    feed(&mut d, 0, &[800.0; 40]);
+    assert!(feed(&mut d, 1200 + 1200, &[4200.0, 4200.0, 4200.0, 4200.0]).is_empty());
+}
+
+#[test]
+fn a_restart_during_a_charge_does_not_produce_a_removal_at_charge_end() {
+    let mut d = EdgeDetector::default();
+    assert!(feed(&mut d, 0, &[4000.0; 5]).is_empty());
+    assert!(feed(&mut d, 150, &[800.0; 60]).is_empty());
+}
+
+#[test]
+fn alternating_high_and_idle_every_quarter_hour_gives_one_label() {
+    let mut d = EdgeDetector::default();
+    feed(&mut d, 0, &[800.0; 40]);
+    let mut edges = Vec::new();
+    for round in 0..8 {
+        let level = if round % 2 == 0 { 4000.0 } else { 800.0 };
+        edges.extend(feed(&mut d, 1200 + round * 900, &[level; 30]));
+    }
+    assert_eq!(edges.len(), 1);
+}
+
+#[test]
+fn a_draw_hovering_near_the_rise_threshold_does_not_flip_the_state() {
+    let mut d = EdgeDetector::default();
+    feed(&mut d, 0, &[800.0; 100]);
+    let mut samples = vec![2000.0; 4];
+    samples.extend([1500.0, 2000.0].repeat(20));
+    assert_eq!(feed(&mut d, 3000, &samples).len(), 1);
+}
+
+#[test]
+fn at_most_six_edges_per_day() {
+    let mut d = EdgeDetector::default();
+    feed(&mut d, 0, &[800.0; 40]);
+    let mut edges = Vec::new();
+    for round in 0..20 {
+        let level = if round % 2 == 0 { 4000.0 } else { 800.0 };
+        edges.extend(feed(&mut d, 1200 + round * 3000, &[level; 100]));
+    }
+    assert_eq!(edges.len(), 6);
 }
