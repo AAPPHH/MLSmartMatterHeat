@@ -1,0 +1,180 @@
+import copy
+import json
+import math
+import numpy as np
+import pytest
+from heattrain.__main__ import CONFIG
+from heattrain.roomfit import fit_bundle
+from heattrain.thermal import House, RoomData, RoomIn, RoomPar, build_rooms, kalman, plan
+from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
+from test_thermal import CFG, T0, simulate
+
+
+def run(docs, inputs, shock=SHOCK, house=HOUSE):
+    h = House(docs, shock, house)
+    rec = {n: {k: [] for k in ("p_window", "lam", "p_supply", "a")} for n in NAMES}
+    for row in inputs:
+        for n, o in h.step(row).items():
+            for k in rec[n]:
+                rec[n][k].append(o.get(k, math.nan))
+    return h, {n: {k: np.array(v) for k, v in r.items()} for n, r in rec.items()}
+
+
+def test_regression_matches_old_kalman():
+    d, _, _ = simulate(hours=12)
+    ks, v, s, xs, ps = kalman(dict(TRUE), d, "rc2", CFG, collect=True)
+    doc = {"params": dict(TRUE), "c": {}, "valve_gain": 0.5, "sigma_u": 0.2, "noise_r": CFG["noise_r"], "p0": CFG["p0"], "q_r": CFG["q_r"], "q_a": CFG["q_a"]}
+    shock = dict(SHOCK, q_calm=0.0, q_jump=0.0, p_jump=0.0, p_l0=0.0)
+    house = dict(HOUSE, p_up=0.0, p_down=0.0, p_supply0=1.0, reset_gap_min=1e9, reset_sigma=1e9, r_grid=0.0, balance_seed=0)
+    h = House({"r": doc}, shock, house)
+    worst = 0.0
+    for k in range(d.n):
+        out = h.step({"r": RoomIn(d.y[k], math.nan, d.u[k], math.nan, d.tout[k], d.wind[k], d.rad[k], bool(d.night[k]), (), ())})["r"]
+        if out["ok"]:
+            worst = max(worst, abs(out["m"] - xs[k][0]), abs(out["a"] - xs[k][1]))
+    assert worst < 1e-9
+    assert not h.resets
+
+
+def test_outage_mask_excludes_gap_restart_and_stale_nodes():
+    minutes = 400
+    reports = []
+    for i in range(minutes):
+        if 100 <= i < 280:
+            continue
+        for node in (5, 6):
+            reports += [(T0 + 60 * i, node, 0, 2000.0 + i % 3), (T0 + 60 * i, node, 8, 40.0)]
+    weather = [(T0 + 3600 * i, "obs", None, 8.0, 2.0, 0.0) for i in range(10)]
+    events = [(T0 + 60 * 100, "shutdown"), (T0 + 60 * 280, "startup")]
+    rooms, _ = build_rooms(reports, weather, [], CFG, events)
+    assert rooms
+    for d in rooms:
+        assert d.bad[100:286].all()
+        assert np.isnan(d.y[100:286]).all() and np.isnan(d.yv[100:286]).all()
+        assert not d.bad[290:].any()
+        assert np.isfinite(d.y[300])
+        assert d.info["n_masked"] >= 186
+    quiet = [r for r in reports if not (r[1] == 6 and (T0 + 60 * 300 > r[0] > T0 + 60 * 100)) and not (T0 + 60 * 100 <= r[0] < T0 + 60 * 280)] + [(T0 + 60 * i, 5, a, v) for i in range(100, 280) for a, v in ((0, 2001.0), (8, 40.0))]
+    rooms, _ = build_rooms(quiet, weather, [], CFG, ())
+    d5, d6 = ([d for d in rooms if d.node == n][0] for n in (5, 6))
+    assert d6.bad[200] and not d6.bad[110] and not d5.bad[200]
+
+
+def test_loss_jump_is_detected_in_the_right_room_only():
+    docs, inputs, truth = simulate_house(900, seed=0, window={"kueche": (400, 520, 4.0)})
+    h, rec = run(docs, inputs)
+    assert not h.resets
+    k = rec["kueche"]
+    first = int(np.nonzero(k["p_window"][400:] > 0.5)[0][0])
+    assert first <= 45
+    assert 2.5 < np.median(k["lam"][450:520]) < 5.5
+    assert k["p_window"][700:].max() < 0.5
+    for other in ("wohnzimmer", "schlafzimmer"):
+        assert rec[other]["p_window"].max() < 0.5
+    err = np.sqrt(np.mean((k["a"][100:] - np.array(truth["kueche"]["a"])[100:]) ** 2))
+    assert err < 0.8
+
+
+def test_boiler_stop_is_one_supply_event_not_four_windows():
+    docs, inputs, _ = simulate_house(900, seed=0, stop=(400, 560))
+    h, rec = run(docs, inputs)
+    for n in NAMES:
+        assert rec[n]["p_window"][300:700].max() < 0.5
+        assert rec[n]["p_supply"][450:560].max() < 0.5
+        assert rec[n]["p_supply"][300:395].min() > 0.9
+        assert rec[n]["p_supply"][650:].min() > 0.9
+    assert not h.resets
+
+
+def test_resets_are_logged_and_never_nan():
+    docs, inputs, _ = simulate_house(500, seed=1)
+    h = House(docs, SHOCK, HOUSE)
+    for k, row in enumerate(inputs):
+        if k == 200:
+            h.rooms["kueche"].x[0][1] = math.nan
+        outs = h.step(row)
+        for o in outs.values():
+            if o["ok"]:
+                assert all(math.isfinite(o[x]) for x in ("m", "a", "lam", "lam_std", "p_window", "p_supply"))
+    assert [(r["room"], r["cause"]) for r in h.resets] == [("kueche", "nan")]
+    assert math.isnan(h.resets[0]["prior"][0]) or h.resets[0]["step"] == 200
+    docs, inputs, _ = simulate_house(500, seed=1, corrupt=(300, 6, 12.0), report_p=1.0)
+    h, _ = run(docs, inputs)
+    assert any(r["cause"] == "innovation" and r["room"] == NAMES[0] for r in h.resets)
+    docs, inputs, _ = simulate_house(700, seed=2, gap=(200, 500))
+    h, rec = run(docs, inputs)
+    assert [(r["cause"], r["step"]) for r in h.resets if r["room"] == NAMES[0]] == [("gap", 500 + next(i for i in range(200) if math.isfinite(inputs[500 + i][NAMES[0]].y)))]
+    assert np.isfinite(rec[NAMES[0]]["a"][520:]).all()
+
+
+def plan_env(**over):
+    env = {"tout": -5.0, "wind": 3.0, "rad": 0.0, "night": False, "ncnt": (), "nsum": (), "target": 21.0, "present": 1.0, "sp_cur": 21.0, "sp_live": 21.0, "frost": 7.0, "boost_c": 24.0, "boost_ok": False,
+           "raise_cost": 15.0, "cold_cost": 1.0, "r_grid": HOUSE["r_grid"]}
+    env.update(over)
+    return env
+
+
+def light_par():
+    doc = room_doc(False, 0.3)
+    doc["params"].update(w=0.3, b1=2.0, a1=3.0, ts=35.0, ts_night=35.0)
+    return RoomPar(doc)
+
+
+def comps_at(m, a, lam, p=1e-4):
+    return [(0.25, [m, a, lam], [0.01, 0, 0, 0, 0.01, 0, 0, 0, p]) for _ in range(4)]
+
+
+def test_plan_chooses_frost_for_a_window_and_heat_otherwise():
+    par = light_par()
+    shock = dict(SHOCK, lambda_jump=6.0)
+    open_ = plan(par, shock, comps_at(14.0, 12.0, 6.0), 1.0, plan_env(cold_cost=0.1))
+    shut = plan(par, shock, comps_at(18.0, 17.0, 1.0), 1.0, plan_env(sp_cur=19.0, sp_live=19.0))
+    assert open_["p_window"] > 0.99 and open_["kind"] == "frost" and open_["setpoint"] == 7.0
+    assert shut["p_window"] < 0.01 and shut["setpoint"] >= 19.0 and shut["kind"] != "frost"
+    assert open_["total"] < open_["cost_live"]
+
+
+def test_plan_raise_cost_blocks_small_raises_and_no_supply_blocks_heating():
+    par = light_par()
+    comps = comps_at(19.4, 19.0, 1.0)
+    cheap = plan(par, SHOCK, comps, 1.0, plan_env(sp_cur=20.0, sp_live=20.0, raise_cost=0.0))
+    dear = plan(par, SHOCK, comps, 1.0, plan_env(sp_cur=20.0, sp_live=20.0, raise_cost=500.0))
+    assert dear["raise"] is False and dear["setpoint"] <= 20.0
+    assert cheap["best_cost"] <= dear["best_cost"] + 1e-9
+    stop = plan(par, SHOCK, comps_at(14.0, 13.0, 1.0), 0.0, plan_env(raise_cost=15.0))
+    assert not stop["raise"]
+
+
+def test_plan_probe_is_chosen_only_with_value_of_information():
+    par = light_par()
+    shock = dict(SHOCK, lambda_jump=6.0)
+    comps = [(0.5, [16.0, 15.0, 1.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4]), (0.5, [16.0, 15.0, 6.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4])]
+    p = plan(par, shock, comps, 1.0, plan_env(raise_cost=1.0, cold_cost=0.3))
+    sure = plan(par, shock, comps_at(16.0, 15.0, 1.0), 1.0, plan_env(raise_cost=1.0, cold_cost=0.3))
+    assert sure["kind"] != "probe" and sure["evoi"] == 0.0
+    assert p["evoi"] >= 0.0
+
+
+def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
+    rooms = []
+    for i, name in enumerate(("wohnzimmer", "kueche")):
+        d, air, sens = simulate(hours=30, seed=i, report_p=0.4)
+        d.room, d.node = name, 5 + i
+        d.sp = np.full(d.n, 21.0)
+        d.yv = np.where(np.isfinite(d.y), d.u, np.nan)
+        d.bad = np.zeros(d.n, bool)
+        d.info["neighbour_nodes"] = {}
+        d.info["n_masked"] = 0
+        rooms.append(d)
+    config = copy.deepcopy(CONFIG)
+    rm = config["roommodel"]
+    rm["shock"].update(days=1, passes=1, grid={"q_calm": [0.01, 0.03], "p_jump": [1e-3], "q_jump": [0.3]})
+    bundle, report = fit_bundle(config, rooms, tmp_path, version="20261101T000000Z")
+    assert bundle["kind"] == "room_model" and set(bundle["rooms"]) == {"wohnzimmer", "kueche"}
+    s = bundle["shock"]
+    assert 0 < s["p_jump"] < 1 and s["lambda_w"] > 1 and s["lambda_jump"] > s["lambda_w"]
+    for r in bundle["rooms"].values():
+        assert set(r["params"]) == {"a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night"}
+        assert all(math.isfinite(v) for v in r["params"].values()) and r["sigma_u"] > 0
+    json.dumps(bundle)
+    assert report["forecast_20min"]["wohnzimmer"]["n"] > 0
