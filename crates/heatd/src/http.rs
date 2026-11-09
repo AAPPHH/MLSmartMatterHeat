@@ -35,6 +35,7 @@ pub struct AppState {
     pub batch_seq: Arc<AtomicU64>,
     pub watchmatch: WatchMatch,
     pub boost: crate::boost::Boost,
+    pub room_model: crate::room_shadow::RoomModel,
     pub failsafe: crate::failsafe::Failsafe,
 }
 
@@ -715,7 +716,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                     })
                 })
                 .collect();
-            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
+            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "room_model": state.room_model.view(&room.name), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
     Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "boost": state.boost.summary(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
@@ -1084,6 +1085,7 @@ mod tests {
             explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
             tracker: Default::default(),
             boost,
+            room_model: Default::default(),
             batch_seq: Arc::new(AtomicU64::new(1)),
         };
         Harness { state, mock, _dir: dir }

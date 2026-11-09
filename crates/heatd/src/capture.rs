@@ -466,6 +466,7 @@ resubscribe_gap_s = 3600
             explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
             tracker: Default::default(),
             boost: Default::default(),
+            room_model: Default::default(),
             failsafe: Default::default(),
             batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }

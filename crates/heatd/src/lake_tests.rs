@@ -54,6 +54,12 @@ fn schema_decisions() {
 }
 
 #[test]
+fn schema_shadow_decisions() {
+    let row = ShadowDecision { ts: 1, room: "bad".into(), why: "x".into(), kind: "frost".into(), model_version: "v".into(), forecast_c: Some(19.0), ..Default::default() };
+    check_schema(Table::ShadowDecisions, ShadowDecision::to_batch(&[row]).unwrap());
+}
+
+#[test]
 fn schema_labels() {
     let row = Label { ts: 1, from_ts: Some(0), to_ts: Some(2), room: "bad".into(), source: "watch".into(), answer: Some("yes".into()), via: Some("page".into()), ..Default::default() };
     check_schema(Table::Labels, Label::to_batch(&[row]).unwrap());

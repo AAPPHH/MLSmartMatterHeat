@@ -45,6 +45,7 @@ fn env(head: &str, schedule: &[(&str, &str, f64)]) -> Env {
         explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
         tracker: Default::default(),
         boost,
+        room_model: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
     };
     Env { state, mock, _dir: dir }

@@ -8,13 +8,13 @@ HOUSE = {"p_up": 0.02, "p_down": 0.001, "p_supply0": 0.95, "r_grid": 0.25 / 12.0
 NAMES = ("wohnzimmer", "kueche", "schlafzimmer")
 
 
-def room_doc(coupling=True, gain=0.5):
-    return {"params": dict(TRUE), "c": {"wall": 0.2} if coupling else {}, "valve_gain": gain, "sigma_u": 0.25, "noise_r": 0.15, "p0": 1.0, "q_r": 0.5, "q_a": 0.05}
+def room_doc(coupling=True, gain=0.5, **params):
+    return {"params": {**TRUE, **params}, "c": {"wall": 0.2} if coupling else {}, "valve_gain": gain, "sigma_u": 0.25, "noise_r": 0.15, "p0": 1.0, "q_r": 0.5, "q_a": 0.05}
 
 
-def simulate_house(n, seed=0, window=None, stop=None, gap=None, corrupt=None, coupling=True, report_p=0.3, grid=0.5):
+def simulate_house(n, seed=0, window=None, stop=None, gap=None, corrupt=None, coupling=True, report_p=0.3, grid=0.5, gain=0.5, **params):
     rng = np.random.default_rng(seed)
-    docs = {name: room_doc(coupling) for name in NAMES}
+    docs = {name: room_doc(coupling, gain, **params) for name in NAMES}
     pars = {name: RoomPar(docs[name]) for name in NAMES}
     h = 1.0 / 60.0
     m = {name: 22.5 - i for i, name in enumerate(NAMES)}

@@ -31,6 +31,12 @@ mod report_tests;
 #[cfg(test)]
 mod dynamics_tests;
 mod restore;
+mod room_model;
+mod room_shadow;
+#[cfg(test)]
+mod room_model_tests;
+#[cfg(test)]
+mod room_shadow_tests;
 mod rules;
 mod status;
 mod storage;
@@ -222,6 +228,13 @@ async fn serve(config: Config) -> Result<()> {
     status.set_stale_after(config.stale.after_s);
     status.register_nodes(config.all_nodes());
     let boost = boost::Boost::new(&config);
+    let room_model = room_shadow::RoomModel::default();
+    if config.room_model.enabled {
+        if let Some(bundle) = room_model::try_load(&config.room_model.model_dir) {
+            room_model.set_bundle(bundle);
+        }
+        room_shadow::spawn_reload(room_model.clone(), config.room_model.model_dir.clone());
+    }
     let config = Arc::new(config);
     context::spawn_background(sink.clone(), status.clone(), config.clone(), context::Io::live(&config));
     let watchmatch = watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone());
@@ -231,6 +244,7 @@ async fn serve(config: Config) -> Result<()> {
     let state = http::AppState {
         watchmatch,
         boost: boost.clone(),
+        room_model,
         failsafe: failsafe::Failsafe::new(&config.failsafe, Some(Path::new(&config.data_dir).join("failsafe"))),
         sink: sink.clone(),
         latest: Default::default(),

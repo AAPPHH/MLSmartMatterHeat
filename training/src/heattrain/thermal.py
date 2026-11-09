@@ -918,7 +918,7 @@ def plan(par, shock, comps, p_supply, env):
     if env["boost_ok"]:
         for d in BOOSTS:
             cands.append(evaluate(f"boost{d}", "boost", profile(env["boost_c"], d, target), env["boost_c"], boost_min=d))
-    allowed = [c for c in cands if c["kind"] == "frost" or c["peak"] <= limit]
+    allowed = [c for c in cands if c["kind"] == "frost" or c["peak"] <= limit] or [min(cands, key=lambda c: c["peak"])]
     best = allowed[0]
     for c in allowed[1:]:
         if c["total"] < best["total"] - 1e-12:

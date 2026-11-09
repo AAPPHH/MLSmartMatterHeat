@@ -70,6 +70,7 @@ async fn phase1_acceptance_simulated_day() {
         explorer: Arc::new(std::sync::Mutex::new(crate::explore::Explorer::new(config.exploration_seed.unwrap()))),
         tracker: Default::default(),
         boost: Default::default(),
+        room_model: Default::default(),
         failsafe: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
     };
