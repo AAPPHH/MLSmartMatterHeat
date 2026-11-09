@@ -397,3 +397,25 @@ def test_anchor_devices_are_excluded_from_scans_and_drift_is_reported(tmp_path, 
     assert drift["baseline"] == {"aa:00": -50.0, "bb:00": -60.0, "cc:00": -70.0} and sorted(drift["days"]) == ["2026-10-25", "2026-10-26"]
     assert [(f["day"], f["sender"], f["kind"]) for f in drift["flags"]] == [("2026-10-26", "aa:00", "shift"), ("2026-10-26", "cc:00", "missing")]
     assert drift["flags"][0]["delta"] == -8.0
+
+
+def test_toothbrush_labels_keep_their_three_minute_interval_and_match_any_device(tmp_path, config):
+    import pyarrow as pa
+    from conftest import LABELS, write_table
+    from heattrain.watchroom import Lake, Scan, assign_labels
+    base = 1_790_000_000.0
+    ts = lambda t: datetime.fromtimestamp(t, timezone.utc)
+    schema = pa.schema(list(LABELS) + [("label_id", pa.string()), ("voided_label_id", pa.string())])
+    row = lambda t, f, e, room, source, device, lid: {"ts": ts(t), "from_ts": ts(f), "to_ts": ts(e), "room": room, "source": source, "device": device, "label_id": lid, "voided_label_id": None}
+    write_table(tmp_path, "labels", [row(base, base - 180, base + 180, "bad", "toothbrush", None, "t1"), row(base + 9000, base + 8000, base + 9300, "kueche", "watch", "pixel", "w1")], schema, "ts")
+    scans = [Scan(base + dt, d, {}) for dt, d in ((-170, "pixel"), (0, "other"), (170, "pixel"), (200, "pixel"), (8500, "pixel"))]
+    cfg = {**config, "label_intervals": False, "label_tolerance_s": 30.0, "labels_from": None, "tap_labels_from": "2020-01-01T00:00:00+00:00"}
+    assign_labels(Lake(tmp_path), {**cfg, "interval_sources": []}, scans)
+    assert [s.room for s in scans] == [None] * 5
+    assign_labels(Lake(tmp_path), {**cfg, "sources": ["watch", "toothbrush"], "interval_sources": ["toothbrush"]}, scans)
+    assert [s.room for s in scans] == ["bad", "bad", "bad", None, None]
+
+
+def test_the_shipped_config_trains_on_toothbrush_labels_as_intervals():
+    from heattrain.__main__ import CONFIG
+    assert "toothbrush" in CONFIG["sources"] and CONFIG["interval_sources"] == ["toothbrush"]

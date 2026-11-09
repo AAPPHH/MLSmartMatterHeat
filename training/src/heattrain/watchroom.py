@@ -148,24 +148,24 @@ def classify_state(cfg, tz, t, dev, sig):
 def assign_labels(lake, cfg, scans):
     if not scans:
         return
-    rows = lake.query("labels", [("epoch(ts)", None), ("epoch(from_ts)", "from_ts"), ("epoch(to_ts)", "to_ts"), ("room", None), ("device", "device"), ("label_id", "label_id")], f"source IN ({','.join(repr(s) for s in cfg['sources'])})", "ORDER BY ts")
+    rows = lake.query("labels", [("epoch(ts)", None), ("epoch(from_ts)", "from_ts"), ("epoch(to_ts)", "to_ts"), ("room", None), ("device", "device"), ("label_id", "label_id"), ("source", None)], f"source IN ({','.join(repr(s) for s in cfg['sources'])})", "ORDER BY ts")
     voided = {v for (v,) in lake.query("labels", [("voided_label_id", None)], "voided_label_id IS NOT NULL", need=("voided_label_id",))}
     tap_from = datetime.fromisoformat(cfg["tap_labels_from"]).timestamp() if cfg.get("tap_labels_from") else None
     rows = [r for r in rows if r[5] not in voided and not (tap_from is not None and r[0] >= tap_from and (r[1] is None or r[2] is None))]
-    rows = [r[:5] for r in rows]
     tol = cfg["label_tolerance_s"]
-    rows = [(ts, f, to, name, d) if f is None or to is None or cfg.get("label_intervals", True) or to - f > 2 * tol else ((f + to) / 2, None, None, name, d) for ts, f, to, name, d in rows]
+    keep = set(cfg.get("interval_sources", []))
+    rows = [(ts, f, to, name, d, True) if f is None or to is None or cfg.get("label_intervals", True) or src in keep else (ts, f, to, name, d, False) if to - f > 2 * tol else ((f + to) / 2, None, None, name, d, False) for ts, f, to, name, d, _, src in rows]
     t = np.array([s.ts for s in scans])
     dev = np.array([s.device for s in scans])
     room = np.full(len(scans), None, dtype=object)
     best = np.full(len(scans), np.inf)
     start = datetime.fromisoformat(cfg["labels_from"]).timestamp() if cfg.get("labels_from") else None
     rows = [r for r in rows if start is None or r[0] >= start]
-    for ts, f, to, name, d in rows:
-        if f is not None and to is not None and cfg.get("label_intervals", True):
+    for ts, f, to, name, d, interval in rows:
+        if f is not None and to is not None and interval:
             mask = (t >= f) & (t <= to) & ((dev == str(d)) if d else True)
             room[mask], best[mask] = name, -1.0
-    for ts, f, to, name, d in rows:
+    for ts, f, to, name, d, interval in rows:
         if f is None or to is None:
             dist = np.abs(t - ts)
             mask = (dist <= cfg["label_tolerance_s"]) & (dist < best) & ((dev == str(d)) if d else True)
