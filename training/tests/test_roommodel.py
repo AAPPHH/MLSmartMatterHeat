@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.roomfit import fit_bundle
+from heattrain.roomfit import fit_bundle, fit_shock, run_batch, shock_defaults
 from heattrain.thermal import House, RoomData, RoomIn, RoomPar, build_rooms, kalman, plan
 from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
 from test_thermal import CFG, T0, simulate
@@ -197,3 +197,62 @@ def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
 def test_parity_fixture_is_in_sync_with_the_model():
     from make_room_model_fixture import OUT, build
     assert json.loads(OUT.read_text()) == json.loads(json.dumps(build(), separators=(",", ":")))
+
+
+def sim_grid(steps=1500, seed=7, **kw):
+    from make_room_model_fixture import SCENARIO
+    docs, inputs, _ = simulate_house(steps, seed=seed, **(kw or SCENARIO))
+    g = type("SimGrid", (), {})()
+    g.names, g.n = list(NAMES), len(inputs)
+    g.cols = {n: {k: np.array([getattr(r[n], k) for r in inputs], float) for k in ("y", "yv", "u", "sp", "tout", "wind", "rad")} for n in NAMES}
+    for n in NAMES:
+        g.cols[n].update(night=np.array([float(r[n].night) for r in inputs]), ncnt=[np.array([r[n].ncnt[0] for r in inputs])], nsum=[np.array([r[n].nsum[0] for r in inputs])])
+    return docs, inputs, g
+
+
+def test_batched_filter_matches_the_reference_house_including_resets():
+    shocks = [SHOCK, dict(SHOCK, q_calm=0.03), dict(SHOCK, p_jump=1e-2, q_jump=0.6, hold_min=10.0, tau_l=60.0)]
+    causes = set()
+    for docs, inputs, g in (sim_grid(), sim_grid(500, seed=1, corrupt=(300, 6, 12.0), report_p=1.0)):
+        bh, rec = run_batch(g, docs, shocks, HOUSE, record=True)
+        for gi, shock in enumerate(shocks):
+            h, ref = run(docs, inputs, shock)
+            assert abs(h.loglik - bh.loglik[gi]) < 1e-9 * abs(h.loglik)
+            assert [(r["room"], r["cause"], r["step"]) for r in h.resets] == [(r["room"], r["cause"], r["step"]) for r in bh.resets(gi)]
+            causes |= {r["cause"] for r in h.resets}
+            for n in NAMES:
+                for key in ("p_window", "lam", "p_supply", "a"):
+                    np.testing.assert_allclose(rec[gi][n][key], ref[n][key], rtol=0, atol=1e-9, equal_nan=True)
+    assert causes >= {"gap", "innovation", "lambda"}
+
+
+def test_fast_shock_fit_replays_the_reference_coordinate_descent():
+    docs, inputs, g = sim_grid(600)
+    rc = copy.deepcopy(CONFIG["roommodel"])
+    rc["house"] = dict(HOUSE)
+    rc["shock"].update(passes=2, grid={"q_calm": [0.003, 0.03], "p_jump": [1e-4, 1e-2], "q_jump": [0.6]})
+    drop = {n: np.arange(g.n) % 97 < 5 for n in NAMES}
+
+    def ref_nll(vals):
+        h = House(docs, shock_defaults(rc, **vals), rc["house"])
+        for k, row in enumerate(inputs):
+            h.step({n: RoomIn(math.nan, math.nan, *list(vars(r).values())[2:]) if drop[n][k] else r for n, r in row.items()})
+        return -h.loglik
+
+    best = dict(rc["shock"]["start"])
+    score = ref_nll(best)
+    trace = [(dict(best), score)]
+    for _ in range(rc["shock"]["passes"]):
+        for key, values in rc["shock"]["grid"].items():
+            for v in values:
+                if v != best[key]:
+                    trial = dict(best, **{key: v})
+                    s = ref_nll(trial)
+                    trace.append((trial, s))
+                    best, score = (trial, s) if s < score else (best, score)
+    for batch_max in (64, 1):
+        rc["shock"]["batch_max"] = batch_max
+        fb, fs, ft = fit_shock(g, docs, rc, drop)
+        assert fb == best and abs(fs - score) < 1e-9 * abs(score)
+        assert [t for t, _ in ft] == [t for t, _ in trace]
+        np.testing.assert_allclose([s for _, s in ft], [s for _, s in trace], rtol=1e-12)

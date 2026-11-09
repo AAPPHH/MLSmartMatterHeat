@@ -47,7 +47,7 @@ CONFIG = {
     },
     "roommodel": {
         "hold_min": 20.0, "valve": {"sigma_u_min": 0.05, "sigma_u_default": 0.25}, "forecast": {"horizon_min": 20, "stride": 5},
-        "shock": {"tau_l": 90.0, "hold_min": 20.0, "p_l0": 0.01, "lambda_jump": 3.0, "lambda_w": 2.0, "start": {"q_calm": 0.01, "p_jump": 1e-3, "q_jump": 0.3}, "passes": 2, "days": 7,
+        "shock": {"tau_l": 90.0, "hold_min": 20.0, "p_l0": 0.01, "lambda_jump": 3.0, "lambda_w": 2.0, "start": {"q_calm": 0.01, "p_jump": 1e-3, "q_jump": 0.3}, "passes": 2, "batch_max": 64, "days": 7,
                   "grid": {"q_calm": [0.003, 0.01, 0.03], "p_jump": [1e-4, 1e-3, 1e-2], "q_jump": [0.1, 0.3, 0.6]}, "lambda_w_grid": [1.5, 2.0, 2.5, 3.0], "hit_min": 20, "pad_min": 30, "fa_weight": 1.0},
         "house": {"p_up": 0.02, "p_down": 0.001, "p_supply0": 0.95, "r_grid": 0.25 / 12.0, "reset_gap_min": 240.0, "reset_sigma": 8.0, "reset_n": 3, "boost_c": 24.0, "balance_seed": 1},
     },

@@ -332,30 +332,27 @@ def kalman(p, d, struct, cfg, collect=False):
     x1 = x2 = first
     p11, p12, p22 = cfg["p0"], 0.0, cfg["p0"]
     ks, vs, ss, xs, ps = [], [], [], [], []
-    for k in range(d.n):
-        yk = y[k]
+    w1 = 1 - w
+    ww, w2, w11 = w * w, 2 * w * w1, w1 ** 2
+    for k, (yk, a11, a12, a21, a22, e1, e2) in enumerate(zip(y, A11, A12, A21, A22, c1, c2)):
         if yk == yk:
-            s = w * w * p11 + 2 * w * (1 - w) * p12 + (1 - w) ** 2 * p22 + r
-            v = yk - (w * x1 + (1 - w) * x2)
-            k1 = (w * p11 + (1 - w) * p12) / s
-            k2 = (w * p12 + (1 - w) * p22) / s
+            s = ww * p11 + w2 * p12 + w11 * p22 + r
+            v = yk - (w * x1 + w1 * x2)
+            h1, h2 = w * p11 + w1 * p12, w * p12 + w1 * p22
+            k1, k2 = h1 / s, h2 / s
             x1 += k1 * v
             x2 += k2 * v
-            n11 = p11 - k1 * (w * p11 + (1 - w) * p12)
-            n12 = p12 - k1 * (w * p12 + (1 - w) * p22)
-            n22 = p22 - k2 * (w * p12 + (1 - w) * p22)
-            p11, p12, p22 = n11, n12, n22
+            p11, p12, p22 = p11 - k1 * h1, p12 - k1 * h2, p22 - k2 * h2
             ks.append(k)
             vs.append(v)
             ss.append(s)
         if collect:
             xs.append((x1, x2))
             ps.append((p11, p12, p22) if collect == "full" else p22)
-        a11, a12, a21, a22 = A11[k], A12[k], A21[k], A22[k]
         t11, t12 = a11 * p11 + a12 * p12, a11 * p12 + a12 * p22
         t21, t22 = a21 * p11 + a22 * p12, a21 * p12 + a22 * p22
         p11, p12, p22 = t11 * a11 + t12 * a12 + q1, t11 * a21 + t12 * a22, t21 * a21 + t22 * a22 + q2
-        x1, x2 = a11 * x1 + a12 * x2 + c1[k], a21 * x1 + a22 * x2 + c2[k]
+        x1, x2 = a11 * x1 + a12 * x2 + e1, a21 * x1 + a22 * x2 + e2
     return np.array(ks), np.array(vs), np.array(ss), np.array(xs), np.array(ps)
 
 
@@ -474,20 +471,19 @@ def fit_room(d, cfg):
     if not can_hold:
         warnings.append("span too short for held-out block; metrics are in-sample")
         ns = 0
-    res = {}
+    held = {}
     for struct in ("rc2", "rc1"):
         tr, x = fit(d.slice(0, ns) if can_hold else d, struct, cfg)
-        full, x_full = fit(d, struct, cfg, x)
-        res[struct] = (full, horizon_error(tr.p, d, struct, cfg, ns))
-    f2, m2 = res["rc2"]
-    f1, m1 = res["rc1"]
+        held[struct] = (x, horizon_error(tr.p, d, struct, cfg, ns))
+    f2, _ = fit(d, "rc2", cfg, held["rc2"][0])
+    m2, m1 = held["rc2"][1], held["rc1"][1]
     key = [n for n in ("a2", "b1", "w") if n in f2.rel_std]
     ident = all(f2.rel_std[n] < cfg["std_max"] for n in key) and not (set(key) & set(f2.at_bound))
     better = m2["rmse_horizon"] is not None and m1["rmse_horizon"] is not None and m2["rmse_horizon"] <= m1["rmse_horizon"] * cfg["rc2_margin"]
     chosen = "rc2" if ident and better else "rc1"
     if chosen == "rc1":
         warnings.append("2-state model not identifiable or not better on held-out block: 1-state fallback" if not ident else "2-state not better than 1-state on held-out block: 1-state used")
-    f, m = res[chosen]
+    f, m = f2 if chosen == "rc2" else fit(d, "rc1", cfg, held["rc1"][0])[0], held[chosen][1]
     for n, s in f.rel_std.items():
         if s > cfg["std_max"]:
             warnings.append(f"{n} poorly identified (relative std {s:.2f})")
@@ -498,7 +494,7 @@ def fit_room(d, cfg):
         "room": d.room, "node": d.node, "structure": chosen, "params": f.p, "rel_std": f.rel_std,
         "bounds": {n: spec(cfg, n)[1:] for n in f.names}, "at_bound": f.at_bound, "cond": f.cond, "names": f.names, "cov_log": f.cov.tolist(),
         "tau_min": tau_minutes(f.p, chosen, wind), "valve_gain": valve_gain(d, cfg), "night_hours": cfg["night_hours"],
-        "metrics": {chosen: m, "alternative": {"structure": "rc1" if chosen == "rc2" else "rc2", **res["rc1" if chosen == "rc2" else "rc2"][1]}, "holdout": can_hold, "fit_rmse_normalised": f.cost},
+        "metrics": {chosen: m, "alternative": {"structure": "rc1" if chosen == "rc2" else "rc2", **held["rc1" if chosen == "rc2" else "rc2"][1]}, "holdout": can_hold, "fit_rmse_normalised": f.cost},
         "span": span_info(d), "neighbours": {k: int(v[0].max()) for k, v in d.nb.items()}, "dt_s": d.dt, "warnings": warnings,
     }
 
