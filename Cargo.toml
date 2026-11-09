@@ -5,6 +5,7 @@ members = ["crates/matter-controller", "crates/heatd"]
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+license = "GPL-3.0-or-later"
 
 [profile.release]
 lto = "thin"

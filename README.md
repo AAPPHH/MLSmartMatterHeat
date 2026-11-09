@@ -91,4 +91,4 @@ cd training && uv run pytest
 sh wear/build.sh                       # Tests + signierte Release-APK (Docker)
 ```
 
-Wer die Uhr-App selbst baut, legt `wear/local.properties` und `wear/keystore.properties` an (beide gitignored). Eine Lizenz ist noch nicht festgelegt.
+Wer die Uhr-App selbst baut, legt `wear/local.properties` und `wear/keystore.properties` an (beide gitignored). Lizenz: GPL-3.0-or-later, siehe [LICENSE](LICENSE).

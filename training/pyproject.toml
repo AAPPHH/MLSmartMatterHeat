@@ -2,6 +2,7 @@
 name = "heattrain"
 version = "0.1.0"
 description = "Offline training and evaluation of the watch matchers"
+license = "GPL-3.0-or-later"
 authors = [
     { name = "AAPPHH" }
 ]
