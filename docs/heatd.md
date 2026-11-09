@@ -1,0 +1,113 @@
+# heatd: Daten, Konfiguration, Regeln, Fenster, Boost, Geräte, API
+
+Verhalten und Konfiguration des Rust-Dienstes `crates/heatd`. Überblick: [README](../README.md).
+
+## Datenlake, Export und Konfiguration
+
+`heatd` schreibt alle Rohdaten als Arrow-Streams nach `<data_dir>/raw/` und rollt sie täglich um 03:00 in Parquet (`<data_dir>/parquet/`, Marker `.rolled`). Schema: `docs/data-foundation.md`.
+
+```bash
+heatd migrate                                                   # einmalig, VOR dem ersten Start dieses Builds: alte DuckDB-Daten in die Lake übernehmen
+heatd inventory 5                                               # Geräteinventar (siehe docs/setup.md), heatd vorher stoppen
+heatd export --room wohnzimmer --from 2026-10-01 --to 2026-10-20   # 1-min-Raster (analysis/views/room_minute.sql) als Parquet, --to inklusive
+heatd report [2026-10-20]                                       # Tagesreport nach <data_dir>/reports/<datum>.md (läuft automatisch um 03:10)
+```
+
+`migrate` übernimmt nur Zeilen vor dem ersten `startup`-Event von `heatd` in `raw/events` (ohne dieses Event vor dem ältesten `watch_raw`-Zeitstempel), liest vorher alle Tabellen vollständig ein und schreibt danach; so entstehen keine Doppelzeilen, weil der laufende Build DuckDB und Lake parallel beschreibt.
+
+Docker: `docker compose run --rm heatd export --room wohnzimmer --from ... --to ...` schreibt nach `/data/exports/`.
+
+Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `deploy/docker/heatd.docker.toml`):
+
+| Schlüssel | Bedeutung |
+|---|---|
+| `latitude`, `longitude` | schaltet den stündlichen Open-Meteo-Abruf (Wetter, `weather_url` überschreibt den Endpunkt) und `coordinates` in `meta` ein; ohne beide aus |
+| `away_setpoint`, `away_guard_minutes` | Sollwert bei Abwesenheit (18 °C) und Zeit, die die getragene Uhr das WLAN fehlen muss (20 min) |
+| `occupied_setpoint` / `sleep_room` | Sollwert des belegten Raums (21) und Schlafzimmer, das bei Schlafen den Zeitplanwert behält (z. B. `schlafzimmer`; leer = keine Ausnahme) |
+| `manual_hold_minutes` | ändert jemand den Sollwert am Thermostat, hält `heatd` diesen Wert genau so lange (60 Minuten, auch wenn sich Zeitplan oder Anwesenheit ändern; nur offenes Fenster und Abwesenheit gehen vor), setzt dann sofort den Systemwert und läuft weiter; Entscheidung `rule=manual` und Label `override` einmal, ein laufendes Experiment bricht ab |
+| `poll_silence_s` | Heartbeat-Poll pro Node nur, wenn so lange (300 s) kein Report kam |
+| `exploration_seed` | Seed für die zufälligen Startzeiten der Experimente |
+| `[rooms.exploration]` | je Raum `enabled` (Standard `false`), `p_per_day`, `comfort_min`, `comfort_max`, `blackout = [{from, to}]` |
+| `neighbours` | Nachbarräume: `{ a, b, kind = "wall" oder "ceiling" oder "open", partial }` (bei `ceiling` liegt `a` über `b`), alte Paare `["a","b"]` gelten weiter (Art unbekannt); die Paare liefern die Nachbartemperaturen im Raster, die Arten stehen als `links` in `meta` |
+| `[heat_source]` | `kind`, `scope`, `efficiency_class`, `flow_temp_controllable`, `night_setback_controllable`, `operating_hours`, `night_shutdown` als `meta` |
+| `[building]`, `rooms.exterior` | `floor`, `roof_rooms`; Außentüren je Raum (`exterior = ["front_door"]`) als `meta` `building`. Räume ohne Thermostat (`nodes` weglassen, z. B. der Flur) sind erlaubt |
+| `ntp_server` | SNTP-Drift-Check (Event ab 1 s), leer schaltet ihn aus |
+| `inventory_dir` | Ablage der Inventardateien |
+
+`/health` zeigt je Node Subscription-Status und Alter des letzten Reports (`degraded` bei Verlust), `/metrics` dieselben Werte für Prometheus.
+
+## Regeln
+
+| Priorität | Bedingung | Sollwert |
+|---|---|---|
+| 1 | Fenster offen (`POST /api/window`) | `frost_setpoint` |
+| 2 | Uhr abwesend (Schutz: `away_guard_minutes`, Uhr muss getragen worden sein) | `away_setpoint` (18 °C) in allen Räumen, ohne Zeitplan |
+| 3 | Laufendes Explorationsexperiment (`rooms.exploration`) | Experiment-Sollwert |
+| 4 | Raum, in dem du bist, außer `sleep_room`, solange die Uhr auf Schlafen steht | `occupied_setpoint` (21 °C), immer genau dieser Wert |
+| 5 | Zeitplan greift (auch über Mitternacht), auch im `sleep_room` bei Schlafen | Zeitplan-Wert |
+| – | sonst | `default_setpoint` |
+
+Ein manueller Eingriff am Thermostat (`manual_hold_minutes`) hält den Wert des Geräts genau 60 Minuten und geht allem außer offenem Fenster und Abwesenheit vor. Frost (`frost_setpoint`) ist der Wert bei offenem Fenster.
+
+Der belegte Raum ist der Raum des Matchers, solange er sicher ist (nicht abstained, innerhalb von `t_hold_min`, Alter höchstens `presence_timeout_minutes`). Fehlt er, gilt das bestätigte Stay-Label der Uhr (Scan-Label oder `/api/label`), wenn es jünger als `presence_timeout_minutes` ist und die Uhr seither keine Bewegung gemeldet hat. Räume ohne Node (z. B. `flur`) bekommen keine Aktion. Schlafen heißt: Zustand `sleep` aus dem Watch-Zustand oder das Feld `bedtime: true`, das die Uhr aus dem Bettzeit-Modus sendet. `presence_boost` wird nicht mehr verwendet (Schlüssel bleibt erlaubt, ohne Wirkung). Entscheidungen tragen `rule=presence`, `reason` = `occupied` oder `sleep`, sowie `source` (`matcher` oder `stay_label`) und `sleep` in `inputs.extra`.
+
+Nach einem Neustart baut heatd die Anwesenheit beim Start aus dem auf, was es ohnehin speichert, damit nicht bis zum nächsten Upload der Uhr (oft 20-30 Minuten) nur "vermutlich zuhause" gilt: Tracker (Weg/Zurück, inklusive `away_guard_minutes`) aus `device_state` der letzten `[presence] tracker_lookback_h` Stunden, Matcher-Raum, Stay-Label und Schlafzustand (Hr/Bewegung/Offbody/Ladegerät) aus Lake (`watch_inference`, `labels`, `watch_state`, `watch_raw`) der letzten `presence_timeout_minutes`, und die Raum-Belegung (`occupancy_enter_min` rechnet ab dem ersten Treffer des Raums). Ältere Daten werden ignoriert, Abwesenheit bleibt bis `still_contact_timeout_minutes` erhalten. `tracker_lookback_h` (Standard 72) muss die längste Ruhephase während der Abwesenheit abdecken, sonst startet der Tracker ohne die Bewegung, die das Weg bestätigt, und meldet zuhause. Stay-Labels werden nach ihrem Ende (`to`) einsortiert, nicht nach dem Upload, und gelöschte Labels (void) werden ignoriert, unabhängig von der Upload-Reihenfolge. Abschalten mit `[presence] restore = false`.
+
+Die Regeln laufen alle 60 s. Geschrieben wird nur, wenn der neue Wert ≥ 0,5 °C vom zuletzt gesetzten abweicht. Die Entscheidung wird vor dem Geräte-Schreiben auf Platte geschrieben (fsync). Berichte, die kurz nach einem eigenen Schreiben noch den alten oder einen vom Gerät gerundeten Wert zeigen (2 × `timeout_s`), und Poll-Antworten gelten nie als manueller Eingriff. Ein echter manueller Eingriff am Thermostat wird genau `manual_hold_minutes` (60) gehalten; danach schreibt `heatd` sofort den Systemwert (ohne Ratenlimit).
+
+Anhebungs-Budget: Damit die Thermostate nicht dauernd umschalten, darf jeder Raum pro rollender Stunde nur `raise_budget_per_hour` (Standard 1, 0 = unbegrenzt) Sollwert-Anhebungen bekommen. Eine Anhebung ist jedes Schreiben, dessen Wert über dem liegt, was das Gerät meldet bzw. heatd zuletzt geschrieben hat. Senkungen (Fenster-Frost, Abwesenheit, Boost-Ende, Zeitplan/Anwesenheit nach unten) sind immer sofort und kosten nichts. Ist das Budget aufgebraucht, wird die Anhebung aufgeschoben (Entscheidung mit `reason=raise_budget`, `deferred=true`, einmal je Wert) und sobald ein Slot frei wird, mit dem dann aktuellen Wunschwert geschrieben; es gibt keine Warteschlange alter Werte. Der Boost auf 24 °C zählt als Anhebung (er ersetzt die gleichzeitige Anhebung auf den Zielwert, beides zusammen kostet eine). Boost-Zyklen und Explorationsexperimente starten nicht, solange das Budget des Raums aufgebraucht ist (laufende werden nicht abgebrochen). Frei, aber in `inputs.extra.budget` als `exempt_*` protokolliert: das Zurückschreiben nach Neustart oder Border-Router-Failsafe, wenn das Gerät noch auf dem Failsafe-Wert (`[failsafe] setpoint` bzw. `[br_watchdog] setpoint_c`) steht (je Knoten das erste Schreiben nach dem Start), das Nachschreiben eines unveränderten Ziels durch die Sollwert-Prüfung (`[node_health]`), die Obergrenze bei `no_supply` und die Rückkehr auf das vorherige Ziel nach Fenster-Schließen bzw. PI-Reset (`exempt_window_close`), weil sie nur heatds eigene Frost-Senkung zurücknimmt; sie verbraucht kein Budget. Sichtbar in `/api/state` (`rooms[].raise_budget`: `limit`, `used`, `next_free_ts`, `deferred_setpoint`), Prometheus (`heatd_raise_budget_limit`, `heatd_raise_budget_used`, `heatd_raise_next_free_seconds`, `heatd_raise_deferred`, `heatd_raises_deferred_total`) und im Tagesbericht (Abschnitt "Anhebungs-Budget je Raum").
+
+## Boost (Aufheizen)
+
+Geboostet wird nur in zwei Szenarien. Morgens: die Uhr meldet Aufwachen (Schlafzustand oder Bettzeit endet) zwischen 05:00 und 11:00, solange jemand da ist; Räume, deren Wunsch-Sollwert dann um mindestens 1 K steigt. Heimkehr: Abwesenheit endet nach mindestens `[boost] homecoming_min_away_min` (60) Minuten (kuerzer: `kein Boost: nur N min weg`); Räume, die vom Abwesenheits-Sollwert um mindestens 1 K steigen. Raumwechsel, Zeitplan-Stufen und jede andere Anhebung boosten nie. Der Boost schreibt 24 °C, hält 5 bis 20 Minuten (Ventil offen) und schreibt dann den Zielwert des Raums. Nach einem offenen Fenster (eigener Raum oder Haus-Kanal) boostet heatd automatisch nicht mehr, solange es weniger als `[boost] after_window_min` (180) Minuten her ist, weil Heizkoerper und Waende noch warm sind (von Hand per `POST /api/boost` bleibt es erlaubt, mit Hinweis). Abbruch bei Sensor ≥ 24 °C, Fenster auf, Abwesenheit, manueller Änderung am Gerät oder Absenkung des Ziels. Das Anhebungs-Budget (1 pro Raum und Stunde) gilt, der Boost ist die Anhebung, die Rückkehr ist eine freie Senkung.
+
+Die Dosis kommt aus dem gelernten Modell (`/models/boost/<Zeitstempel>/bundle.json`, neuestes gültiges Bundle, Neuladen alle `[boost] reload_min`): höchstens 10 % über der stärksten bekannten Dosis in ähnlicher Lage (eigener Raum, Kontextvektor), 5 Minuten ohne ähnliche Lage, und nur so lang, dass das dem Boost zuzurechnende Risiko P_Boost(Spitze > Ziel + 0,5 K) − P_ohne_Boost(Spitze > Ziel + 0,5 K) höchstens 10 % beträgt (ohne Boost = nur der Thermostat). Ohne Bundle gibt es keinen Boost. Nach jedem Boost misst heatd 60 Minuten die Spitze und schreibt ein `boost_cycle`-Event; der Trainer-Timer (alle 10 Minuten) lernt danach neu. `POST /api/boost` löst einen Boost von Hand über denselben Weg aus (Szenario `manual`, Dosis `min(minuten, 20)`, ohne Angabe 5 Minuten, gleiche 24-°C-Grenzen und Budget; kein Bundle → 409 mit Grund). Alle manuellen Eingaben laufen über eine Intent-Schicht (`Boost`, `WindowOpen`, `WindowClose`); ein späterer Thermostat-Tastendruck (kurzer lokaler Sollwert-Schub, in `rules::on_report` erkannt) baut nur den Intent und ruft dieselbe Funktion. Zustand in `/api/state` (`rooms[].boost`: Szenario, erlaubt, gewählt, Grund in einem Satz), `/api/boost`, Prometheus `heatd_boost_*` und im Tagesbericht („Aufheizen: Boost nach Szenario“, inklusive verweigerter Boosts). Details: `docs/boost.md`.
+
+
+## Fenster-offen-Erkennung
+
+heatd erkennt offene Fenster mit einem gelernten Physik-Residuum-Modell (Detektor `v3`; die alten Schwellen-Detektoren v1/v2 und `window-replay` sind entfernt). Der Fühler des Comet Zero sitzt am Heizkörper, ein schließendes Ventil kühlt ihn wie ein offenes Fenster ab. Das Modell kennt deshalb das Ventil.
+
+- **Modell**: je Raum eine Ridge-Regression, die die Fühleränderung der nächsten 20 min aus dem eigenen Ventilverlauf (Mittel über 20 min, gefilterte Werte mit tau 4/12/40 min, Ventil jetzt und vor 20 min), Sollwert, Außentemperatur, Strahlung, Wind und Minuten seit offenem Ventil vorhersagt. Evidenz = standardisiertes negatives Residuum z je Raum (auf 6 begrenzt). Hausscore = Summe der positiven z mit Gewicht 1 (Erdgeschoss) bzw. 0,3 (Schlafzimmer). Alarm, wenn der Score den Schwellwert des Bundles überschreitet (aus 0,5 Episoden pro Tag auf unmarkierten Daten abgeleitet, Stand der ersten Auswertung 8,0). Ein einzelner Raum erreicht höchstens 6 und löst allein nie aus, es müssen mindestens zwei Räume zusammenkommen. Offline erkannte das Modell das Fenster vom 2026-11-07 (Bad und Flur) 25 min nach dem Öffnen bei 0,4 Fehlalarmen pro Tag und 0 Alarmen bei Kesselausfall.
+- **Bundle**: `models/window/<version>/bundle.json` (nächtlich vom Trainingscontainer geschrieben, `python -m heattrain window`, nur wenn das feste Kriterium erfüllt ist). heatd lädt das neueste beim Start und prüft alle `reload_min` = 10 min auf eine neuere Version. Fehlt das Bundle oder ist es ungültig, wird einmal geloggt, es gibt keine Erkennung und die Heizung läuft unverändert weiter.
+- **Eingaben minutengenau**: Aus den Berichten `local_temperature`, `pi_heating_demand` und `occupied_heating_setpoint` jedes Knotens wird pro Minute der letzte gültige Wert übernommen (Temperatur höchstens 10 min, Ventil 30 min, Sollwert 6 h alt), dazu die letzte Wetterbeobachtung (Außentemperatur, Wind, Strahlung, höchstens 180 min alt, keine Interpolation). Fehlt ein Wert, ist die Minute nicht bewertbar. Ein fehlendes Ventil gilt nie als geschlossen. Nach einem Neustart wird der Verlauf aus dem Lake nachgespielt (ohne Wetter, die ersten 20 min danach sind deshalb nicht bewertbar), nach einer Ventillücke dauert es 141 min bis zur nächsten Bewertung.
+- **Kessel-Veto**: Solange irgendein Raum `no_supply` meldet (Event `supply`, Zeitpunkt der Meldung), und 60 min danach gibt es keinen Alarm.
+- **Wirkung**: Beim Alarm bekommen die Erdgeschossräume mit Thermostat (nicht in `building.roof_rooms`) Frost (`frost_setpoint`), deren z mindestens `room_z` = 1,0 beträgt; trägt keiner so viel bei, alle Erdgeschossräume mit Thermostat. Experimente werden in offenen Räumen nicht gestartet und laufende abgebrochen. Events `window_open` (Detail: Detektor `v3`, Räume, z je Raum, Hausscore, Schwellwert, Bundle-Version, Quelle `auto`).
+- **Zu** nach spätestens `hold_min` = 20 min (`window_close`, Grund `timeout`), früher mit `POST /api/window {open: false}` (Grund `manual`) oder mit der Antwort "zu" der Uhr auf die Fensterfrage (Grund `label`). Danach öffnet derselbe Raum `rearm_min` = 30 min lang nicht automatisch neu.
+- **Kein Alarm** (Event `window_suppressed`, Grund `rearm`, `setpoint`, `manual_hold` oder `away`) für einen Raum, der gerade geschlossen wurde, dessen Sollwert innerhalb von `setpoint_guard_min` = 20 min gesenkt wurde, der im manuellen Hold ist oder wenn niemand zu Hause ist (Abwesenheit). Je Grund wird höchstens alle 15 min geloggt.
+- **Rückfragen an die Uhr**: Bei jedem automatischen Öffnen steht (höchstens ein offener, `prompt_expire_min` = 20 min gültiger) `window_prompt {id, room, question: open}` in den Antworten von `/api/scan` und `/api/scans`, solange eine Uhr zu Hause ist (Raum mit dem höchsten z). Antwort: `POST /watch/window_label {device, ts, room, answer, via, prompt_id, label_id}` (Label-Quelle `window`; `answer` = yes, no, unknown, timeout oder voided, alte Clients senden nur `open`); "yes" ändert nichts, "no" schließt das automatisch geöffnete Fenster, `unknown`/`timeout` beenden nur die Frage und bestätigen nie, `voided` nimmt die früheren Antworten der Frage zurück (Details in `contract/README.md`). Ohne `prompt_id` gilt der Eintrag als manuell und wirkt wie `POST /api/window`. Zurücknehmen über `/watch/label/void`. Pro Episode landet 25 min nach Ende (`label_grace_min`) ein `window_episode`-Event im Lake, der Tagesbericht fasst es zusammen.
+- Ein manuell geöffnetes Fenster (`POST /api/window`) schließt nach spätestens `manual_max_min` = 12 h von selbst (`manual_timeout`).
+- `POST /api/window {"room": "...", "open": true|false}` überschreibt manuell. Zustand: `/api/state` (je Raum Zustand, z, Modellversion), `/metrics` (`heatd_window_z`, `heatd_window_house_score`), Tagesbericht. Einstellungen unter `[window]` in der Konfiguration (alte Schlüssel der v1/v2-Zeit werden ignoriert).
+
+## Zusatzgeräte (Stecker, Sensoren)
+
+`[[devices]]` in `heatd.toml` nimmt weitere Matter-Geräte auf (Node-IDs außerhalb aller Räume): `kind` = `plug` (GRILLPLATS, Wirkleistung/Energie/Ein-Aus mit `min_s` = 1 s), `climate` (TIMMERFLOTTE, Batterie, nur seltene Abos) oder `air` (ALPSTUGA), dazu `role` und optional `room` (bei der Alpstuga noch offen). Alles, was die Geräte melden, landet roh und verlustfrei in der Lake-Tabelle `device_readings` (Schema v7, `docs/data-foundation.md`), eine Zeile je Bericht. Die Geräte haben eigene Abos (Router-Geräte: schnelle Messcluster plus langsames Rest-Abo), eigene Gesundheit (nur eine Zeile `device_link` im Event-Log und im Tagesbericht, kein Alarm) und fließen weder in Failsafe, Router-Watchdog, Fenster, Boost, Raummodell noch Thermostat-Health ein. `/api/state` hat dazu den Block `matter_devices`, der Tagesbericht den Abschnitt „Zusatzgeraete“.
+
+**Einzige Schreibaktion:** `wake_on = true` (nur `plug` mit `role = "coffee"`, Fenster `wake_window`, Standard `06:00-09:00` Ortszeit) schaltet die Kaffeemaschine mit OnOff **On** ein, sobald der Schlafmodus der Uhr endet (dasselbe Signal wie der Morgen-Boost: Schlaf wird zu wach, Anwesenheit bekannt), höchstens einmal je Ortszeit-Tag (Marker unter `data_dir/devices/`), nicht bei Abwesenheit. Schlägt das Schreiben fehl, wird alle 2 min wiederholt, nach 10 min gibt heatd für den Tag auf. Jeder Ausgang steht als Event `coffee_on` (Grund `wake`, `gave_up`, `away`) im Lake und als Zeile im Tagesbericht. Der Code sieht von den Geräten nur `DeviceFeed` (Abo, Resubscribe) und `SwitchOn` (nur OnOff On), anderes ist strukturell nicht erreichbar (Test `nothing_but_one_on_command_ever_reaches_the_devices`). Alle anderen Rollen werden nur gelesen, etwa `toothbrush` (Ladestation der elektrischen Zahnbürste im Bad, Node 10, `min_s = 10`, damit Entnahme und Rückkehr der Bürste im Leistungsverlauf sichtbar sind).
+
+## API
+
+| Methode | Pfad | |
+|---|---|---|
+| `POST` | `/api/scan` | Scan der Uhr → `{stored, room}` |
+| `GET` | `/api/state` | Räume, Temperaturen, Sollwerte, letzter Raum je Gerät |
+| `POST` | `/watch/measurement` | `{device, ts, measurements:[{sender, rssi, freq oder channel}]}` nach `watch_raw` |
+| `POST` | `/watch/label` | wie `/api/label`, nach `labels` |
+| `GET` | `/watch/update` | App-Update der Uhr: `{version_code, version_name, sha256, size}` oder 404 (nichts veröffentlicht oder Prüfsumme/Größe passt nicht) |
+| `GET` | `/watch/update.apk` | die APK dazu (`application/vnd.android.package-archive`); Dateien `update.json` + `update.apk` in `[watch] update_dir` (Standard `/data/watch_update`, im Docker-Mount `data/`), veröffentlicht mit `deploy/watch-publish.sh` auf dem PC |
+| `POST` | `/api/snapshot` | DuckDB-Snapshot für das Training |
+| `POST` | `/api/window` | `{room, open}` |
+| `POST` | `/api/boost` | `{room, minutes?}` manueller Boost (Szenario `manual`) über denselben Sicherheitsweg, 200 mit Entscheidung oder 409 mit `reason` |
+| `GET` | `/api/boost` | Boost-Zustand je Raum (Szenario, erlaubt, gewählt, Grund) |
+| `POST` | `/watch/window_label` | `{device, ts, room, answer, via, open?, prompt_id, label_id}` |
+| `POST` / `GET` / `DELETE` | `/api/setpoint` | manuelle Vorgabe je Raum: `{room, celsius, hold_min?, source?}` (`api` oder `watch`; 15 bis 720 min, Standard 120; `celsius` von `frost_setpoint` bis 26 in 0,5er Schritten), `{room, clear: true}` oder `DELETE ?room=` hebt sie auf; `GET` zeigt die aktiven Vorgaben. Ein offenes Fenster geht vor, die Antwort sagt es auf Deutsch |
+| `POST` | `/api/scans` | gebündelte Scans der Uhr (Warteschlange nach Funkloch) |
+| `POST` | `/api/label`, `/api/label/void` | Raumetiketten der Uhr setzen bzw. zurücknehmen (gleich unter `/watch/label`, `/watch/label/void`) |
+| `GET` | `/api/labels/progress` | Etikettenfortschritt je Raum |
+| `POST` | `/watch/sensors` | Sensor-Batches der Uhr (Puls, Hauttemperatur, Bewegung, Trageerkennung, Akku) |
+| `POST` | `/api/ambient` | Umgebungswerte (Gerätetemperaturen, Leistung), siehe `docs/ambient-sources.md` |
+| `GET` | `/api/usage?from=&to=` | Nutzung je Tag im Zeitraum (`YYYY-MM-DD`, höchstens 93 Tage) |
+| `GET` | `/health`, `/metrics` | Gesundheit je Node, Prometheus |
+
+Die API hat keine Authentifizierung und gehört nur ins LAN.
+

@@ -3,7 +3,7 @@ set -euo pipefail
 M=${MINIX:-aapphh@192.168.178.29}
 PORT=${HEATD_PORT:-8090}
 cd "$(dirname "$0")/../.."
-docker image inspect heatd:local >/dev/null 2>&1 || { echo "image heatd:local fehlt, erst mit docker build bauen (README)" >&2; exit 1; }
+docker image inspect heatd:local >/dev/null 2>&1 || { echo "image heatd:local fehlt, erst mit docker build bauen (docs/setup.md)" >&2; exit 1; }
 T=$(mktemp -d)
 sed -e "s/^listen = .*/listen = \"0.0.0.0:$PORT\"/" -e 's/^controller = .*/controller = "mock"/' deploy/docker/heatd.docker.toml > "$T/heatd.toml"
 printf 'HEATD_UID=1000\nHEATD_GID=1000\nHEATD_PORT=%s\nNINJA_JOBS=4\n' "$PORT" > "$T/.env"
