@@ -629,6 +629,16 @@ class RoomPar:
         self.kinds = sorted(doc["c"])
         self.ck = [doc["c"][k] for k in self.kinds]
         self.g, self.sigma_u, self.noise_r, self.p0, self.q_r, self.q_a = (doc[k] for k in ("valve_gain", "sigma_u", "noise_r", "p0", "q_r", "q_a"))
+        self.q_um, self.q_ua = doc.get("q_um", 0.0), doc.get("q_ua", 0.0)
+        self.tau_v = p.get("tau_v", 0.0)
+        self.alpha = 1.0 - math.exp(-1.0 / self.tau_v) if self.tau_v > 0 else 1.0
+        self.valve_obs = bool(doc.get("valve_obs", True))
+
+    def lag(self, state, u):
+        if state is None or self.alpha == 1.0:
+            return [u, u]
+        v1 = state[0] + self.alpha * (u - state[0])
+        return [v1, state[1] + self.alpha * (v1 - state[1])]
 
     def coupling(self, ncnt, nsum):
         cn = cs = 0.0
@@ -692,6 +702,7 @@ class RoomFilter:
         self.pending = None
         self.events = []
         self.comps = []
+        self.lag = None
 
     def weights(self, w):
         return [w[j // 2] * self.nu[j // 2][j % 2] for j in range(4)]
@@ -723,6 +734,8 @@ class RoomFilter:
     def update(self, inp, w, step):
         self.pending, self.flag, self.skipped = None, None, True
         par = self.par
+        if math.isfinite(inp.u):
+            self.lag = par.lag(self.lag, inp.u)
         if not finite(inp.u, inp.tout, inp.wind, inp.rad, *inp.nsum):
             self.since_obs += 1
             return None
@@ -735,7 +748,7 @@ class RoomFilter:
         elif y_ok and self.since_obs > self.house["reset_gap_min"]:
             self.reset("gap", inp, w, step)
         self.skipped = False
-        v_ok = math.isfinite(inp.yv) and 0.0 < inp.yv < 1.0 and math.isfinite(inp.sp)
+        v_ok = par.valve_obs and math.isfinite(inp.yv) and 0.0 < inp.yv < 1.0 and math.isfinite(inp.sp)
         r1 = self.house["r_grid"] + par.noise_r ** 2
         ll = [0.0] * 4
         yhat = [0.0] * 4
@@ -818,11 +831,12 @@ class RoomFilter:
             else:
                 xb, pb = list(self.x[jt]), list(self.p[jt])
             new_nu[st][mt] = c
-            f11, f12, f21, f22, g1, g2, amb = par.terms(xb[2], inp.u * st, inp.tout, inp.wind, inp.rad, inp.night, cn, cs, h)
+            f11, f12, f21, f22, g1, g2, amb = par.terms(xb[2], self.lag[1] * st, inp.tout, inp.wind, inp.rad, inp.night, cn, cs, h)
             fm = [f11, f12, 0.0, f21, f22, h * amb * (inp.tout - xb[1]), 0.0, 0.0, self.phi]
             fp = mat_mul(mat_mul(fm, pb), mat_t(fm))
-            fp[0] += par.q_r * h
-            fp[4] += par.q_a * h
+            ug = self.lag[1] * st
+            fp[0] += (par.q_r + par.q_um * ug) * h
+            fp[4] += (par.q_a + par.q_ua * ug) * h
             fp[8] += self.q_l[mt]
             new_x.append([f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2, 1.0 + self.phi * (xb[2] - 1.0)])
             new_p.append([0.5 * (fp[3 * i + k] + fp[3 * k + i]) for i in range(3) for k in range(3)])
@@ -876,9 +890,11 @@ class House:
 def rollout(par, m, a, lam, s, sp, env):
     h = 1.0 / 60.0
     en, co, sens = [], [], []
+    lag = env["lag"]
     for k in range(HORIZON):
         u = min(max(par.g * (sp[k] - par.sensor(m, a)), 0.0), 1.0)
-        f11, f12, f21, f22, g1, g2, _ = par.terms(lam, u * s, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], h)
+        lag = par.lag(lag, u)
+        f11, f12, f21, f22, g1, g2, _ = par.terms(lam, lag[1] * s, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], h)
         m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2
         sens.append(par.sensor(m, a))
         en.append(u * s)
@@ -901,6 +917,7 @@ def plan(par, shock, comps, p_supply, env):
     lam_o = max(shock["lambda_jump"], sum(mu[j] * q[j] * comps[j][1][2] for j in range(len(comps))) / pw) if pw > 0 else shock["lambda_jump"]
     env = dict(env)
     env["cn"], env["cs"] = par.coupling(env["ncnt"], env["nsum"])
+    env["lag"] = list(env["lag"]) if env.get("lag") is not None else None
     modes = ((1.0 - pw, lam_c), (pw, lam_o))
     supplies = ((1, p_supply), (0, 1.0 - p_supply))
     calm = (1.0, 0.0)
@@ -949,6 +966,9 @@ def plan(par, shock, comps, p_supply, env):
         if evoi > evoi_best + 1e-12:
             chosen, evoi_best = pr, evoi
     fc = sum(modes[mi][0] * supplies[si][1] * live["runs"][mi][si][2][FORECAST_MIN - 1] for mi in range(2) for si in range(2))
+    y_last = env.get("y_last")
+    if y_last is not None and math.isfinite(y_last):
+        fc += y_last - sensor0
     return {"kind": chosen["kind"], "name": chosen["name"], "setpoint": chosen["first"], "raise": chosen["raise_flag"], "probe_min": chosen["probe_min"], "boost_min": chosen["boost_min"],
             "energy": chosen["energy"], "cold": chosen["cold"], "raise_cost": chosen["raise"], "cost_live": live["total"], "total": chosen["total"], "p_window": pw, "lam_closed": lam_c, "lam_open": lam_o,
             "mass": m, "air": a, "sensor": sensor0, "forecast": fc, "evoi": evoi_best, "best_cost": best["total"], "perfect_cost": perf, "n_allowed": len(allowed)}

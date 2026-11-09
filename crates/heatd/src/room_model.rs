@@ -21,6 +21,12 @@ pub struct Params {
     pub w: f64,
     pub ts: f64,
     pub ts_night: f64,
+    #[serde(default)]
+    pub tau_v: f64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +41,12 @@ pub struct RoomDoc {
     pub p0: f64,
     pub q_r: f64,
     pub q_a: f64,
+    #[serde(default = "yes")]
+    pub valve_obs: bool,
+    #[serde(default)]
+    pub q_um: f64,
+    #[serde(default)]
+    pub q_ua: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,8 +122,8 @@ impl Bundle {
         }
         for (name, r) in &self.rooms {
             let p = &r.params;
-            let values = [p.a1, p.a2, p.b1, p.b2, p.b3, p.b4, p.w, p.ts, p.ts_night, r.valve_gain, r.sigma_u, r.noise_r, r.p0, r.q_r, r.q_a];
-            if values.iter().any(|v| !v.is_finite()) || !(p.w > 0.0 && p.w < 1.0) || r.valve_gain <= 0.0 || r.sigma_u <= 0.0 || r.noise_r <= 0.0 || r.p0 <= 0.0 || r.q_r < 0.0 || r.q_a < 0.0 || r.c.values().any(|v| !v.is_finite()) {
+            let values = [p.a1, p.a2, p.b1, p.b2, p.b3, p.b4, p.w, p.ts, p.ts_night, p.tau_v, r.valve_gain, r.sigma_u, r.noise_r, r.p0, r.q_r, r.q_a, r.q_um, r.q_ua];
+            if values.iter().any(|v| !v.is_finite()) || !(p.w >= 0.0 && p.w < 1.0) || p.tau_v < 0.0 || r.valve_gain <= 0.0 || r.sigma_u <= 0.0 || r.noise_r <= 0.0 || r.p0 <= 0.0 || r.q_r < 0.0 || r.q_a < 0.0 || r.q_um < 0.0 || r.q_ua < 0.0 || r.c.values().any(|v| !v.is_finite()) {
                 bail!("room model bundle {}: invalid model for {name}", self.version);
             }
             if r.neighbours.keys().any(|k| !r.c.contains_key(k)) {
@@ -188,11 +200,27 @@ pub struct RoomPar {
     pub p0: f64,
     pub q_r: f64,
     pub q_a: f64,
+    pub alpha: f64,
+    pub valve_obs: bool,
+    pub q_um: f64,
+    pub q_ua: f64,
 }
 
 impl RoomPar {
     pub fn new(doc: &RoomDoc) -> Self {
-        Self { p: doc.params.clone(), ck: doc.c.values().copied().collect(), g: doc.valve_gain, sigma_u: doc.sigma_u, noise_r: doc.noise_r, p0: doc.p0, q_r: doc.q_r, q_a: doc.q_a }
+        let tau = doc.params.tau_v;
+        let alpha = if tau > 0.0 { 1.0 - (-1.0 / tau).exp() } else { 1.0 };
+        Self { p: doc.params.clone(), ck: doc.c.values().copied().collect(), g: doc.valve_gain, sigma_u: doc.sigma_u, noise_r: doc.noise_r, p0: doc.p0, q_r: doc.q_r, q_a: doc.q_a, alpha, valve_obs: doc.valve_obs, q_um: doc.q_um, q_ua: doc.q_ua }
+    }
+
+    pub fn lag(&self, state: Option<[f64; 2]>, u: f64) -> [f64; 2] {
+        match state {
+            Some([s1, s2]) if self.alpha != 1.0 => {
+                let v1 = s1 + self.alpha * (u - s1);
+                [v1, s2 + self.alpha * (v1 - s2)]
+            }
+            _ => [u, u],
+        }
     }
 
     pub fn coupling(&self, ncnt: &[f64], nsum: &[f64]) -> (f64, f64) {
@@ -318,6 +346,7 @@ pub struct RoomFilter {
     events: Vec<ResetRec>,
     pub comps: Vec<Comp>,
     pub last: Out,
+    pub lag: Option<[f64; 2]>,
 }
 
 impl RoomFilter {
@@ -344,6 +373,7 @@ impl RoomFilter {
             events: Vec::new(),
             comps: Vec::new(),
             last: Out::default(),
+            lag: None,
         }
     }
 
@@ -399,6 +429,9 @@ impl RoomFilter {
         self.pending = None;
         self.flag = None;
         self.skipped = true;
+        if inp.u.is_finite() {
+            self.lag = Some(self.par.lag(self.lag, inp.u));
+        }
         if !inp.dynamic_ok() {
             self.since_obs += 1;
             return None;
@@ -415,7 +448,7 @@ impl RoomFilter {
         }
         self.skipped = false;
         let par = self.par.clone();
-        let v_ok = inp.yv.is_finite() && 0.0 < inp.yv && inp.yv < 1.0 && inp.sp.is_finite();
+        let v_ok = par.valve_obs && inp.yv.is_finite() && 0.0 < inp.yv && inp.yv < 1.0 && inp.sp.is_finite();
         let r1 = self.house.r_grid + par.noise_r.powi(2);
         let (mut ll, mut yhat, mut s1) = ([0.0; 4], [0.0; 4], [0.0; 4]);
         for j in 0..4 {
@@ -512,6 +545,7 @@ impl RoomFilter {
         let (par, h) = (&self.par, 1.0 / 60.0);
         let mu = self.weights(w);
         let (cn, cs) = par.coupling(&inp.ncnt, &inp.nsum);
+        let ue = self.lag.map_or(inp.u, |l| l[1]);
         let (mut new_x, mut new_p, mut new_nu) = ([[0.0; 3]; 4], [[0.0; 9]; 4], [[0.0; 2]; 2]);
         for jt in 0..4 {
             let (st, mt) = (jt / 2, jt % 2);
@@ -533,11 +567,12 @@ impl RoomFilter {
                 (self.x[jt], self.p[jt])
             };
             new_nu[st][mt] = c;
-            let [f11, f12, f21, f22, g1, g2, amb] = par.terms(xb[2], inp.u * st as f64, inp.tout, inp.wind, inp.rad, inp.night, cn, cs, h);
+            let [f11, f12, f21, f22, g1, g2, amb] = par.terms(xb[2], ue * st as f64, inp.tout, inp.wind, inp.rad, inp.night, cn, cs, h);
             let fm = [f11, f12, 0.0, f21, f22, h * amb * (inp.tout - xb[1]), 0.0, 0.0, self.phi];
             let mut fp = mat_mul(&mat_mul(&fm, &pb), &mat_t(&fm));
-            fp[0] += par.q_r * h;
-            fp[4] += par.q_a * h;
+            let ug = ue * st as f64;
+            fp[0] += (par.q_r + par.q_um * ug) * h;
+            fp[4] += (par.q_a + par.q_ua * ug) * h;
             fp[8] += self.q_l[mt];
             new_x[jt] = [f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2, 1.0 + self.phi * (xb[2] - 1.0)];
             for i in 0..3 {
@@ -633,6 +668,8 @@ pub struct Env {
     pub raise_cost: f64,
     pub cold_cost: f64,
     pub r_grid: f64,
+    pub lag: Option<[f64; 2]>,
+    pub y_last: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -689,9 +726,12 @@ struct Cand {
 fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64) -> Run {
     let h = 1.0 / 60.0;
     let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new() };
+    let mut lag = env.lag;
     for &set in sp.iter().take(HORIZON) {
         let u = (par.g * (set - par.sensor(m, a))).clamp(0.0, 1.0);
-        let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, u * s, env.tout, env.wind, env.rad, env.night, cn, cs, h);
+        let l = par.lag(lag, u);
+        lag = Some(l);
+        let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, l[1] * s, env.tout, env.wind, env.rad, env.night, cn, cs, h);
         (m, a) = (f11 * m + f12 * a + g1, f21 * m + f22 * a + g2);
         let sens = par.sensor(m, a);
         run.sens.push(sens);
@@ -795,7 +835,8 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
         }
     }
     let live = &cands[0];
-    let forecast = (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * live.runs[mi][si].sens[FORECAST_MIN - 1]));
+    let model_fc = (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * live.runs[mi][si].sens[FORECAST_MIN - 1]));
+    let forecast = env.y_last.filter(|y| y.is_finite()).map_or(model_fc, |y| model_fc + (y - sensor0));
     let (cost_live, best_cost, n_allowed, energy_live) = (live.total, cands[best].total, allowed.len(), live.energy);
     let chosen = probe.as_ref().unwrap_or(&cands[best]);
     PlanOut {

@@ -12,9 +12,13 @@ def room_doc(coupling=True, gain=0.5, **params):
     return {"params": {**TRUE, **params}, "c": {"wall": 0.2} if coupling else {}, "valve_gain": gain, "sigma_u": 0.25, "noise_r": 0.15, "p0": 1.0, "q_r": 0.5, "q_a": 0.05}
 
 
-def simulate_house(n, seed=0, window=None, stop=None, gap=None, corrupt=None, coupling=True, report_p=0.3, grid=0.5, gain=0.5, **params):
+def simulate_house(n, seed=0, window=None, stop=None, gap=None, corrupt=None, coupling=True, report_p=0.3, grid=0.5, gain=0.5, room_over=None, **params):
     rng = np.random.default_rng(seed)
     docs = {name: room_doc(coupling, gain, **params) for name in NAMES}
+    for name, over in (room_over or {}).items():
+        docs[name]["params"].update(over.get("params", {}))
+        docs[name].update({k: v for k, v in over.items() if k != "params"})
+    lag = dict.fromkeys(NAMES)
     pars = {name: RoomPar(docs[name]) for name in NAMES}
     h = 1.0 / 60.0
     m = {name: 22.5 - i for i, name in enumerate(NAMES)}
@@ -48,7 +52,8 @@ def simulate_house(n, seed=0, window=None, stop=None, gap=None, corrupt=None, co
             if corrupt and name == NAMES[0] and corrupt[0] <= k < corrupt[0] + corrupt[1] and math.isfinite(y):
                 y += corrupt[2]
             row[name] = RoomIn(y, yv, u, sp, tout, 3.0, 0.0, False, ncnt, nsum)
-            f11, f12, f21, f22, g1, g2, _ = par.terms(lam, u * s, tout, 3.0, 0.0, False, cn, cs, h)
+            lag[name] = par.lag(lag[name], u)
+            f11, f12, f21, f22, g1, g2, _ = par.terms(lam, lag[name][1] * s, tout, 3.0, 0.0, False, cn, cs, h)
             m[name], a[name] = f11 * m[name] + f12 * a[name] + g1 + rng.normal(0, math.sqrt(par.q_r * h)), f21 * m[name] + f22 * a[name] + g2 + rng.normal(0, math.sqrt(par.q_a * h))
             new_sensor[name] = par.sensor(m[name], a[name])
         sensor = new_sensor

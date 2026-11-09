@@ -50,6 +50,8 @@ fn env(e: &Value) -> Env {
         raise_cost: num(&e["raise_cost"]),
         cold_cost: num(&e["cold_cost"]),
         r_grid: num(&e["r_grid"]),
+        lag: e["lag"].as_array().map(|l| [num(&l[0]), num(&l[1])]),
+        y_last: e["y_last"].as_f64(),
     }
 }
 
@@ -176,7 +178,7 @@ fn erf_matches_reference_values() {
 }
 
 pub(crate) fn preset_env() -> Env {
-    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0 }
+    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None }
 }
 
 pub(crate) fn comps_at(m: f64, a: f64, lam: f64, p: f64) -> Vec<Comp> {

@@ -274,6 +274,8 @@ impl RoomModel {
                 raise_cost: cfg.raise_cost_min,
                 cold_cost: cfg.cold_cost_min,
                 r_grid: bundle.house.r_grid,
+                lag: filter.lag,
+                y_last: nodes.get(&ctx.room).and_then(|n| inner.feeds.get(n)).and_then(|f| f.temp).filter(|(t, _)| now_ms - t <= stale_ms).map(|(_, v)| v),
             };
             let p = plan(&filter.par, &bundle.shock, &filter.comps, filt.p_supply, &env);
             let why = sentence(&ctx.room, &p, &filt, ctx.live, bundle.house.boost_c);
