@@ -332,7 +332,7 @@ mod tests {
         assert!(md.contains("| BatPercentRemaining | 95 % (raw 190) |"));
         assert!(md.contains("| BatChargeLevel | OK (0) |"));
         assert!(md.contains("| RoutingRole | SleepyEndDevice (2) |"));
-        assert!(md.contains("| Channel | 26 |"));
+        assert!(md.contains("| Channel | 15 |"));
         assert!(md.contains("| Parent RLOC16 | 0x5000 |"));
         assert!(md.contains("| Parent AverageRssi / LastRssi / Lqi | -61 / -63 / 3 |"));
         assert!(md.contains("| 0x5001 | true | 2 | null | -80 | 3 | 1 | false | false | 40 |"));

@@ -223,4 +223,4 @@ node = 12
 kind = "air"
 role = "air"
 name = "Luftqualitaet"
-# room = "schlafzimmer"
+room = "schlafzimmer"

@@ -44,11 +44,11 @@
 [0;32m[1761580800.044] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_0013 DataVersion: 21[0m
 [0;32m[1761580800.045] [4821:4825] [TOO]   BatReplacementDescription: "2x AA"[0m
 [0;32m[1761580800.046] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0000 DataVersion: 5[0m
-[0;32m[1761580800.047] [4821:4825] [TOO]   Channel: 26[0m
+[0;32m[1761580800.047] [4821:4825] [TOO]   Channel: 15[0m
 [0;32m[1761580800.048] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0001 DataVersion: 5[0m
 [0;32m[1761580800.049] [4821:4825] [TOO]   RoutingRole: 2[0m
 [0;32m[1761580800.050] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0002 DataVersion: 5[0m
-[0;32m[1761580800.051] [4821:4825] [TOO]   NetworkName: "thread-net-1"[0m
+[0;32m[1761580800.051] [4821:4825] [TOO]   NetworkName: "example-thread"[0m
 [0;32m[1761580800.052] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0003 DataVersion: 5[0m
 [0;32m[1761580800.053] [4821:4825] [TOO]   PanId: 12345[0m
 [0;32m[1761580800.054] [4821:4825] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0007 DataVersion: 5[0m

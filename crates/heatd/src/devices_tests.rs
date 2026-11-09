@@ -72,7 +72,7 @@ fn shipped_configs_list_the_new_devices() {
         assert_eq!(config.all_nodes(), vec![5, 6, 7, 8]);
         let coffee: Vec<&DeviceConfig> = config.devices.iter().filter(|d| d.wake_on).collect();
         assert_eq!((coffee.len(), coffee[0].node, coffee[0].role.as_str(), coffee[0].wake_window.as_str(), coffee[0].onoff_endpoint), (1, 9, "coffee", "06:00-09:00", 1));
-        assert!(config.devices.iter().find(|d| d.node == 12).unwrap().room.is_none());
+        assert_eq!(config.devices.iter().find(|d| d.node == 12).unwrap().room.as_deref(), Some("schlafzimmer"));
         let brush = config.devices.iter().find(|d| d.node == 10).unwrap();
         assert_eq!((brush.role.as_str(), brush.room.as_deref(), brush.subscription().fast.unwrap().min_s), ("toothbrush", Some("bad"), 10));
     }
