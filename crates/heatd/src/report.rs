@@ -483,6 +483,15 @@ Nicht verfuegbar: {e:#}");
             let _ = writeln!(md, "## Soll/Ist und Nachregeln\n\nNicht verfuegbar: {e:#}");
         }
     }
+    match shadow_section(root, date) {
+        Ok(section) => md.push_str(&section),
+        Err(e) => {
+            let _ = writeln!(md, "
+## Raummodell Schatten
+
+Nicht verfuegbar: {e:#}");
+        }
+    }
     Ok((md, sum))
 }
 
@@ -679,6 +688,136 @@ pub fn supply_section(root: &Path, date: NaiveDate) -> Result<String> {
 Kein wiederkehrendes Muster gelernt.
 "),
     }
+    Ok(md)
+}
+
+const SHADOW_HIT_MIN: i64 = 20;
+const SHADOW_STOP_MIN: i64 = 20;
+const SHADOW_ROW_GAP_MIN: i64 = 35;
+const SHADOW_MIN_N: usize = 10;
+
+struct ShadowRow {
+    us: i64,
+    room: String,
+    p_window: f64,
+    p_supply: f64,
+    raise: bool,
+    cost_live: f64,
+    cost_total: f64,
+}
+
+fn rmse(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| (values.iter().map(|v| v * v).sum::<f64>() / values.len() as f64).sqrt())
+}
+
+fn share(hit: usize, n: usize) -> String {
+    if n >= SHADOW_MIN_N { format!("{hit} von {n} ({:.0} %)", 100.0 * hit as f64 / n as f64) } else { format!("{hit} von {n} (N < {SHADOW_MIN_N}, keine Prozentangabe)") }
+}
+
+fn ground_truth(root: &Path, lo_us: i64, hi_us: i64) -> Vec<(i64, Vec<String>)> {
+    let Ok(text) = std::fs::read_to_string(root.join("ground_truth").join("windows.jsonl")) else { return Vec::new() };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|w| {
+            let open = chrono::DateTime::parse_from_rfc3339(w["open_utc"].as_str()?).ok()?.timestamp_micros();
+            let rooms = w["rooms_open"].as_array()?.iter().filter_map(|r| r.as_str().map(String::from)).collect();
+            (lo_us..hi_us).contains(&open).then_some((open, rooms))
+        })
+        .collect()
+}
+
+fn episodes(times: &[i64], gap_us: i64) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for &t in times {
+        match out.last_mut() {
+            Some(last) if t - last.1 <= gap_us => last.1 = t,
+            _ => out.push((t, t)),
+        }
+    }
+    out
+}
+
+pub fn shadow_section(root: &Path, date: NaiveDate) -> Result<String> {
+    let db = open_room_minute(root, date, date)?;
+    let c = &db.conn;
+    let (lo, hi) = (midnight_us(date), midnight_us(date) + DAY_US);
+    let day = format!("epoch_us(ts) >= {lo} AND epoch_us(ts) < {hi}");
+    let mut md = String::from("\n## Raummodell Schatten\n\nSchattenbetrieb: das Modell schreibt nichts an Thermostate oder Uhr. Zeilen entstehen bei Wechsel des Schatten-Sollwerts, bei Wechsel von P(Fenster) ueber/unter 0,5 oder spaetestens alle 30 min; Latenzen und Episoden sind deshalb nur auf diese Zeilen genau.\n\n");
+    let shadow = rows(
+        c,
+        &format!("SELECT epoch_us(ts), room, p_window, p_supply, raise, cost_live, cost_energy + cost_cold + cost_raise FROM shadow_decisions WHERE {day} ORDER BY ts"),
+        |r| Ok(ShadowRow { us: r.get(0)?, room: r.get(1)?, p_window: r.get(2)?, p_supply: r.get(3)?, raise: r.get(4)?, cost_live: r.get(5)?, cost_total: r.get(6)? }),
+    )?;
+    let resets = rows(c, &format!("SELECT coalesce(json_extract_string(detail, '$.room'), '-'), coalesce(json_extract_string(detail, '$.cause'), '-'), count(*) FROM events WHERE kind = 'filter_reset' AND {day} GROUP BY 1, 2 ORDER BY 1, 2"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+    if shadow.is_empty() {
+        md.push_str("Keine Schattenzeilen (kein Modell geladen oder kein Datenstand).\n");
+        let _ = writeln!(md, "\nFilterresets: {}.", if resets.is_empty() { "0".into() } else { resets.iter().map(|(r, cause, n)| format!("{r} {cause} {n}")).collect::<Vec<_>>().join(", ") });
+        return Ok(md);
+    }
+    let forecast = rows(
+        c,
+        &format!(
+            "SELECT s.room, s.forecast_c - m.actual, s.sensor_c - m.actual, s.resid_live_k FROM shadow_decisions s JOIN room_minute m ON m.room = s.room AND epoch_us(m.t) = (epoch_us(s.ts) // 60000000 + 20) * 60000000
+             WHERE s.forecast_c IS NOT NULL AND m.actual IS NOT NULL AND m.gap_mask & 1 = 0 AND epoch_us(s.ts) >= {lo} AND epoch_us(s.ts) < {hi} ORDER BY s.room, s.ts"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?)),
+    )?;
+    let live = rows(c, &format!("SELECT room, resid_live_k FROM shadow_decisions WHERE resid_live_k IS NOT NULL AND {day} ORDER BY room"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?;
+    md.push_str("20-min-Prognose der Sensortemperatur (Ursprung = Schattenzeile; Modell bei Live-Sollwert gegen Messung, Persistenz = letzte Messung, Live-Detektor = sein Residuum Prognose minus Messung)\n\n| Raum | N | Modell RMSE K | Persistenz RMSE K | Live-Fenstermodell Residuum RMS K (N) |\n|---|---|---|---|---|\n");
+    let rooms: std::collections::BTreeSet<&str> = shadow.iter().map(|s| s.room.as_str()).collect();
+    for room in &rooms {
+        let (model, persist): (Vec<f64>, Vec<f64>) = forecast.iter().filter(|f| f.0 == *room).map(|f| (f.1, f.2)).unzip();
+        let resid: Vec<f64> = live.iter().filter(|l| l.0 == *room).map(|l| l.1).collect();
+        let _ = writeln!(md, "| {room} | {} | {} | {} | {} ({}) |", model.len(), opt(rmse(&model), 2), opt(rmse(&persist), 2), opt(rmse(&resid), 2), resid.len());
+    }
+    let flagged = |room: &str, from: i64, to: i64| shadow.iter().filter(|s| s.room == room && s.p_window > 0.5 && (from..=to).contains(&s.us)).map(|s| s.us).min();
+    let hit_us = SHADOW_HIT_MIN * 60_000_000;
+    let gt = ground_truth(root, lo, hi);
+    md.push_str("\nFenstererkennung (P(Fenster) > 0,5 binnen 20 min nach Beginn)\n\n");
+    if gt.is_empty() {
+        md.push_str("- Messtechnisch bestaetigte Fenster (`ground_truth/windows.jsonl`): keine an diesem Tag.\n");
+    } else {
+        let events: Vec<(i64, &String)> = gt.iter().flat_map(|(t, rs)| rs.iter().filter(|r| rooms.contains(r.as_str())).map(move |r| (*t, r))).collect();
+        let latencies: Vec<f64> = events.iter().filter_map(|(t, r)| flagged(r, *t, *t + hit_us).map(|f| (f - t) as f64 / 60e6)).collect();
+        let _ = writeln!(md, "- Bestaetigte Fenster (Raum-Ereignisse): erkannt {}{}.", share(latencies.len(), events.len()), if latencies.is_empty() { String::new() } else { format!(", mittlere Latenz {:.0} min", latencies.iter().sum::<f64>() / latencies.len() as f64) });
+    }
+    let labels = rows(c, &format!("SELECT epoch_us(ts), room, window_open FROM labels WHERE source = 'window' AND window_open IS NOT NULL AND {day} ORDER BY ts"), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?;
+    let (yes, no): (Vec<_>, Vec<_>) = labels.iter().partition(|l| l.2);
+    let yes_hit = yes.iter().filter(|(t, r, _)| flagged(r, t - hit_us, t + hit_us).is_some()).count();
+    let no_flagged = no.iter().filter(|(t, r, _)| flagged(r, t - hit_us, *t).is_some()).count();
+    let _ = writeln!(md, "- Uhr-Antworten ja: Modell meldete offen {}.\n- Uhr-Antworten nein: Modell meldete trotzdem offen (Fehlalarm) {}.", share(yes_hit, yes.len()), share(no_flagged, no.len()));
+    let false_ep = rooms
+        .iter()
+        .map(|room| {
+            let times: Vec<i64> = shadow.iter().filter(|s| s.room == *room && s.p_window > 0.5).map(|s| s.us).collect();
+            let known = |a: i64| gt.iter().any(|(t, rs)| rs.contains(&room.to_string()) && (t - 3_600_000_000..=t + 7_200_000_000).contains(&a)) || yes.iter().any(|(t, r, _)| r == room && (t - 3_600_000_000..=t + 3_600_000_000).contains(&a));
+            episodes(&times, SHADOW_ROW_GAP_MIN * 60_000_000).iter().filter(|e| !known(e.0)).count()
+        })
+        .sum::<usize>();
+    let _ = writeln!(md, "- Schatten-Fensterepisoden ohne bestaetigtes Fenster oder Ja-Antwort: {false_ep}.");
+
+    let low: Vec<i64> = shadow.iter().filter(|s| s.p_supply < 0.5).map(|s| s.us).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let stops: Vec<(i64, i64)> = episodes(&low, SHADOW_ROW_GAP_MIN * 60_000_000).into_iter().filter(|e| e.1 - e.0 >= SHADOW_STOP_MIN * 60_000_000).collect();
+    let supply = rows(c, &format!("SELECT CAST(epoch_us(ts) / 1000 AS BIGINT), json_extract_string(detail, '$.state'), CAST(json_extract(detail, '$.since_ms') AS BIGINT) FROM events WHERE kind = 'supply' AND {day} ORDER BY ts"), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<i64>>(2)?)))?;
+    let live_eps: Vec<(i64, i64)> = supply.iter().filter(|e| e.1.as_deref() == Some("end")).filter_map(|e| Some((e.2? * 1000, e.0 * 1000))).collect();
+    let overlap = stops.iter().filter(|s| live_eps.iter().any(|l| s.0 <= l.1 && l.0 <= s.1)).count();
+    let _ = writeln!(md, "\nVersorgung: Schatten-Kesselstillstaende (p_supply < 0,5 laenger als 20 min) {}, Live-Erkennung (`supply`-Events mit Ende) {}, davon ueberlappend {overlap}.", stops.len(), live_eps.len());
+
+    let actual = rows(c, &format!("SELECT room, count(*) FROM decisions WHERE applied AND setpoint_new > setpoint_old AND {day} GROUP BY room ORDER BY room"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    md.push_str("\nErhoehungen und Kosten (Modellrechnung in Heizminuten, kein Messwert; Energie und Komfort gelten erst nach dem Umschalten als messbar)\n\n| Raum | Schatten-Erhoehungen | tatsaechliche Erhoehungen | Zeilen | Kosten live (Summe) | Kosten Schatten (Summe) |\n|---|---|---|---|---|---|\n");
+    for room in &rooms {
+        let mine: Vec<&ShadowRow> = shadow.iter().filter(|s| s.room == *room).collect();
+        let _ = writeln!(
+            md,
+            "| {room} | {} | {} | {} | {:.0} | {:.0} |",
+            mine.iter().filter(|s| s.raise).count(),
+            actual.iter().find(|a| a.0 == *room).map_or(0, |a| a.1),
+            mine.len(),
+            mine.iter().map(|s| s.cost_live).sum::<f64>(),
+            mine.iter().map(|s| s.cost_total).sum::<f64>()
+        );
+    }
+    let _ = writeln!(md, "\nFilterresets: {}.", if resets.is_empty() { "0".into() } else { resets.iter().map(|(r, cause, n)| format!("{r} {cause} {n}")).collect::<Vec<_>>().join(", ") });
     Ok(md)
 }
 

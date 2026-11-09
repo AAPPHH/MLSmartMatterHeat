@@ -324,7 +324,7 @@ unit: dict<utf8>
 
 ### shadow_decisions
 
-Producer: Raummodell im Schattenbetrieb (`crates/heatd/src/room_model.rs`, `docs/room-model.md`). Eine Zeile je Raum bei Wechsel des Schatten-Sollwerts oder spaetestens alle 30 min; schreibt nie an Thermostate oder Uhr und ersetzt `decisions` nicht (Soll/Ist- und Raise-Auswertungen bleiben unberuehrt). Partitioned by date.
+Producer: Raummodell im Schattenbetrieb (`crates/heatd/src/room_model.rs`, `docs/room-model.md`). Eine Zeile je Raum bei Wechsel des Schatten-Sollwerts, bei Wechsel von P(Fenster) ueber/unter 0,5 oder spaetestens alle 30 min; schreibt nie an Thermostate oder Uhr und ersetzt `decisions` nicht (Soll/Ist- und Raise-Auswertungen bleiben unberuehrt). Partitioned by date.
 
 ```schema shadow_decisions
 ts: timestamp[us,UTC]

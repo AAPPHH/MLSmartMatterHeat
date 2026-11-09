@@ -480,3 +480,70 @@ Keine Stoerungen"));
     let md = build(dir.path(), day()).unwrap().0;
     assert!(md.contains("## Thermostat-Gesundheit") && md.contains("| 2 | 2 | silent | 30 min | 0 | 0 |") && md.contains("Node 2: silent -> ok"), "{md}");
 }
+
+fn shadow_row(minute: i64, room: &str, p_window: f64, p_supply: f64) -> ShadowDecision {
+    ShadowDecision { ts: at(minute), room: room.into(), setpoint_live: 21.0, setpoint_shadow: 21.0, p_window, p_supply, why: "x".into(), kind: "live".into(), model_version: "v".into(), cost_energy: 2.0, cost_cold: 1.0, cost_raise: 0.0, cost_live: 4.0, sensor_c: 20.0, ..Default::default() }
+}
+
+fn shadow_lake(root: &Path) {
+    let clock = start() + 12 * HOUR_US;
+    let sink = Sink::open_with_clock(LakeConfig::new(root), Arc::new(move || clock)).unwrap();
+    write_meta(&sink, &config(), start()).unwrap();
+    for m in 0..1440 {
+        sink.append(attr(1, m, 513, 0, 2000 + m / 10)).unwrap();
+    }
+    for minute in [100, 200, 300] {
+        let actual = 20.0 + (minute + 20) as f64 / 1000.0;
+        let base = 20.0 + minute as f64 / 1000.0;
+        sink.append(ShadowDecision { forecast_c: Some(actual + 0.2), sensor_c: base, resid_live_k: Some(if minute == 200 { -0.3 } else { 0.3 }), ..shadow_row(minute, "a", 0.0, 0.99) }).unwrap();
+    }
+    sink.append(shadow_row(400, "a", 0.1, 0.99)).unwrap();
+    sink.append(shadow_row(410, "a", 0.9, 0.99)).unwrap();
+    sink.append(shadow_row(790, "a", 0.8, 0.99)).unwrap();
+    for minute in [500, 520, 540] {
+        sink.append(shadow_row(minute, "a", 0.0, 0.1)).unwrap();
+    }
+    sink.append(ShadowDecision { raise: true, ..shadow_row(600, "a", 0.0, 0.99) }).unwrap();
+    let window_label = |minute: i64, open: bool| Label { ts: at(minute), room: "a".into(), source: "window".into(), window_open: Some(open), answer: Some(if open { "yes" } else { "no" }.into()), ..Default::default() };
+    sink.append(window_label(412, true)).unwrap();
+    sink.append(window_label(800, false)).unwrap();
+    sink.append(Event { ts: at(545), kind: kind::SUPPLY.into(), source: "heatd".into(), ..Default::default() }.with_detail(serde_json::json!({"room": "a", "state": "end", "since_ms": at(495) / 1000}))).unwrap();
+    sink.append(Event { ts: at(300), kind: kind::FILTER_RESET.into(), source: "heatd".into(), ..Default::default() }.with_detail(serde_json::json!({"room": "a", "cause": "nan"}))).unwrap();
+    sink.append(Decision { ts: at(650), room: "a".into(), node: 1, rule: "schedule".into(), applied: true, setpoint_old: Some(19.0), setpoint_new: Some(21.0), commit: "t".into(), ..Default::default() }).unwrap();
+    sink.roll_day(day()).unwrap();
+    sink.close().unwrap();
+    let open = chrono::DateTime::from_timestamp_micros(at(405)).unwrap().to_rfc3339();
+    std::fs::create_dir_all(root.join("ground_truth")).unwrap();
+    std::fs::write(root.join("ground_truth").join("windows.jsonl"), format!("{{\"open_utc\": \"{open}\", \"close_utc\": null, \"rooms_open\": [\"a\"]}}
+")).unwrap();
+}
+
+#[test]
+fn shadow_section_reports_forecast_detection_supply_raises_and_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    shadow_lake(dir.path());
+    let md = shadow_section(dir.path(), day()).unwrap();
+    assert!(md.contains("## Raummodell Schatten"), "{md}");
+    assert!(md.contains("| a | 3 | 0.20 | 0.02 | 0.30 (3) |"), "forecast
+{md}");
+    assert!(md.contains("erkannt 1 von 1 (N < 10, keine Prozentangabe), mittlere Latenz 5 min"), "ground truth
+{md}");
+    assert!(md.contains("Modell meldete offen 1 von 1") && md.contains("(Fehlalarm) 1 von 1"), "labels
+{md}");
+    assert!(md.contains("Schatten-Kesselstillstaende (p_supply < 0,5 laenger als 20 min) 1, Live-Erkennung (`supply`-Events mit Ende) 1, davon ueberlappend 1"), "supply
+{md}");
+    assert!(md.contains("| a | 1 | 1 | 10 | 40 | 30 |"), "raises
+{md}");
+    assert!(md.contains("Filterresets: a nan 1."), "resets
+{md}");
+    let (full, _) = build(dir.path(), day()).unwrap();
+    assert!(full.contains("## Raummodell Schatten") && full.contains("| shadow_decisions | 1 |"), "{full}");
+}
+
+#[test]
+fn shadow_section_without_rows_still_counts_resets() {
+    let dir = tempfile::tempdir().unwrap();
+    sample_lake(dir.path());
+    let md = shadow_section(dir.path(), day()).unwrap();
+    assert!(md.contains("Keine Schattenzeilen") && md.contains("Filterresets: 0."), "{md}");
+}

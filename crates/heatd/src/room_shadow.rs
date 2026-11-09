@@ -65,7 +65,7 @@ struct Inner {
     feeds: HashMap<u64, Feed>,
     inputs: BTreeMap<String, RoomIn>,
     decided: HashMap<String, i64>,
-    last_row: HashMap<String, (f64, i64)>,
+    last_row: HashMap<String, (f64, i64, bool)>,
     views: BTreeMap<String, serde_json::Value>,
     resets_seen: usize,
     away_since: Option<i64>,
@@ -254,9 +254,10 @@ impl RoomModel {
                 serde_json::json!({"loss_ratio": nan_null(filt.lam), "mass_c": nan_null(filt.m), "air_c": nan_null(filt.a), "p_supply": filt.p_supply, "p_window": filt.p_window, "setpoint_shadow": p.setpoint,
                                     "setpoint_live": ctx.live, "kind": p.kind, "why": why, "model": bundle.version, "ts": now_ms}),
             );
-            let due = inner.last_row.get(&ctx.room).is_none_or(|(sp, at)| (sp - p.setpoint).abs() > EPS || target - at >= ROW_EVERY_MIN);
+            let flagged = filt.p_window >= 0.5;
+            let due = inner.last_row.get(&ctx.room).is_none_or(|(sp, at, was)| (sp - p.setpoint).abs() > EPS || target - at >= ROW_EVERY_MIN || *was != flagged);
             if due {
-                inner.last_row.insert(ctx.room.clone(), (p.setpoint, target));
+                inner.last_row.insert(ctx.room.clone(), (p.setpoint, target, flagged));
                 out.rows.push(crate::lake::ShadowDecision {
                     ts: crate::lake::now_us(),
                     room: ctx.room.clone(),
