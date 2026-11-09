@@ -93,6 +93,25 @@ def load_ambient(src):
     return {s: tuple(np.array(x) for x in zip(*sorted(v))) for s, v in out.items()}
 
 
+def load_device_readings(src, nodes=None, kind="attribute"):
+    p = Path(src)
+    base = p / "parquet" / "device_readings"
+    cols = "epoch(ts), node, endpoint, cluster, attribute, name::VARCHAR, value"
+    if base.is_dir() and any(base.rglob("part.parquet")):
+        rows = duckdb.connect().execute(f"SELECT {cols} FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true) WHERE kind::VARCHAR = ? AND value IS NOT NULL", [kind]).fetchall()
+    else:
+        t = read_arrows(p, "device_readings")
+        rows = []
+        if t is not None:
+            c = {n: t.column(n).to_pylist() for n in ("ts", "node", "endpoint", "cluster", "attribute", "name", "value", "kind")}
+            rows = [(c["ts"][i].timestamp(), c["node"][i], c["endpoint"][i], c["cluster"][i], c["attribute"][i], c["name"][i], c["value"][i]) for i in range(t.num_rows) if c["kind"][i] == kind and c["value"][i] is not None]
+    out = {}
+    for ts, node, endpoint, cluster, attribute, name, value in rows:
+        if nodes is None or node in nodes:
+            out.setdefault((node, endpoint, cluster, attribute), (name, []))[1].append((float(ts), float(value)))
+    return {k: (name, *(np.array(x) for x in zip(*sorted(v)))) for k, (name, v) in out.items()}
+
+
 def ambient_ctx(ambient, t, stale_s):
     out = {}
     for s in AMBIENT:

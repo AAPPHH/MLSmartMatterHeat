@@ -1,5 +1,6 @@
 import copy
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ import numpy as np
 import onnxruntime as ort
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.thermalml import build_bundle, choose_t_off, decay_labels, env_from, feature_matrix, feature_names, load_ambient, optimum_start, origin_state, since_boost
+from heattrain.thermalml import build_bundle, choose_t_off, decay_labels, env_from, feature_matrix, feature_names, load_ambient, load_device_readings, optimum_start, origin_state, since_boost
 from test_thermal import simulate
 
 CONF = copy.deepcopy(CONFIG)
@@ -112,6 +113,48 @@ def test_little_data_never_crashes(tmp_path):
 
 def test_ambient_loader_empty(tmp_path):
     assert load_ambient(tmp_path) == {}
+
+
+def device_table(rows):
+    import pyarrow as pa
+    cols = ("ts", "node", "endpoint", "cluster", "attribute", "kind", "name", "value", "raw", "source")
+    data = {c: [r[i] for r in rows] for i, c in enumerate(cols)}
+    data["ts"] = pa.array(data["ts"], pa.timestamp("us", "UTC"))
+    return pa.table(data)
+
+
+def test_device_readings_loader_reads_parquet_and_raw_arrows(tmp_path):
+    import pyarrow.ipc as ipc
+    import pyarrow.parquet as pq
+    t0 = datetime(2026, 11, 10, 6, 0, tzinfo=timezone.utc)
+    at = lambda s: t0 + timedelta(seconds=s)
+    rows = [
+        (at(2), 9, 2, 0x90, 8, "attribute", "ActivePower", 18200.0, "  ActivePower: 18200", "subscription"),
+        (at(0), 9, 2, 0x90, 8, "attribute", "ActivePower", 1243100.0, "  ActivePower: 1243100", "subscription"),
+        (at(1), 9, 1, 6, 0, "attribute", "OnOff", 1.0, "  OnOff: TRUE", "subscription"),
+        (at(1), 9, 2, 0x91, 1, "attribute", "CumulativeEnergyImported", None, "  CumulativeEnergyImported: {", "subscription"),
+        (at(1), 9, 2, 0x91, 0, "event", "CumulativeEnergyMeasured", None, "  Event number: 4", "subscription"),
+        (at(5), 11, 1, 0x402, 0, "attribute", "MeasuredValue", 2156.0, "  MeasuredValue: 2156", "subscription"),
+    ]
+    part = tmp_path / "parquet" / "device_readings" / "date=2026-11-10"
+    for node in (9, 11):
+        (part / f"node={node}").mkdir(parents=True)
+        pq.write_table(device_table([r for r in rows if r[1] == node]), part / f"node={node}" / "part.parquet")
+    for src in (tmp_path, None):
+        if src is None:
+            raw = tmp_path / "arrows" / "raw" / "device_readings"
+            raw.mkdir(parents=True)
+            table = device_table(rows)
+            with open(raw / "2026-11-10.arrows", "wb") as fh, ipc.new_stream(fh, table.schema) as w:
+                w.write_table(table)
+            src = tmp_path / "arrows"
+        out = load_device_readings(src)
+        name, t, v = out[(9, 2, 0x90, 8)]
+        assert name == "ActivePower" and list(v) == [1243100.0, 18200.0] and list(np.diff(t)) == [2.0]
+        assert out[(9, 1, 6, 0)][2][0] == 1.0 and (11, 1, 0x402, 0) in out
+        assert (9, 2, 0x91, 1) not in out and (9, 2, 0x91, 0) not in out
+        assert set(load_device_readings(src, nodes={11})) == {(11, 1, 0x402, 0)}
+    assert load_device_readings(tmp_path / "empty") == {}
 
 
 def test_parity_fixture_in_repo():
