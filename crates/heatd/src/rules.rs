@@ -1019,7 +1019,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     Ok(written)
 }
 
-fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64, reconnected: bool) -> Option<f64> {
+fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64, reconnected: bool) -> Option<(f64, Option<Hold>)> {
     let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
     let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
     let mut commands = state.commanded.lock().unwrap();
@@ -1048,8 +1048,8 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     }
     let previous = sent.acked.unwrap_or(sent.target);
     commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
-    commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, until_ms: now_ms + (state.config.manual_hold_minutes * 60_000.0) as i64, source: HoldSource::Dial });
-    Some(previous)
+    let replaced = commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, until_ms: now_ms + (state.config.manual_hold_minutes * 60_000.0) as i64, source: HoldSource::Dial });
+    Some((previous, replaced.filter(Hold::explicit)))
 }
 
 pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
@@ -1065,8 +1065,11 @@ pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
         return;
     }
     let reconnected = state.windows.lock().unwrap().reconnected(report.node, now_ms, GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000);
-    let Some(previous) = manual_change(state, report, poll, now_ms, reconnected) else { return };
+    let Some((previous, replaced)) = manual_change(state, report, poll, now_ms, reconnected) else { return };
     let Some(room) = state.config.rooms.iter().find(|r| r.nodes.contains(&report.node)) else { return };
+    if let Some(hold) = replaced {
+        crate::manual::record(state, room, json!({"room": room.name, "target": hold.value, "cleared": true, "source": hold.source.name(), "until_ts": now_ms}));
+    }
     if report.value < previous {
         state.windows.lock().unwrap().note_decrease(&room.name, now_ms);
     }

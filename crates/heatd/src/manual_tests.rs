@@ -224,6 +224,9 @@ async fn dial_turn_replaces_an_api_hold_and_report_lists_the_hold() {
     crate::rules::on_report(&e.state, &matter_controller::AttributeReport { value: 19.0, ..report }, false, e.t + 10 * MIN);
     let hold = e.state.commanded.lock().unwrap().hold(5).cloned().unwrap();
     assert_eq!((hold.source, hold.value), (crate::rules::HoldSource::Dial, 19.0));
+    e.state.sink.flush().unwrap();
+    *e.state.commanded.lock().unwrap() = Default::default();
+    assert_eq!(crate::restore::restore_holds(&e.state, e.t + 11 * MIN).unwrap(), 0);
 }
 
 #[test]

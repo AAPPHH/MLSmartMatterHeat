@@ -44,7 +44,7 @@ fn valid(state: &AppState, celsius: Option<f64>, hold_min: Option<f64>) -> Resul
     Ok((celsius, hold))
 }
 
-fn record(state: &AppState, room: &Room, detail: Value) {
+pub fn record(state: &AppState, room: &Room, detail: Value) {
     let mut event = lake::Event::now(kind::MANUAL_SETPOINT, "heatd").with_detail(detail);
     event.node = room.nodes.first().copied();
     if let Err(e) = state.sink.append(event) {
