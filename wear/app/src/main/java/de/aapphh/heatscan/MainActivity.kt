@@ -226,12 +226,23 @@ class MainActivity : ComponentActivity() {
         var result by remember { mutableStateOf<BoostResult?>(null) }
         var busy by remember { mutableStateOf(false) }
         var confirm by remember { mutableStateOf(boostFirst) }
+        var target by remember(room) { mutableStateOf(SetpointControl.start(g)) }
+        var hold by remember { mutableStateOf(HoldChoice.TWO_HOURS) }
+        var held by remember { mutableStateOf<BoostResult?>(null) }
+        var sending by remember { mutableStateOf(false) }
+        val finished = { r: BoostResult -> ui { held = r; sending = false; Remote.refresh(this, true) } }
+        val control = SetpointUi(
+            target, hold, sending, held, SetpointControl.active(g, System.currentTimeMillis()),
+            { target = SetpointControl.step(target, it) }, { hold = hold.next() },
+            { sending = true; Remote.setpoint(this, room, target, SetpointControl.minutes(hold, System.currentTimeMillis()), finished) },
+            { sending = true; Remote.clearSetpoint(this, room, finished) }
+        )
         if (confirm) return BoostConfirmScreen(room, {
             confirm = false
             busy = true
             Remote.boost(this, room) { r -> ui { result = r; busy = false; Remote.refresh(this, true) } }
         }) { confirm = false }
-        RoomDetailScreen(room, g, result, busy, Heat.heatable(room, null), { report(room, g?.open != true) }, { confirm = true })
+        RoomDetailScreen(room, g, result, busy, Heat.heatable(room, null), { report(room, g?.open != true) }, { confirm = true }, control = control.takeIf { Heat.heatable(room, null) })
     }
 
     @Composable

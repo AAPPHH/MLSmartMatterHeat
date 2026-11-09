@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.requiredHeight
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -190,8 +191,25 @@ internal fun RoomsScreen(
     }
 }
 
+class SetpointUi(val target: Double, val hold: HoldChoice, val busy: Boolean, val line: BoostResult?, val active: Manual?, val onStep: (Double) -> Unit, val onHold: () -> Unit, val onApply: () -> Unit, val onEnd: () -> Unit)
+
+private fun TransformingLazyColumnScope.setpoint(spec: TransformationSpec, ui: SetpointUi, colors: ColorScheme, type: androidx.wear.compose.material3.Typography) {
+    ui.active?.let { note(spec, SetpointControl.line(it), colors.primary, type.bodySmall) }
+    item {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp).transformedHeight(this, spec), horizontalArrangement = Arrangement.spacedBy(GAP), verticalAlignment = Alignment.CenterVertically) {
+            FilledTonalButton({ ui.onStep(-SetpointControl.STEP) }, Modifier.width(TARGET).defaultMinSize(minHeight = TARGET).describe("Temperatur senken"), contentPadding = PaddingValues(0.dp)) { Text("–", Modifier.fillMaxWidth(), style = type.titleMedium, textAlign = TextAlign.Center, maxLines = 1) }
+            Text(SetpointControl.celsius(ui.target) + "°", Modifier.weight(1f), style = type.titleSmall, textAlign = TextAlign.Center, maxLines = 1)
+            FilledTonalButton({ ui.onStep(SetpointControl.STEP) }, Modifier.width(TARGET).defaultMinSize(minHeight = TARGET).describe("Temperatur erhöhen"), contentPadding = PaddingValues(0.dp)) { Text("+", Modifier.fillMaxWidth(), style = type.titleMedium, textAlign = TextAlign.Center, maxLines = 1) }
+        }
+    }
+    action(spec, "Dauer: " + ui.hold.label, onClick = ui.onHold)
+    action(spec, if (ui.busy) "…" else SetpointControl.celsius(ui.target) + " °C setzen", tonal = false, enabled = !ui.busy, onClick = ui.onApply)
+    ui.line?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
+    if (ui.active != null) action(spec, SetpointControl.END, enabled = !ui.busy, onClick = ui.onEnd)
+}
+
 @Composable
-internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?, busy: Boolean, canBoost: Boolean, onWindow: () -> Unit, onBoost: () -> Unit, saved: Boolean = false, applying: Boolean = saved, onUndo: () -> Unit = {}) {
+internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?, busy: Boolean, canBoost: Boolean, onWindow: () -> Unit, onBoost: () -> Unit, saved: Boolean = false, applying: Boolean = saved, control: SetpointUi? = null, onUndo: () -> Unit = {}) {
     val colors = MaterialTheme.colorScheme
     val type = MaterialTheme.typography
     ListScreen { spec ->
@@ -200,6 +218,7 @@ internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?
         (if (applying) listOf(RoomView.APPLYING) else listOfNotNull(RoomView.target(g), RoomView.why(g))).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
         if (canBoost) action(spec, if (busy) "…" else "Boost", tonal = false, enabled = !busy, icon = R.drawable.ic_mark_boost, onClick = onBoost)
         result?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
+        if (control != null && !saved) setpoint(spec, control, colors, type)
         action(spec, if (g?.open == true) "Fenster zu melden" else "Fenster offen melden", icon = R.drawable.ic_mark_window, onClick = onWindow)
         if (saved) action(spec, Tap.UNDO, onClick = onUndo)
     }

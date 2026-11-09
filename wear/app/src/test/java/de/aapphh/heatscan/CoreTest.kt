@@ -2098,7 +2098,7 @@ class CoreTest {
         assertEquals("Aufheizen beendet", RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "boost_off")))
         val said = mapOf("occupied" to "Du bist hier – normale Temperatur", "default" to "Niemand hier – Grundtemperatur", "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt", "sleep" to "Nachtruhe – Schlaftemperatur", "home" to "Du bist zuhause – normale Temperatur")
         said.forEach { (reason, text) -> assertEquals(text, RoomView.why(RoomGlance("bad", 20.0, 20.0, false, reason))) }
-        listOf("home", "occupied", "sleep", "default", "away", "window_open", "boost", "boost_off", "no_supply", "pi_reset", "schedule", "exploration").forEach { assertNotNull(it, RoomView.REASONS[it]) }
+        listOf("home", "occupied", "sleep", "default", "away", "window_open", "boost", "boost_off", "no_supply", "pi_reset", "schedule", "exploration", "manual_api", "manual_watch").forEach { assertNotNull(it, RoomView.REASONS[it]) }
         assertEquals("19,0° · heizt", RoomView.row(RoomView.glance(g, "wohnzimmer")))
         assertEquals("19,9° · normal", RoomView.row(RoomView.glance(g, "flur")))
         assertEquals("keine Daten", RoomView.row(null))
@@ -2135,5 +2135,56 @@ class CoreTest {
         assertTrue(l.last().startsWith("Stand "))
         assertEquals(GlanceView.NONE, GlanceView.lines(Glance.EMPTY, emptyList(), 5L).first().text)
         assertEquals(GlanceView.NONE, GlanceView.lines(g, emptyList(), 1_000L + Glance.STALE_MS + 1).first().text)
+    }
+
+    @Test
+    fun setpointControlStepsClampsAndFormats() {
+        assertEquals(22.5, SetpointControl.step(22.0, 0.5), 0.0)
+        assertEquals(26.0, SetpointControl.step(26.0, 0.5), 0.0)
+        assertEquals(8.0, SetpointControl.step(8.0, -0.5), 0.0)
+        assertEquals(21.5, SetpointControl.clamp(21.4), 0.0)
+        assertEquals("22", SetpointControl.celsius(22.0))
+        assertEquals("22,5", SetpointControl.celsius(22.5))
+        val held = Manual(23.0, 5_000L, "api")
+        assertEquals(23.0, SetpointControl.start(RoomGlance("bad", 20.0, 19.0, false, null, false, null, held)), 0.0)
+        assertEquals(19.0, SetpointControl.start(RoomGlance("bad", 20.0, 19.0, false)), 0.0)
+        assertEquals(20.0, SetpointControl.start(null), 0.0)
+        assertNull(SetpointControl.active(RoomGlance("bad", 20.0, 19.0, false, null, false, null, held), 5_000L))
+        assertEquals(held, SetpointControl.active(RoomGlance("bad", 20.0, 19.0, false, null, false, null, held), 4_999L))
+        assertEquals("23 °C bis " + RoomView.clock(5_000L), SetpointControl.line(held))
+        assertEquals(listOf("1 Std.", "2 Std.", "4 Std.", "bis morgen 6 Uhr"), HoldChoice.entries.map { it.label })
+        assertEquals(HoldChoice.ONE_HOUR, HoldChoice.MORNING.next())
+    }
+
+    @Test
+    fun setpointControlHoldsMorningAndBodies() {
+        val zone = java.util.TimeZone.getTimeZone("Europe/Berlin")
+        val at = { h: Int, m: Int -> java.util.Calendar.getInstance(zone).apply { clear(); set(2026, 10, 9, h, m) }.timeInMillis }
+        assertEquals(420, SetpointControl.morning(at(23, 0), zone))
+        assertEquals(15, SetpointControl.morning(at(5, 50), zone))
+        assertEquals(720, SetpointControl.morning(at(6, 10), zone))
+        assertEquals(60, SetpointControl.minutes(HoldChoice.ONE_HOUR, 0L, zone))
+        assertEquals(420, SetpointControl.minutes(HoldChoice.MORNING, at(23, 0), zone))
+        val o = JSONObject(SetpointControl.body("bad", 22.5, 120))
+        assertEquals(listOf("bad", 22.5, 120, "watch"), listOf(o.getString("room"), o.getDouble("celsius"), o.getInt("hold_min"), o.getString("source")))
+        val c = JSONObject(SetpointControl.clearBody("bad"))
+        assertEquals(listOf("bad", true, "watch"), listOf(c.getString("room"), c.getBoolean("clear"), c.getString("source")))
+        val ok = SetpointControl.result(200, """{"ok":true,"room":"bad","target":22.0,"hold_min":120.0,"until_ts":3600000,"source":"watch"}""")
+        assertTrue(ok.ok)
+        assertEquals("22 °C bis " + RoomView.clock(3_600_000L), ok.line)
+        assertEquals(BoostResult(false, SetpointControl.DENIED), SetpointControl.result(400, """{"ok":false,"error":"x"}"""))
+        assertEquals(BoostResult(false, "Antwort unlesbar (500)"), SetpointControl.result(500, "nope"))
+        assertEquals(BoostResult(true, "Vorgabe beendet"), SetpointControl.cleared(200, """{"ok":true,"cleared":true}"""))
+        assertFalse(SetpointControl.cleared(404, """{"ok":false}""").ok)
+    }
+
+    @Test
+    fun glanceCarriesTheManualHoldFromStateAndStorage() {
+        val state = """{"rooms":[{"name":"bad","window_open":false,"manual":{"target":22.5,"value":22.5,"until_ts":1700000000000,"since_ts":1,"source":"watch"},"nodes":[{"local_temperature":20.0,"commanded_setpoint":22.5,"reason":"manual_watch"}]},{"name":"kueche","window_open":false,"manual":null,"nodes":[{"local_temperature":19.0,"commanded_setpoint":20.0}]}]}"""
+        val g = Glance.parse(state, 7L)!!
+        assertEquals(Manual(22.5, 1_700_000_000_000L, "watch"), RoomView.glance(g, "bad")!!.manual)
+        assertNull(RoomView.glance(g, "kueche")!!.manual)
+        assertEquals(g, Glance.fromJson(g.json()))
+        assertEquals("Von dir vorgegeben", RoomView.why(RoomView.glance(g, "bad")))
     }
 }

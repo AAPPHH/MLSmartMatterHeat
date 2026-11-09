@@ -105,6 +105,12 @@ class ScreenshotTest {
 
     @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun detail_saved_41mm() = shot("detail_saved_41mm") { RoomDetailScreen("kueche", rg("kueche"), null, false, true, {}, {}, true) {} }
 
+    private fun control(active: Manual? = null, line: BoostResult? = null) = SetpointUi(22.5, HoldChoice.TWO_HOURS, false, line, active, {}, {}, {}, {})
+
+    @Test fun detail_control() = shot("detail_control", swipe = 1, short = true) { RoomDetailScreen("wohnzimmer", rg("wohnzimmer"), null, false, true, {}, {}, control = control()) }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun detail_control_active_41mm() = shot("detail_control_active_41mm", swipe = 1, short = true) { RoomDetailScreen("wohnzimmer", rg("wohnzimmer"), null, false, true, {}, {}, control = control(Manual(22.5, until, "watch"), BoostResult(true, "22,5 °C bis 18:40"))) }
+
     @Test fun detail_saved() = shot("detail_saved") { RoomDetailScreen("kueche", rg("kueche"), null, false, true, {}, {}, true) {} }
 
     @Test fun detail_saved_font_1_3() = shot("detail_saved_font_1_3", 1.3f) { RoomDetailScreen("kueche", rg("kueche"), null, false, true, {}, {}, true) {} }

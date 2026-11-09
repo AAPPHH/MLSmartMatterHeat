@@ -27,11 +27,13 @@ object AlertList {
     fun notificationId(a: Alert): Int = 1000 + (a.id.hashCode() and 0xFFFF)
 }
 
-data class RoomGlance(val room: String, val temp: Double?, val target: Double?, val open: Boolean, val reason: String? = null, val boosting: Boolean = false, val boostUntil: Long? = null)
+data class Manual(val target: Double, val until: Long, val source: String)
+
+data class RoomGlance(val room: String, val temp: Double?, val target: Double?, val open: Boolean, val reason: String? = null, val boosting: Boolean = false, val boostUntil: Long? = null, val manual: Manual? = null)
 
 data class Glance(val at: Long, val rooms: List<RoomGlance>) {
     fun json(): String = JSONObject().put("at", at).put("rooms", JSONArray().also { a ->
-        rooms.forEach { a.put(JSONObject().put("room", it.room).put("temp", it.temp ?: JSONObject.NULL).put("target", it.target ?: JSONObject.NULL).put("open", it.open).put("reason", it.reason ?: JSONObject.NULL).put("boosting", it.boosting).put("boostUntil", it.boostUntil ?: JSONObject.NULL)) }
+        rooms.forEach { a.put(JSONObject().put("room", it.room).put("temp", it.temp ?: JSONObject.NULL).put("target", it.target ?: JSONObject.NULL).put("open", it.open).put("reason", it.reason ?: JSONObject.NULL).put("boosting", it.boosting).put("boostUntil", it.boostUntil ?: JSONObject.NULL).put("manual", it.manual?.let { m -> JSONObject().put("target", m.target).put("until", m.until).put("source", m.source) } ?: JSONObject.NULL)) }
     }).toString()
 
     fun openRooms(): List<String> = rooms.filter { it.open }.map { it.room }
@@ -46,7 +48,7 @@ data class Glance(val at: Long, val rooms: List<RoomGlance>) {
         fun fromJson(text: String?): Glance = try {
             val o = JSONObject(text ?: "")
             val a = o.getJSONArray("rooms")
-            Glance(o.getLong("at"), (0 until a.length()).map { a.getJSONObject(it) }.map { RoomGlance(it.getString("room"), num(it, "temp"), num(it, "target"), it.optBoolean("open"), str(it, "reason"), it.optBoolean("boosting"), if (it.isNull("boostUntil")) null else it.optLong("boostUntil")) })
+            Glance(o.getLong("at"), (0 until a.length()).map { a.getJSONObject(it) }.map { RoomGlance(it.getString("room"), num(it, "temp"), num(it, "target"), it.optBoolean("open"), str(it, "reason"), it.optBoolean("boosting"), if (it.isNull("boostUntil")) null else it.optLong("boostUntil"), it.optJSONObject("manual")?.let { m -> Manual(m.getDouble("target"), m.getLong("until"), m.optString("source")) }) })
         } catch (e: Exception) { EMPTY }
 
         fun parse(text: String, now: Long): Glance? = try {
@@ -65,7 +67,8 @@ data class Glance(val at: Long, val rooms: List<RoomGlance>) {
                     r.optBoolean("window_open"),
                     reason,
                     boost?.optString("state") in Boost.ACTIVE || reason == "boost",
-                    if (written != null && minutes != null) (written + minutes * 60_000.0).toLong() else null
+                    if (written != null && minutes != null) (written + minutes * 60_000.0).toLong() else null,
+                    r.optJSONObject("manual")?.let { m -> num(m, "target")?.let { t -> num(m, "until_ts")?.let { u -> Manual(t, u.toLong(), m.optString("source")) } } }
                 )
             })
         } catch (e: Exception) { null }
@@ -138,6 +141,23 @@ object Remote {
             }
         }
     }
+
+    private fun setpoint(c: Context, body: String, parse: (Int, String) -> BoostResult, done: (BoostResult) -> Unit) {
+        val store = Store(c.applicationContext)
+        val net = wifi() ?: return done(Boost.failed(Boost.NO_WIFI))
+        run {
+            done(try {
+                Poster.send(store.server, SetpointControl.PATH, body, net).let { parse(it.code, it.text) }
+            } catch (e: Exception) {
+                Trace.w("setpoint_failed", e)
+                Boost.failed()
+            })
+        }
+    }
+
+    fun setpoint(c: Context, room: String, celsius: Double, minutes: Int, done: (BoostResult) -> Unit) = setpoint(c, SetpointControl.body(room, celsius, minutes), SetpointControl::result, done)
+
+    fun clearSetpoint(c: Context, room: String, done: (BoostResult) -> Unit) = setpoint(c, SetpointControl.clearBody(room), SetpointControl::cleared, done)
 
     fun boost(c: Context, room: String, done: (BoostResult) -> Unit) {
         val store = Store(c.applicationContext)
