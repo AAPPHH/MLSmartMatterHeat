@@ -18,7 +18,7 @@ pub struct RoomModelSection {
 
 impl Default for RoomModelSection {
     fn default() -> Self {
-        Self { enabled: true, model_dir: "/models/room_model".into(), raise_cost_min: 15.0, cold_cost_min: 1.0 }
+        Self { enabled: false, model_dir: "/models/room_model".into(), raise_cost_min: 15.0, cold_cost_min: 1.0 }
     }
 }
 
@@ -67,9 +67,11 @@ struct Inner {
     decided: HashMap<String, i64>,
     last_row: HashMap<String, (f64, i64, bool)>,
     views: BTreeMap<String, serde_json::Value>,
-    resets_seen: usize,
+    pending: Vec<crate::lake::Event>,
     away_since: Option<i64>,
     returned: Option<i64>,
+    weather: [Option<f64>; 3],
+    state: Option<&'static str>,
 }
 
 #[derive(Clone, Default)]
@@ -110,13 +112,33 @@ fn reset_event(rec: &ResetRec, now_ms: i64) -> crate::lake::Event {
     crate::lake::Event::now(crate::lake::kind::FILTER_RESET, "heatd").with_detail(serde_json::json!({"room": rec.room, "cause": rec.cause, "step_ms": now_ms, "prior": json_prior(rec.prior)}))
 }
 
+fn house_resets(house: &House, cause: &'static str, now_ms: i64) -> Vec<crate::lake::Event> {
+    house
+        .rooms
+        .iter()
+        .map(|(name, f)| reset_event(&ResetRec { room: name.clone(), cause, step: 0, prior: if f.last.ok { [f.last.m, f.last.a, f.last.lam] } else { [f64::NAN; 3] } }, now_ms))
+        .collect()
+}
+
+impl Inner {
+    fn set_state(&mut self, state: &'static str, out: &mut StepOut) {
+        if self.state != Some(state) {
+            self.state = Some(state);
+            out.events.push(crate::lake::Event::now(crate::lake::kind::SHADOW_STATE, "heatd").with_detail(serde_json::json!({"state": state})));
+        }
+    }
+}
+
 impl RoomModel {
     pub fn set_bundle(&self, bundle: Bundle) {
         let mut inner = self.0.lock().unwrap();
+        if let Some(house) = inner.house.take() {
+            let events = house_resets(&house, "reload", crate::lake::now_us() / 1000);
+            inner.pending.extend(events);
+        }
         inner.house = Some(House::new(&bundle));
         inner.bundle = Some(Arc::new(bundle));
         inner.cursor = None;
-        inner.resets_seen = 0;
         inner.inputs.clear();
         inner.decided.clear();
     }
@@ -164,8 +186,19 @@ impl RoomModel {
         let cfg = &config.room_model;
         let mut guard = self.0.lock().unwrap();
         let inner = &mut *guard;
-        let (Some(bundle), Some(house)) = (inner.bundle.clone(), inner.house.as_mut()) else { return StepOut::default() };
-        let mut out = StepOut::default();
+        let mut out = StepOut { events: std::mem::take(&mut inner.pending), ..Default::default() };
+        for (slot, v) in inner.weather.iter_mut().zip(weather) {
+            if v.is_finite() {
+                *slot = Some(v);
+            }
+        }
+        let weather = inner.weather.map(|v| v.unwrap_or(f64::NAN));
+        if inner.bundle.is_none() {
+            inner.set_state("no_model", &mut out);
+            return out;
+        }
+        inner.set_state(if weather[0].is_finite() { "running" } else { "no_weather" }, &mut out);
+        let (Some(bundle), Some(house)) = (inner.bundle.clone(), inner.house.as_mut()) else { return out };
         let stale_ms = config.stale.after_ms();
         let nodes: BTreeMap<String, u64> = bundle
             .rooms
@@ -178,12 +211,8 @@ impl RoomModel {
         let target = now_ms.div_euclid(MIN_MS);
         let mut cursor = inner.cursor.unwrap_or(target - 1);
         if target - cursor > MAX_CATCHUP_MIN {
-            for (name, f) in house.rooms.iter() {
-                let prior = if f.last.ok { [f.last.m, f.last.a, f.last.lam] } else { [f64::NAN; 3] };
-                out.events.push(reset_event(&ResetRec { room: name.clone(), cause: "restart_gap", step: 0, prior }, now_ms));
-            }
+            out.events.extend(house_resets(house, "restart_gap", now_ms));
             *house = House::new(&bundle);
-            inner.resets_seen = 0;
             cursor = target - 1;
         }
         let [night_from, night_to] = bundle.house.night_hours;
@@ -197,7 +226,7 @@ impl RoomModel {
                 let age_ok = |p: Option<(i64, f64)>| p.filter(|(t, _)| now_ms - t <= stale_ms).map(|(_, v)| v);
                 let feed = inner.feeds.entry(node).or_default();
                 let (y, yv) = (feed.fresh_temp.take().unwrap_or(f64::NAN), feed.fresh_valve.take().map_or(f64::NAN, |v| v / 100.0));
-                let u = age_ok(feed.valve).map_or(f64::NAN, |v| (v / 100.0).clamp(0.0, 1.0));
+                let u = feed.valve.map_or(f64::NAN, |(_, v)| (v / 100.0).clamp(0.0, 1.0));
                 let sp = feed.setpoint.map_or(f64::NAN, |p| p.1);
                 let (mut ncnt, mut nsum) = (Vec::new(), Vec::new());
                 for kind in doc.c.keys() {
@@ -217,8 +246,7 @@ impl RoomModel {
             inner.inputs = inputs;
         }
         inner.cursor = Some(target);
-        out.events.extend(house.resets.iter().skip(inner.resets_seen).map(|rec| reset_event(rec, now_ms)));
-        inner.resets_seen = house.resets.len();
+        out.events.extend(house.resets.drain(..).map(|rec| reset_event(&rec, now_ms)));
         if target % TICK_MIN != 0 {
             return out;
         }
