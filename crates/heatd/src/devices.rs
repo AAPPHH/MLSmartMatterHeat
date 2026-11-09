@@ -1,7 +1,7 @@
 use crate::boost::WakeEdge;
 use crate::config::{parse_minutes, Config, Room};
 use crate::http::AppState;
-use crate::lake::{self, kind, DeviceReading, Event, Sink};
+use crate::lake::{self, kind, DeviceReading, Event, Label, Sink};
 use crate::report::{dur, hhmm, midnight_us, open_lake, rows};
 use anyhow::{anyhow, bail, Result};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
@@ -11,7 +11,7 @@ use matter_controller::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,19 @@ const SOURCE_HEATD: &str = "heatd";
 const DAY_FILE: &str = "devices/coffee_days.json";
 const VIEW_RAW_CHARS: usize = 120;
 const GLOBAL_ATTRIBUTES: u32 = 0xFFF0;
+const POWER_ATTRIBUTE: u32 = 8;
+const POWER_PER_WATT: f64 = 1000.0;
+const LABEL_HALF_WINDOW_US: i64 = 180_000_000;
+const BASELINE_KEEP_US: i64 = 6 * 3600 * 1_000_000;
+const BASELINE_MAX_SAMPLES: usize = 720;
+const BASELINE_MEDIAN_FROM: usize = 30;
+const EDGE_MIN_SAMPLES: usize = 5;
+const EDGE_DEBOUNCE: u32 = 2;
+const EDGE_COOLDOWN_US: i64 = 600_000_000;
+const RISE_MARGIN_W: f64 = 1.0;
+const RISE_MARGIN_RATIO: f64 = 0.5;
+const DROP_RATIO: f64 = 0.4;
+const DROP_MIN_BASELINE_W: f64 = 0.3;
 const MAX_RESUBSCRIBE_BACKOFF: Duration = Duration::from_secs(24 * 3600);
 
 fn default_window() -> String {
@@ -80,6 +93,123 @@ impl DeviceKind {
             Self::Climate => 300.0,
             _ => 60.0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Edge {
+    Rise,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Low,
+    Idle,
+    High,
+}
+
+pub struct PresenceRule {
+    role: &'static str,
+    source: &'static str,
+    name: &'static str,
+    rise: (&'static str, &'static str),
+    drop: (&'static str, &'static str),
+}
+
+impl PresenceRule {
+    fn answer(&self, edge: Edge) -> (&'static str, &'static str) {
+        match edge {
+            Edge::Rise => self.rise,
+            Edge::Drop => self.drop,
+        }
+    }
+}
+
+pub const PRESENCE_RULES: [PresenceRule; 1] = [PresenceRule {
+    role: "toothbrush",
+    source: "toothbrush",
+    name: "Zahnbuerste",
+    rise: ("charge_start", "zurueckgestellt, Ladestart"),
+    drop: ("removed", "vom Ladestaender genommen"),
+}];
+
+fn presence_rule(role: &str) -> Option<&'static PresenceRule> {
+    PRESENCE_RULES.iter().find(|r| r.role == role)
+}
+
+#[derive(Debug)]
+struct EdgeDetector {
+    idle: VecDeque<(i64, f64)>,
+    state: Level,
+    run: Option<(Level, u32, i64)>,
+    last: BTreeMap<Edge, i64>,
+}
+
+impl Default for EdgeDetector {
+    fn default() -> Self {
+        Self { idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new() }
+    }
+}
+
+impl EdgeDetector {
+    fn baseline(&self) -> f64 {
+        let mut values: Vec<f64> = self.idle.iter().map(|s| s.1).collect();
+        values.sort_by(f64::total_cmp);
+        if values.len() < BASELINE_MEDIAN_FROM {
+            values[0]
+        } else {
+            values[values.len() / 2]
+        }
+    }
+
+    fn remember(&mut self, ts: i64, watts: f64) {
+        self.idle.push_back((ts, watts));
+        while self.idle.len() > BASELINE_MAX_SAMPLES || self.idle.front().is_some_and(|f| ts - f.0 > BASELINE_KEEP_US) {
+            self.idle.pop_front();
+        }
+    }
+
+    fn push(&mut self, ts: i64, watts: f64) -> Option<(Edge, i64)> {
+        if self.idle.len() < EDGE_MIN_SAMPLES {
+            self.remember(ts, watts);
+            return None;
+        }
+        let base = self.baseline();
+        let class = if watts > base + RISE_MARGIN_W.max(base * RISE_MARGIN_RATIO) {
+            Level::High
+        } else if base >= DROP_MIN_BASELINE_W && watts < base * DROP_RATIO {
+            Level::Low
+        } else {
+            Level::Idle
+        };
+        if class != Level::High {
+            self.remember(ts, watts);
+        }
+        if class == self.state {
+            self.run = None;
+            return None;
+        }
+        let (count, first) = match self.run {
+            Some((level, count, first)) if level == class => (count + 1, first),
+            _ => (1, ts),
+        };
+        if count < EDGE_DEBOUNCE {
+            self.run = Some((class, count, first));
+            return None;
+        }
+        self.run = None;
+        self.state = class;
+        let edge = match class {
+            Level::High => Edge::Rise,
+            Level::Low => Edge::Drop,
+            Level::Idle => return None,
+        };
+        if self.last.get(&edge).is_some_and(|t| first - t < EDGE_COOLDOWN_US) {
+            return None;
+        }
+        self.last.insert(edge, first);
+        Some((edge, first))
     }
 }
 
@@ -162,6 +292,9 @@ pub fn validate(devices: &[DeviceConfig], rooms: &[Room]) -> Result<()> {
         }
         if device.role.trim().is_empty() {
             bail!("devices: node {} needs a role", device.node);
+        }
+        if let Some(rule) = presence_rule(&device.role).filter(|_| device.kind != DeviceKind::Plug || device.room.is_none()) {
+            bail!("devices: node {} with role {} needs kind plug and a room", device.node, rule.role);
         }
         if [device.min_s, device.max_s, device.rest_min_s, device.rest_max_s].into_iter().flatten().any(|s| s == 0) || device.silent_after_min.is_some_and(|m| m <= 0.0) {
             bail!("devices: node {} has a zero interval", device.node);
@@ -279,9 +412,33 @@ struct Inner {
     done: BTreeMap<u64, NaiveDate>,
     away_logged: BTreeMap<u64, NaiveDate>,
     day_file: Option<PathBuf>,
+    detectors: BTreeMap<u64, EdgeDetector>,
 }
 
 impl Inner {
+    fn edge_label(&mut self, node: u64, row: &DeviceReading) -> Option<Label> {
+        let config = self.configs.iter().find(|c| c.node == node)?;
+        let rule = presence_rule(&config.role)?;
+        let room = config.room.clone()?;
+        if row.cluster != ELECTRICAL_POWER_MEASUREMENT_CLUSTER || row.attribute != POWER_ATTRIBUTE || row.kind != "attribute" {
+            return None;
+        }
+        let (edge, ts) = self.detectors.entry(node).or_default().push(row.ts, row.value? / POWER_PER_WATT)?;
+        let (answer, _) = rule.answer(edge);
+        Some(Label {
+            ts,
+            from_ts: Some(ts - LABEL_HALF_WINDOW_US),
+            to_ts: Some(ts + LABEL_HALF_WINDOW_US),
+            room,
+            source: rule.source.into(),
+            confidence: Some(1.0),
+            label_id: Some(format!("{}-{node}-{ts}", rule.source)),
+            answer: Some(answer.into()),
+            via: Some("plug".into()),
+            ..Default::default()
+        })
+    }
+
     fn persist(&self) {
         let Some(path) = &self.day_file else { return };
         let days: BTreeMap<String, String> = self.done.iter().map(|(n, d)| (n.to_string(), d.to_string())).collect();
@@ -420,7 +577,11 @@ impl Devices {
             CaptureItem::Attribute(_) | CaptureItem::Event(_) => {
                 let Some(row) = reading_of(&item, now_us).filter(|r| r.node == node) else { return };
                 let recovered = self.inner.lock().unwrap().report(node, std::slice::from_ref(&row), now_us);
+                let label = self.inner.lock().unwrap().edge_label(node, &row);
                 log_row("device reading", sink.append(row));
+                if let Some(label) = label {
+                    log_row("presence label", sink.append(label));
+                }
                 if let Some((since, now)) = recovered {
                     self.link_event(sink, node, "ok", json!({"silent_s": (now - since) / 1_000_000}));
                 }
@@ -711,6 +872,17 @@ pub fn report_section(root: &Path, date: NaiveDate) -> Result<String> {
         for m in meta.iter().filter(|m| m["wake_on"] == true) {
             let _ = writeln!(md, "- Kaffeemaschine (Node {}): nicht eingeschaltet, kein Ende des Schlafmodus im Fenster {} Ortszeit.", m["node"], m["wake_window"].as_str().unwrap_or("?"));
         }
+    }
+    let sources = PRESENCE_RULES.iter().map(|r| format!("'{}'", r.source)).collect::<Vec<_>>().join(", ");
+    let presence = rows(
+        c,
+        &format!("SELECT epoch_us(ts), source, room, answer FROM labels WHERE source IN ({sources}) AND {day} ORDER BY ts"),
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)),
+    )?;
+    for (us, source, room, answer) in &presence {
+        let Some(rule) = PRESENCE_RULES.iter().find(|r| r.source == source) else { continue };
+        let text = [rule.rise, rule.drop].into_iter().find(|a| Some(a.0) == answer.as_deref()).map_or("Kante", |a| a.1);
+        let _ = writeln!(md, "- {} um {} UTC {text}: Aufenthalt im Raum {room} als Label (Quelle {source}, Scans +-3 min).", rule.name, hhmm(*us));
     }
     let links = rows(
         c,

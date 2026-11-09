@@ -513,6 +513,7 @@ fn a_toothbrush_plug_is_a_calm_read_only_plug_with_the_configured_fast_interval(
 node = 10
 kind = 'plug'
 role = 'toothbrush'
+room = 'a'
 min_s = 10
 ";
     let config = config(dir.path(), cfg);
@@ -561,4 +562,105 @@ async fn fast_retries_skip_a_reporting_device_and_keep_doubling_for_a_silent_one
     }
     let doubled = state.devices.inner.lock().unwrap().nodes.get(&12).map(|n| n.retry_s).unwrap();
     assert_eq!(doubled, 960.0);
+}
+
+const BRUSH: &str = "[[devices]]\nnode = 10\nkind = 'plug'\nrole = 'toothbrush'\nroom = 'a'\nmin_s = 10\n";
+
+fn power(ts: i64, milliwatts: f64) -> DeviceReading {
+    DeviceReading { ts, node: 10, endpoint: 1, cluster: 0x90, attribute: 8, kind: "attribute".into(), name: "ActivePower".into(), value: Some(milliwatts), raw: String::new(), source: "subscription".into() }
+}
+
+fn feed(detector: &mut EdgeDetector, from_s: i64, milliwatts: &[f64]) -> Vec<(Edge, i64)> {
+    milliwatts.iter().enumerate().filter_map(|(i, mw)| detector.push((from_s + 30 * i as i64) * 1_000_000, mw / POWER_PER_WATT)).collect()
+}
+
+#[test]
+fn a_clear_power_rise_after_a_quiet_baseline_is_one_debounced_charge_start_edge() {
+    let mut d = EdgeDetector::default();
+    let idle: Vec<f64> = (0..40).map(|i| 750.0 + 50.0 * (i % 3) as f64).collect();
+    assert!(feed(&mut d, 0, &idle).is_empty());
+    assert!(feed(&mut d, 1200, &[4200.0, 800.0, 800.0]).is_empty());
+    let edges = feed(&mut d, 1400, &[4200.0, 4300.0, 4100.0, 3900.0, 4000.0]);
+    assert_eq!(edges, vec![(Edge::Rise, 1400 * 1_000_000)]);
+    assert!(feed(&mut d, 1600, &[3800.0; 20]).is_empty());
+    assert!(feed(&mut d, 2400, &[800.0; 10]).is_empty());
+}
+
+#[test]
+fn a_drop_far_below_the_idle_level_is_a_removal_edge_and_rises_inside_the_cooldown_are_ignored() {
+    let mut d = EdgeDetector::default();
+    feed(&mut d, 0, &[800.0; 40]);
+    let drop = feed(&mut d, 1200, &[100.0, 100.0, 100.0]);
+    assert_eq!(drop, vec![(Edge::Drop, 1200 * 1_000_000)]);
+    assert!(feed(&mut d, 1300, &[800.0, 800.0]).is_empty());
+    assert_eq!(feed(&mut d, 1400, &[4000.0, 4000.0]), vec![(Edge::Rise, 1400 * 1_000_000)]);
+    assert!(feed(&mut d, 1500, &[800.0, 800.0, 4000.0, 4000.0]).is_empty());
+}
+
+#[test]
+fn nothing_fires_during_warm_up_and_a_sagging_baseline_adapts() {
+    let mut d = EdgeDetector::default();
+    assert!(feed(&mut d, 0, &[800.0, 4000.0, 4000.0, 800.0]).is_empty());
+    let mut e = EdgeDetector::default();
+    feed(&mut e, 0, &[800.0; 40]);
+    feed(&mut e, 2000, &[300.0; 60]);
+    assert!((e.baseline() - 0.3).abs() < 0.2);
+    assert!(feed(&mut e, 5000, &[300.0, 310.0, 290.0]).is_empty());
+}
+
+#[test]
+fn an_edge_becomes_a_high_confidence_room_label_with_a_three_minute_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let devices = devices_of(dir.path(), BRUSH, &mock());
+    let min = 60_000_000;
+    let mut labels = Vec::new();
+    for i in 0..40 {
+        labels.extend(devices.inner.lock().unwrap().edge_label(10, &power(i * min / 2, 800.0)));
+    }
+    assert!(labels.is_empty());
+    for i in 0..2 {
+        labels.extend(devices.inner.lock().unwrap().edge_label(10, &power(30 * min + i * 10_000_000, 4500.0)));
+    }
+    assert_eq!(labels.len(), 1);
+    let label = &labels[0];
+    assert_eq!((label.ts, label.from_ts, label.to_ts), (30 * min, Some(27 * min), Some(33 * min)));
+    assert_eq!((label.room.as_str(), label.source.as_str(), label.confidence, label.answer.as_deref()), ("a", "toothbrush", Some(1.0), Some("charge_start")));
+    assert!(label.device.is_none() && label.label_id.as_deref() == Some(&format!("toothbrush-10-{}", 30 * min)[..]));
+    let other = DeviceReading { node: 9, ..power(0, 9000.0) };
+    assert!(devices.inner.lock().unwrap().edge_label(9, &other).is_none());
+}
+
+#[tokio::test]
+async fn a_toothbrush_edge_reaches_the_labels_table_and_the_device_report_has_one_german_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let date = "2026-11-10".parse::<NaiveDate>().unwrap();
+    let cfg = config(dir.path(), BRUSH);
+    let base = midnight_us(date);
+    let sink = dated_sink(dir.path(), date);
+    crate::context::write_meta(&sink, &cfg, base).unwrap();
+    let devices = devices_of(dir.path(), BRUSH, &mock());
+    let hour = 3_600_000_000;
+    for i in 0..40 {
+        sink.append_on(date, power(base + 6 * hour + i * 30_000_000, 800.0)).unwrap();
+        devices.inner.lock().unwrap().edge_label(10, &power(base + 6 * hour + i * 30_000_000, 800.0));
+    }
+    let at = base + 7 * hour + 15 * 60_000_000;
+    let label = (0..2).filter_map(|i| devices.inner.lock().unwrap().edge_label(10, &power(at + i * 10_000_000, 4500.0))).next().unwrap();
+    sink.append_on(date, label).unwrap();
+    sink.roll_day(date).unwrap();
+    let md = report_section(dir.path(), date).unwrap();
+    assert!(md.contains("- Zahnbuerste um 07:15:00 UTC zurueckgestellt, Ladestart: Aufenthalt im Raum a als Label (Quelle toothbrush, Scans +-3 min)."), "{md}");
+}
+
+#[test]
+fn a_presence_role_needs_a_plug_and_a_room() {
+    let no_room = "[[devices]]\nnode = 10\nkind = 'plug'\nrole = 'toothbrush'\n";
+    let wrong_kind = "[[devices]]\nnode = 10\nkind = 'air'\nrole = 'toothbrush'\nroom = 'a'\n";
+    for text in [no_room, wrong_kind] {
+        let err = Config::parse(&format!("[[rooms]]
+name = 'a'
+nodes = [5]
+{text}")).unwrap_err();
+        assert!(err.to_string().contains("needs kind plug and a room"), "{err}");
+    }
 }
