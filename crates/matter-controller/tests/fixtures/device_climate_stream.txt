@@ -1,0 +1,13 @@
+[1794243900.000] [15:17] [EM] >>> [E:1r S:2 M:200 (Ack:3)] (S) Msg RX from 1:000000000000000B [B2C3] --- Type 0001:05 (IM:ReportData) (B:120)
+[1794243900.010] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_0402 Attribute 0x0000_0000 DataVersion: 376740343
+[1794243900.010] [15:17] [TOO]   MeasuredValue: 2156
+[1794243900.020] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0405 Attribute 0x0000_0000 DataVersion: 4157019950
+[1794243900.020] [15:17] [TOO]   MeasuredValue: 8855
+[1794243900.030] [15:17] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000B DataVersion: 3014273002
+[1794243900.030] [15:17] [TOO]   BatVoltage: 3081
+[1794243900.040] [15:17] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000C DataVersion: 3014273002
+[1794243900.040] [15:17] [TOO]   BatPercentRemaining: 200
+[1794243900.050] [15:17] [TOO] Endpoint: 0 Cluster: 0x0000_002F Attribute 0x0000_000E DataVersion: 3014273002
+[1794243900.050] [15:17] [TOO]   BatChargeLevel: 0
+[1794243900.060] [15:17] [TOO] Endpoint: 0 Cluster: 0x0000_0035 Attribute 0x0000_0001 DataVersion: 3014273003
+[1794243900.060] [15:17] [TOO]   RoutingRole: 2

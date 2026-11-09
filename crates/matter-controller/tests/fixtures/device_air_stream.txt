@@ -1,0 +1,17 @@
+[1794243900.000] [15:17] [EM] >>> [E:1r S:2 M:300 (Ack:3)] (S) Msg RX from 1:000000000000000C [B2C3] --- Type 0001:05 (IM:ReportData) (B:120)
+[1794243900.010] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_005B Attribute 0x0000_0000 DataVersion: 1711602831
+[1794243900.010] [15:17] [TOO]   AirQuality: 1
+[1794243900.020] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_0402 Attribute 0x0000_0000 DataVersion: 1158743273
+[1794243900.020] [15:17] [TOO]   MeasuredValue: 1856
+[1794243900.030] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_0405 Attribute 0x0000_0000 DataVersion: 798893441
+[1794243900.030] [15:17] [TOO]   MeasuredValue: 4425
+[1794243900.040] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_040D Attribute 0x0000_0000 DataVersion: 1417743785
+[1794243900.040] [15:17] [TOO]   MeasuredValue: 396.000000
+[1794243900.050] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_040D Attribute 0x0000_000A DataVersion: 1417743785
+[1794243900.050] [15:17] [TOO]   LevelValue: 1
+[1794243900.060] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_042A Attribute 0x0000_0000 DataVersion: 2378997940
+[1794243900.060] [15:17] [TOO]   MeasuredValue: 9.000000
+[1794243900.070] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_042A Attribute 0x0000_000A DataVersion: 2378997940
+[1794243900.070] [15:17] [TOO]   LevelValue: 1
+[1794243900.080] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_0402 Attribute 0x0000_0002 DataVersion: 1158743273
+[1794243900.080] [15:17] [TOO]   MaxMeasuredValue: 9990

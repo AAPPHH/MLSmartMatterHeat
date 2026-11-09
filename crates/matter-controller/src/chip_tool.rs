@@ -1,10 +1,10 @@
 use crate::capture::{CaptureItem, CaptureParser, SOURCE_POLL};
 use crate::{
-    centi_degrees, parse_number, AttributeReport, AttributeSpec, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
+    centi_degrees, parse_number, AttributeReport, AttributeSpec, DeviceLink, DeviceSubscription, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
     MAX_HEAT_SETPOINT_LIMIT, NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, SYSTEM_MODE, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -159,10 +159,35 @@ impl ChipToolConfig {
     }
 
     fn wildcard_line_keeping(&self, command: &str, node: NodeId, keep: u8) -> String {
-        format!(
-            "any {command} {WILDCARD} {WILDCARD} {} {} {node} {WILDCARD_ENDPOINT} --keepSubscriptions {keep} --auto-resubscribe 1",
-            self.subscribe_min_s, self.subscribe_max_s
-        )
+        Self::paths_line(command, node, &[], (self.subscribe_min_s, self.subscribe_max_s), keep)
+    }
+
+    fn paths_line(command: &str, node: NodeId, clusters: &[u32], (min_s, max_s): (u32, u32), keep: u8) -> String {
+        let repeat = |each: &str| vec![each; clusters.len().max(1)].join(",");
+        let ids = if clusters.is_empty() { WILDCARD.to_string() } else { clusters.iter().map(|c| format!("0x{c:04X}")).collect::<Vec<_>>().join(",") };
+        format!("any {command} {ids} {} {min_s} {max_s} {node} {} --keepSubscriptions {keep} --auto-resubscribe 1", repeat(WILDCARD), repeat(WILDCARD_ENDPOINT))
+    }
+
+    pub fn device_lines(&self, node: NodeId, plan: &DeviceSubscription, fresh: bool) -> Vec<String> {
+        let rest = (plan.min_s, plan.max_s);
+        let mut lines = Vec::new();
+        if let Some(fast) = &plan.fast {
+            lines.push(Self::paths_line("subscribe-by-id", node, &fast.clusters, (fast.min_s, fast.max_s), 1));
+        }
+        lines.push(Self::paths_line("subscribe-by-id", node, &[], rest, 1));
+        lines.push(Self::paths_line("subscribe-event-by-id", node, &[], rest, 1));
+        if fresh {
+            lines[0] = lines[0].replace("--keepSubscriptions 1", "--keepSubscriptions 0");
+        }
+        lines
+    }
+
+    pub fn switch_on_parts(&self, node: NodeId, endpoint: u16) -> Vec<String> {
+        strings(&["onoff", "on", &node.to_string(), &endpoint.to_string()])
+    }
+
+    pub fn switch_on_args(&self, node: NodeId, endpoint: u16) -> Vec<String> {
+        self.args(&self.switch_on_parts(node, endpoint))
     }
 
     pub fn resubscribe_lines(&self, node: NodeId) -> Vec<String> {
@@ -409,9 +434,13 @@ impl StreamParser {
                 return vec![StreamEvent::Write(if code == 0 { Ok(()) } else { Err(line.trim().to_string()) })];
             }
         }
+        let command_status = writing && line.contains("Command Response Status");
+        if command_status && status_code(&line, "Status=0x") == Some(0) {
+            return vec![StreamEvent::Write(Ok(()))];
+        }
         if is_failure(&line) {
             let message = line.trim().to_string();
-            let ours = self.in_write || (writing && payload(&line).unwrap_or(&line).trim().starts_with("Run command failure"));
+            let ours = self.in_write || command_status || (writing && payload(&line).unwrap_or(&line).trim().starts_with("Run command failure"));
             self.in_write = false;
             return vec![if ours { StreamEvent::Write(Err(message)) } else { StreamEvent::Failure(message) }];
         }
@@ -461,6 +490,7 @@ struct Hub {
     poll: Mutex<Option<PollWindow>>,
     pending: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
     logged: Mutex<HashSet<String>>,
+    plans: Mutex<HashMap<NodeId, DeviceSubscription>>,
 }
 
 impl Hub {
@@ -655,17 +685,25 @@ impl Session {
 
     async fn start_node(&self, stdin: &mut ChildStdin, node: NodeId) -> Result<()> {
         if self.hub.sent.lock().unwrap().insert(node) {
-            for line in self.config.subscribe_lines(node) {
+            for line in self.lines(node, false) {
                 Self::send(stdin, &line).await?;
             }
         }
         Ok(())
     }
 
+    fn lines(&self, node: NodeId, fresh: bool) -> Vec<String> {
+        match self.hub.plans.lock().unwrap().get(&node) {
+            Some(plan) => self.config.device_lines(node, plan, fresh),
+            None if fresh => self.config.resubscribe_lines(node),
+            None => self.config.subscribe_lines(node),
+        }
+    }
+
     async fn resubscribe(&self, node: NodeId) -> Result<()> {
         let mut guard = self.stdin.lock().await;
         let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
-        for line in self.config.resubscribe_lines(node) {
+        for line in self.lines(node, true) {
             Self::send(stdin, &line).await?;
         }
         Ok(())
@@ -724,6 +762,12 @@ impl Session {
             return Err(Error::Command(format!("no poll response from node {node} within {}s", POLL_TIMEOUT.as_secs())));
         }
         Ok(got)
+    }
+
+    async fn command(&self, parts: Vec<String>) -> Result<()> {
+        let line = parts.join(" ");
+        let _gate = self.write_gate.lock().await;
+        self.write_once(&line).await
     }
 
     async fn write(&self, parts: Vec<String>) -> Result<()> {
@@ -957,10 +1001,37 @@ impl MatterController for ChipToolController {
     }
 }
 
+#[async_trait]
+impl DeviceLink for ChipToolController {
+    async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>> {
+        match &self.session {
+            Some(session) => {
+                session.hub.plans.lock().unwrap().insert(node, plan);
+                session.capture(node).await
+            }
+            None => Err(Error::Command("capture needs a serving controller".into())),
+        }
+    }
+
+    async fn device_resubscribe(&self, node: NodeId) -> Result<()> {
+        match &self.session {
+            Some(session) => session.resubscribe(node).await,
+            None => Err(Error::Command("resubscribe needs a serving controller".into())),
+        }
+    }
+
+    async fn device_switch_on(&self, node: NodeId, endpoint: u16) -> Result<()> {
+        match &self.session {
+            Some(session) => session.command(self.config.switch_on_parts(node, endpoint)).await,
+            None => check_output(&self.run(self.config.switch_on_args(node, endpoint), self.config.timeout_s).await?),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LOCAL_TEMPERATURE, SYSTEM_MODE};
+    use crate::{FastSubscription, LOCAL_TEMPERATURE, SYSTEM_MODE};
 
     fn config() -> ChipToolConfig {
         ChipToolConfig { storage_dir: Some("/var/lib/heatd/chip".into()), paa_trust_store: Some("/opt/paa".into()), ..Default::default() }
@@ -1156,6 +1227,42 @@ mod tests {
         let failed = stream(include_str!("../tests/fixtures/write_fail.txt"), Some(5));
         assert!(matches!(failed.first(), Some(StreamEvent::Write(Err(m))) if m.contains("0x87")));
         assert!(matches!(failed.get(1), Some(StreamEvent::Failure(_))));
+    }
+
+    #[test]
+    fn builds_device_lines_with_per_node_intervals_and_fresh_resubscribe() {
+        let c = config();
+        let plug = DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }) };
+        let lines = c.device_lines(9, &plug, false);
+        assert_eq!(
+            lines,
+            vec![
+                "any subscribe-by-id 0x0006,0x0090,0x0091 0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF 1 60 9 0xFFFF,0xFFFF,0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 300 900 9 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+                "any subscribe-event-by-id 0xFFFFFFFF 0xFFFFFFFF 300 900 9 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
+            ]
+        );
+        let fresh = c.device_lines(9, &plug, true);
+        assert!(fresh[0].contains("--keepSubscriptions 0") && fresh[1..].iter().all(|l| l.contains("--keepSubscriptions 1")));
+        let climate = DeviceSubscription { min_s: 60, max_s: 1800, fast: None };
+        let slow = c.device_lines(11, &climate, true);
+        assert_eq!(slow.len(), 2);
+        assert_eq!(slow[0], "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 60 1800 11 0xFFFF --keepSubscriptions 0 --auto-resubscribe 1");
+        assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
+        assert_eq!(c.switch_on_parts(9, 1), vec!["onoff", "on", "9", "1"]);
+    }
+
+    #[test]
+    fn command_response_status_completes_a_pending_switch() {
+        let run = |text: &str, writing: bool| {
+            let mut parser = StreamParser::new(1);
+            text.lines().flat_map(|l| parser.feed(l, Some(9), writing)).collect::<Vec<_>>()
+        };
+        assert_eq!(run(include_str!("../tests/fixtures/command_onoff_ok.txt"), true), vec![StreamEvent::Write(Ok(()))]);
+        assert!(run(include_str!("../tests/fixtures/command_onoff_ok.txt"), false).is_empty());
+        let failed = run(include_str!("../tests/fixtures/command_onoff_fail.txt"), true);
+        assert!(matches!(failed.first(), Some(StreamEvent::Write(Err(m))) if m.contains("0x81")));
+        assert!(run(include_str!("../tests/fixtures/command_onoff_fail.txt"), false).iter().all(|e| matches!(e, StreamEvent::Failure(_))));
     }
 
     #[test]

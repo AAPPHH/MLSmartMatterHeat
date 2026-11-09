@@ -1,0 +1,30 @@
+[1794243900.000] [15:17] [EM] >>> [E:1r S:2 M:100 (Ack:3)] (S) Msg RX from 1:0000000000000009 [B2C3] --- Type 0001:05 (IM:ReportData) (B:120)
+[1794243900.010] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_0006 Attribute 0x0000_0000 DataVersion: 945258654
+[1794243900.010] [15:17] [TOO]   OnOff: TRUE
+[1794243900.020] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0000 DataVersion: 179070943
+[1794243900.020] [15:17] [TOO]   PowerMode: 2
+[1794243900.030] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0004 DataVersion: 179070943
+[1794243900.030] [15:17] [TOO]   Voltage: 230412
+[1794243900.040] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0005 DataVersion: 179070943
+[1794243900.040] [15:17] [TOO]   ActiveCurrent: 5412
+[1794243900.050] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0008 DataVersion: 179070943
+[1794243900.050] [15:17] [TOO]   ActivePower: 1243100
+[1794243900.060] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_000A DataVersion: 179070943
+[1794243900.060] [15:17] [TOO]   ApparentPower: 1247800
+[1794243900.070] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_000E DataVersion: 179070943
+[1794243900.070] [15:17] [TOO]   Frequency: 50
+[1794243900.080] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0091 Attribute 0x0000_0001 DataVersion: 4121556172
+[1794243900.080] [15:17] [TOO]   CumulativeEnergyImported: {
+[1794243900.080] [15:17] [TOO]       Energy: 12000
+[1794243900.080] [15:17] [TOO]       EndSystime: 17900
+[1794243900.080] [15:17] [TOO]    }
+[1794243901.000] [15:17] [EM] >>> [E:1r S:2 M:101 (Ack:3)] (S) Msg RX from 1:0000000000000009 [B2C3] --- Type 0001:05 (IM:ReportData) (B:120)
+[1794243901.010] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0005 DataVersion: 179070944
+[1794243901.010] [15:17] [TOO]   ActiveCurrent: 5405
+[1794243901.020] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0008 DataVersion: 179070944
+[1794243901.020] [15:17] [TOO]   ActivePower: 1241900
+[1794243902.000] [15:17] [EM] >>> [E:1r S:2 M:102 (Ack:3)] (S) Msg RX from 1:0000000000000009 [B2C3] --- Type 0001:05 (IM:ReportData) (B:120)
+[1794243902.010] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0008 DataVersion: 179070945
+[1794243902.010] [15:17] [TOO]   ActivePower: 18200
+[1794243902.020] [15:17] [TOO] Endpoint: 1 Cluster: 0x0000_0006 Attribute 0x0000_0000 DataVersion: 945258655
+[1794243902.020] [15:17] [TOO]   OnOff: FALSE

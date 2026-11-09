@@ -1,5 +1,5 @@
 use crate::{
-    centi_degrees, AttributeReport, CaptureItem, CaptureParser, Error, Inventory, MatterController, NodeId, RawAttribute, Result, ThermostatState, TypedValue,
+    centi_degrees, AttributeReport, CaptureItem, CaptureParser, DeviceLink, DeviceSubscription, Error, Inventory, MatterController, NodeId, RawAttribute, Result, ThermostatState, TypedValue,
     BAT_PERCENT_REMAINING, LOCAL_TEMPERATURE, OCCUPIED_HEATING_SETPOINT, PI_HEATING_DEMAND, POWER_SOURCE_CLUSTER, SOURCE_POLL, SOURCE_SUBSCRIPTION, SYSTEM_MODE,
     THERMOSTAT_CLUSTER,
 };
@@ -31,6 +31,10 @@ struct Inner {
     silent: BTreeSet<NodeId>,
     dropping: BTreeSet<NodeId>,
     restarts: usize,
+    devices: BTreeMap<NodeId, String>,
+    plans: Vec<(NodeId, DeviceSubscription)>,
+    device_resubscribes: Vec<NodeId>,
+    switch_failures: usize,
 }
 
 pub struct MockController {
@@ -45,6 +49,22 @@ impl MockController {
 
     pub fn add_node(&self, node: NodeId, temperature: f64, setpoint: f64) {
         self.inner.lock().unwrap().nodes.insert(node, MockNode { temperature, setpoint, mode: MODE_HEAT });
+    }
+
+    pub fn add_device(&self, node: NodeId, raw: &str) {
+        self.inner.lock().unwrap().devices.insert(node, raw.to_string());
+    }
+
+    pub fn device_plans(&self) -> Vec<(NodeId, DeviceSubscription)> {
+        self.inner.lock().unwrap().plans.clone()
+    }
+
+    pub fn device_resubscribes(&self) -> Vec<NodeId> {
+        self.inner.lock().unwrap().device_resubscribes.clone()
+    }
+
+    pub fn fail_switch_on(&self, attempts: usize) {
+        self.inner.lock().unwrap().switch_failures = attempts;
     }
 
     pub fn push_capture(&self, node: NodeId, item: CaptureItem) {
@@ -313,6 +333,46 @@ impl MatterController for MockController {
     }
 }
 
+#[async_trait]
+impl DeviceLink for MockController {
+    async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>> {
+        let mut inner = self.inner.lock().unwrap();
+        let raw = inner.devices.get(&node).cloned().ok_or(Error::UnknownNode(node))?;
+        let (tx, rx) = channel(4096);
+        for item in CaptureParser::new().feed_all(&raw, Some(node)) {
+            let _ = tx.try_send(item);
+        }
+        let _ = tx.try_send(CaptureItem::Subscribed { node: Some(node) });
+        inner.captures.retain(|(n, _)| *n != node);
+        inner.captures.push((node, tx));
+        inner.plans.push((node, plan));
+        Ok(rx)
+    }
+
+    async fn device_resubscribe(&self, node: NodeId) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.devices.contains_key(&node) {
+            return Err(Error::UnknownNode(node));
+        }
+        inner.device_resubscribes.push(node);
+        Self::send_capture(&inner, node, CaptureItem::Subscribed { node: Some(node) });
+        Ok(())
+    }
+
+    async fn device_switch_on(&self, node: NodeId, endpoint: u16) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.devices.contains_key(&node) {
+            return Err(Error::UnknownNode(node));
+        }
+        inner.write_log.push(("on_off_on", node, f64::from(endpoint)));
+        if inner.switch_failures > 0 {
+            inner.switch_failures -= 1;
+            return Err(Error::Command(format!("no write status after 90s: node {node}")));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +408,28 @@ mod tests {
         assert!(inventory.attributes.iter().any(|a| a.vendor && a.cluster_id == 0xFFF1_FC01));
         assert_eq!(inventory.events[0].event_name, "StartUp");
         assert!(matches!(mock.inventory(9).await, Err(Error::UnknownNode(9))));
+    }
+
+    #[tokio::test]
+    async fn devices_replay_their_text_and_record_only_the_switch_on() {
+        let mock = MockController::new(1);
+        mock.add_device(9, include_str!("../tests/fixtures/device_plug_stream.txt"));
+        let plan = DeviceSubscription { min_s: 300, max_s: 900, fast: None };
+        let mut rx = mock.device_capture(9, plan.clone()).await.unwrap();
+        let mut seen = 0;
+        while let Ok(item) = rx.try_recv() {
+            seen += usize::from(matches!(item, CaptureItem::Attribute(_)));
+        }
+        assert_eq!(seen, 12);
+        assert_eq!(mock.device_plans(), vec![(9, plan.clone())]);
+        assert!(matches!(mock.device_capture(10, plan).await, Err(Error::UnknownNode(10))));
+        mock.fail_switch_on(1);
+        assert!(mock.device_switch_on(9, 1).await.is_err());
+        mock.device_switch_on(9, 1).await.unwrap();
+        assert!(matches!(mock.device_switch_on(11, 1).await, Err(Error::UnknownNode(11))));
+        assert_eq!(mock.write_log(), vec![("on_off_on", 9, 1.0), ("on_off_on", 9, 1.0)]);
+        mock.device_resubscribe(9).await.unwrap();
+        assert_eq!(mock.device_resubscribes(), vec![9]);
     }
 
     #[tokio::test]

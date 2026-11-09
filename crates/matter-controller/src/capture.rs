@@ -320,6 +320,56 @@ mod tests {
         assert_eq!(items[1], CaptureItem::Subscribed { node: Some(9) });
     }
 
+    fn named(items: &[CaptureItem]) -> Vec<(u16, u32, u32, &str, &TypedValue)> {
+        attributes(items).into_iter().map(|a| (a.endpoint, a.cluster, a.attribute, a.name.as_str(), &a.value)).collect()
+    }
+
+    #[test]
+    fn plug_power_stream_keeps_every_report_with_its_peer_and_types() {
+        let items = parse(include_str!("../tests/fixtures/device_plug_stream.txt"), None);
+        let all = attributes(&items);
+        assert_eq!(all.len(), 12);
+        assert!(all.iter().all(|a| a.node == 9 && a.source == "subscription"));
+        let power: Vec<Option<i64>> = all.iter().filter(|a| a.cluster == 0x90 && a.attribute == 0x08).map(|a| a.value.v_i64).collect();
+        assert_eq!(power, vec![Some(1243100), Some(1241900), Some(18200)]);
+        let on_off: Vec<(Option<bool>, &str)> = all.iter().filter(|a| a.cluster == 0x06).map(|a| (a.value.v_bool, a.value.dtype)).collect();
+        assert_eq!(on_off, vec![(Some(true), "bool"), (Some(false), "bool")]);
+        let energy = all.iter().find(|a| a.cluster == 0x91).unwrap();
+        assert_eq!((energy.name.as_str(), energy.endpoint, energy.value.dtype), ("CumulativeEnergyImported", 2, "struct"));
+        assert_eq!(energy.value.json(), Some(serde_json::json!({"Energy": 12000, "EndSystime": 17900})));
+        assert!(String::from_utf8_lossy(&energy.raw).contains("EndSystime: 17900"));
+        assert_eq!(all[2].raw, b"  Voltage: 230412");
+    }
+
+    #[test]
+    fn plug_energy_event_is_a_struct_with_number_and_priority() {
+        let items = parse(include_str!("../tests/fixtures/device_plug_event.txt"), None);
+        let [CaptureItem::Event(e)] = items.as_slice() else { panic!("{items:?}") };
+        assert_eq!((e.node, e.endpoint, e.cluster, e.name.as_str(), e.number, e.priority), (9, 2, 0x91, "CumulativeEnergyMeasured", Some(4), Some(1)));
+        assert_eq!(e.value.json().unwrap()["EnergyImported"]["EndSystime"], 17345);
+    }
+
+    #[test]
+    fn climate_sensor_reports_temperature_humidity_and_battery_on_their_endpoints() {
+        let items = parse(include_str!("../tests/fixtures/device_climate_stream.txt"), None);
+        let rows = named(&items);
+        assert_eq!(rows.iter().map(|r| (r.0, r.1, r.2, r.4.v_i64)).collect::<Vec<_>>(), vec![(1, 0x402, 0, Some(2156)), (2, 0x405, 0, Some(8855)), (0, 0x2F, 0x0B, Some(3081)), (0, 0x2F, 0x0C, Some(200)), (0, 0x2F, 0x0E, Some(0)), (0, 0x35, 1, Some(2))]);
+        assert!(attributes(&items).iter().all(|a| a.node == 11));
+    }
+
+    #[test]
+    fn air_monitor_floats_arrive_as_float_dtype() {
+        let items = parse(include_str!("../tests/fixtures/device_air_stream.txt"), None);
+        let all = attributes(&items);
+        let co2 = all.iter().find(|a| a.cluster == 0x40D && a.attribute == 0).unwrap();
+        assert_eq!((co2.node, co2.value.dtype, co2.value.v_f64, co2.value.number()), (12, "float", Some(396.0), Some(396.0)));
+        let pm = all.iter().find(|a| a.cluster == 0x42A && a.attribute == 0).unwrap();
+        assert_eq!(pm.value.v_f64, Some(9.0));
+        assert_eq!(all.iter().find(|a| a.cluster == 0x5B).unwrap().value.v_i64, Some(1));
+        assert_eq!(all.iter().find(|a| a.cluster == 0x402 && a.attribute == 0).unwrap().value.v_i64, Some(1856));
+        assert_eq!(all.len(), 8);
+    }
+
     #[test]
     fn data_without_a_known_node_is_dropped() {
         assert!(parse(include_str!("../tests/fixtures/subscribe_extras.txt").lines().skip(1).collect::<Vec<_>>().join("\n").as_str(), None).is_empty());

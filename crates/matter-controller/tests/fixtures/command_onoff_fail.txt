@@ -1,0 +1,3 @@
+[1794243900.000] [15:17] [TOO] Sending command to node 0x9
+[1794243900.100] [15:17] [DMG] Received Command Response Status for Endpoint=1 Cluster=0x0000_0006 Command=0x0000_0001 Status=0x81
+[1794243900.100] [15:17] [TOO] Run command failure: IM Error 0x00000581: General error: 0x81 (FAILURE)

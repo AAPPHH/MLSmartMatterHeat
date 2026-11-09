@@ -19,6 +19,14 @@ pub use mock::MockController;
 pub type NodeId = u64;
 
 pub const THERMOSTAT_CLUSTER: u32 = 0x0201;
+pub const ON_OFF_CLUSTER: u32 = 0x0006;
+pub const ELECTRICAL_POWER_MEASUREMENT_CLUSTER: u32 = 0x0090;
+pub const ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER: u32 = 0x0091;
+pub const TEMPERATURE_MEASUREMENT_CLUSTER: u32 = 0x0402;
+pub const HUMIDITY_MEASUREMENT_CLUSTER: u32 = 0x0405;
+pub const AIR_QUALITY_CLUSTER: u32 = 0x005B;
+pub const CO2_CLUSTER: u32 = 0x040D;
+pub const PM25_CLUSTER: u32 = 0x042A;
 
 pub struct AttributeSpec {
     pub id: u32,
@@ -109,6 +117,27 @@ impl ThermostatState {
 
 pub fn centi_degrees(celsius: f64) -> i16 {
     (celsius * 100.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FastSubscription {
+    pub clusters: Vec<u32>,
+    pub min_s: u32,
+    pub max_s: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceSubscription {
+    pub min_s: u32,
+    pub max_s: u32,
+    pub fast: Option<FastSubscription>,
+}
+
+#[async_trait]
+pub trait DeviceLink: Send + Sync {
+    async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>>;
+    async fn device_resubscribe(&self, node: NodeId) -> Result<()>;
+    async fn device_switch_on(&self, node: NodeId, endpoint: u16) -> Result<()>;
 }
 
 #[async_trait]
