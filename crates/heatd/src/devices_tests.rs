@@ -366,6 +366,9 @@ async fn silent_devices_get_one_low_priority_line_and_backed_off_resubscribes() 
     let (state, mock) = setup(dir.path(), DEVICES);
     let t0 = lake::now_us();
     let min = 60_000_000;
+    for (node, text) in [(9, PLUG), (11, CLIMATE), (12, AIR)] {
+        state.devices.handle(&state.sink, node, CaptureParser::new().feed_all(text, None).into_iter().next().unwrap());
+    }
     state.devices.health_tick(&state.sink, t0 + 10 * min).await;
     assert!(mock.device_resubscribes().is_empty());
     state.devices.health_tick(&state.sink, t0 + 31 * min).await;
@@ -515,4 +518,47 @@ min_s = 10
     let config = config(dir.path(), cfg);
     assert_eq!(config.devices[0].subscription().fast.unwrap().min_s, 10);
     assert!(CoffeePlug::from_config(&config.devices[0]).is_none());
+}
+
+#[tokio::test]
+async fn a_device_that_never_reported_is_retried_fast_with_doubling_up_to_the_silence_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mock) = setup(dir.path(), DEVICES);
+    let t0 = lake::now_us();
+    let s = 1_000_000;
+    let at = |secs: i64| t0 + secs * s;
+    state.devices.health_tick(&state.sink, at(30)).await;
+    assert!(mock.device_resubscribes().is_empty());
+    state.devices.health_tick(&state.sink, at(61)).await;
+    assert_eq!(mock.device_resubscribes(), vec![9, 12]);
+    state.devices.health_tick(&state.sink, at(120)).await;
+    assert_eq!(mock.device_resubscribes(), vec![9, 12]);
+    state.devices.health_tick(&state.sink, at(182)).await;
+    assert_eq!(mock.device_resubscribes(), vec![9, 12, 9, 12]);
+    state.devices.health_tick(&state.sink, at(301)).await;
+    assert_eq!(mock.device_resubscribes(), vec![9, 12, 9, 12, 11]);
+    state.devices.health_tick(&state.sink, at(430)).await;
+    assert_eq!(mock.device_resubscribes(), vec![9, 12, 9, 12, 11, 9, 12]);
+    let view = state.devices.view(at(430));
+    assert_eq!((view[0]["resubscribes"].clone(), view[0]["silent"].clone()), (json!(3), json!(false)));
+    flushed(&state);
+    assert!(string_column(dir.path(), "events", "kind").is_empty());
+}
+
+#[tokio::test]
+async fn fast_retries_skip_a_reporting_device_and_keep_doubling_for_a_silent_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mock) = setup(dir.path(), DEVICES);
+    let t0 = lake::now_us();
+    let s = 1_000_000;
+    state.devices.handle(&state.sink, 9, CaptureParser::new().feed_all(PLUG, None).into_iter().next().unwrap());
+    state.devices.health_tick(&state.sink, t0 + 600 * s).await;
+    assert_eq!(mock.device_resubscribes(), vec![11, 12]);
+    let gaps = state.devices.inner.lock().unwrap().nodes.get(&12).map(|n| n.retry_s).unwrap();
+    assert_eq!(gaps, 120.0);
+    for at in [900, 1500, 2700] {
+        state.devices.health_tick(&state.sink, t0 + at * s).await;
+    }
+    let doubled = state.devices.inner.lock().unwrap().nodes.get(&12).map(|n| n.retry_s).unwrap();
+    assert_eq!(doubled, 960.0);
 }

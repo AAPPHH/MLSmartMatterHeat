@@ -74,6 +74,13 @@ impl DeviceKind {
             Self::Climate => 480.0,
         }
     }
+
+    fn retry_start_s(self) -> f64 {
+        match self {
+            Self::Climate => 300.0,
+            _ => 60.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -125,6 +132,10 @@ impl DeviceConfig {
 
     pub fn silent_after(&self) -> Duration {
         Duration::from_secs_f64(self.silent_after_min.unwrap_or(self.kind.silent_after_min()) * 60.0)
+    }
+
+    fn retry_start_s(&self) -> f64 {
+        self.kind.retry_start_s().min(self.silent_after().as_secs_f64())
     }
 
     pub fn window(&self) -> Result<(u32, u32)> {
@@ -253,6 +264,10 @@ struct NodeState {
     next_resubscribe_us: i64,
     resubscribe_backoff_s: f64,
     resubscribes: u32,
+    reported_since_issue: bool,
+    retry_start_s: f64,
+    retry_s: f64,
+    issued_us: i64,
     latest: BTreeMap<(u16, u32, u32), Latest>,
 }
 
@@ -317,6 +332,8 @@ impl Inner {
         state.last_us = Some(now_us);
         state.reports += rows.len() as u64;
         state.resubscribe_backoff_s = 0.0;
+        state.reported_since_issue = true;
+        state.retry_s = state.retry_start_s;
         for row in rows {
             state.latest.insert((row.endpoint, row.cluster, row.attribute), Latest { name: row.name.clone(), value: row.value, raw: row.raw.chars().take(VIEW_RAW_CHARS).collect(), ts_us: row.ts });
         }
@@ -382,7 +399,7 @@ impl Devices {
             .and_then(|text| serde_json::from_str::<BTreeMap<String, String>>(&text).ok())
             .map(|days| days.into_iter().filter_map(|(n, d)| Some((n.parse().ok()?, d.parse().ok()?))).collect())
             .unwrap_or_default();
-        let nodes = config.devices.iter().map(|d| (d.node, NodeState { started_us: now_us, ..Default::default() })).collect();
+        let nodes = config.devices.iter().map(|d| (d.node, NodeState { started_us: now_us, issued_us: now_us, retry_start_s: d.retry_start_s(), retry_s: d.retry_start_s(), ..Default::default() })).collect();
         let inner = Inner { configs: config.devices.clone(), nodes, done, day_file: Some(day_file), ..Default::default() };
         Self { inner: Arc::new(Mutex::new(inner)), feed: Some(feed), switch: Some(switch), wake_timing: None }
     }
@@ -452,6 +469,12 @@ impl Devices {
             let limit_s = config.silent_after().as_secs_f64();
             let reference = state.last_us.unwrap_or(state.started_us);
             if ((now_us - reference) as f64 / 1e6) < limit_s {
+                if !state.reported_since_issue && now_us >= state.issued_us + (state.retry_s * 1e6) as i64 {
+                    state.resubscribes += 1;
+                    state.issued_us = now_us;
+                    state.retry_s = (state.retry_s * 2.0).min(limit_s);
+                    due.push((config.node, false));
+                }
                 continue;
             }
             let first = state.silent_since_us.is_none();
@@ -464,6 +487,8 @@ impl Devices {
                 continue;
             }
             state.resubscribes += 1;
+            state.reported_since_issue = false;
+            state.issued_us = now_us;
             state.next_resubscribe_us = now_us + (state.resubscribe_backoff_s * 1e6) as i64;
             state.resubscribe_backoff_s = (state.resubscribe_backoff_s * 2.0).min(MAX_RESUBSCRIBE_BACKOFF.as_secs_f64());
             due.push((config.node, first));
