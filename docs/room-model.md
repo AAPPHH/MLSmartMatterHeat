@@ -61,10 +61,10 @@ Neue additive Tabelle `shadow_decisions` (nicht `decisions`, damit Soll/Ist-, Bu
 
 ## Tagesbericht (Abschnitt "Raummodell Schatten")
 
-- 20-min-Prognosefehler je Raum (RMSE Luft, Ursprung alle 5 min) neben dem Residuum des Live-Fensterdetektors (z-Wert) und Persistenz.
+- 20-min-Prognosefehler je Raum (RMSE Sensor, Ursprung = Schattenzeile) gegen Persistenz (letzte tatsaechliche Messung, nicht Filterschaetzung); daneben nur zur Groessenordnung das eigene Residuum des Live-Fensterdetektors (keine 20-min-Prognose). Bei N < 10 als unsicher markiert.
 - Fenstererkennung: P(Fenster) > 0,5 gegen `ground_truth/windows.jsonl` (Treffer binnen 20 min) und gegen Uhr-Antworten in `labels` (source `window`, answer ja/nein): Treffer, Fehlalarme, Latenz; Hinweis kleine Fallzahl (N ausweisen, keine Prozente unter N=10).
 - Versorgung: Schatten-Kesselstillstaende (w_1 < 0,5 laenger 20 min) gegen vorhandene `supply`-Events (start/end).
-- Schatten-Erhoehungen gegen tatsaechliche Erhoehungen je Raum und Tag; Summe geschaetzter Heizminuten Schatten gegen live (Modellrechnung, kein Messwert).
+- Schatten-Erhoehungen (Schatten-Sollwert steigt gegenueber der vorigen Schattenzeile des Raums) gegen tatsaechliche Erhoehungen je Raum und Tag; Summe geschaetzter Heizminuten Schatten gegen live (Modellrechnung, kein Messwert).
 - Filterresets je Raum. Energie und Komfort gelten erst nach Umschalten als messbar, nicht aus dem Schatten.
 
 ## Regeln, die spaetere Schritte entfernen

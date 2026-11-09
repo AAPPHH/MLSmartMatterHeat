@@ -497,13 +497,13 @@ fn shadow_lake(root: &Path) {
         let base = 20.0 + minute as f64 / 1000.0;
         sink.append(ShadowDecision { forecast_c: Some(actual + 0.2), sensor_c: base, resid_live_k: Some(if minute == 200 { -0.3 } else { 0.3 }), ..shadow_row(minute, "a", 0.0, 0.99) }).unwrap();
     }
-    sink.append(shadow_row(400, "a", 0.1, 0.99)).unwrap();
+    sink.append(ShadowDecision { raise: true, ..shadow_row(400, "a", 0.1, 0.99) }).unwrap();
     sink.append(shadow_row(410, "a", 0.9, 0.99)).unwrap();
     sink.append(shadow_row(790, "a", 0.8, 0.99)).unwrap();
     for minute in [500, 520, 540] {
         sink.append(shadow_row(minute, "a", 0.0, 0.1)).unwrap();
     }
-    sink.append(ShadowDecision { raise: true, ..shadow_row(600, "a", 0.0, 0.99) }).unwrap();
+    sink.append(ShadowDecision { raise: true, setpoint_shadow: 21.5, ..shadow_row(600, "a", 0.0, 0.99) }).unwrap();
     let window_label = |minute: i64, open: bool| Label { ts: at(minute), room: "a".into(), source: "window".into(), window_open: Some(open), answer: Some(if open { "yes" } else { "no" }.into()), ..Default::default() };
     sink.append(window_label(412, true)).unwrap();
     sink.append(window_label(800, false)).unwrap();
@@ -524,7 +524,7 @@ fn shadow_section_reports_forecast_detection_supply_raises_and_resets() {
     shadow_lake(dir.path());
     let md = shadow_section(dir.path(), day()).unwrap();
     assert!(md.contains("## Raummodell Schatten"), "{md}");
-    assert!(md.contains("| a | 3 | 0.20 | 0.02 | 0.30 (3) |"), "forecast
+    assert!(md.contains("| a | 3 | 0.20 (N < 10, unsicher) | 0.02 (N < 10, unsicher) | 0.30 (N < 10, unsicher) (3) |"), "forecast
 {md}");
     assert!(md.contains("erkannt 1 von 1 (N < 10, keine Prozentangabe), mittlere Latenz 5 min"), "ground truth
 {md}");
@@ -545,5 +545,19 @@ fn shadow_section_without_rows_still_counts_resets() {
     let dir = tempfile::tempdir().unwrap();
     sample_lake(dir.path());
     let md = shadow_section(dir.path(), day()).unwrap();
-    assert!(md.contains("Keine Schattenzeilen") && md.contains("Filterresets: 0."), "{md}");
+    assert!(md.contains("Keine Schattenzeilen (kein Modell geladen oder kein Datenstand)") && md.contains("Filterresets: 0."), "{md}");
+}
+
+#[test]
+fn shadow_section_without_weather_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = start() + 12 * HOUR_US;
+    let sink = Sink::open_with_clock(LakeConfig::new(dir.path()), Arc::new(move || clock)).unwrap();
+    write_meta(&sink, &config(), start()).unwrap();
+    sink.append(Event { ts: at(10), kind: kind::SHADOW_STATE.into(), source: "heatd".into(), ..Default::default() }.with_detail(serde_json::json!({"state": "no_model"}))).unwrap();
+    sink.append(Event { ts: at(20), kind: kind::SHADOW_STATE.into(), source: "heatd".into(), ..Default::default() }.with_detail(serde_json::json!({"state": "no_weather"}))).unwrap();
+    sink.roll_day(day()).unwrap();
+    sink.close().unwrap();
+    let md = shadow_section(dir.path(), day()).unwrap();
+    assert!(md.contains("Keine Schattenzeilen (kein Wetter)."), "{md}");
 }

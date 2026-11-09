@@ -701,13 +701,20 @@ struct ShadowRow {
     room: String,
     p_window: f64,
     p_supply: f64,
-    raise: bool,
+    setpoint: f64,
     cost_live: f64,
     cost_total: f64,
 }
 
 fn rmse(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| (values.iter().map(|v| v * v).sum::<f64>() / values.len() as f64).sqrt())
+}
+
+fn rmse_cell(values: &[f64]) -> String {
+    match rmse(values) {
+        Some(v) if values.len() < SHADOW_MIN_N => format!("{v:.2} (N < {SHADOW_MIN_N}, unsicher)"),
+        v => opt(v, 2),
+    }
 }
 
 fn share(hit: usize, n: usize) -> String {
@@ -745,30 +752,38 @@ pub fn shadow_section(root: &Path, date: NaiveDate) -> Result<String> {
     let mut md = String::from("\n## Raummodell Schatten\n\nSchattenbetrieb: das Modell schreibt nichts an Thermostate oder Uhr. Zeilen entstehen bei Wechsel des Schatten-Sollwerts, bei Wechsel von P(Fenster) ueber/unter 0,5 oder spaetestens alle 30 min; Latenzen und Episoden sind deshalb nur auf diese Zeilen genau.\n\n");
     let shadow = rows(
         c,
-        &format!("SELECT epoch_us(ts), room, p_window, p_supply, raise, cost_live, cost_energy + cost_cold + cost_raise FROM shadow_decisions WHERE {day} ORDER BY ts"),
-        |r| Ok(ShadowRow { us: r.get(0)?, room: r.get(1)?, p_window: r.get(2)?, p_supply: r.get(3)?, raise: r.get(4)?, cost_live: r.get(5)?, cost_total: r.get(6)? }),
+        &format!("SELECT epoch_us(ts), room, p_window, p_supply, setpoint_shadow, cost_live, cost_energy + cost_cold + cost_raise FROM shadow_decisions WHERE {day} ORDER BY ts"),
+        |r| Ok(ShadowRow { us: r.get(0)?, room: r.get(1)?, p_window: r.get(2)?, p_supply: r.get(3)?, setpoint: r.get(4)?, cost_live: r.get(5)?, cost_total: r.get(6)? }),
     )?;
     let resets = rows(c, &format!("SELECT coalesce(json_extract_string(detail, '$.room'), '-'), coalesce(json_extract_string(detail, '$.cause'), '-'), count(*) FROM events WHERE kind = 'filter_reset' AND {day} GROUP BY 1, 2 ORDER BY 1, 2"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
     if shadow.is_empty() {
-        md.push_str("Keine Schattenzeilen (kein Modell geladen oder kein Datenstand).\n");
+        let state = rows(c, &format!("SELECT json_extract_string(detail, '$.state') FROM events WHERE kind = 'shadow_state' AND {day} ORDER BY ts DESC LIMIT 1"), |r| r.get::<_, Option<String>>(0))?.into_iter().flatten().next();
+        let why = match state.as_deref() {
+            Some("no_weather") => "kein Wetter",
+            Some("no_model") => "kein Modell geladen",
+            Some(_) => "kein Datenstand",
+            None => "kein Modell geladen oder kein Datenstand",
+        };
+        let _ = writeln!(md, "Keine Schattenzeilen ({why}).");
         let _ = writeln!(md, "\nFilterresets: {}.", if resets.is_empty() { "0".into() } else { resets.iter().map(|(r, cause, n)| format!("{r} {cause} {n}")).collect::<Vec<_>>().join(", ") });
         return Ok(md);
     }
     let forecast = rows(
         c,
         &format!(
-            "SELECT s.room, s.forecast_c - m.actual, s.sensor_c - m.actual, s.resid_live_k FROM shadow_decisions s JOIN room_minute m ON m.room = s.room AND epoch_us(m.t) = (epoch_us(s.ts) // 60000000 + 20) * 60000000
-             WHERE s.forecast_c IS NOT NULL AND m.actual IS NOT NULL AND m.gap_mask & 1 = 0 AND epoch_us(s.ts) >= {lo} AND epoch_us(s.ts) < {hi} ORDER BY s.room, s.ts"
+            "SELECT s.room, s.forecast_c - m.actual, m0.actual - m.actual FROM shadow_decisions s JOIN room_minute m ON m.room = s.room AND epoch_us(m.t) = (epoch_us(s.ts) // 60000000 + 20) * 60000000
+             JOIN room_minute m0 ON m0.room = s.room AND epoch_us(m0.t) = (epoch_us(s.ts) // 60000000) * 60000000
+             WHERE s.forecast_c IS NOT NULL AND m.actual IS NOT NULL AND m.gap_mask & 1 = 0 AND m0.actual IS NOT NULL AND m0.gap_mask & 1 = 0 AND epoch_us(s.ts) >= {lo} AND epoch_us(s.ts) < {hi} ORDER BY s.room, s.ts"
         ),
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?)),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?)),
     )?;
     let live = rows(c, &format!("SELECT room, resid_live_k FROM shadow_decisions WHERE resid_live_k IS NOT NULL AND {day} ORDER BY room"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?;
-    md.push_str("20-min-Prognose der Sensortemperatur (Ursprung = Schattenzeile; Modell bei Live-Sollwert gegen Messung, Persistenz = letzte Messung, Live-Detektor = sein Residuum Prognose minus Messung)\n\n| Raum | N | Modell RMSE K | Persistenz RMSE K | Live-Fenstermodell Residuum RMS K (N) |\n|---|---|---|---|---|\n");
+    let _ = writeln!(md, "20-min-Prognose der Sensortemperatur (Ursprung = Schattenzeile; Modell bei Live-Sollwert gegen die Messung 20 min spaeter, Persistenz = letzte tatsaechliche Messung zum Ursprung gegen dieselbe Messung; bei N < {SHADOW_MIN_N} sind die RMSE unsicher). Die letzte Spalte ist keine 20-min-Prognose, sondern das momentane Residuum des Live-Fensterdetektors (z mal sigma seines eigenen Modells), nur als Groessenordnung.\n\n| Raum | N | Modell RMSE K | Persistenz RMSE K | Live-Fensterdetektor eigenes Residuum RMS K (N) |\n|---|---|---|---|---|");
     let rooms: std::collections::BTreeSet<&str> = shadow.iter().map(|s| s.room.as_str()).collect();
     for room in &rooms {
         let (model, persist): (Vec<f64>, Vec<f64>) = forecast.iter().filter(|f| f.0 == *room).map(|f| (f.1, f.2)).unzip();
         let resid: Vec<f64> = live.iter().filter(|l| l.0 == *room).map(|l| l.1).collect();
-        let _ = writeln!(md, "| {room} | {} | {} | {} | {} ({}) |", model.len(), opt(rmse(&model), 2), opt(rmse(&persist), 2), opt(rmse(&resid), 2), resid.len());
+        let _ = writeln!(md, "| {room} | {} | {} | {} | {} ({}) |", model.len(), rmse_cell(&model), rmse_cell(&persist), rmse_cell(&resid), resid.len());
     }
     let flagged = |room: &str, from: i64, to: i64| shadow.iter().filter(|s| s.room == room && s.p_window > 0.5 && (from..=to).contains(&s.us)).map(|s| s.us).min();
     let hit_us = SHADOW_HIT_MIN * 60_000_000;
@@ -804,13 +819,13 @@ pub fn shadow_section(root: &Path, date: NaiveDate) -> Result<String> {
     let _ = writeln!(md, "\nVersorgung: Schatten-Kesselstillstaende (p_supply < 0,5 laenger als 20 min) {}, Live-Erkennung (`supply`-Events mit Ende) {}, davon ueberlappend {overlap}.", stops.len(), live_eps.len());
 
     let actual = rows(c, &format!("SELECT room, count(*) FROM decisions WHERE applied AND setpoint_new > setpoint_old AND {day} GROUP BY room ORDER BY room"), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-    md.push_str("\nErhoehungen und Kosten (Modellrechnung in Heizminuten, kein Messwert; Energie und Komfort gelten erst nach dem Umschalten als messbar)\n\n| Raum | Schatten-Erhoehungen | tatsaechliche Erhoehungen | Zeilen | Kosten live (Summe) | Kosten Schatten (Summe) |\n|---|---|---|---|---|---|\n");
+    md.push_str("\nErhoehungen und Kosten (Schatten-Erhoehung = Schatten-Sollwert hoeher als in der vorigen Schattenzeile desselben Raums an diesem Tag; Kosten sind Modellrechnung in Heizminuten, kein Messwert; Energie und Komfort gelten erst nach dem Umschalten als messbar)\n\n| Raum | Schatten-Erhoehungen | tatsaechliche Erhoehungen | Zeilen | Kosten live (Summe) | Kosten Schatten (Summe) |\n|---|---|---|---|---|---|\n");
     for room in &rooms {
         let mine: Vec<&ShadowRow> = shadow.iter().filter(|s| s.room == *room).collect();
         let _ = writeln!(
             md,
             "| {room} | {} | {} | {} | {:.0} | {:.0} |",
-            mine.iter().filter(|s| s.raise).count(),
+            mine.windows(2).filter(|w| w[1].setpoint > w[0].setpoint + 1e-9).count(),
             actual.iter().find(|a| a.0 == *room).map_or(0, |a| a.1),
             mine.len(),
             mine.iter().map(|s| s.cost_live).sum::<f64>(),
