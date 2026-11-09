@@ -41,6 +41,8 @@ pub enum DeviceKind {
     Air,
 }
 
+const CALM_PLUG_MIN_S: u32 = 30;
+
 impl DeviceKind {
     fn fast_clusters(self) -> &'static [u32] {
         match self {
@@ -108,13 +110,15 @@ impl DeviceConfig {
 
     pub fn subscription(&self) -> DeviceSubscription {
         let (default_min, default_max) = self.kind.primary();
+        let default_min = if self.kind == DeviceKind::Plug && self.role != "coffee" { default_min.max(CALM_PLUG_MIN_S) } else { default_min };
         let (min_s, max_s) = (self.min_s.unwrap_or(default_min), self.max_s.unwrap_or(default_max));
         match self.kind.fast_clusters() {
-            [] => DeviceSubscription { min_s, max_s, fast: None },
+            [] => DeviceSubscription { min_s, max_s, fast: None, events: false },
             clusters => DeviceSubscription {
                 min_s: self.rest_min_s.unwrap_or(300),
                 max_s: self.rest_max_s.unwrap_or(900),
                 fast: Some(FastSubscription { clusters: clusters.to_vec(), min_s, max_s }),
+                events: true,
             },
         }
     }
@@ -488,7 +492,9 @@ impl Devices {
                 WakeStep::Away { plug, day, local } => coffee_event(&state.sink, &plug, day, local, json!({"reason": "away", "ok": false})),
                 WakeStep::Attempt { plug, day, local } => {
                     if let Some(switch) = self.switch.clone() {
-                        tokio::spawn(wake_attempts(switch, state.sink.clone(), plug, day, local, self.wake_timing.unwrap_or_default()));
+                        let failsafe = state.failsafe.clone();
+                        let stopping: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || failsafe.stopping());
+                        tokio::spawn(wake_attempts(switch, state.sink.clone(), plug, day, local, self.wake_timing.unwrap_or_default(), stopping));
                     }
                 }
             }
@@ -542,10 +548,13 @@ fn coffee_event(sink: &Sink, plug: &CoffeePlug, day: NaiveDate, local: NaiveDate
     log_row("coffee event", sink.append(Event::now(kind::COFFEE_ON, SOURCE_HEATD).with_node(plug.node).with_detail(detail)));
 }
 
-pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime, timing: WakeTiming) {
+pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime, timing: WakeTiming, stopping: Arc<dyn Fn() -> bool + Send + Sync>) {
     let started = Instant::now();
     let mut attempt = 0u32;
     let outcome = loop {
+        if stopping() {
+            break Err("heatd stopping".to_string());
+        }
         attempt += 1;
         match plug.turn_on(switch.as_ref()).await {
             Ok(()) => break Ok(()),

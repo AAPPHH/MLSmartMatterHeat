@@ -21,6 +21,10 @@ fn config(dir: &Path, devices: &str) -> Config {
     Config::parse(&format!("data_dir = '{}'\n[[rooms]]\nname = 'a'\nnodes = [5]\n{devices}", dir.to_str().unwrap().replace('\\', "/"))).unwrap()
 }
 
+fn never() -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(|| false)
+}
+
 fn mock() -> Arc<MockController> {
     let mock = Arc::new(MockController::new(1));
     mock.add_node(5, 19.0, 19.0);
@@ -77,10 +81,10 @@ fn shipped_configs_list_the_new_devices() {
 fn subscription_plans_follow_the_kind_and_the_overrides() {
     let config = config(Path::new("x"), &format!("{DEVICES}[[devices]]\nnode = 13\nkind = 'plug'\nrole = 'charger'\nmin_s = 2\nmax_s = 30\nrest_min_s = 120\nrest_max_s = 600\nsilent_after_min = 5\n"));
     let plans: Vec<DeviceSubscription> = config.devices.iter().map(DeviceConfig::subscription).collect();
-    assert_eq!(plans[0], DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }) });
-    assert_eq!(plans[1], DeviceSubscription { min_s: 60, max_s: 1800, fast: None });
+    assert_eq!(plans[0], DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }), events: true });
+    assert_eq!(plans[1], DeviceSubscription { min_s: 60, max_s: 1800, fast: None, events: false });
     assert_eq!(plans[2].fast.as_ref().unwrap().clusters, vec![0x005B, 0x0402, 0x0405, 0x040D, 0x042A]);
-    assert_eq!(plans[3], DeviceSubscription { min_s: 120, max_s: 600, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 2, max_s: 30 }) });
+    assert_eq!(plans[3], DeviceSubscription { min_s: 120, max_s: 600, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 2, max_s: 30 }), events: true });
     let silent: Vec<u64> = config.devices.iter().map(|d| d.silent_after().as_secs()).collect();
     assert_eq!(silent, vec![1800, 28800, 3600, 300]);
     assert_eq!(config.devices[0].label(), "plug 9");
@@ -290,11 +294,11 @@ async fn failed_writes_are_retried_then_given_up_and_logged() {
     let (day, at) = ("2026-11-10".parse().unwrap(), local("2026-11-10 06:41"));
     let ok = mock();
     ok.fail_switch_on(2);
-    wake_attempts(ok.clone(), sink.clone(), plug.clone(), day, at, QUICK).await;
+    wake_attempts(ok.clone(), sink.clone(), plug.clone(), day, at, QUICK, never()).await;
     assert_eq!(ok.write_log(), vec![("on_off_on", 9, 1.0); 3]);
     let lost = mock();
     lost.fail_switch_on(1000);
-    wake_attempts(lost.clone(), sink.clone(), plug, day, at, QUICK).await;
+    wake_attempts(lost.clone(), sink.clone(), plug, day, at, QUICK, never()).await;
     let tries = lost.write_log().len();
     assert!((3..=6).contains(&tries) && lost.write_log().iter().all(|w| *w == ("on_off_on", 9, 1.0)), "{tries}");
     sink.flush().unwrap();
@@ -304,6 +308,31 @@ async fn failed_writes_are_retried_then_given_up_and_logged() {
     assert_eq!((details[1]["reason"].clone(), details[1]["ok"].clone(), details[1]["attempt"].clone()), (json!("gave_up"), json!(false), json!(tries)));
     assert!(details[1]["error"].as_str().unwrap().contains("no write status"));
     assert_eq!(string_column(dir.path(), "events", "node"), vec!["9"; 2]);
+}
+
+#[tokio::test]
+async fn a_stopping_heatd_starts_no_coffee_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = Sink::open(LakeConfig::new(dir.path().join("lake"))).unwrap();
+    let plug = CoffeePlug::from_config(&config(dir.path(), DEVICES).devices[0]).unwrap();
+    let switch = mock();
+    wake_attempts(switch.clone(), sink.clone(), plug, "2026-11-10".parse().unwrap(), local("2026-11-10 06:41"), QUICK, Arc::new(|| true)).await;
+    assert!(switch.write_log().is_empty());
+    sink.flush().unwrap();
+    assert!(string_column(dir.path(), "events", "detail")[0].contains("heatd stopping"));
+}
+
+#[test]
+fn a_calm_plug_defaults_to_a_slow_power_interval_and_climate_skips_events() {
+    let config = config(Path::new("x"), &format!("{DEVICES}[[devices]]
+node = 13
+kind = 'plug'
+role = 'charger'
+"));
+    let plans: Vec<DeviceSubscription> = config.devices.iter().map(DeviceConfig::subscription).collect();
+    assert_eq!(plans.last().unwrap().fast.as_ref().unwrap().min_s, 30);
+    assert_eq!(plans[0].fast.as_ref().unwrap().min_s, 1);
+    assert!(!plans[1].events);
 }
 
 #[tokio::test]

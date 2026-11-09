@@ -325,6 +325,16 @@ mod tests {
     }
 
     #[test]
+    fn null_values_keep_their_raw_text_without_a_typed_value() {
+        let items = parse(include_str!("../tests/fixtures/device_nulls.txt"), None);
+        let all = attributes(&items);
+        assert_eq!(all.len(), 2);
+        assert_eq!((all[0].name.as_str(), all[0].value.v_i64, all[0].value.v_f64, all[0].value.v_bool), ("ActivePower", None, None, None));
+        assert_eq!(all[0].raw, b"  ActivePower: null");
+        assert_eq!(all[1].value.v_i64, Some(230100));
+    }
+
+    #[test]
     fn plug_power_stream_keeps_every_report_with_its_peer_and_types() {
         let items = parse(include_str!("../tests/fixtures/device_plug_stream.txt"), None);
         let all = attributes(&items);

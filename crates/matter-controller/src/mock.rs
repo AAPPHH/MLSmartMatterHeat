@@ -417,7 +417,7 @@ mod tests {
     async fn devices_replay_their_text_and_record_only_the_switch_on() {
         let mock = MockController::new(1);
         mock.add_device(9, include_str!("../tests/fixtures/device_plug_stream.txt"));
-        let plan = DeviceSubscription { min_s: 300, max_s: 900, fast: None };
+        let plan = DeviceSubscription { min_s: 300, max_s: 900, fast: None, events: true };
         let mut rx = mock.device_capture(9, plan.clone()).await.unwrap();
         let mut seen = 0;
         while let Ok(item) = rx.try_recv() {

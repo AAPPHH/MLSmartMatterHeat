@@ -1,0 +1,5 @@
+[1794244000.000] [15:17] [EM] >>> [E:1r S:2 M:100 (Ack:3)] (S) Msg RX from 1:0000000000000009 [B2C3] --- Type 0001:05 (IM:ReportData) (B:120)
+[1794244000.010] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0008 DataVersion: 179070943
+[1794244000.010] [15:17] [TOO]   ActivePower: null
+[1794244000.020] [15:17] [TOO] Endpoint: 2 Cluster: 0x0000_0090 Attribute 0x0000_0004 DataVersion: 179070943
+[1794244000.020] [15:17] [TOO]   Voltage: 230100

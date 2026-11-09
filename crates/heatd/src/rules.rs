@@ -285,6 +285,7 @@ pub struct Presence {
     pub contact_age_minutes: Option<f64>,
     pub source: &'static str,
     pub sleep: bool,
+    pub bedtime: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -503,6 +504,7 @@ pub(crate) fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<P
         room,
         source,
         sleep,
+        bedtime: status.as_ref().is_some_and(|s| s.bedtime == Some(true)),
         motion: status.as_ref().and_then(|s| s.motion),
         power: status.as_ref().and_then(|s| s.power),
         away,
@@ -799,7 +801,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let windows = state.windows.lock().unwrap().open_rooms();
     let window_busy = &windows;
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
-    state.devices.on_control(state, now, presence.is_some(), presence.as_ref().is_some_and(|p| p.sleep), away);
+    state.devices.on_control(state, now, presence.is_some(), presence.as_ref().is_some_and(|p| p.bedtime), away);
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
         let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
@@ -1065,11 +1067,11 @@ sleep_hours = '3-3'
     }
 
     fn presence(room: &str, age: f64) -> Option<Presence> {
-        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion: None, power: None, away: false, contact_age_minutes: None, source: "matcher", sleep: false })
+        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion: None, power: None, away: false, contact_age_minutes: None, source: "matcher", sleep: false, bedtime: false })
     }
 
     fn device(room: &str, age: f64, motion: Option<Motion>, power: Option<Power>, away: bool, contact: f64) -> Option<Presence> {
-        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion, power, away, contact_age_minutes: Some(contact), source: "matcher", sleep: false })
+        Some(Presence { room: Some(room.into()), prediction_age_minutes: Some(age), motion, power, away, contact_age_minutes: Some(contact), source: "matcher", sleep: false, bedtime: false })
     }
 
     fn raw(now: NaiveDateTime, config: &Config, p: Option<&Presence>, windows: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
@@ -1169,8 +1171,8 @@ home_setpoint = 20.0
             ("away goes eco", at(27, 12, 0), device("wohnzimmer", 1.0, Some(Motion::Moving), None, true, 1.0), vec![], 5, (18.0, "away")),
             ("away with saver is unknown", at(27, 12, 0), device("wohnzimmer", 1.0, None, Some(Power::Saver), true, 1.0), vec![], 5, (18.0, "default")),
             ("away but contact stale is unknown", at(27, 12, 0), device("wohnzimmer", 1.0, None, None, true, 181.0), vec![], 5, (18.0, "default")),
-            ("away without prediction", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: None, power: None, away: true, contact_age_minutes: Some(1.0), source: "matcher", sleep: false }), vec![], 5, (18.0, "away")),
-            ("heartbeat without prediction is unknown", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: Some(Motion::Still), power: None, away: false, contact_age_minutes: Some(1.0), source: "matcher", sleep: false }), vec![], 5, (18.0, "default")),
+            ("away without prediction", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: None, power: None, away: true, contact_age_minutes: Some(1.0), source: "matcher", sleep: false, bedtime: false }), vec![], 5, (18.0, "away")),
+            ("heartbeat without prediction is unknown", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: Some(Motion::Still), power: None, away: false, contact_age_minutes: Some(1.0), source: "matcher", sleep: false, bedtime: false }), vec![], 5, (18.0, "default")),
             ("window open frost", at(27, 7, 0), presence("wohnzimmer", 1.0), vec!["wohnzimmer"], 5, (7.0, "window_open")),
             ("window open other room unaffected", at(27, 7, 0), None, vec!["wohnzimmer"], 6, (18.0, "default")),
         ];

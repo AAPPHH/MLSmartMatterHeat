@@ -30,6 +30,7 @@ const CAPTURE_QUEUE: usize = 4096;
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_GRACE: Duration = Duration::from_secs(2);
 const WRITE_ATTEMPTS: u32 = 3;
+const SWITCH_LIMIT_S: u64 = 15;
 const WRITE_BACKOFF: Duration = Duration::from_secs(5);
 
 pub fn strip_ansi(text: &str) -> String {
@@ -175,7 +176,9 @@ impl ChipToolConfig {
             lines.push(Self::paths_line("subscribe-by-id", node, &fast.clusters, (fast.min_s, fast.max_s), 1));
         }
         lines.push(Self::paths_line("subscribe-by-id", node, &[], rest, 1));
-        lines.push(Self::paths_line("subscribe-event-by-id", node, &[], rest, 1));
+        if plan.events {
+            lines.push(Self::paths_line("subscribe-event-by-id", node, &[], rest, 1));
+        }
         if fresh {
             lines[0] = lines[0].replace("--keepSubscriptions 1", "--keepSubscriptions 0");
         }
@@ -766,18 +769,19 @@ impl Session {
 
     async fn command(&self, parts: Vec<String>) -> Result<()> {
         let line = parts.join(" ");
-        let _gate = self.write_gate.lock().await;
-        self.write_once(&line).await
+        let limit = Duration::from_secs(self.config.timeout_s.min(SWITCH_LIMIT_S));
+        let _gate = timeout(limit, self.write_gate.lock()).await.map_err(|_| Error::Command(format!("write gate busy: {line}")))?;
+        self.write_once(&line, limit).await
     }
 
     async fn write(&self, parts: Vec<String>) -> Result<()> {
         let line = parts.join(" ");
         let _gate = self.write_gate.lock().await;
-        retrying(WRITE_ATTEMPTS, WRITE_BACKOFF, || self.write_once(&line)).await
+        let limit = Duration::from_secs(self.config.timeout_s);
+        retrying(WRITE_ATTEMPTS, WRITE_BACKOFF, || self.write_once(&line, limit)).await
     }
 
-    async fn write_once(&self, line: &str) -> Result<()> {
-        let limit = Duration::from_secs(self.config.timeout_s);
+    async fn write_once(&self, line: &str, limit: Duration) -> Result<()> {
         let failed = |what: &str| Error::Command(format!("{what}: {line}"));
         let mut ready = self.ready.subscribe();
         timeout(limit, ready.wait_for(|r| *r)).await.map_err(|_| failed("chip-tool interactive session not ready"))?.map_err(|_| failed("session closed"))?;
@@ -796,7 +800,7 @@ impl Session {
             Ok(Ok(Err(message))) => Err(Error::Command(message)),
             _ => {
                 self.hub.pending.lock().unwrap().take();
-                Err(failed(&format!("no write status after {}s", self.config.timeout_s)))
+                Err(failed(&format!("no write status after {}s", limit.as_secs())))
             }
         }
     }
@@ -1235,7 +1239,7 @@ mod tests {
     #[test]
     fn builds_device_lines_with_per_node_intervals_and_fresh_resubscribe() {
         let c = config();
-        let plug = DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }) };
+        let plug = DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }), events: true };
         let lines = c.device_lines(9, &plug, false);
         assert_eq!(
             lines,
@@ -1247,9 +1251,9 @@ mod tests {
         );
         let fresh = c.device_lines(9, &plug, true);
         assert!(fresh[0].contains("--keepSubscriptions 0") && fresh[1..].iter().all(|l| l.contains("--keepSubscriptions 1")));
-        let climate = DeviceSubscription { min_s: 60, max_s: 1800, fast: None };
+        let climate = DeviceSubscription { min_s: 60, max_s: 1800, fast: None, events: false };
         let slow = c.device_lines(11, &climate, true);
-        assert_eq!(slow.len(), 2);
+        assert_eq!(slow.len(), 1);
         assert_eq!(slow[0], "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 60 1800 11 0xFFFF --keepSubscriptions 0 --auto-resubscribe 1");
         assert_eq!(c.subscribe_line(5), "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 30 300 5 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1");
         assert_eq!(c.switch_on_parts(9, 1), vec!["onoff", "on", "9", "1"]);

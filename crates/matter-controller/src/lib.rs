@@ -131,6 +131,7 @@ pub struct DeviceSubscription {
     pub min_s: u32,
     pub max_s: u32,
     pub fast: Option<FastSubscription>,
+    pub events: bool,
 }
 
 #[async_trait]
