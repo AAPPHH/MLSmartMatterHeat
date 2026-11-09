@@ -17,8 +17,8 @@ stub ip 'N=$NG_NET
 case "$*" in
   "-4 -o addr show dev wlo1 scope global") [ -e $N/v4 ] && echo "2: wlo1 inet 192.168.178.29/24 scope global" ;;
   "-4 route show default dev wlo1") [ -e $N/def4 ] && echo "default via 192.168.178.1 proto dhcp src 192.168.178.29" ;;
-  "-6 -o addr show dev wlo1") [ -e $N/a6 ] && echo "2: wlo1 inet6 fd62:beb2:b2a6::29/64 scope global" ;;
-  "-6 route show to fdf7:3085:de79:1::/64 dev wlo1") [ -e $N/r6 ] && echo "fdf7:3085:de79:1::/64 via fe80::7e4f:adff:fe82:f4d8 metric 1024" ;;
+  "-6 -o addr show dev wlo1") [ -e $N/a6 ] && echo "2: wlo1 inet6 fd00:aaaa:aaaa::29/64 scope global" ;;
+  "-6 route show to fd00:bbbb:bbbb:1::/64 dev wlo1") [ -e $N/r6 ] && echo "fd00:bbbb:bbbb:1::/64 via fe80::1 metric 1024" ;;
   "-6 addr add"*) touch $N/a6; echo "ip $*" >> $NG_CALLS ;;
   "-6 route replace"*) touch $N/r6; echo "ip $*" >> $NG_CALLS ;;
 esac
@@ -114,13 +114,13 @@ rm "$N/r6"
 runs 2
 expect route_waits "$(calls)" ""
 run
-expect route_readded "$(calls)" "ip -6 route replace fdf7:3085:de79:1::/64 via fe80::7e4f:adff:fe82:f4d8 dev wlo1|"
+expect route_readded "$(calls)" "ip -6 route replace fd00:bbbb:bbbb:1::/64 via fe80::1 dev wlo1|"
 expect route_back "$(grep -c 'healthy again' "$T/out")" "1"
 
 reset
 rm "$N/a6"
 runs 3
-expect addr_readded "$(calls)" "ip -6 addr add fd62:beb2:b2a6::29/64 dev wlo1|"
+expect addr_readded "$(calls)" "ip -6 addr add fd00:aaaa:aaaa::29/64 dev wlo1|"
 
 reset
 rm "$N/v4" "$N/def4" "$N/assoc"
