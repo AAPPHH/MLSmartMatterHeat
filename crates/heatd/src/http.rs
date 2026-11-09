@@ -36,6 +36,7 @@ pub struct AppState {
     pub watchmatch: WatchMatch,
     pub boost: crate::boost::Boost,
     pub failsafe: crate::failsafe::Failsafe,
+    pub devices: crate::devices::Devices,
 }
 
 impl AppState {
@@ -718,7 +719,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "boost": state.boost.summary(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 fn devices_view(state: &AppState) -> anyhow::Result<Vec<Value>> {
@@ -1085,6 +1086,7 @@ mod tests {
             tracker: Default::default(),
             boost,
             batch_seq: Arc::new(AtomicU64::new(1)),
+            devices: Default::default(),
         };
         Harness { state, mock, _dir: dir }
     }

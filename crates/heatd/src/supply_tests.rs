@@ -39,6 +39,7 @@ fn env(extra: &str) -> Env {
         tracker: Default::default(),
         boost: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        devices: Default::default(),
     };
     Env { state, mock, t: T0, _dir: dir }
 }

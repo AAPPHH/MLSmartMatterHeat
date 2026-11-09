@@ -85,6 +85,7 @@ fn env(url: &str, token_file: Option<&str>, started_us: i64) -> Env {
         tracker: Default::default(),
         boost: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        devices: Default::default(),
         failsafe: crate::failsafe::Failsafe::new(&config.failsafe, None),
     };
     Env { state, dog, dir }

@@ -124,6 +124,19 @@ struct Env {
     ms: i64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WakeEdge {
+    prev: Option<bool>,
+}
+
+impl WakeEdge {
+    pub fn advance(&mut self, sleep: bool) -> bool {
+        let woke = self.prev == Some(true) && !sleep;
+        self.prev = Some(sleep);
+        woke
+    }
+}
+
 struct Inner {
     cfg: BoostSection,
     rooms: Vec<RoomState>,
@@ -131,7 +144,7 @@ struct Inner {
     dir_name: Option<String>,
     rng: Rng,
     env: Env,
-    prev_sleep: Option<bool>,
+    sleep_edge: WakeEdge,
     prev_away: Option<bool>,
     away_since: Option<i64>,
     trigger: Option<Trigger>,
@@ -156,7 +169,7 @@ impl Boost {
         let cfg = config.boost.clone();
         let rooms = config.rooms.iter().map(|r| RoomState { name: r.name.clone(), nodes: r.nodes.clone(), sensor: VecDeque::new(), valve: VecDeque::new(), last_desired: None, last_in: None, was_no_supply: false, resume_ms: None, cycle: None, last: None, cycles_total: 0, refused_total: 0 }).collect();
         let seed = cfg.seed.or(config.exploration_seed).unwrap_or_else(|| crate::lake::now_us() as u64);
-        let inner = Inner { cfg, rooms, model: None, dir_name: None, rng: Rng::new(seed ^ 0xB005), env: Env::default(), prev_sleep: None, prev_away: None, away_since: None, trigger: None, pending: Vec::new(), stale_ms: config.stale.after_ms() };
+        let inner = Inner { cfg, rooms, model: None, dir_name: None, rng: Rng::new(seed ^ 0xB005), env: Env::default(), sleep_edge: WakeEdge::default(), prev_away: None, away_since: None, trigger: None, pending: Vec::new(), stale_ms: config.stale.after_ms() };
         let boost = Self { inner: Arc::new(Mutex::new(inner)), wake: Arc::new(tokio::sync::Notify::new()) };
         if config.boost.enabled {
             if let Err(e) = boost.reload() {
@@ -341,14 +354,15 @@ impl Inner {
         } else {
             self.away_since = None;
         }
+        let woke = self.sleep_edge.advance(input.sleep);
         let found = if self.prev_away == Some(true) && !input.away {
             Some(HOMECOMING)
-        } else if self.prev_sleep == Some(true) && !input.sleep && !input.away && self.in_morning(input.hour) {
+        } else if woke && !input.away && self.in_morning(input.hour) {
             Some(MORNING)
         } else {
             None
         };
-        (self.prev_sleep, self.prev_away) = (Some(input.sleep), Some(input.away));
+        self.prev_away = Some(input.away);
         if let Some(scenario) = found {
             let base = self.rooms.iter().filter_map(|r| r.last_desired.map(|d| (r.name.clone(), d))).collect();
             self.trigger = Some(Trigger { scenario, until_ms: input.now_ms + (self.cfg.trigger_window_min * MIN_MS as f64) as i64, base, away_min, done: HashSet::new() });

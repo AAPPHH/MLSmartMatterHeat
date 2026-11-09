@@ -46,6 +46,7 @@ fn env(head: &str, schedule: &[(&str, &str, f64)]) -> Env {
         tracker: Default::default(),
         boost,
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        devices: Default::default(),
     };
     Env { state, mock, _dir: dir }
 }

@@ -468,6 +468,7 @@ resubscribe_gap_s = 3600
             boost: Default::default(),
             failsafe: Default::default(),
             batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            devices: Default::default(),
         }
     }
 

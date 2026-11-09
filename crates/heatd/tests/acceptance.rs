@@ -72,6 +72,7 @@ async fn phase1_acceptance_simulated_day() {
         boost: Default::default(),
         failsafe: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        devices: Default::default(),
     };
     write_meta(&sink, &config, midnight()).unwrap();
     for h in 0..24 {
@@ -106,6 +107,7 @@ async fn phase1_acceptance_simulated_day() {
     assert_eq!(post(&state, "/watch/sensors", sensors.to_string()).await, axum::http::StatusCode::OK);
     sink.append(lake::WatchInference { ts: midnight() + 12 * HOUR, matcher: "room".into(), template_id: "none".into(), abstained: true, reason: Some("no_model".into()), state: "rest".into(), features_hash: "0".into(), model_version: "none".into(), ..Default::default() }).unwrap();
     sink.append(lake::Ambient { ts: midnight() + 12 * HOUR, source: "minix".into(), sensor: "nvme_c".into(), value: 40.0, unit: "C".into() }).unwrap();
+    sink.append(lake::DeviceReading { ts: midnight() + 12 * HOUR, node: 9, endpoint: 2, cluster: 0x90, attribute: 8, kind: "attribute".into(), name: "ActivePower".into(), value: Some(18200.0), raw: "  ActivePower: 18200".into(), source: "subscription".into() }).unwrap();
     let before: Vec<(Table, i64)> = Table::ALL.into_iter().map(|t| (t, raw_rows(&sink, t))).collect();
     for (t, n) in &before {
         assert!(*n > 0, "{} empty", t.name());

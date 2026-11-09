@@ -188,3 +188,38 @@ alert_retries = 3
 
 [watch]
 update_dir = "/data/watch_update"
+
+[[devices]]
+node = 9
+kind = "plug"
+role = "coffee"
+room = "kueche"
+name = "Espressomaschine"
+wake_on = true
+wake_window = "06:00-09:00"
+onoff_endpoint = 1
+min_s = 1
+max_s = 60
+
+[[devices]]
+node = 10
+kind = "plug"
+role = "charger"
+room = "wohnzimmer"
+name = "Ladegeraet"
+
+[[devices]]
+node = 11
+kind = "climate"
+role = "sink"
+room = "kueche"
+name = "Spuele"
+min_s = 60
+max_s = 1800
+
+[[devices]]
+node = 12
+kind = "air"
+role = "air"
+name = "Luftqualitaet"
+# room = "schlafzimmer"

@@ -309,6 +309,12 @@ heatd erkennt offene Fenster mit einem gelernten Physik-Residuum-Modell (Detekto
 - Ein manuell geöffnetes Fenster (`POST /api/window`) schließt nach spätestens `manual_max_min` = 12 h von selbst (`manual_timeout`).
 - `POST /api/window {"room": "...", "open": true|false}` überschreibt manuell. Zustand: `/api/state` (je Raum Zustand, z, Modellversion), `/metrics` (`heatd_window_z`, `heatd_window_house_score`), Tagesbericht. Einstellungen unter `[window]` in der Konfiguration (alte Schlüssel der v1/v2-Zeit werden ignoriert).
 
+## Zusatzgeräte (Stecker, Sensoren) 🔌
+
+`[[devices]]` in `heatd.toml` nimmt weitere Matter-Geräte auf (Node-IDs außerhalb aller Räume): `kind` = `plug` (GRILLPLATS, Wirkleistung/Energie/Ein-Aus mit `min_s` = 1 s), `climate` (TIMMERFLOTTE, Batterie, nur seltene Abos) oder `air` (ALPSTUGA), dazu `role` und optional `room` (bei der Alpstuga noch offen). Alles, was die Geräte melden, landet roh und verlustfrei in der Lake-Tabelle `device_readings` (Schema v7, `docs/data-foundation.md`), eine Zeile je Bericht. Die Geräte haben eigene Abos (Router-Geräte: schnelle Messcluster plus langsames Rest-Abo), eigene Gesundheit (nur eine Zeile `device_link` im Event-Log und im Tagesbericht, kein Alarm) und fließen weder in Failsafe, Router-Watchdog, Fenster, Boost, Raummodell noch Thermostat-Health ein. `/api/state` hat dazu den Block `matter_devices`, der Tagesbericht den Abschnitt „Zusatzgeraete“.
+
+**Einzige Schreibaktion:** `wake_on = true` (nur `plug` mit `role = "coffee"`, Fenster `wake_window`, Standard `06:00-09:00` Ortszeit) schaltet die Kaffeemaschine mit OnOff **On** ein, sobald der Schlafmodus der Uhr endet (dasselbe Signal wie der Morgen-Boost: Schlaf wird zu wach, Anwesenheit bekannt), höchstens einmal je Ortszeit-Tag (Marker unter `data_dir/devices/`), nicht bei Abwesenheit. Schlägt das Schreiben fehl, wird alle 2 min wiederholt, nach 10 min gibt heatd für den Tag auf. Jeder Ausgang steht als Event `coffee_on` (Grund `wake`, `gave_up`, `away`) im Lake und als Zeile im Tagesbericht. Der Code sieht von den Geräten nur `DeviceFeed` (Abo, Resubscribe) und `SwitchOn` (nur OnOff On), anderes ist strukturell nicht erreichbar (Test `nothing_but_one_on_command_ever_reaches_the_devices`).
+
 ## API
 
 | Methode | Pfad | |

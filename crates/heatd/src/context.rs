@@ -201,6 +201,9 @@ pub fn meta_values(config: &Config) -> Vec<(&'static str, String)> {
             }),
         ),
     ];
+    if !config.devices.is_empty() {
+        out.push(("devices", crate::devices::meta_value(&config.devices)));
+    }
     let mut links: Vec<Value> = config.neighbours.iter().filter(|n| n.kind != "unknown").map(|n| json!({"a": n.a, "b": n.b, "kind": n.kind, "partial": n.partial})).collect();
     links.sort_by_key(|l| l.to_string());
     links.dedup();

@@ -423,6 +423,7 @@ pub struct Config {
     pub watch: WatchSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
     pub node_health: crate::node_health::NodeHealthSection,
+    pub devices: Vec<crate::devices::DeviceConfig>,
 }
 
 impl Default for Config {
@@ -472,6 +473,7 @@ impl Default for Config {
             watch: WatchSection::default(),
             br_watchdog: Default::default(),
             node_health: Default::default(),
+            devices: Vec::new(),
         }
     }
 }
@@ -515,6 +517,7 @@ impl Config {
         if let Some(unknown) = config.building.roof_rooms.iter().find(|r| !known(r)) {
             return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
+        crate::devices::validate(&config.devices, &config.rooms)?;
         Ok(config)
     }
 
@@ -532,7 +535,7 @@ impl Config {
     }
 }
 
-fn parse_minutes(text: &str) -> Result<u32> {
+pub(crate) fn parse_minutes(text: &str) -> Result<u32> {
     let (h, m) = text.split_once(':').ok_or_else(|| anyhow!("bad time {text}"))?;
     let (h, m): (u32, u32) = (h.trim().parse()?, m.trim().parse()?);
     if h > 24 || m > 59 || (h == 24 && m > 0) {

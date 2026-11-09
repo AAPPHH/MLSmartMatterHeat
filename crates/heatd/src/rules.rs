@@ -799,6 +799,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let windows = state.windows.lock().unwrap().open_rooms();
     let window_busy = &windows;
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
+    state.devices.on_control(state, now, presence.is_some(), presence.as_ref().is_some_and(|p| p.sleep), away);
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
         let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };

@@ -173,3 +173,36 @@ restart_grace_s = 180.0
 verify_min = 10.0
 tolerance_c = 0.3
 alert_retries = 3
+
+# Zusatzgeraete (Matter ueber Thread), nur Aufzeichnung ohne Einfluss auf die Heizung.
+# Einzige Schreibaktion: wake_on schaltet den Stecker mit Rolle coffee einmal je Tag im
+# Fenster ein (OnOff On), wenn der Schlafmodus der Uhr endet.
+[[devices]]
+node = 9
+kind = "plug"
+role = "coffee"
+room = "kueche"
+name = "Espressomaschine"
+wake_on = true
+wake_window = "06:00-09:00"
+
+# [[devices]]
+# node = 10
+# kind = "plug"
+# role = "charger"
+# room = "wohnzimmer"
+# name = "Ladegeraet"
+
+[[devices]]
+node = 11
+kind = "climate"
+role = "sink"
+room = "kueche"
+name = "Spuele"
+
+[[devices]]
+node = 12
+kind = "air"
+role = "air"
+name = "Luftqualitaet"
+# room = "schlafzimmer"   # wohnzimmer oder schlafzimmer, noch offen

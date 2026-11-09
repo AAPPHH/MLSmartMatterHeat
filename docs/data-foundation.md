@@ -299,7 +299,7 @@ precip_mm: f32?
 
 ### meta
 
-Producer: config loader at start and on change. Versioned key/value pairs; the latest row per key with `valid_from <= t` is valid at time t. Keys: `rooms` (JSON list), `adjacency` (JSON list of room pairs), `heat_source` (JSON: type, operating hours/night shutdown if known), `coordinates` (JSON lat/lon). A new row is only written when the value changed. Partitioned by date.
+Producer: config loader at start and on change. Versioned key/value pairs; the latest row per key with `valid_from <= t` is valid at time t. Keys: `rooms` (JSON list), `adjacency` (JSON list of room pairs), `heat_source` (JSON: type, operating hours/night shutdown if known), `coordinates` (JSON lat/lon). `devices` (JSON list of the additional Matter devices: node, kind, role, room, name, wake_on, wake_window; only if `[[devices]]` is configured). A new row is only written when the value changed. Partitioned by date.
 
 ```schema meta
 ts: timestamp[us,UTC]

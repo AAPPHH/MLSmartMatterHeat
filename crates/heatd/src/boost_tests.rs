@@ -110,6 +110,13 @@ fn room_change_and_ordinary_rises_never_boost() {
 }
 
 #[test]
+fn the_wake_edge_is_a_sleep_to_awake_transition_and_needs_history() {
+    let mut edge = WakeEdge::default();
+    let seen: Vec<bool> = [false, false, true, true, false, false, true, false].into_iter().map(|sleep| edge.advance(sleep)).collect();
+    assert_eq!(seen, vec![false, false, false, false, true, false, false, true]);
+}
+
+#[test]
 fn waking_up_outside_the_morning_hours_or_while_away_does_not_boost() {
     for (hour, flags) in [(12.0, (false, false)), (4.0, (false, false)), (6.0, (false, true))] {
         let rig = Rig::new();

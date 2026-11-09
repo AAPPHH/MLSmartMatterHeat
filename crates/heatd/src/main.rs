@@ -8,6 +8,7 @@ mod br_watchdog;
 mod br_watchdog_tests;
 mod capture;
 mod config;
+mod devices;
 mod explore;
 mod failsafe;
 mod context;
@@ -50,7 +51,7 @@ mod window_model_tests;
 
 use anyhow::{anyhow, bail, Context, Result};
 use config::{Config, ControllerKind};
-use matter_controller::{ChipToolController, MatterController, MockController, StorageLock};
+use matter_controller::{ChipToolController, DeviceFeed, MatterController, MockController, StorageLock, SwitchOn};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -177,24 +178,32 @@ fn lock_storage(config: &Config) -> Result<Option<StorageLock>> {
     }
 }
 
-fn build_controller(config: &Config, serving: bool) -> (Arc<dyn MatterController>, Option<Arc<MockController>>) {
+struct Built {
+    controller: Arc<dyn MatterController>,
+    mock: Option<Arc<MockController>>,
+    feed: Arc<dyn DeviceFeed>,
+    switch: Arc<dyn SwitchOn>,
+}
+
+fn build_controller(config: &Config, serving: bool) -> Built {
     match config.controller {
         ControllerKind::ChipTool => {
             let chip_tool = config.chip_tool.to_controller_config();
-            let controller = if serving { ChipToolController::serving(chip_tool) } else { ChipToolController::new(chip_tool) };
-            (Arc::new(controller), None)
+            let controller = Arc::new(if serving { ChipToolController::serving(chip_tool) } else { ChipToolController::new(chip_tool) });
+            Built { controller: controller.clone(), mock: None, feed: controller.clone(), switch: controller }
         }
         ControllerKind::Mock => {
             let mock = Arc::new(MockController::new(config.chip_tool.endpoint));
             config.all_nodes().into_iter().for_each(|n| mock.add_node(n, 18.0, 18.0));
-            (mock.clone(), Some(mock))
+            config.devices.iter().for_each(|d| mock.add_device(d.node, ""));
+            Built { controller: mock.clone(), feed: mock.clone(), switch: mock.clone(), mock: Some(mock) }
         }
     }
 }
 
 async fn serve(config: Config) -> Result<()> {
     let _lock = lock_storage(&config)?;
-    let (controller, mock) = build_controller(&config, true);
+    let Built { controller, mock, feed, switch } = build_controller(&config, true);
     if let Some(mock) = mock {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -222,6 +231,7 @@ async fn serve(config: Config) -> Result<()> {
     status.set_stale_after(config.stale.after_s);
     status.register_nodes(config.all_nodes());
     let boost = boost::Boost::new(&config);
+    let devices = devices::Devices::new(&config, feed, switch);
     let config = Arc::new(config);
     context::spawn_background(sink.clone(), status.clone(), config.clone(), context::Io::live(&config));
     let watchmatch = watchmatch::WatchMatch::new(&config.watchmatch, sink.clone(), status.clone());
@@ -232,6 +242,7 @@ async fn serve(config: Config) -> Result<()> {
         watchmatch,
         boost: boost.clone(),
         failsafe: failsafe::Failsafe::new(&config.failsafe, Some(Path::new(&config.data_dir).join("failsafe"))),
+        devices,
         sink: sink.clone(),
         latest: Default::default(),
         status,
@@ -261,6 +272,7 @@ async fn serve(config: Config) -> Result<()> {
     }
     node_health::spawn(state.clone());
     capture::spawn(state.clone(), capture::Timing::default());
+    devices::spawn(state.clone(), devices::LoopTiming::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);
     let stopper = state.clone();
@@ -292,7 +304,7 @@ async fn shutdown_signal() {
 
 async fn controller_command(config: Config, args: &[String]) -> Result<()> {
     let _lock = lock_storage(&config)?;
-    let (controller, _) = build_controller(&config, false);
+    let controller = build_controller(&config, false).controller;
     match args {
         [cmd, node, code] if cmd == "commission" => {
             let dataset = std::fs::read_to_string(&config.dataset_path).with_context(|| format!("read {}", config.dataset_path))?;
