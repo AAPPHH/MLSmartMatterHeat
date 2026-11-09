@@ -2172,6 +2172,7 @@ class CoreTest {
         val ok = SetpointControl.result(200, """{"ok":true,"room":"bad","target":22.0,"hold_min":120.0,"until_ts":3600000,"source":"watch"}""")
         assertTrue(ok.ok)
         assertEquals("22 °C bis " + RoomView.clock(3_600_000L), ok.line)
+        assertEquals("Fenster offen – Vorgabe 22 °C gilt, sobald es zu ist", SetpointControl.result(200, """{"ok":true,"target":22.0,"until_ts":3600000,"source":"watch","note":"Fenster offen – Vorgabe 22 °C gilt, sobald es zu ist"}""").line)
         assertEquals(BoostResult(false, SetpointControl.DENIED), SetpointControl.result(400, """{"ok":false,"error":"x"}"""))
         assertEquals(BoostResult(false, "Antwort unlesbar (500)"), SetpointControl.result(500, "nope"))
         assertEquals(BoostResult(true, "Vorgabe beendet"), SetpointControl.cleared(200, """{"ok":true,"cleared":true}"""))

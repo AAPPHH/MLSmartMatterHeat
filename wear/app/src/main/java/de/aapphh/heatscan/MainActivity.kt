@@ -226,16 +226,32 @@ class MainActivity : ComponentActivity() {
         var result by remember { mutableStateOf<BoostResult?>(null) }
         var busy by remember { mutableStateOf(false) }
         var confirm by remember { mutableStateOf(boostFirst) }
-        var target by remember(room) { mutableStateOf(SetpointControl.start(g)) }
+        var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+        val manualUntil = g?.manual?.until
+        LaunchedEffect(manualUntil) {
+            manualUntil?.let {
+                delay((it - System.currentTimeMillis()).coerceAtLeast(0L) + 500L)
+                now = System.currentTimeMillis()
+                Remote.refresh(this@MainActivity, true)
+            }
+        }
+        val active = SetpointControl.active(g, now)
+        var target by remember(room) { mutableStateOf(SetpointControl.start(g, now)) }
+        var wasActive by remember { mutableStateOf(active != null) }
+        LaunchedEffect(active != null) {
+            if (wasActive && active == null) target = SetpointControl.start(g, now)
+            wasActive = active != null
+        }
         var hold by remember { mutableStateOf(HoldChoice.TWO_HOURS) }
         var held by remember { mutableStateOf<BoostResult?>(null) }
         var sending by remember { mutableStateOf(false) }
         val finished = { r: BoostResult -> ui { held = r; sending = false; Remote.refresh(this, true) } }
         val control = SetpointUi(
-            target, hold, sending, held, SetpointControl.active(g, System.currentTimeMillis()),
+            target, hold, sending, held, active,
             { target = SetpointControl.step(target, it) }, { hold = hold.next() },
             { sending = true; Remote.setpoint(this, room, target, SetpointControl.minutes(hold, System.currentTimeMillis()), finished) },
-            { sending = true; Remote.clearSetpoint(this, room, finished) }
+            { sending = true; Remote.clearSetpoint(this, room, finished) },
+            g?.open == true
         )
         if (confirm) return BoostConfirmScreen(room, {
             confirm = false

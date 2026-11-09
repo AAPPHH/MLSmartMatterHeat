@@ -159,6 +159,16 @@ async fn open_window_beats_the_hold_and_the_hold_returns_after_closing() {
 }
 
 #[tokio::test]
+async fn setpoint_reply_carries_a_german_note_while_the_window_is_open() {
+    let e = env();
+    assert!(e.post(json!({"room": "wohnzimmer", "celsius": 22.0})).await.1["note"].is_null());
+    crate::intent::apply(&e.state, Intent::WindowOpen { room: "wohnzimmer".into() });
+    let (_, reply) = e.post(json!({"room": "wohnzimmer", "celsius": 22.5})).await;
+    assert_eq!(reply["note"], "Fenster offen – Vorgabe 22,5 °C gilt, sobald es zu ist");
+    assert!(e.post(json!({"room": "bad", "celsius": 22.0})).await.1["note"].is_null());
+}
+
+#[tokio::test]
 async fn away_does_not_cancel_an_explicit_hold() {
     let mut e = env();
     let now = now_ms();

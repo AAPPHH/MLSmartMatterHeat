@@ -107,7 +107,7 @@ object SetpointControl {
 
     fun step(v: Double, by: Double): Double = clamp(v + by)
 
-    fun start(g: RoomGlance?): Double = clamp(g?.manual?.target ?: g?.target ?: 20.0)
+    fun start(g: RoomGlance?, now: Long = 0L): Double = clamp(active(g, now)?.target ?: g?.target ?: 20.0)
 
     fun celsius(v: Double): String = if (v % 1.0 == 0.0) "%.0f".format(Locale.GERMANY, v) else "%.1f".format(Locale.GERMANY, v)
 
@@ -125,11 +125,13 @@ object SetpointControl {
 
     fun line(m: Manual): String = celsius(m.target) + " °C bis " + RoomView.clock(m.until)
 
+    fun held(m: Manual, open: Boolean): String = if (open) "Fenster offen – Vorgabe " + celsius(m.target) + " °C gilt, sobald es zu ist" else line(m)
+
     fun active(g: RoomGlance?, now: Long): Manual? = g?.manual?.takeIf { it.until > now }
 
     fun result(code: Int, text: String): BoostResult = try {
         val o = JSONObject(text)
-        if (code in 200..299 && o.optBoolean("ok")) BoostResult(true, line(Manual(o.getDouble("target"), o.getLong("until_ts"), o.optString("source")))) else BoostResult(false, if (code == 400) DENIED else "Gerade nicht möglich")
+        if (code in 200..299 && o.optBoolean("ok")) BoostResult(true, o.optString("note").ifEmpty { line(Manual(o.getDouble("target"), o.getLong("until_ts"), o.optString("source"))) }) else BoostResult(false, if (code == 400) DENIED else "Gerade nicht möglich")
     } catch (e: Exception) { BoostResult(false, if (code <= 0) "Server nicht erreichbar" else "Antwort unlesbar ($code)") }
 
     fun cleared(code: Int, text: String): BoostResult = try {

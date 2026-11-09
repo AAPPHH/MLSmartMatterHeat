@@ -191,10 +191,10 @@ internal fun RoomsScreen(
     }
 }
 
-class SetpointUi(val target: Double, val hold: HoldChoice, val busy: Boolean, val line: BoostResult?, val active: Manual?, val onStep: (Double) -> Unit, val onHold: () -> Unit, val onApply: () -> Unit, val onEnd: () -> Unit)
+class SetpointUi(val target: Double, val hold: HoldChoice, val busy: Boolean, val line: BoostResult?, val active: Manual?, val onStep: (Double) -> Unit, val onHold: () -> Unit, val onApply: () -> Unit, val onEnd: () -> Unit, val open: Boolean = false)
 
 private fun TransformingLazyColumnScope.setpoint(spec: TransformationSpec, ui: SetpointUi, colors: ColorScheme, type: androidx.wear.compose.material3.Typography) {
-    ui.active?.let { note(spec, SetpointControl.line(it), colors.primary, type.bodySmall) }
+    ui.active?.let { note(spec, SetpointControl.held(it, ui.open), colors.primary, type.bodySmall) }
     item {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp).transformedHeight(this, spec), horizontalArrangement = Arrangement.spacedBy(GAP), verticalAlignment = Alignment.CenterVertically) {
             FilledTonalButton({ ui.onStep(-SetpointControl.STEP) }, Modifier.width(TARGET).defaultMinSize(minHeight = TARGET).describe("Temperatur senken"), contentPadding = PaddingValues(0.dp)) { Text("–", Modifier.fillMaxWidth(), style = type.titleMedium, textAlign = TextAlign.Center, maxLines = 1) }
@@ -216,7 +216,7 @@ internal fun RoomDetailScreen(room: String, g: RoomGlance?, result: BoostResult?
         header(spec, (if (saved) "✓ Gespeichert: " else "") + WindowEvent.caption(room))
         note(spec, RoomView.temp(g) ?: "–", colors.onBackground, type.numeralSmall)
         (if (applying) listOf(RoomView.APPLYING) else listOfNotNull(RoomView.target(g), RoomView.why(g))).takeIf { it.isNotEmpty() }?.let { note(spec, it.joinToString(" · "), colors.onSurface, type.bodySmall) }
-        if (canBoost) action(spec, if (busy) "…" else "Boost", tonal = false, enabled = !busy, icon = R.drawable.ic_mark_boost, onClick = onBoost)
+        if (canBoost && control?.active == null) action(spec, if (busy) "…" else "Boost", tonal = false, enabled = !busy, icon = R.drawable.ic_mark_boost, onClick = onBoost)
         result?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
         if (control != null && !saved) setpoint(spec, control, colors, type)
         action(spec, if (g?.open == true) "Fenster zu melden" else "Fenster offen melden", icon = R.drawable.ic_mark_window, onClick = onWindow)

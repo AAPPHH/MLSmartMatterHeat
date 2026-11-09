@@ -67,7 +67,11 @@ pub fn set(state: &AppState, room: &str, celsius: Option<f64>, hold_min: Option<
     let until = now_ms + (hold * MIN_MS) as i64;
     state.commanded.lock().unwrap().set_manual(&room.nodes, celsius, now_ms, until, source);
     record(state, room, json!({"room": room.name, "target": celsius, "hold_min": hold, "source": source.name(), "until_ts": until}));
-    Reply { status: StatusCode::OK, body: json!({"ok": true, "room": room.name, "target": celsius, "hold_min": hold, "until_ts": until, "source": source.name()}) }
+    let mut body = json!({"ok": true, "room": room.name, "target": celsius, "hold_min": hold, "until_ts": until, "source": source.name()});
+    if state.windows.lock().unwrap().open_rooms().contains(&room.name) {
+        body["note"] = json!(format!("Fenster offen – Vorgabe {} °C gilt, sobald es zu ist", celsius_text(celsius)));
+    }
+    Reply { status: StatusCode::OK, body }
 }
 
 pub fn clear(state: &AppState, room: &str, source: Option<&str>, now_ms: i64) -> Reply {
