@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -u
+ENV_FILE=$(dirname "${BASH_SOURCE[0]}")/netguard.env
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
 IFACE=${NETGUARD_IFACE:-wlo1}
 GATEWAY=${NETGUARD_GATEWAY:-192.168.178.1}
-ADDR6=${NETGUARD_ADDR6:-fd00:aaaa:aaaa::29/64}
-ROUTE6=${NETGUARD_ROUTE6:-fd00:bbbb:bbbb:1::/64}
-VIA6=${NETGUARD_VIA6:-fe80::1}
+ADDR6=${NETGUARD_ADDR6:-}
+ROUTE6=${NETGUARD_ROUTE6:-}
+VIA6=${NETGUARD_VIA6:-}
 STATE_DIR=${NETGUARD_STATE_DIR:-/var/lib/heatd-netguard}
 MAINTENANCE=${NETGUARD_MAINTENANCE:-/var/lib/heatd-failsafe/maintenance}
 THRESHOLD=${NETGUARD_THRESHOLD:-3}
@@ -26,8 +28,8 @@ check() {
   local gw
   ip -4 -o addr show dev "$IFACE" scope global 2> /dev/null | grep -q inet || problems="$problems ip4"
   ip -4 route show default dev "$IFACE" 2> /dev/null | grep -q default || problems="$problems def4"
-  ip -6 -o addr show dev "$IFACE" 2> /dev/null | grep -qF "${ADDR6%/*}/" || problems="$problems a6"
-  ip -6 route show to "$ROUTE6" dev "$IFACE" 2> /dev/null | grep -qF "via $VIA6" || problems="$problems r6"
+  [ -z "$ADDR6" ] || ip -6 -o addr show dev "$IFACE" 2> /dev/null | grep -qF "${ADDR6%/*}/" || problems="$problems a6"
+  [ -z "$ROUTE6" ] || [ -z "$VIA6" ] || ip -6 route show to "$ROUTE6" dev "$IFACE" 2> /dev/null | grep -qF "via $VIA6" || problems="$problems r6"
   wpa_cli -i "$IFACE" status 2> /dev/null | grep -q '^wpa_state=COMPLETED' || problems="$problems assoc"
   fix=$problems
   case "$problems" in

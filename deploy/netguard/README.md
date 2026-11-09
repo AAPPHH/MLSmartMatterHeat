@@ -8,4 +8,4 @@ Checks wlo1 once a minute (IPv4 address, IPv4 default route, gateway ping, stati
     sudo systemctl daemon-reload
     sudo systemctl enable --now heatd-netguard.timer
 
-Settings via `NETGUARD_*` environment variables (IFACE, GATEWAY, ADDR6, ROUTE6, VIA6, THRESHOLD, RESTART_INTERVAL). The IPv6 defaults (ADDR6, ROUTE6, VIA6) are placeholders: set your own in a systemd drop-in (`systemctl edit heatd-netguard`, `Environment=NETGUARD_ADDR6=...`). Test: `bash deploy/netguard/test.sh`.
+Settings via `NETGUARD_*` environment variables (IFACE, GATEWAY, ADDR6, ROUTE6, VIA6, THRESHOLD, RESTART_INTERVAL), or via the optional gitignored file `deploy/netguard/netguard.env` next to the script (copy `netguard.env.example`; it is sourced first). ADDR6, ROUTE6 and VIA6 default to empty; while empty, the IPv6 address/route checks and repairs are skipped. Test: `bash deploy/netguard/test.sh`.

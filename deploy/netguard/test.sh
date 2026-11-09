@@ -33,6 +33,7 @@ stub systemctl 'echo "systemctl $*" >> $NG_CALLS
 exit 0'
 
 export NG_NET=$N NG_CALLS=$T/calls
+export NETGUARD_ADDR6=fd00:aaaa:aaaa::29/64 NETGUARD_ROUTE6=fd00:bbbb:bbbb:1::/64 NETGUARD_VIA6=fe80::1
 export NETGUARD_STATE_DIR=$T/state NETGUARD_MAINTENANCE=$T/maint NETGUARD_SETTLE=0
 export PATH="$BIN:$PATH"
 
@@ -134,6 +135,23 @@ runs 6
 expect maintenance_calls "$(calls)" ""
 expect maintenance_silent "$(lines)" "0"
 expect maintenance_no_state "$([ -e "$T/state/state" ] && echo yes || echo no)" "no"
+
+reset
+rm "$N/a6" "$N/r6"
+NETGUARD_ADDR6= NETGUARD_ROUTE6= NETGUARD_VIA6= runs 6
+expect ipv6_unset_skipped "$(calls)" ""
+expect ipv6_unset_quiet "$(lines)" "0"
+
+reset
+rm "$N/a6" "$N/r6"
+cp "$HERE/heatd-netguard.sh" "$T/ng.sh"
+printf 'NETGUARD_ADDR6=fd00:cccc::5/64
+NETGUARD_ROUTE6=fd00:dddd::/64
+NETGUARD_VIA6=fe80::2
+' > "$T/netguard.env"
+unset NETGUARD_ADDR6 NETGUARD_ROUTE6 NETGUARD_VIA6
+for i in 1 2 3; do NETGUARD_NOW=1000000 bash "$T/ng.sh" >> "$T/out" 2>&1; done
+expect env_file_used "$(calls)" "ip -6 addr add fd00:cccc::5/64 dev wlo1|ip -6 route replace fd00:dddd::/64 via fe80::2 dev wlo1|"
 
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -31,3 +31,4 @@ wear/keystore.properties
 /deploy/docker/.env
 /paa/
 /inventory/
+/deploy/netguard/netguard.env
