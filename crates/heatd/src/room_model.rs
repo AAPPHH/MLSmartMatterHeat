@@ -719,6 +719,7 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let (cn, cs) = par.coupling(&env.ncnt, &env.nsum);
     let modes = [(1.0 - pw, lam_c), (pw, lam_o)];
     let supplies = [(1.0, p_supply), (0.0, 1.0 - p_supply)];
+    let calm = [1.0, 0.0];
     let (target, frost, cold_w) = (env.target, env.frost, env.cold_cost);
     let cur = env.sp_cur;
     let sensor0 = par.sensor(m, a);
@@ -728,13 +729,13 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
         let runs = [[run(0, 0), run(0, 1)], [run(1, 0), run(1, 1)]];
         let mut mode_cost = [0.0; 2];
         for (mi, mc) in mode_cost.iter_mut().enumerate() {
-            *mc = (0..2).fold(0.0, |acc, si| acc + supplies[si].1 * (runs[mi][si].en.iter().fold(0.0, |x, v| x + v) + cold_w * runs[mi][si].co.iter().fold(0.0, |x, v| x + v)));
+            *mc = (0..2).fold(0.0, |acc, si| acc + supplies[si].1 * (runs[mi][si].en.iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * runs[mi][si].co.iter().fold(0.0, |x, v| x + v)));
         }
         let raise_flag = cur.is_some_and(|c| first > c + EPS);
         let raise = if raise_flag { env.raise_cost } else { 0.0 };
         let both = |f: &dyn Fn(&Run) -> f64| (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * f(&runs[mi][si])));
         let energy = both(&|r| r.en.iter().fold(0.0, |x, v| x + v));
-        let cold = both(&|r| r.co.iter().fold(0.0, |x, v| x + v));
+        let cold = (0..2).fold(0.0, |acc, si| acc + modes[0].0 * supplies[si].1 * runs[0][si].co.iter().fold(0.0, |x, v| x + v));
         let total = (0..2).fold(0.0, |acc, mi| acc + modes[mi].0 * mode_cost[mi]) + raise;
         let peak = runs[0][0].sens.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         Cand { name: name.to_string(), kind, first, mode_cost: [mode_cost[0] + raise, mode_cost[1] + raise], energy, cold: cold_w * cold, raise, raise_flag, total, peak, boost_min, probe_min, runs }
@@ -776,7 +777,7 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let sigma_obs = (env.r_grid + par.noise_r.powi(2)).sqrt();
     let prefix = |c: &Cand, d: usize| (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| {
         let r = &c.runs[mi][si];
-        acc2 + modes[mi].0 * supplies[si].1 * (r.en[..d].iter().fold(0.0, |x, v| x + v) + cold_w * r.co[..d].iter().fold(0.0, |x, v| x + v))
+        acc2 + modes[mi].0 * supplies[si].1 * (r.en[..d].iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * r.co[..d].iter().fold(0.0, |x, v| x + v))
     }));
     let mut probe: Option<Cand> = None;
     let mut evoi_best = 0.0;

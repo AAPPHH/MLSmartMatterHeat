@@ -35,7 +35,7 @@ Kosten(c) in Minuten Heizen = Energie + cold_cost_min * Kaelte + raise_cost_min 
 - Energie = Summe u_k s_k (Ventilminuten) im Rollout. Rollout wie `ThermalModel.predict`: u_k = clip(g (c - Sensor_k), 0, 1) mit Ventilkern/Verzoegerung des Heizkoerpers (25-70 min, ueber m).
 - Kaelte = Summe max(0, Ziel_k - a_k) * anwesend_k [K min]; anwesend_k = Ziel laut Zeitplan gilt und Nutzer ist da oder wird erwartet (Praesenz, Uhr-Schlaf, Zeitplan).
 - Strafe nur auf Sollwert-Erhoehungen, die heatd befiehlt; Senkungen kosten nichts. Nicht auf Ventilbewegungen.
-- Erwartungswert ueber Modi: Kosten = P(Fenster) Kosten(c | lambda = lambda_J) + (1-P) Kosten(c | lambda = Mittel), gewichtet ueber P(Versorgung).
+- Erwartungswert ueber Modi: Kosten = (1-P) (Energie + Kaelte + Anheben | lambda = Mittel) + P(Fenster) (Energie + Anheben | lambda = lambda_J), jeweils gewichtet ueber P(Versorgung); Kaelte zaehlt nur im Modus "zu", denn bei offenem Fenster hat der Nutzer frische Luft statt Waerme gewaehlt, also gilt bei P(Fenster) nahe 1 nur noch Energie und Heizen sinkt immer (bei P = 0,5 waehlt der Planer die Probe).
 - Kandidaten c: Frost, aktueller Sollwert, Ziel, Ziel +/- Raster 0,5 K, Boost (24 C, d min, nur wenn die Boost-Tore offen sind), Probe(d).
 - Harte Regeln (einzige): Prognose-Spitze im Modus "ruhig" <= Ziel + 0,5 K sonst Kandidat verworfen; Boost nur 05-11 Wake oder >= 60 min weg; kein Boost <= 180 min nach Fenster (bleibt vorerst); BR-Failsafe; Knoten-Selbstheilung.
 - Zwei Regler in `heatd.toml` `[room_model]`: `raise_cost_min` (Vorgabe 15), `cold_cost_min` (Vorgabe 1,0: 1 K zu kalt eine Stunde = 60 Heizminuten). Daneben nur Betriebsparameter: `enabled`, `shadow`, `tick_min` (5), `model_dir`, `reload_min`.
@@ -57,7 +57,7 @@ Kosten(c) in Minuten Heizen = Energie + cold_cost_min * Kaelte + raise_cost_min 
 
 ## Schattenprotokoll
 
-Neue additive Tabelle `shadow_decisions` (nicht `decisions`, damit Soll/Ist-, Budget- und Dynamikauswertungen unberuehrt bleiben): ts, room, setpoint_live (was heatd gerade will), setpoint_shadow, raise (Bool), probe_min, boost_min, cost_energy, cost_cold, cost_raise, cost_live (Kosten des Live-Sollwerts im Modell), lambda, lambda_std, mass_c, air_c, p_supply, p_window, p_window_live (alter Detektor offen), model_version, why (ein deutscher Satz), z.B. `Schlafzimmer: Verlust 3x normal -> Fenster offen -> 8 C, spart ca. 40 min Heizen`. Zeile bei Wechsel des Schatten-Sollwerts oder alle 30 min, nicht jede Minute. Event `filter_reset` in `events`.
+Neue additive Tabelle `shadow_decisions` (nicht `decisions`, damit Soll/Ist-, Budget- und Dynamikauswertungen unberuehrt bleiben): ts, room, setpoint_live (was heatd gerade will), setpoint_shadow, raise (Bool), probe_min, boost_min, cost_energy, cost_cold, cost_raise, cost_live (Kosten des Live-Sollwerts im Modell), lambda, lambda_std, mass_c, air_c, p_supply, p_window, p_window_live (alter Detektor offen), model_version, why (ein deutscher Satz), z.B. `Schlafzimmer: Verlust 3x normal -> Fenster offen -> Kälte zählt nicht, Heizen wäre Verlust -> 8 °C, spart ca. 40 min Heizen`. Zeile bei Wechsel des Schatten-Sollwerts oder alle 30 min, nicht jede Minute. Event `filter_reset` in `events`.
 
 ## Tagesbericht (Abschnitt "Raummodell Schatten")
 

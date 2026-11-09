@@ -83,22 +83,22 @@ fn nan_null(v: f64) -> serde_json::Value {
     if v.is_finite() { serde_json::json!(v) } else { serde_json::Value::Null }
 }
 
-fn sentence(room: &str, p: &PlanOut, out: &Out, live: f64, boost_c: f64) -> String {
+pub(crate) fn sentence(room: &str, p: &PlanOut, out: &Out, live: f64, boost_c: f64) -> String {
     let sp = fmt_c(p.setpoint);
     let saving = (p.energy_live - p.energy).max(0.0);
-    if out.p_window >= 0.5 && p.kind != "probe" {
+    if p.p_window >= 0.5 && p.kind != "probe" && p.setpoint < live - EPS {
         let tail = if saving >= 1.0 { format!(", spart ca. {saving:.0} min Heizen") } else { String::new() };
-        return format!("{room}: Verlust {:.0}x normal -> Fenster offen -> {sp} C{tail}", out.lam.max(1.0));
+        return format!("{room}: Verlust {:.0}x normal -> Fenster offen -> Kälte zählt nicht, Heizen wäre Verlust -> {sp} °C{tail}", out.lam.max(1.0));
     }
     if out.p_supply < 0.5 && !p.raise {
-        return format!("{room}: Kessel liefert nicht -> Anheben bringt nichts -> {sp} C");
+        return format!("{room}: Kessel liefert nicht -> Anheben bringt nichts -> {sp} °C");
     }
     match p.kind {
-        "probe" => format!("{room}: Fenster noch offen? Probe {} min bei {sp} C", p.probe_min.unwrap_or(0)),
-        "boost" => format!("{room}: Boost {} min bei {} C -> schneller auf {} C", p.boost_min.unwrap_or(0), fmt_c(boost_c), fmt_c(p.target)),
-        _ if p.raise => format!("{room}: zu kalt bei Anwesenheit -> Soll auf {sp} C anheben"),
-        _ if p.setpoint < live - EPS => format!("{room}: Heizen lohnt kaum -> Soll {sp} C statt {} C", fmt_c(live)),
-        _ => format!("{room}: Modell passt -> Soll {sp} C bleibt"),
+        "probe" => format!("{room}: Fenster noch offen? Probe {} min bei {sp} °C", p.probe_min.unwrap_or(0)),
+        "boost" => format!("{room}: Boost {} min bei {} °C -> schneller auf {} °C", p.boost_min.unwrap_or(0), fmt_c(boost_c), fmt_c(p.target)),
+        _ if p.raise => format!("{room}: zu kalt bei Anwesenheit -> Soll auf {sp} °C anheben"),
+        _ if p.setpoint < live - EPS => format!("{room}: Heizen lohnt kaum -> Soll {sp} °C statt {} °C", fmt_c(live)),
+        _ => format!("{room}: Modell passt -> Soll {sp} °C bleibt"),
     }
 }
 

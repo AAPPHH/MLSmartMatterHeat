@@ -45,9 +45,9 @@ def build():
             for key in OUTPUT_KEYS:
                 expected[n][key].append(clean(o[key]) if o["ok"] else None)
             if o["ok"] and k >= PLAN_FROM and k % PLAN_EVERY == 0:
-                env = plan_env(row[n], k)
+                env = clean_env(plan_env(row[n], k))
                 p = plan(RoomPar(docs[n]), SHOCK, h.rooms[n].comps, h.w[1], env)
-                plans.append({"step": k, "room": n, "env": clean_env(env), "out": {key: clean(p[key]) for key in PLAN_KEYS}})
+                plans.append({"step": k, "room": n, "env": env, "out": {key: clean(p[key]) for key in PLAN_KEYS}})
     bundle_rooms = {n: {"node": 5 + i, "struct": "rc2", **{key: docs[n][key] for key in ("params", "c", "valve_gain", "sigma_u", "noise_r", "p0", "q_r", "q_a")}, "neighbours": {"wall": [5 + (i + 1) % 3]}} for i, n in enumerate(NAMES)}
     return {
         "bundle": {"kind": "room_model", "version": "20261101T000000Z", "dt_s": 60.0, "rooms": bundle_rooms, "shock": SHOCK, "house": {**HOUSE, "night_hours": [22, 5], "timezone": "Europe/Berlin"}},

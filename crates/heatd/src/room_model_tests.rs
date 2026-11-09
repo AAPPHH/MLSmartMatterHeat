@@ -174,3 +174,42 @@ fn erf_matches_reference_values() {
     }
     assert!((norm_cdf(0.0) - 0.5).abs() < 1e-9);
 }
+
+pub(crate) fn preset_env() -> Env {
+    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0 }
+}
+
+pub(crate) fn comps_at(m: f64, a: f64, lam: f64, p: f64) -> Vec<Comp> {
+    (0..4).map(|_| Comp { mu: 0.25, x: [m, a, lam], p: [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, p] }).collect()
+}
+
+pub(crate) fn preset_rig(lambda_jump: f64) -> (RoomPar, Shock) {
+    let bundle = Bundle::parse(&base_bundle().to_string()).unwrap();
+    (RoomPar::new(&bundle.rooms["kueche"]), Shock { lambda_jump, ..bundle.shock })
+}
+
+#[test]
+fn preset_costs_drop_to_frost_for_an_open_window_and_heat_a_closed_cold_room() {
+    for lam in [3.0, 6.0] {
+        let (par, shock) = preset_rig(lam);
+        let open = plan(&par, &shock, &comps_at(17.0, 16.0, lam, 1e-4), 1.0, &preset_env());
+        assert!(open.p_window > 0.99 && open.kind == "frost" && open.setpoint == 7.0 && !open.raise, "{lam} {open:?}");
+        assert!(open.cold < 1e-6 && open.total < open.cost_live);
+    }
+    let (par, shock) = preset_rig(3.0);
+    let cold = plan(&par, &shock, &comps_at(17.0, 16.0, 1.0, 1e-4), 1.0, &preset_env());
+    assert!(cold.p_window < 0.01 && cold.kind != "frost" && cold.setpoint >= 21.0, "{cold:?}");
+    let warm = plan(&par, &shock, &comps_at(23.0, 22.5, 1.0, 1e-4), 1.0, &preset_env());
+    assert!(warm.p_window < 0.01 && !warm.raise && warm.setpoint <= 21.0, "{warm:?}");
+}
+
+#[test]
+fn half_window_probability_probes_and_certainty_does_not() {
+    let (par, shock) = preset_rig(6.0);
+    let half = plan(&par, &shock, &comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, &preset_env());
+    assert!((half.p_window - 0.5).abs() < 1e-6 && half.kind == "probe" && half.probe_min == Some(15) && half.setpoint == 21.0 && !half.raise && half.evoi > 1.0, "{half:?}");
+    for lam in [1.0, 6.0] {
+        let sure = plan(&par, &shock, &comps_at(17.0, 16.0, lam, 1e-4), 1.0, &preset_env());
+        assert!(sure.kind != "probe" && sure.evoi == 0.0, "{sure:?}");
+    }
+}

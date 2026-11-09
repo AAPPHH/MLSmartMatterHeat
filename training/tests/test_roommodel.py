@@ -124,14 +124,25 @@ def comps_at(m, a, lam, p=1e-4):
     return [(0.25, [m, a, lam], [0.01, 0, 0, 0, 0.01, 0, 0, 0, p]) for _ in range(4)]
 
 
-def test_plan_chooses_frost_for_a_window_and_heat_otherwise():
+def test_plan_with_preset_costs_drops_to_frost_for_an_open_window_and_heats_a_closed_cold_room():
+    par = light_par()
+    for lam in (3.0, 6.0):
+        open_ = plan(par, dict(SHOCK, lambda_jump=lam), comps_at(17.0, 16.0, lam), 1.0, plan_env())
+        assert open_["p_window"] > 0.99 and open_["kind"] == "frost" and open_["setpoint"] == 7.0 and not open_["raise"]
+        assert open_["cold"] < 1e-6 and open_["total"] < open_["cost_live"]
+    cold = plan(par, SHOCK, comps_at(17.0, 16.0, 1.0), 1.0, plan_env())
+    assert cold["p_window"] < 0.01 and cold["kind"] != "frost" and cold["setpoint"] >= 21.0
+    warm = plan(par, SHOCK, comps_at(23.0, 22.5, 1.0), 1.0, plan_env())
+    assert warm["p_window"] < 0.01 and not warm["raise"] and warm["setpoint"] <= 21.0
+
+
+def test_plan_at_half_window_probability_probes_instead_of_guessing():
     par = light_par()
     shock = dict(SHOCK, lambda_jump=6.0)
-    open_ = plan(par, shock, comps_at(14.0, 12.0, 6.0), 1.0, plan_env(cold_cost=0.1))
-    shut = plan(par, shock, comps_at(18.0, 17.0, 1.0), 1.0, plan_env(sp_cur=19.0, sp_live=19.0))
-    assert open_["p_window"] > 0.99 and open_["kind"] == "frost" and open_["setpoint"] == 7.0
-    assert shut["p_window"] < 0.01 and shut["setpoint"] >= 19.0 and shut["kind"] != "frost"
-    assert open_["total"] < open_["cost_live"]
+    half = plan(par, shock, comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, plan_env())
+    assert abs(half["p_window"] - 0.5) < 1e-6
+    assert half["kind"] == "probe" and half["probe_min"] == 15 and half["setpoint"] == 21.0 and not half["raise"]
+    assert half["evoi"] > 1.0
 
 
 def test_plan_raise_cost_blocks_small_raises_and_no_supply_blocks_heating():
@@ -148,11 +159,14 @@ def test_plan_raise_cost_blocks_small_raises_and_no_supply_blocks_heating():
 def test_plan_probe_is_chosen_only_with_value_of_information():
     par = light_par()
     shock = dict(SHOCK, lambda_jump=6.0)
-    comps = [(0.5, [16.0, 15.0, 1.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4]), (0.5, [16.0, 15.0, 6.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4])]
-    p = plan(par, shock, comps, 1.0, plan_env(raise_cost=1.0, cold_cost=0.3))
-    sure = plan(par, shock, comps_at(16.0, 15.0, 1.0), 1.0, plan_env(raise_cost=1.0, cold_cost=0.3))
-    assert sure["kind"] != "probe" and sure["evoi"] == 0.0
-    assert p["evoi"] >= 0.0
+    mixed = [(0.5, [17.0, 16.0, 1.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4]), (0.5, [17.0, 16.0, 6.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4])]
+    p = plan(par, shock, mixed, 1.0, plan_env())
+    assert 0.4 < p["p_window"] < 0.6 and p["kind"] == "probe" and p["evoi"] > 1.0
+    assert p["best_cost"] - p["perfect_cost"] > p["evoi"]
+    for lam in (1.0, 6.0):
+        sure = plan(par, shock, comps_at(17.0, 16.0, lam), 1.0, plan_env())
+        assert sure["kind"] != "probe" and sure["evoi"] == 0.0
+        assert sure["best_cost"] - sure["perfect_cost"] < 1e-9
 
 
 def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):

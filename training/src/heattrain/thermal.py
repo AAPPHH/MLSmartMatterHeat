@@ -907,17 +907,18 @@ def plan(par, shock, comps, p_supply, env):
     env["cn"], env["cs"] = par.coupling(env["ncnt"], env["nsum"])
     modes = ((1.0 - pw, lam_c), (pw, lam_o))
     supplies = ((1, p_supply), (0, 1.0 - p_supply))
+    calm = (1.0, 0.0)
     target, frost, cur, cold_w = env["target"], env["frost"], env["sp_cur"], env["cold_cost"]
     sensor0 = par.sensor(m, a)
     limit = max(target + 0.5, sensor0) + EPS
 
     def evaluate(name, kind, sp, first, **meta):
         runs = [[rollout(par, m, a, lam, s, sp, env) for s, _ in supplies] for _, lam in modes]
-        mode_cost = [sum(supplies[si][1] * (sum(r[si][0]) + cold_w * sum(r[si][1])) for si in range(2)) for r in runs]
+        mode_cost = [sum(supplies[si][1] * (sum(r[si][0]) + calm[mi] * cold_w * sum(r[si][1])) for si in range(2)) for mi, r in enumerate(runs)]
         rz = cur is not None and first > cur + EPS
         raise_c = env["raise_cost"] if rz else 0.0
         energy = sum(modes[mi][0] * supplies[si][1] * sum(runs[mi][si][0]) for mi in range(2) for si in range(2))
-        cold = sum(modes[mi][0] * supplies[si][1] * sum(runs[mi][si][1]) for mi in range(2) for si in range(2))
+        cold = sum(modes[0][0] * supplies[si][1] * sum(runs[0][si][1]) for si in range(2))
         return {"name": name, "kind": kind, "first": first, "runs": runs, "mode_cost": [c + raise_c for c in mode_cost], "energy": energy, "cold": cold_w * cold, "raise": raise_c, "raise_flag": rz,
                 "total": sum(modes[mi][0] * mode_cost[mi] for mi in range(2)) + raise_c, "peak": max(runs[0][0][2]), "boost_min": None, "probe_min": None, **meta}
 
@@ -947,7 +948,7 @@ def plan(par, shock, comps, p_supply, env):
             continue
         sep = abs(pr["runs"][1][0][2][d - 1] - pr["runs"][0][0][2][d - 1]) / sigma_obs
         rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0)
-        prefix = lambda c: sum(modes[mi][0] * supplies[si][1] * (sum(c["runs"][mi][si][0][:d]) + cold_w * sum(c["runs"][mi][si][1][:d])) for mi in range(2) for si in range(2))
+        prefix = lambda c: sum(modes[mi][0] * supplies[si][1] * (sum(c["runs"][mi][si][0][:d]) + calm[mi] * cold_w * sum(c["runs"][mi][si][1][:d])) for mi in range(2) for si in range(2))
         evoi = rho * gain - max(0.0, prefix(pr) - prefix(best) + pr["raise"] - best["raise"])
         if evoi > evoi_best + 1e-12:
             chosen, evoi_best = pr, evoi
