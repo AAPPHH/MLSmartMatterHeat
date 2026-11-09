@@ -3,7 +3,7 @@
 Local, cloud-free heating control: a Rust daemon (`heatd`) talks Matter over Thread to radiator thermostats, a Pixel Watch app detects which room you are in from WiFi scans, and small ML models (room matcher, window detection, boost dosing, thermal model) are trained locally.
 An ESP32 Thread Border Router also acts as a hardware failsafe. Documentation is in German, the code and API names are English.
 
-**Heizung, die weiß, in welchem Raum du bist.** Ohne Cloud und Hersteller-App, alles im eigenen LAN. Die Pixel Watch misst alle 30 s das WLAN-Umfeld, ein Modell erkennt daraus den Raum, `heatd` regelt damit die Matter-Thermostate (Eurotronic Comet Zero) über Thread.
+**Heizung, die weiß, in welchem Raum du bist.** Ohne Cloud und Hersteller-App, alles im eigenen LAN. Die Pixel Watch misst in Bewegung alle 30 s, in Ruhe nur alle 12 min das WLAN-Umfeld, ein Modell erkennt daraus den Raum, `heatd` regelt damit die Matter-Thermostate (Eurotronic Comet Zero) über Thread.
 
 ## Architektur
 

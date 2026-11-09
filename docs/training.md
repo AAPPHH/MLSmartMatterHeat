@@ -71,3 +71,9 @@ uv run python -m heattrain thermal /data /models        # <data_root> (parquet/)
 
 Ausgabe: `<models_dir>/thermal/<datum>/<raum>.json` (Parameter, Grenzen, relative Standardabweichung, Zeitkonstanten, RMSE auf dem Hold-out-Block gegen Persistenz, Datenspanne, Warnungen). Python: `estimate_room_air` liefert die gefilterte Raumluft samt Unsicherheit, `predict` und `ThermalModel.lead_time` rechnen Vorlaufzeiten für geplante Ventilstellung oder Solltemperatur. Die Quelle `legacy` wird ausgeschlossen (Config `exclude_sources`). Mit weniger als etwa einem Tag Daten sind die Parameter schwach bestimmt; die Warnungen im JSON sagen, welche.
 
+
+## Uhr-Debug und synthetische Daten
+
+Debug-Aktionen der Uhr (`adb shell am broadcast -n de.aapphh.heatscan.debug/de.aapphh.heatscan.DebugReceiver -a de.aapphh.heatscan.<AKTION>`, Debug-Build; beim Release-Build Paket `de.aapphh.heatscan`, nur mit DUMP-Recht): `STATUS`, `START`, `CONFIG`, `PAUSE`, `FLUSH` und `DEMO`. `DEMO` schreibt Beispieldaten (Küche 82 %, fünf WLANs) in den Speicher, damit man die Datenseite ohne Modell sieht; eine echte Server-Antwort mit Räumen überschreibt sie wieder.
+
+Mit `heatml.synth` lassen sich realistische Fake-Scans erzeugen.
