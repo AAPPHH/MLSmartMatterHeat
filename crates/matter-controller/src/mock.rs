@@ -1,5 +1,5 @@
 use crate::{
-    centi_degrees, AttributeReport, CaptureItem, CaptureParser, DeviceLink, DeviceSubscription, Error, Inventory, MatterController, NodeId, RawAttribute, Result, ThermostatState, TypedValue,
+    centi_degrees, AttributeReport, CaptureItem, CaptureParser, DeviceFeed, DeviceSubscription, Error, Inventory, MatterController, NodeId, RawAttribute, Result, SwitchOn, ThermostatState, TypedValue,
     BAT_PERCENT_REMAINING, LOCAL_TEMPERATURE, OCCUPIED_HEATING_SETPOINT, PI_HEATING_DEMAND, POWER_SOURCE_CLUSTER, SOURCE_POLL, SOURCE_SUBSCRIPTION, SYSTEM_MODE,
     THERMOSTAT_CLUSTER,
 };
@@ -334,7 +334,7 @@ impl MatterController for MockController {
 }
 
 #[async_trait]
-impl DeviceLink for MockController {
+impl DeviceFeed for MockController {
     async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>> {
         let mut inner = self.inner.lock().unwrap();
         let raw = inner.devices.get(&node).cloned().ok_or(Error::UnknownNode(node))?;
@@ -358,7 +358,10 @@ impl DeviceLink for MockController {
         Self::send_capture(&inner, node, CaptureItem::Subscribed { node: Some(node) });
         Ok(())
     }
+}
 
+#[async_trait]
+impl SwitchOn for MockController {
     async fn device_switch_on(&self, node: NodeId, endpoint: u16) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.devices.contains_key(&node) {

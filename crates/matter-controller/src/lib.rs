@@ -134,9 +134,13 @@ pub struct DeviceSubscription {
 }
 
 #[async_trait]
-pub trait DeviceLink: Send + Sync {
+pub trait DeviceFeed: Send + Sync {
     async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>>;
     async fn device_resubscribe(&self, node: NodeId) -> Result<()>;
+}
+
+#[async_trait]
+pub trait SwitchOn: Send + Sync {
     async fn device_switch_on(&self, node: NodeId, endpoint: u16) -> Result<()>;
 }
 

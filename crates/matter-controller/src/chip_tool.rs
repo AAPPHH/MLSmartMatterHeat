@@ -1,6 +1,6 @@
 use crate::capture::{CaptureItem, CaptureParser, SOURCE_POLL};
 use crate::{
-    centi_degrees, parse_number, AttributeReport, AttributeSpec, DeviceLink, DeviceSubscription, Error, Inventory, MatterController, NodeId, Result, ThermostatState, EXTRA_SUBSCRIPTIONS,
+    centi_degrees, parse_number, AttributeReport, AttributeSpec, DeviceFeed, DeviceSubscription, Error, Inventory, MatterController, NodeId, Result, SwitchOn, ThermostatState, EXTRA_SUBSCRIPTIONS,
     MAX_HEAT_SETPOINT_LIMIT, NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, SYSTEM_MODE, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
@@ -1002,7 +1002,7 @@ impl MatterController for ChipToolController {
 }
 
 #[async_trait]
-impl DeviceLink for ChipToolController {
+impl DeviceFeed for ChipToolController {
     async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>> {
         match &self.session {
             Some(session) => {
@@ -1019,7 +1019,10 @@ impl DeviceLink for ChipToolController {
             None => Err(Error::Command("resubscribe needs a serving controller".into())),
         }
     }
+}
 
+#[async_trait]
+impl SwitchOn for ChipToolController {
     async fn device_switch_on(&self, node: NodeId, endpoint: u16) -> Result<()> {
         match &self.session {
             Some(session) => session.command(self.config.switch_on_parts(node, endpoint)).await,
