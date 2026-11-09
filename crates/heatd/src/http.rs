@@ -783,7 +783,11 @@ async fn manual_reply(state: AppState, intent: crate::intent::Intent) -> Respons
     (reply.status, Json(reply.body)).into_response()
 }
 
-async fn setpoint(State(state): State<AppState>, Json(body): Json<SetpointBody>) -> Response {
+async fn setpoint(State(state): State<AppState>, body: Result<Json<SetpointBody>, axum::extract::rejection::JsonRejection>) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "Ungueltige Anfrage: JSON mit room, celsius und hold_min erwartet"}))).into_response(),
+    };
     let intent = if body.clear { crate::intent::Intent::SetpointClear { room: body.room, source: body.source } } else { crate::intent::Intent::Setpoint { room: body.room, celsius: body.celsius, hold_min: body.hold_min, source: body.source } };
     manual_reply(state, intent).await
 }

@@ -254,3 +254,16 @@ fn the_report_lists_one_german_line_per_hold_and_per_early_end() {
     assert!(md.contains("bad: Vorgabe vorzeitig beendet (api)"), "{md}");
     assert!(crate::manual::report_section(tempfile::tempdir().unwrap().path(), date).unwrap().contains("Keine Raumtemperatur"));
 }
+
+#[tokio::test]
+async fn bad_json_is_a_german_400_not_a_plain_422() {
+    let e = env();
+    for body in ["{", "{\"room\": \"bad\", \"celsius\": \"warm\"}", "{\"celsius\": 21.0}"] {
+        let request = Request::builder().method("POST").uri("/api/setpoint").header("content-type", "application/json").body(Body::from(body)).unwrap();
+        let response = crate::http::router(e.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let reply: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(reply["ok"].as_bool(), Some(false));
+        assert!(reply["error"].as_str().unwrap().contains("JSON"));
+    }
+}
