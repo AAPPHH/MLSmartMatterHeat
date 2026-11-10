@@ -1,6 +1,6 @@
 use crate::capture::{CaptureItem, CaptureParser, SOURCE_POLL};
 use crate::{
-    centi_degrees, parse_number, AttributeReport, AttributeSpec, DeviceFeed, DeviceSubscription, Error, Inventory, MatterController, NodeId, Result, SwitchOn, ThermostatState, EXTRA_SUBSCRIPTIONS,
+    centi_degrees, parse_number, ANY_ATTRIBUTE, AttributeReport, AttributeSpec, DeviceFeed, DeviceSubscription, Error, Inventory, MatterController, NodeId, Result, SwitchOn, ThermostatState, EXTRA_SUBSCRIPTIONS,
     MAX_HEAT_SETPOINT_LIMIT, NEIGHBOR_TABLE, OCCUPIED_HEATING_SETPOINT, POLL_ATTRIBUTES, SYSTEM_MODE, THREAD_DIAGNOSTICS_CLUSTER, THREAD_PARENT_LAST_RSSI, THREAD_PARENT_LQI, THREAD_PARENT_RSSI, WATCHED,
 };
 use async_trait::async_trait;
@@ -163,26 +163,37 @@ impl ChipToolConfig {
         Self::paths_line(command, node, &[], (self.subscribe_min_s, self.subscribe_max_s), keep)
     }
 
-    fn paths_line(command: &str, node: NodeId, clusters: &[u32], (min_s, max_s): (u32, u32), keep: u8) -> String {
-        let repeat = |each: &str| vec![each; clusters.len().max(1)].join(",");
-        let ids = if clusters.is_empty() { WILDCARD.to_string() } else { clusters.iter().map(|c| format!("0x{c:04X}")).collect::<Vec<_>>().join(",") };
-        format!("any {command} {ids} {} {min_s} {max_s} {node} {} --keepSubscriptions {keep} --auto-resubscribe 1", repeat(WILDCARD), repeat(WILDCARD_ENDPOINT))
+    fn paths_line(command: &str, node: NodeId, paths: &[(u32, u32)], (min_s, max_s): (u32, u32), keep: u8) -> String {
+        let join = |each: &dyn Fn(&(u32, u32)) -> String| paths.iter().map(each).collect::<Vec<_>>().join(",");
+        let (ids, attributes, endpoints) = match paths.is_empty() {
+            true => (WILDCARD.to_string(), WILDCARD.to_string(), WILDCARD_ENDPOINT.to_string()),
+            false => (join(&|p| format!("0x{:04X}", p.0)), join(&|p| if p.1 == ANY_ATTRIBUTE { WILDCARD.to_string() } else { format!("0x{:04X}", p.1) }), vec![WILDCARD_ENDPOINT; paths.len()].join(",")),
+        };
+        format!("any {command} {ids} {attributes} {min_s} {max_s} {node} {endpoints} --keepSubscriptions {keep} --auto-resubscribe 1")
     }
 
     pub fn device_lines(&self, node: NodeId, plan: &DeviceSubscription, fresh: bool) -> Vec<String> {
         let rest = (plan.min_s, plan.max_s);
         let mut lines = Vec::new();
         if let Some(fast) = &plan.fast {
-            lines.push(Self::paths_line("subscribe-by-id", node, &fast.clusters, (fast.min_s, fast.max_s), 1));
+            lines.push(Self::paths_line("subscribe-by-id", node, &fast.paths, (fast.min_s, fast.max_s), 1));
         }
-        lines.push(Self::paths_line("subscribe-by-id", node, &[], rest, 1));
+        if plan.rest {
+            lines.push(Self::paths_line("subscribe-by-id", node, &[], rest, 1));
+        }
         if plan.events {
             lines.push(Self::paths_line("subscribe-event-by-id", node, &[], rest, 1));
         }
         if fresh {
-            lines[0] = lines[0].replace("--keepSubscriptions 1", "--keepSubscriptions 0");
+            if let Some(first) = lines.first_mut() {
+                *first = first.replace("--keepSubscriptions 1", "--keepSubscriptions 0");
+            }
         }
         lines
+    }
+
+    pub fn read_all_line(node: NodeId) -> String {
+        format!("any read-by-id {WILDCARD} {WILDCARD} {node} {WILDCARD_ENDPOINT}")
     }
 
     pub fn switch_on_parts(&self, node: NodeId, endpoint: u16) -> Vec<String> {
@@ -703,6 +714,12 @@ impl Session {
         }
     }
 
+    async fn read_all(&self, node: NodeId) -> Result<()> {
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
+        Self::send(stdin, &ChipToolConfig::read_all_line(node)).await
+    }
+
     async fn resubscribe(&self, node: NodeId) -> Result<()> {
         let mut guard = self.stdin.lock().await;
         let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
@@ -1023,6 +1040,13 @@ impl DeviceFeed for ChipToolController {
             None => Err(Error::Command("resubscribe needs a serving controller".into())),
         }
     }
+
+    async fn device_read_all(&self, node: NodeId) -> Result<()> {
+        match &self.session {
+            Some(session) => session.read_all(node).await,
+            None => Err(Error::Command("read needs a serving controller".into())),
+        }
+    }
 }
 
 #[async_trait]
@@ -1239,19 +1263,18 @@ mod tests {
     #[test]
     fn builds_device_lines_with_per_node_intervals_and_fresh_resubscribe() {
         let c = config();
-        let plug = DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }), events: true };
+        let plug = DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { paths: vec![(0x0006, 0x0000), (0x0090, 0x0008), (0x0091, ANY_ATTRIBUTE)], min_s: 1, max_s: 300 }), rest: false, events: false };
         let lines = c.device_lines(9, &plug, false);
-        assert_eq!(
-            lines,
-            vec![
-                "any subscribe-by-id 0x0006,0x0090,0x0091 0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF 1 60 9 0xFFFF,0xFFFF,0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-                "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 300 900 9 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-                "any subscribe-event-by-id 0xFFFFFFFF 0xFFFFFFFF 300 900 9 0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string(),
-            ]
-        );
+        assert_eq!(lines, vec!["any subscribe-by-id 0x0006,0x0090,0x0091 0x0000,0x0008,0xFFFFFFFF 1 300 9 0xFFFF,0xFFFF,0xFFFF --keepSubscriptions 1 --auto-resubscribe 1".to_string()]);
         let fresh = c.device_lines(9, &plug, true);
-        assert!(fresh[0].contains("--keepSubscriptions 0") && fresh[1..].iter().all(|l| l.contains("--keepSubscriptions 1")));
-        let climate = DeviceSubscription { min_s: 60, max_s: 1800, fast: None, events: false };
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].contains("--keepSubscriptions 0"));
+        let air = DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { paths: vec![(0x040D, ANY_ATTRIBUTE)], min_s: 10, max_s: 300 }), rest: true, events: false };
+        let both = c.device_lines(12, &air, true);
+        assert_eq!(both.len(), 2);
+        assert!(both[0].contains("--keepSubscriptions 0") && both[1].contains("--keepSubscriptions 1") && both[1].contains("0xFFFFFFFF 0xFFFFFFFF 300 900"));
+        assert_eq!(ChipToolConfig::read_all_line(9), "any read-by-id 0xFFFFFFFF 0xFFFFFFFF 9 0xFFFF");
+        let climate = DeviceSubscription { min_s: 60, max_s: 1800, fast: None, rest: true, events: false };
         let slow = c.device_lines(11, &climate, true);
         assert_eq!(slow.len(), 1);
         assert_eq!(slow[0], "any subscribe-by-id 0xFFFFFFFF 0xFFFFFFFF 60 1800 11 0xFFFF --keepSubscriptions 0 --auto-resubscribe 1");

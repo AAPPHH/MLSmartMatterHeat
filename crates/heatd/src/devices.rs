@@ -6,7 +6,7 @@ use crate::report::{dur, hhmm, midnight_us, open_lake, rows};
 use anyhow::{anyhow, bail, Result};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use matter_controller::{
-    CaptureItem, DeviceFeed, DeviceSubscription, FastSubscription, SwitchOn, TypedValue, AIR_QUALITY_CLUSTER, CO2_CLUSTER, ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER, ELECTRICAL_POWER_MEASUREMENT_CLUSTER,
+    CaptureItem, ANY_ATTRIBUTE, DeviceFeed, DeviceSubscription, FastSubscription, SwitchOn, TypedValue, AIR_QUALITY_CLUSTER, CO2_CLUSTER, ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER, ELECTRICAL_POWER_MEASUREMENT_CLUSTER,
     HUMIDITY_MEASUREMENT_CLUSTER, ON_OFF_CLUSTER, PM25_CLUSTER, POWER_SOURCE_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER,
 };
 use serde::Deserialize;
@@ -60,26 +60,34 @@ pub enum DeviceKind {
 }
 
 const CALM_PLUG_MIN_S: u32 = 30;
+const PLUG_PATHS: [(u32, u32); 5] = [
+    (ON_OFF_CLUSTER, 0x0000),
+    (ELECTRICAL_POWER_MEASUREMENT_CLUSTER, POWER_ATTRIBUTE),
+    (ELECTRICAL_POWER_MEASUREMENT_CLUSTER, 0x0005),
+    (ELECTRICAL_POWER_MEASUREMENT_CLUSTER, 0x0004),
+    (ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER, 0x0001),
+];
+const READ_ALL_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 impl DeviceKind {
-    fn fast_clusters(self) -> &'static [u32] {
+    fn fast_paths(self) -> Vec<(u32, u32)> {
         match self {
-            Self::Plug => &[ON_OFF_CLUSTER, ELECTRICAL_POWER_MEASUREMENT_CLUSTER, ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER],
-            Self::Air => &[AIR_QUALITY_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, CO2_CLUSTER, PM25_CLUSTER],
-            Self::Climate => &[],
+            Self::Plug => PLUG_PATHS.to_vec(),
+            Self::Air => [AIR_QUALITY_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, CO2_CLUSTER, PM25_CLUSTER].map(|c| (c, ANY_ATTRIBUTE)).to_vec(),
+            Self::Climate => Vec::new(),
         }
     }
 
-    fn view_clusters(self) -> &'static [u32] {
+    fn view_clusters(self) -> Vec<u32> {
         match self {
-            Self::Climate => &[TEMPERATURE_MEASUREMENT_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, POWER_SOURCE_CLUSTER],
-            other => other.fast_clusters(),
+            Self::Climate => vec![TEMPERATURE_MEASUREMENT_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, POWER_SOURCE_CLUSTER],
+            other => other.fast_paths().into_iter().map(|p| p.0).collect(),
         }
     }
 
     fn primary(self) -> (u32, u32) {
         match self {
-            Self::Plug => (1, 60),
+            Self::Plug => (1, 300),
             Self::Air => (10, 300),
             Self::Climate => (60, 1800),
         }
@@ -294,14 +302,10 @@ impl DeviceConfig {
         let (default_min, default_max) = self.kind.primary();
         let default_min = if self.kind == DeviceKind::Plug && self.role != ROLE_COFFEE { default_min.max(CALM_PLUG_MIN_S) } else { default_min };
         let (min_s, max_s) = (self.min_s.unwrap_or(default_min), self.max_s.unwrap_or(default_max));
-        match self.kind.fast_clusters() {
-            [] => DeviceSubscription { min_s, max_s, fast: None, events: false },
-            clusters => DeviceSubscription {
-                min_s: self.rest_min_s.unwrap_or(300),
-                max_s: self.rest_max_s.unwrap_or(900),
-                fast: Some(FastSubscription { clusters: clusters.to_vec(), min_s, max_s }),
-                events: true,
-            },
+        let (rest_min_s, rest_max_s) = (self.rest_min_s.unwrap_or(300), self.rest_max_s.unwrap_or(900));
+        match self.kind.fast_paths() {
+            paths if paths.is_empty() => DeviceSubscription { min_s, max_s, fast: None, rest: true, events: false },
+            paths => DeviceSubscription { min_s: rest_min_s, max_s: rest_max_s, fast: Some(FastSubscription { paths, min_s, max_s }), rest: self.kind != DeviceKind::Plug, events: false },
         }
     }
 
@@ -443,6 +447,7 @@ struct NodeState {
     resubscribe_backoff_s: f64,
     resubscribes: u32,
     reported_since_issue: bool,
+    read_all_us: Option<i64>,
     retry_start_s: f64,
     retry_s: f64,
     issued_us: i64,
@@ -702,7 +707,32 @@ impl Devices {
         due
     }
 
+    fn read_all_due(&self, now_us: i64) -> Vec<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let plain: Vec<u64> = inner.configs.iter().filter(|c| !c.subscription().rest && c.subscription().fast.is_some()).map(|c| c.node).collect();
+        let every = READ_ALL_EVERY.as_micros() as i64;
+        plain
+            .into_iter()
+            .filter(|node| {
+                let Some(state) = inner.nodes.get_mut(node) else { return false };
+                let healthy = !state.lost && state.silent_since_us.is_none() && state.reported_since_issue;
+                let due = healthy && now_us - state.read_all_us.unwrap_or(state.started_us) >= every;
+                if due {
+                    state.read_all_us = Some(now_us);
+                }
+                due
+            })
+            .collect()
+    }
+
     pub async fn health_tick(&self, sink: &Sink, now_us: i64) {
+        if let Some(feed) = &self.feed {
+            for node in self.read_all_due(now_us) {
+                if let Err(e) = feed.device_read_all(node).await {
+                    eprintln!("device {node} read: {e}");
+                }
+            }
+        }
         for (node, first) in self.silent_nodes(now_us) {
             if let Some(feed) = &self.feed {
                 if let Err(e) = feed.device_resubscribe(node).await {

@@ -20,6 +20,7 @@ pub type NodeId = u64;
 
 pub const THERMOSTAT_CLUSTER: u32 = 0x0201;
 pub const ON_OFF_CLUSTER: u32 = 0x0006;
+pub const ANY_ATTRIBUTE: u32 = 0xFFFF_FFFF;
 pub const ELECTRICAL_POWER_MEASUREMENT_CLUSTER: u32 = 0x0090;
 pub const ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER: u32 = 0x0091;
 pub const TEMPERATURE_MEASUREMENT_CLUSTER: u32 = 0x0402;
@@ -121,7 +122,7 @@ pub fn centi_degrees(celsius: f64) -> i16 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FastSubscription {
-    pub clusters: Vec<u32>,
+    pub paths: Vec<(u32, u32)>,
     pub min_s: u32,
     pub max_s: u32,
 }
@@ -131,6 +132,7 @@ pub struct DeviceSubscription {
     pub min_s: u32,
     pub max_s: u32,
     pub fast: Option<FastSubscription>,
+    pub rest: bool,
     pub events: bool,
 }
 
@@ -138,6 +140,7 @@ pub struct DeviceSubscription {
 pub trait DeviceFeed: Send + Sync {
     async fn device_capture(&self, node: NodeId, plan: DeviceSubscription) -> Result<Receiver<CaptureItem>>;
     async fn device_resubscribe(&self, node: NodeId) -> Result<()>;
+    async fn device_read_all(&self, node: NodeId) -> Result<()>;
 }
 
 #[async_trait]

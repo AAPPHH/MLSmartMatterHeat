@@ -34,6 +34,7 @@ struct Inner {
     devices: BTreeMap<NodeId, String>,
     plans: Vec<(NodeId, DeviceSubscription)>,
     device_resubscribes: Vec<NodeId>,
+    device_reads: Vec<NodeId>,
     switch_failures: usize,
 }
 
@@ -57,6 +58,10 @@ impl MockController {
 
     pub fn device_plans(&self) -> Vec<(NodeId, DeviceSubscription)> {
         self.inner.lock().unwrap().plans.clone()
+    }
+
+    pub fn device_reads(&self) -> Vec<NodeId> {
+        self.inner.lock().unwrap().device_reads.clone()
     }
 
     pub fn device_resubscribes(&self) -> Vec<NodeId> {
@@ -358,6 +363,15 @@ impl DeviceFeed for MockController {
         Self::send_capture(&inner, node, CaptureItem::Subscribed { node: Some(node) });
         Ok(())
     }
+
+    async fn device_read_all(&self, node: NodeId) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.devices.contains_key(&node) {
+            return Err(Error::UnknownNode(node));
+        }
+        inner.device_reads.push(node);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -417,7 +431,7 @@ mod tests {
     async fn devices_replay_their_text_and_record_only_the_switch_on() {
         let mock = MockController::new(1);
         mock.add_device(9, include_str!("../tests/fixtures/device_plug_stream.txt"));
-        let plan = DeviceSubscription { min_s: 300, max_s: 900, fast: None, events: true };
+        let plan = DeviceSubscription { min_s: 300, max_s: 900, fast: None, rest: true, events: true };
         let mut rx = mock.device_capture(9, plan.clone()).await.unwrap();
         let mut seen = 0;
         while let Ok(item) = rx.try_recv() {

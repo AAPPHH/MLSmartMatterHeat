@@ -5,7 +5,7 @@ use crate::storage::ScanBody;
 use axum::body::Body;
 use axum::http::Request;
 use http_body_util::BodyExt;
-use matter_controller::{CaptureParser, MockController};
+use matter_controller::{CaptureParser, MockController, ANY_ATTRIBUTE};
 use tower::ServiceExt;
 
 const PLUG: &str = include_str!("../../matter-controller/tests/fixtures/device_plug_stream.txt");
@@ -79,14 +79,16 @@ fn shipped_configs_list_the_new_devices() {
     assert!(Config::default().devices.is_empty());
 }
 
+const PLUG_PATHS_EXPECTED: [(u32, u32); 5] = [(0x0006, 0), (0x0090, 8), (0x0090, 5), (0x0090, 4), (0x0091, 1)];
+
 #[test]
 fn subscription_plans_follow_the_kind_and_the_overrides() {
     let config = config(Path::new("x"), &format!("{DEVICES}[[devices]]\nnode = 13\nkind = 'plug'\nrole = 'charger'\nmin_s = 2\nmax_s = 30\nrest_min_s = 120\nrest_max_s = 600\nsilent_after_min = 5\n"));
     let plans: Vec<DeviceSubscription> = config.devices.iter().map(DeviceConfig::subscription).collect();
-    assert_eq!(plans[0], DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 1, max_s: 60 }), events: true });
-    assert_eq!(plans[1], DeviceSubscription { min_s: 60, max_s: 1800, fast: None, events: false });
-    assert_eq!(plans[2].fast.as_ref().unwrap().clusters, vec![0x005B, 0x0402, 0x0405, 0x040D, 0x042A]);
-    assert_eq!(plans[3], DeviceSubscription { min_s: 120, max_s: 600, fast: Some(FastSubscription { clusters: vec![0x0006, 0x0090, 0x0091], min_s: 2, max_s: 30 }), events: true });
+    assert_eq!(plans[0], DeviceSubscription { min_s: 300, max_s: 900, fast: Some(FastSubscription { paths: PLUG_PATHS_EXPECTED.to_vec(), min_s: 1, max_s: 300 }), rest: false, events: false });
+    assert_eq!(plans[1], DeviceSubscription { min_s: 60, max_s: 1800, fast: None, rest: true, events: false });
+    assert_eq!(plans[2].fast.as_ref().unwrap().paths, [0x005B, 0x0402, 0x0405, 0x040D, 0x042A].map(|c| (c, ANY_ATTRIBUTE)).to_vec());
+    assert_eq!(plans[3], DeviceSubscription { min_s: 120, max_s: 600, fast: Some(FastSubscription { paths: PLUG_PATHS_EXPECTED.to_vec(), min_s: 2, max_s: 30 }), rest: false, events: false });
     let silent: Vec<u64> = config.devices.iter().map(|d| d.silent_after().as_secs()).collect();
     assert_eq!(silent, vec![1800, 28800, 3600, 300]);
     assert_eq!(config.devices[0].label(), "plug 9");
@@ -358,6 +360,25 @@ async fn the_control_step_wake_signal_switches_the_coffee_plug_once() {
     assert_eq!(mock.write_log().iter().filter(|w| w.1 != 5).collect::<Vec<_>>(), vec![&("on_off_on", 9, 1.0)]);
     flushed(&state);
     assert_eq!(string_column(dir.path(), "events", "kind").iter().filter(|k| *k == "coffee_on").count(), 1);
+}
+
+#[tokio::test]
+async fn plugs_get_a_rate_limited_wildcard_read_only_while_healthy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mock) = setup(dir.path(), DEVICES);
+    let t0 = lake::now_us();
+    let hour = 3_600_000_000;
+    let feed = || CaptureParser::new().feed_all(PLUG, None).into_iter().for_each(|item| state.devices.handle(&state.sink, 9, item));
+    feed();
+    state.devices.health_tick(&state.sink, t0 + 5 * hour).await;
+    assert!(mock.device_reads().is_empty());
+    feed();
+    state.devices.health_tick(&state.sink, t0 + 7 * hour).await;
+    state.devices.health_tick(&state.sink, t0 + 8 * hour).await;
+    assert_eq!(mock.device_reads(), vec![9]);
+    state.devices.handle(&state.sink, 9, CaptureItem::SubscriptionLost { node: Some(9), reason: "x".into(), backoff_s: None });
+    state.devices.health_tick(&state.sink, t0 + 14 * hour).await;
+    assert_eq!(mock.device_reads(), vec![9]);
 }
 
 #[tokio::test]
