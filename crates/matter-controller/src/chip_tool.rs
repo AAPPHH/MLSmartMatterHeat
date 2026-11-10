@@ -192,6 +192,10 @@ impl ChipToolConfig {
         lines
     }
 
+    pub fn shutdown_line(node: NodeId) -> String {
+        format!("subscriptions shutdown-all-for-node {node}")
+    }
+
     pub fn read_all_line(node: NodeId) -> String {
         format!("any read-by-id {WILDCARD} {WILDCARD} {node} {WILDCARD_ENDPOINT}")
     }
@@ -723,6 +727,7 @@ impl Session {
     async fn resubscribe(&self, node: NodeId) -> Result<()> {
         let mut guard = self.stdin.lock().await;
         let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
+        Self::send(stdin, &ChipToolConfig::shutdown_line(node)).await?;
         for line in self.lines(node, true) {
             Self::send(stdin, &line).await?;
         }
@@ -1273,6 +1278,7 @@ mod tests {
         let both = c.device_lines(12, &air, true);
         assert_eq!(both.len(), 2);
         assert!(both[0].contains("--keepSubscriptions 0") && both[1].contains("--keepSubscriptions 1") && both[1].contains("0xFFFFFFFF 0xFFFFFFFF 300 900"));
+        assert_eq!(ChipToolConfig::shutdown_line(9), "subscriptions shutdown-all-for-node 9");
         assert_eq!(ChipToolConfig::read_all_line(9), "any read-by-id 0xFFFFFFFF 0xFFFFFFFF 9 0xFFFF");
         let climate = DeviceSubscription { min_s: 60, max_s: 1800, fast: None, rest: true, events: false };
         let slow = c.device_lines(11, &climate, true);

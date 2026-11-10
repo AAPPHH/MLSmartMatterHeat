@@ -31,7 +31,6 @@ const BASELINE_MEDIAN_FROM: usize = 30;
 const EDGE_MIN_SAMPLES: usize = 5;
 const EDGE_COOLDOWN_US: i64 = 600_000_000;
 const DROP_MIN_BASELINE_MW: i64 = 300;
-const EDGE_GAP_US: i64 = 660_000_000;
 const RISE_MIN_IDLE_US: i64 = 20 * 60 * 1_000_000;
 const EDGE_DAY_US: i64 = 24 * 3600 * 1_000_000;
 const EDGES_PER_DAY: usize = 6;
@@ -63,7 +62,7 @@ const PLUG_PATHS: [(u32, u32); 5] = [
 ];
 const QUIET_BEFORE_WAKE_MS: i64 = 4 * 3600 * 1000;
 const NIGHT_START_HOUR: u32 = 18;
-const BEDTIME_SEARCHES: usize = 4;
+const BEDTIME_SEARCHES: usize = 12;
 const HUMIDITY_JUMP: f64 = 300.0;
 const HUMIDITY_SPAN_MS: i64 = 20 * 60 * 1000;
 const CO2_FALL_PPM: f64 = 60.0;
@@ -99,7 +98,7 @@ impl DeviceKind {
 
     fn silent_after_min(self) -> f64 {
         match self {
-            Self::Plug => 30.0,
+            Self::Plug => 380.0,
             Self::Air => 60.0,
             Self::Climate => 480.0,
         }
@@ -173,7 +172,7 @@ struct EdgeDetector {
     state: Level,
     run: Option<(Level, u32, i64)>,
     last: BTreeMap<Edge, i64>,
-    prev: Option<i64>,
+    broken: bool,
     idle_since: Option<i64>,
     emitted: VecDeque<i64>,
 }
@@ -186,7 +185,11 @@ impl Default for EdgeDetector {
 
 impl EdgeDetector {
     fn new(rule: &'static PresenceRule) -> Self {
-        Self { rule, idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new(), prev: None, idle_since: None, emitted: VecDeque::new() }
+        Self { rule, idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new(), broken: false, idle_since: None, emitted: VecDeque::new() }
+    }
+
+    fn break_link(&mut self) {
+        self.broken = true;
     }
 }
 
@@ -231,8 +234,7 @@ impl EdgeDetector {
     }
 
     fn push(&mut self, ts: i64, milliwatts: i64) -> Option<(Edge, i64)> {
-        let gap = self.prev.is_some_and(|p| ts - p > EDGE_GAP_US);
-        self.prev = Some(ts);
+        let gap = std::mem::take(&mut self.broken);
         if self.idle.len() < EDGE_MIN_SAMPLES {
             self.remember(ts, milliwatts);
             self.idle_since.get_or_insert(ts);
@@ -483,7 +485,7 @@ struct Inner {
     started_ms: i64,
     sleep_room: Option<String>,
     last_activity_ms: Option<i64>,
-    fallback: Option<&'static str>,
+    fallback: Option<(&'static str, i64)>,
     on: BTreeMap<u64, bool>,
     humidity: BTreeMap<u64, (i64, f64)>,
     co2: BTreeMap<u64, VecDeque<(i64, f64)>>,
@@ -539,7 +541,7 @@ impl Inner {
     fn note_activity(&mut self, source: &'static str, now_ms: i64) {
         let quiet = now_ms - self.last_activity_ms.unwrap_or(self.started_ms) >= QUIET_BEFORE_WAKE_MS;
         if quiet && self.fallback.is_none() {
-            self.fallback = Some(source);
+            self.fallback = Some((source, now_ms));
         }
         self.last_activity_ms = Some(now_ms);
     }
@@ -586,7 +588,8 @@ impl Inner {
         let mut steps = Vec::new();
         for plug in self.candidates(local) {
             let from_bed = bedtime.get(&plug.node).filter(|ts| plug.in_window(local_of(local, now_ms, **ts))).map(|_| "bedtime".to_string());
-            let Some(trigger) = from_bed.or_else(|| fallback.map(|f| format!("fallback:{f}"))) else { continue };
+            let from_edge = fallback.filter(|(_, ts)| plug.in_window(local_of(local, now_ms, *ts))).map(|(f, _)| format!("fallback:{f}"));
+            let Some(trigger) = from_bed.or(from_edge) else { continue };
             if away {
                 if self.away_logged.insert(plug.node, day) != Some(day) {
                     steps.push(WakeStep::Away { plug, day, local });
@@ -732,6 +735,7 @@ impl Devices {
                 }
             }
             CaptureItem::SubscriptionLost { reason, .. } => {
+                self.break_edge_link(node);
                 let first = match self.inner.lock().unwrap().nodes.get_mut(&node) {
                     Some(state) if !state.lost => {
                         state.lost = true;
@@ -745,11 +749,18 @@ impl Devices {
                 }
             }
             CaptureItem::Subscribed { .. } => {
+                self.break_edge_link(node);
                 let was_lost = self.inner.lock().unwrap().nodes.get_mut(&node).is_some_and(|s| std::mem::replace(&mut s.lost, false));
                 if was_lost {
                     self.link_event(sink, node, "resubscribed", json!({}));
                 }
             }
+        }
+    }
+
+    fn break_edge_link(&self, node: u64) {
+        if let Some(detector) = self.inner.lock().unwrap().detectors.get_mut(&node) {
+            detector.break_link();
         }
     }
 
@@ -811,11 +822,7 @@ impl Devices {
             .filter(|node| {
                 let Some(state) = inner.nodes.get_mut(node) else { return false };
                 let healthy = !state.lost && state.silent_since_us.is_none() && state.reported_since_issue;
-                let due = healthy && now_us - state.read_all_us.unwrap_or(state.started_us) >= every;
-                if due {
-                    state.read_all_us = Some(now_us);
-                }
-                due
+                healthy && now_us - state.read_all_us.unwrap_or(state.started_us) >= every
             })
             .collect()
     }
@@ -823,8 +830,13 @@ impl Devices {
     pub async fn health_tick(&self, sink: &Sink, now_us: i64) {
         if let Some(feed) = &self.feed {
             for node in self.read_all_due(now_us) {
-                if let Err(e) = feed.device_read_all(node).await {
-                    eprintln!("device {node} read: {e}");
+                match feed.device_read_all(node).await {
+                    Ok(()) => {
+                        if let Some(state) = self.inner.lock().unwrap().nodes.get_mut(&node) {
+                            state.read_all_us = Some(now_us);
+                        }
+                    }
+                    Err(e) => eprintln!("device {node} read: {e}"),
                 }
             }
         }
@@ -854,7 +866,7 @@ impl Devices {
                     found.insert(plug.node, ts);
                     break;
                 }
-                if at.hour() * 60 + at.minute() >= plug.window.0 {
+                if at.date() == local.date() && at.hour() * 60 + at.minute() >= plug.window.0 {
                     break;
                 }
                 since = ts + 1;

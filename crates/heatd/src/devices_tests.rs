@@ -110,7 +110,7 @@ fn subscription_plans_follow_the_kind_and_the_overrides() {
     assert_eq!(plans[2].fast.as_ref().unwrap().paths, [0x005B, 0x0402, 0x0405, 0x040D, 0x042A].map(|c| (c, ANY_ATTRIBUTE)).to_vec());
     assert_eq!(plans[3], DeviceSubscription { min_s: 120, max_s: 600, fast: Some(FastSubscription { paths: PLUG_PATHS_EXPECTED.to_vec(), min_s: 2, max_s: 30 }), rest: false, events: false });
     let silent: Vec<u64> = config.devices.iter().map(|d| d.silent_after().as_secs()).collect();
-    assert_eq!(silent, vec![1800, 28800, 3600, 300]);
+    assert_eq!(silent, vec![22800, 28800, 3600, 300]);
     assert_eq!(config.devices[0].label(), "plug 9");
 }
 
@@ -325,7 +325,7 @@ fn ambient_sources_raise_the_fallback_only_on_a_real_jump_or_fall() {
     inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5100.0), NOW_MS - 20 * min);
     assert!(inner.fallback.is_none());
     inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5500.0), NOW_MS - 10 * min);
-    assert_eq!(inner.fallback, Some("sink_humidity"));
+    assert_eq!(inner.fallback.map(|f| f.0), Some("sink_humidity"));
     inner.fallback = None;
     inner.last_activity_ms = Some(NOW_MS - 11 * hour);
     for (back, ppm) in [(300, 500.0), (240, 700.0), (120, 900.0), (30, 880.0), (20, 860.0), (10, 820.0)] {
@@ -333,7 +333,7 @@ fn ambient_sources_raise_the_fallback_only_on_a_real_jump_or_fall() {
     }
     assert!(inner.fallback.is_none(), "a slow decline is no wake");
     inner.note_ambient(14, &row(14, CO2_CLUSTER, 740.0), NOW_MS);
-    assert_eq!(inner.fallback, Some("bedroom_co2"));
+    assert_eq!(inner.fallback.map(|f| f.0), Some("bedroom_co2"));
 }
 
 #[test]
@@ -465,6 +465,20 @@ async fn the_control_step_wake_signal_switches_the_coffee_plug_once() {
 }
 
 #[tokio::test]
+async fn an_evening_off_before_the_window_does_not_hide_the_morning_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mock) = setup(dir.path(), DEVICES);
+    let now = crate::storage::now_ms();
+    let scan = |ts: i64, bedtime: bool| ScanBody { ts, device: "pixel-watch".into(), id: None, label: None, aps: Vec::new(), motion: None, queued: false, power: None, away: false, bedtime: Some(bedtime), heat: None, label_id: None };
+    let hour = 3_600_000;
+    for (ago, bed) in [(9 * hour, true), (8 * hour + hour / 2, false), (8 * hour, true), (hour / 6, false)] {
+        state.storage.ingest(&scan(now - ago, bed), now - ago, None).unwrap();
+    }
+    crate::rules::control_step(&state, local("2026-11-10 06:40"), now).await.unwrap();
+    until("coffee on", || on_offs(&mock) == 1).await;
+}
+
+#[tokio::test]
 async fn plugs_get_a_rate_limited_wildcard_read_only_while_healthy() {
     let dir = tempfile::tempdir().unwrap();
     let (state, mock) = setup(dir.path(), DEVICES);
@@ -486,7 +500,10 @@ async fn plugs_get_a_rate_limited_wildcard_read_only_while_healthy() {
 #[tokio::test]
 async fn silent_devices_get_one_low_priority_line_and_backed_off_resubscribes() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, mock) = setup(dir.path(), DEVICES);
+    let (state, mock) = setup(dir.path(), &DEVICES.replacen("wake_on = true
+", "wake_on = true
+silent_after_min = 30
+", 1));
     let t0 = lake::now_us();
     let min = 60_000_000;
     for (node, text) in [(9, PLUG), (11, CLIMATE), (12, AIR)] {
@@ -729,11 +746,11 @@ fn the_real_stand_steps_of_one_hundred_milliwatts_are_noise_and_a_rise_to_point_
 }
 
 #[test]
-fn a_single_report_after_a_long_silence_is_no_edge_and_a_shallow_dip_is_no_removal() {
+fn a_single_report_after_a_long_quiet_stretch_is_the_edge_and_a_shallow_dip_is_no_removal() {
     let mut d = EdgeDetector::default();
     let idle = vec![600; 48];
     assert!(slow(&mut d, 0, &idle).is_empty());
-    assert!(slow(&mut d, 14_400 + 3_600, &[800]).is_empty(), "the previous report is an hour old");
+    assert_eq!(slow(&mut d, 14_400 + 3_600, &[800]), vec![(Edge::Rise, 18_000 * 1_000_000)], "a stand without change sends no rows, so the first report after hours is the edge");
     let mut e = EdgeDetector::default();
     assert!(slow(&mut e, 0, &idle).is_empty());
     assert!(slow(&mut e, 14_400, &[400, 600]).is_empty(), "400 mW is above half the 600 mW baseline");
@@ -819,9 +836,10 @@ nodes = [5]
 }
 
 #[test]
-fn a_gap_between_samples_updates_the_state_quietly() {
+fn a_broken_subscription_link_updates_the_state_quietly() {
     let mut d = EdgeDetector::default();
     feed(&mut d, 0, &[800.0; 40]);
+    d.break_link();
     assert!(feed(&mut d, 1200 + 1200, &[4200.0, 4200.0, 4200.0, 4200.0]).is_empty());
 }
 
