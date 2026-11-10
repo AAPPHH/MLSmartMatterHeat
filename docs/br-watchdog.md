@@ -10,7 +10,7 @@ The Thread Border Router (192.168.178.33, own USB power supply) holds the fallba
 
 ## heatd side (`crates/heatd/src/br_watchdog.rs`, config `[br_watchdog]`)
 
-Every `interval_s` (30) heatd polls the status, then sends the heartbeat only while it is healthy: the last control step is younger than `control_stale_s` (120 s) and at least one thermostat is subscribed (Unknown counts as healthy only for the first 10 minutes after start), at least one thermostat reported within `thread_silent_s` (900 s), and node count (1-8) and endpoint (1-254) fit the router limits (violation is logged once). A hung or zombie heatd therefore stops feeding the router. The token is read from `token_file` (`/secrets/br_watchdog_token` in the container, `~/MLSmartMatterHeat/secrets/br_watchdog_token` on the Minix, gitignored, mounted read-only by `compose.yaml`).
+Every `interval_s` (30) heatd polls the status, then sends the heartbeat only while heatd itself is alive: the last control step is younger than `control_stale_s` (120 s) and node count (1-8) and endpoint (1-254) fit the router limits (violation is logged once). Thermostat subscription state does not matter: a mesh that is resubscribing or silent must not make the router write 18 C everywhere, it only raises the `thread_down` alert (thread silence `thread_silent_s`, 900 s). A hung or zombie heatd stops feeding the router. The token is read from `token_file` (`/secrets/br_watchdog_token` in the container, `~/MLSmartMatterHeat/secrets/br_watchdog_token` on the Minix, gitignored, mounted read-only by `compose.yaml`).
 
 State (in `/api/state` as `br_watchdog`, lake event `br_watchdog` on every change, section "Router-Watchdog" in the daily report):
 

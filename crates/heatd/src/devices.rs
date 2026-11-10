@@ -875,11 +875,11 @@ impl Devices {
         for step in steps {
             match step {
                 WakeStep::Away { plug, day, local } => coffee_event(&state.sink, &plug, day, local, json!({"reason": "away", "ok": false})),
-                WakeStep::Attempt { plug, day, local, trigger } => {
+                WakeStep::Attempt { plug, local, trigger, .. } => {
                     if let Some(switch) = self.switch.clone() {
                         let failsafe = state.failsafe.clone();
                         let stopping: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || failsafe.stopping());
-                        tokio::spawn(wake_attempts(switch, state.sink.clone(), plug, day, local, trigger, self.wake_timing.unwrap_or_default(), stopping));
+                        tokio::spawn(wake_attempts(switch, state.sink.clone(), plug, local, trigger, self.wake_timing.unwrap_or_default(), stopping));
                     }
                 }
             }
@@ -933,7 +933,7 @@ fn coffee_event(sink: &Sink, plug: &CoffeePlug, day: NaiveDate, local: NaiveDate
     log_row("coffee event", sink.append(Event::now(kind::COFFEE_ON, SOURCE_HEATD).with_node(plug.node).with_detail(detail)));
 }
 
-pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime, trigger: String, timing: WakeTiming, stopping: Arc<dyn Fn() -> bool + Send + Sync>) {
+pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePlug, local: NaiveDateTime, trigger: String, timing: WakeTiming, stopping: Arc<dyn Fn() -> bool + Send + Sync>) {
     let started = Instant::now();
     let mut attempt = 0u32;
     let outcome = loop {
@@ -951,7 +951,7 @@ pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePl
         Ok(()) => json!({"reason": "wake", "trigger": trigger, "attempt": attempt, "ok": true}),
         Err(error) => json!({"reason": "gave_up", "trigger": trigger, "attempt": attempt, "ok": false, "error": error}),
     };
-    coffee_event(&sink, &plug, day, local, extra);
+    coffee_event(&sink, &plug, local.date(), local, extra);
 }
 
 async fn capture_loop(state: AppState, feed: Arc<dyn DeviceFeed>, config: DeviceConfig, timing: LoopTiming) {

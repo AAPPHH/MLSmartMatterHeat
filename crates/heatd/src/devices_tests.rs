@@ -397,14 +397,14 @@ async fn failed_writes_are_retried_then_given_up_and_logged() {
     let dir = tempfile::tempdir().unwrap();
     let sink = Sink::open(LakeConfig::new(dir.path().join("lake"))).unwrap();
     let plug = CoffeePlug::from_config(&config(dir.path(), DEVICES).devices[0]).unwrap();
-    let (day, at) = ("2026-11-10".parse().unwrap(), local("2026-11-10 06:41"));
+    let at = local("2026-11-10 06:41");
     let ok = mock();
     ok.fail_switch_on(2);
-    wake_attempts(ok.clone(), sink.clone(), plug.clone(), day, at, "bedtime".into(), QUICK, never()).await;
+    wake_attempts(ok.clone(), sink.clone(), plug.clone(), at, "bedtime".into(), QUICK, never()).await;
     assert_eq!(ok.write_log(), vec![("on_off_on", 9, 1.0); 3]);
     let lost = mock();
     lost.fail_switch_on(1000);
-    wake_attempts(lost.clone(), sink.clone(), plug, day, at, "bedtime".into(), QUICK, never()).await;
+    wake_attempts(lost.clone(), sink.clone(), plug, at, "bedtime".into(), QUICK, never()).await;
     let tries = lost.write_log().len();
     assert!((3..=6).contains(&tries) && lost.write_log().iter().all(|w| *w == ("on_off_on", 9, 1.0)), "{tries}");
     sink.flush().unwrap();
@@ -422,7 +422,7 @@ async fn a_stopping_heatd_starts_no_coffee_attempt() {
     let sink = Sink::open(LakeConfig::new(dir.path().join("lake"))).unwrap();
     let plug = CoffeePlug::from_config(&config(dir.path(), DEVICES).devices[0]).unwrap();
     let switch = mock();
-    wake_attempts(switch.clone(), sink.clone(), plug, "2026-11-10".parse().unwrap(), local("2026-11-10 06:41"), "bedtime".into(), QUICK, Arc::new(|| true)).await;
+    wake_attempts(switch.clone(), sink.clone(), plug, local("2026-11-10 06:41"), "bedtime".into(), QUICK, Arc::new(|| true)).await;
     assert!(switch.write_log().is_empty());
     sink.flush().unwrap();
     assert!(string_column(dir.path(), "events", "detail")[0].contains("heatd stopping"));
