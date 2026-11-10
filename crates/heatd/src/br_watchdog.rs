@@ -188,7 +188,7 @@ impl BrWatchdog {
     }
 
     pub async fn tick(&self, state: &AppState, now_us: i64) {
-        let healthy = self.valid && state.status.control_healthy(now_us, self.cfg.control_stale_s * 1_000_000, self.cfg.thread_silent_s * 1_000_000);
+        let healthy = self.valid && state.status.control_alive(now_us, self.cfg.control_stale_s * 1_000_000);
         let polled = self.poll_status().await;
         let rewrite = {
             let mut rt = self.runtime.lock().unwrap();

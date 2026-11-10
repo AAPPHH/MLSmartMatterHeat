@@ -142,7 +142,7 @@ async fn heartbeat_carries_token_contract_body_and_die_temperature_becomes_ambie
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn no_heartbeat_from_a_stale_or_blind_control_loop() {
+async fn no_heartbeat_from_a_stale_control_loop() {
     let f = fake(false);
     let url = serve_fake(f.clone()).await;
     let e = env(&url, None, lake::now_us());
@@ -152,15 +152,8 @@ async fn no_heartbeat_from_a_stale_or_blind_control_loop() {
     e.dog.tick(&e.state, now).await;
     assert!(f.lock().unwrap().heartbeats.is_empty());
     e.state.status.control_step_done(now);
-    e.state.status.subscription(5, SubState::Lost, now);
     e.dog.tick(&e.state, now).await;
     assert_eq!(f.lock().unwrap().heartbeats.len(), 1);
-    e.state.status.subscription(6, SubState::Lost, now);
-    e.dog.tick(&e.state, now).await;
-    assert_eq!(f.lock().unwrap().heartbeats.len(), 1);
-    e.state.status.subscription(6, SubState::Subscribed, now);
-    e.dog.tick(&e.state, now).await;
-    assert_eq!(f.lock().unwrap().heartbeats.len(), 2);
 }
 
 async fn tick(e: &Env, extra_s: i64) {
@@ -271,21 +264,39 @@ async fn dry_run_triggered_router_causes_no_rewrite() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn heartbeats_stop_when_all_thermostats_are_silent_or_not_subscribed() {
+async fn heartbeats_continue_for_fifteen_minutes_while_every_thermostat_resubscribes() {
     let f = fake(false);
     let url = serve_fake(f.clone()).await;
     let started = lake::now_us() - 3_600_000_000;
     let e = env(&url, None, started);
     let now = lake::now_us();
+    for node in [5, 6] {
+        e.state.status.subscription(node, SubState::Lost, now);
+        e.state.status.node_report(node, now - 30 * 60_000_000);
+    }
+    for minute in 0..15 {
+        let at = now + minute * 60_000_000;
+        e.state.status.control_step_done(at);
+        e.dog.tick(&e.state, at).await;
+    }
+    assert_eq!(f.lock().unwrap().heartbeats.len(), 15);
+    assert_eq!(state_name(&e), "thread_down");
+    assert!(e.state.status.br_alert().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn heartbeats_stop_when_the_control_loop_stalls() {
+    let f = fake(false);
+    let url = serve_fake(f.clone()).await;
+    let e = env(&url, None, lake::now_us());
+    let now = lake::now_us();
+    e.state.status.subscription(5, SubState::Subscribed, now);
     e.state.status.control_step_done(now);
     e.dog.tick(&e.state, now).await;
-    assert!(f.lock().unwrap().heartbeats.is_empty());
-    e.state.status.subscription(5, SubState::Subscribed, now);
-    e.state.status.node_report(5, now);
-    e.dog.tick(&e.state, now).await;
     assert_eq!(f.lock().unwrap().heartbeats.len(), 1);
-    e.state.status.control_step_done(now + 16 * 60_000_000);
-    e.dog.tick(&e.state, now + 16 * 60_000_000).await;
+    for minute in 3..=6 {
+        e.dog.tick(&e.state, now + minute * 60_000_000).await;
+    }
     assert_eq!(f.lock().unwrap().heartbeats.len(), 1);
 }
 

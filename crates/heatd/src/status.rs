@@ -39,7 +39,6 @@ pub struct NodeStatus {
 }
 
 const OUTDOOR_MAX_AGE_US: i64 = 6 * 3_600_000_000;
-const STARTUP_GRACE_US: i64 = 600_000_000;
 pub const DAY_US: i64 = 86_400_000_000;
 const BATTERY_KEEP_US: i64 = DAY_US;
 const BATTERY_MAX_STEP_US: i64 = 1_800_000_000;
@@ -251,12 +250,8 @@ impl Status {
         self.0.lock().unwrap().control_us = Some(ts_us);
     }
 
-    pub fn control_healthy(&self, now_us: i64, stale_us: i64, silent_us: i64) -> bool {
-        let inner = self.0.lock().unwrap();
-        let in_grace = now_us - inner.started_us <= STARTUP_GRACE_US;
-        let reachable = inner.nodes.is_empty() || inner.nodes.values().any(|n| n.state == SubState::Subscribed || (n.state == SubState::Unknown && in_grace));
-        let all_silent = !inner.nodes.is_empty() && inner.nodes.values().all(|n| now_us - n.last_report_us.unwrap_or(inner.started_us) > silent_us);
-        inner.control_us.is_some_and(|t| now_us - t <= stale_us) && reachable && !all_silent
+    pub fn control_alive(&self, now_us: i64, stale_us: i64) -> bool {
+        self.0.lock().unwrap().control_us.is_some_and(|t| now_us - t <= stale_us)
     }
 
     pub fn all_silent(&self, now_us: i64, silent_us: i64) -> bool {
