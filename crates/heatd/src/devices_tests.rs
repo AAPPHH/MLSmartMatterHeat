@@ -698,19 +698,45 @@ fn power(ts: i64, milliwatts: f64) -> DeviceReading {
 }
 
 fn feed(detector: &mut EdgeDetector, from_s: i64, milliwatts: &[f64]) -> Vec<(Edge, i64)> {
-    milliwatts.iter().enumerate().filter_map(|(i, mw)| detector.push((from_s + 30 * i as i64) * 1_000_000, mw / POWER_PER_WATT)).collect()
+    milliwatts.iter().enumerate().filter_map(|(i, mw)| detector.push((from_s + 30 * i as i64) * 1_000_000, *mw as i64)).collect()
 }
 
 #[test]
-fn a_clear_power_rise_after_a_quiet_baseline_is_one_debounced_charge_start_edge() {
+fn a_clear_power_rise_after_a_quiet_baseline_is_one_charge_start_edge_from_a_single_report() {
     let mut d = EdgeDetector::default();
     let idle: Vec<f64> = (0..40).map(|i| 750.0 + 50.0 * (i % 3) as f64).collect();
     assert!(feed(&mut d, 0, &idle).is_empty());
-    assert!(feed(&mut d, 1200, &[4200.0, 800.0, 800.0]).is_empty());
-    let edges = feed(&mut d, 1400, &[4200.0, 4300.0, 4100.0, 3900.0, 4000.0]);
-    assert_eq!(edges, vec![(Edge::Rise, 1400 * 1_000_000)]);
+    assert_eq!(feed(&mut d, 1200, &[4200.0, 800.0, 800.0]), vec![(Edge::Rise, 1200 * 1_000_000)]);
+    assert!(feed(&mut d, 1400, &[4200.0, 4300.0, 4100.0, 3900.0, 4000.0]).is_empty());
     assert!(feed(&mut d, 1600, &[3800.0; 20]).is_empty());
     assert!(feed(&mut d, 2400, &[800.0; 10]).is_empty());
+}
+
+fn slow(detector: &mut EdgeDetector, from_s: i64, milliwatts: &[i64]) -> Vec<(Edge, i64)> {
+    milliwatts.iter().enumerate().filter_map(|(i, mw)| detector.push((from_s + 300 * i as i64) * 1_000_000, *mw)).collect()
+}
+
+#[test]
+fn the_real_stand_steps_of_one_hundred_milliwatts_are_noise_and_a_rise_to_point_eight_watts_is_the_edge() {
+    let mut d = EdgeDetector::default();
+    let idle: Vec<i64> = (0..48).map(|i| if i % 5 == 0 { 700 } else { 600 }).collect();
+    assert!(slow(&mut d, 0, &idle).is_empty(), "600 and 700 mW only wobble");
+    assert!(slow(&mut d, 14_400, &[700, 600, 700]).is_empty());
+    assert_eq!(slow(&mut d, 15_300, &[800]), vec![(Edge::Rise, 15_300 * 1_000_000)]);
+    assert!(slow(&mut d, 15_600, &[800, 700, 800, 700]).is_empty(), "the exit hysteresis keeps 700 mW inside the charge");
+    assert!(slow(&mut d, 17_000, &[600, 600, 600]).is_empty());
+    assert_eq!(slow(&mut d, 17_900, &[0]), vec![(Edge::Drop, 17_900 * 1_000_000)]);
+}
+
+#[test]
+fn a_single_report_after_a_long_silence_is_no_edge_and_a_shallow_dip_is_no_removal() {
+    let mut d = EdgeDetector::default();
+    let idle = vec![600; 48];
+    assert!(slow(&mut d, 0, &idle).is_empty());
+    assert!(slow(&mut d, 14_400 + 3_600, &[800]).is_empty(), "the previous report is an hour old");
+    let mut e = EdgeDetector::default();
+    assert!(slow(&mut e, 0, &idle).is_empty());
+    assert!(slow(&mut e, 14_400, &[400, 600]).is_empty(), "400 mW is above half the 600 mW baseline");
 }
 
 #[test]
@@ -731,7 +757,7 @@ fn nothing_fires_during_warm_up_and_a_sagging_baseline_adapts() {
     let mut e = EdgeDetector::default();
     feed(&mut e, 0, &[800.0; 40]);
     feed(&mut e, 2000, &[300.0; 60]);
-    assert!((e.baseline() - 0.3).abs() < 0.2);
+    assert!((e.baseline() - 300).abs() < 200);
     assert!(feed(&mut e, 5000, &[300.0, 310.0, 290.0]).is_empty());
 }
 

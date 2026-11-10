@@ -24,21 +24,15 @@ const DAY_FILE: &str = "devices/coffee_days.json";
 const VIEW_RAW_CHARS: usize = 120;
 const GLOBAL_ATTRIBUTES: u32 = 0xFFF0;
 const POWER_ATTRIBUTE: u32 = 8;
-const POWER_PER_WATT: f64 = 1000.0;
 const LABEL_HALF_WINDOW_US: i64 = 180_000_000;
 const BASELINE_KEEP_US: i64 = 6 * 3600 * 1_000_000;
 const BASELINE_MAX_SAMPLES: usize = 720;
 const BASELINE_MEDIAN_FROM: usize = 30;
 const EDGE_MIN_SAMPLES: usize = 5;
-const EDGE_DEBOUNCE: u32 = 2;
 const EDGE_COOLDOWN_US: i64 = 600_000_000;
-const RISE_MARGIN_W: f64 = 1.0;
-const RISE_MARGIN_RATIO: f64 = 0.5;
-const DROP_RATIO: f64 = 0.4;
-const DROP_MIN_BASELINE_W: f64 = 0.3;
-const EDGE_GAP_US: i64 = 300_000_000;
+const DROP_MIN_BASELINE_MW: i64 = 300;
+const EDGE_GAP_US: i64 = 660_000_000;
 const RISE_MIN_IDLE_US: i64 = 20 * 60 * 1_000_000;
-const RISE_EXIT_RATIO: f64 = 0.5;
 const EDGE_DAY_US: i64 = 24 * 3600 * 1_000_000;
 const EDGES_PER_DAY: usize = 6;
 const MAX_RESUBSCRIBE_BACKOFF: Duration = Duration::from_secs(24 * 3600);
@@ -132,12 +126,18 @@ enum Level {
     High,
 }
 
+#[derive(Debug)]
 pub struct PresenceRule {
     role: &'static str,
     source: &'static str,
     name: &'static str,
     rise: (&'static str, &'static str),
     drop: (&'static str, &'static str),
+    rise_margin_mw: i64,
+    rise_pct: i64,
+    drop_pct: i64,
+    exit_pct: i64,
+    confirm: u32,
 }
 
 impl PresenceRule {
@@ -155,6 +155,11 @@ pub const PRESENCE_RULES: [PresenceRule; 1] = [PresenceRule {
     name: "Zahnbuerste",
     rise: ("charge_start", "zurueckgestellt, Ladestart"),
     drop: ("removed", "vom Ladestaender genommen"),
+    rise_margin_mw: 150,
+    rise_pct: 0,
+    drop_pct: 50,
+    exit_pct: 50,
+    confirm: 1,
 }];
 
 fn presence_rule(role: &str) -> Option<&'static PresenceRule> {
@@ -163,7 +168,8 @@ fn presence_rule(role: &str) -> Option<&'static PresenceRule> {
 
 #[derive(Debug)]
 struct EdgeDetector {
-    idle: VecDeque<(i64, f64)>,
+    rule: &'static PresenceRule,
+    idle: VecDeque<(i64, i64)>,
     state: Level,
     run: Option<(Level, u32, i64)>,
     last: BTreeMap<Edge, i64>,
@@ -174,14 +180,20 @@ struct EdgeDetector {
 
 impl Default for EdgeDetector {
     fn default() -> Self {
-        Self { idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new(), prev: None, idle_since: None, emitted: VecDeque::new() }
+        Self::new(&PRESENCE_RULES[0])
     }
 }
 
 impl EdgeDetector {
-    fn baseline(&self) -> f64 {
-        let mut values: Vec<f64> = self.idle.iter().map(|s| s.1).collect();
-        values.sort_by(f64::total_cmp);
+    fn new(rule: &'static PresenceRule) -> Self {
+        Self { rule, idle: VecDeque::new(), state: Level::Idle, run: None, last: BTreeMap::new(), prev: None, idle_since: None, emitted: VecDeque::new() }
+    }
+}
+
+impl EdgeDetector {
+    fn baseline(&self) -> i64 {
+        let mut values: Vec<i64> = self.idle.iter().map(|s| s.1).collect();
+        values.sort_unstable();
         if values.len() < BASELINE_MEDIAN_FROM {
             values[0]
         } else {
@@ -189,20 +201,20 @@ impl EdgeDetector {
         }
     }
 
-    fn remember(&mut self, ts: i64, watts: f64) {
-        self.idle.push_back((ts, watts));
+    fn remember(&mut self, ts: i64, milliwatts: i64) {
+        self.idle.push_back((ts, milliwatts));
         while self.idle.len() > BASELINE_MAX_SAMPLES || self.idle.front().is_some_and(|f| ts - f.0 > BASELINE_KEEP_US) {
             self.idle.pop_front();
         }
     }
 
-    fn classify(&self, watts: f64) -> Level {
+    fn classify(&self, milliwatts: i64) -> Level {
         let base = self.baseline();
-        let margin = RISE_MARGIN_W.max(base * RISE_MARGIN_RATIO);
-        let high_from = if self.state == Level::High { base + margin * RISE_EXIT_RATIO } else { base + margin };
-        if watts > high_from {
+        let margin = self.rule.rise_margin_mw.max(base * self.rule.rise_pct / 100);
+        let high_from = if self.state == Level::High { base + margin * self.rule.exit_pct / 100 } else { base + margin };
+        if milliwatts > high_from {
             Level::High
-        } else if self.idle.len() >= BASELINE_MEDIAN_FROM && base >= DROP_MIN_BASELINE_W && watts < base * DROP_RATIO {
+        } else if self.idle.len() >= BASELINE_MEDIAN_FROM && base >= DROP_MIN_BASELINE_MW && milliwatts * 100 < base * self.rule.drop_pct {
             Level::Low
         } else {
             Level::Idle
@@ -218,17 +230,17 @@ impl EdgeDetector {
         quiet && rested && self.emitted.len() < EDGES_PER_DAY
     }
 
-    fn push(&mut self, ts: i64, watts: f64) -> Option<(Edge, i64)> {
+    fn push(&mut self, ts: i64, milliwatts: i64) -> Option<(Edge, i64)> {
         let gap = self.prev.is_some_and(|p| ts - p > EDGE_GAP_US);
         self.prev = Some(ts);
         if self.idle.len() < EDGE_MIN_SAMPLES {
-            self.remember(ts, watts);
+            self.remember(ts, milliwatts);
             self.idle_since.get_or_insert(ts);
             return None;
         }
-        let class = self.classify(watts);
+        let class = self.classify(milliwatts);
         if class != Level::High {
-            self.remember(ts, watts);
+            self.remember(ts, milliwatts);
         }
         if gap {
             self.run = None;
@@ -244,7 +256,7 @@ impl EdgeDetector {
             Some((level, count, first)) if level == class => (count + 1, first),
             _ => (1, ts),
         };
-        if count < EDGE_DEBOUNCE {
+        if count < self.rule.confirm {
             self.run = Some((class, count, first));
             return None;
         }
@@ -489,7 +501,7 @@ impl Inner {
         if row.cluster != ELECTRICAL_POWER_MEASUREMENT_CLUSTER || row.attribute != POWER_ATTRIBUTE || row.kind != "attribute" {
             return None;
         }
-        let (edge, ts) = self.detectors.entry(node).or_default().push(row.ts, row.value? / POWER_PER_WATT)?;
+        let (edge, ts) = self.detectors.entry(node).or_insert_with(|| EdgeDetector::new(rule)).push(row.ts, row.value?.round() as i64)?;
         let (answer, _) = rule.answer(edge);
         Some(Label {
             ts,
