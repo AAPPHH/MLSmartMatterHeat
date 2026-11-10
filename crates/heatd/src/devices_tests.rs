@@ -48,8 +48,28 @@ fn local(text: &str) -> NaiveDateTime {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M").unwrap()
 }
 
+const NOW_MS: i64 = 1_800_000_000_000;
+
+thread_local! {
+    static ASLEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn wakes(node: u64, local_now: &str, woke: &str) -> BTreeMap<u64, i64> {
+    BTreeMap::from([(node, NOW_MS - (local(local_now) - local(woke)).num_milliseconds())])
+}
+
 fn step(d: &Devices, at: &str, sleep: bool, away: bool) -> Vec<WakeStep> {
-    d.inner.lock().unwrap().wake_step(local(at), true, sleep, away)
+    let woke = ASLEEP.with(|a| a.replace(sleep)) && !sleep;
+    let bedtime = if woke { wakes(9, at, at) } else { BTreeMap::new() };
+    d.inner.lock().unwrap().wake_step(local(at), NOW_MS, true, away, &bedtime)
+}
+
+fn plain_step(d: &Devices, at: &str, bedtime: &BTreeMap<u64, i64>) -> Vec<WakeStep> {
+    d.inner.lock().unwrap().wake_step(local(at), NOW_MS, true, false, bedtime)
+}
+
+fn trigger(steps: &[WakeStep]) -> Option<String> {
+    steps.iter().find_map(|s| if let WakeStep::Attempt { trigger, .. } = s { Some(trigger.clone()) } else { None })
 }
 
 fn attempts(steps: &[WakeStep]) -> usize {
@@ -207,7 +227,7 @@ fn wake_fires_once_per_local_day_inside_the_window() {
     assert!(fired.is_empty(), "window end is exclusive");
     assert!(step(&d, "2026-11-10 06:00", true, false).is_empty());
     let fired = step(&d, "2026-11-10 06:00", false, false);
-    let [WakeStep::Attempt { plug, day, local: at }] = fired.as_slice() else { panic!("{fired:?}") };
+    let [WakeStep::Attempt { plug, day, local: at, .. }] = fired.as_slice() else { panic!("{fired:?}") };
     assert_eq!((plug.node, plug.endpoint, plug.window_label(), day.to_string(), at.to_string()), (9, 1, "06:00-09:00".to_string(), "2026-11-10".to_string(), "2026-11-10 06:00:00".to_string()));
     assert!(step(&d, "2026-11-10 07:00", true, false).is_empty());
     assert!(step(&d, "2026-11-10 07:30", false, false).is_empty());
@@ -223,15 +243,97 @@ fn wake_fires_once_per_local_day_inside_the_window() {
 }
 
 #[test]
-fn unknown_presence_and_missing_sleep_history_never_fire() {
+fn unknown_presence_and_missing_wake_evidence_never_fire() {
     let dir = tempfile::tempdir().unwrap();
     let d = devices_of(dir.path(), DEVICES, &mock());
     let mut inner = d.inner.lock().unwrap();
-    assert!(inner.wake_step(local("2026-11-10 06:30"), false, true, false).is_empty());
-    assert!(inner.wake_step(local("2026-11-10 06:40"), true, false, false).is_empty());
-    assert!(inner.wake_step(local("2026-11-10 06:50"), false, true, false).is_empty());
-    assert!(inner.wake_step(local("2026-11-10 06:55"), false, false, false).is_empty());
+    assert!(inner.wake_step(local("2026-11-10 06:30"), NOW_MS, false, false, &wakes(9, "2026-11-10 06:30", "2026-11-10 06:20")).is_empty());
+    assert!(inner.wake_step(local("2026-11-10 06:40"), NOW_MS, true, false, &BTreeMap::new()).is_empty());
     assert!(inner.done.is_empty());
+}
+
+#[test]
+fn a_late_flushed_wake_fires_after_a_restart_while_its_time_and_now_are_in_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = devices_of(dir.path(), DEVICES, &mock());
+    let restarted = devices_of(dir.path(), DEVICES, &mock());
+    drop(first);
+    assert!(plain_step(&restarted, "2026-11-10 06:50", &wakes(9, "2026-11-10 06:50", "2026-11-10 05:40")).is_empty(), "woke before the window");
+    assert!(plain_step(&restarted, "2026-11-10 09:10", &wakes(9, "2026-11-10 09:10", "2026-11-10 08:30")).is_empty(), "now after the window");
+    let fired = plain_step(&restarted, "2026-11-10 06:50", &wakes(9, "2026-11-10 06:50", "2026-11-10 06:20"));
+    assert_eq!(trigger(&fired).as_deref(), Some("bedtime"));
+    assert!(plain_step(&restarted, "2026-11-10 06:51", &wakes(9, "2026-11-10 06:51", "2026-11-10 06:20")).is_empty());
+    let again = devices_of(dir.path(), DEVICES, &mock());
+    assert!(plain_step(&again, "2026-11-10 06:52", &wakes(9, "2026-11-10 06:52", "2026-11-10 06:20")).is_empty(), "the marker survives");
+}
+
+#[test]
+fn a_manual_on_in_the_window_marks_the_day_done_but_a_priming_report_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = devices_of(dir.path(), DEVICES, &mock());
+    let at = local("2026-11-10 06:30");
+    d.inner.lock().unwrap().note_onoff(9, true, at);
+    assert!(d.inner.lock().unwrap().done.is_empty());
+    d.inner.lock().unwrap().note_onoff(9, false, at);
+    d.inner.lock().unwrap().note_onoff(9, true, local("2026-11-10 05:00"));
+    assert!(d.inner.lock().unwrap().done.is_empty());
+    d.inner.lock().unwrap().note_onoff(9, false, at);
+    d.inner.lock().unwrap().note_onoff(9, true, at);
+    assert!(plain_step(&d, "2026-11-10 06:40", &wakes(9, "2026-11-10 06:40", "2026-11-10 06:35")).is_empty());
+    assert_eq!(std::fs::read_to_string(dir.path().join(DAY_FILE)).unwrap(), r#"{"9":"2026-11-10"}"#);
+}
+
+#[test]
+fn the_first_morning_activity_after_four_quiet_hours_wakes_the_coffee_without_the_watch() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = devices_of(dir.path(), DEVICES, &mock());
+    let none = BTreeMap::new();
+    let hour = 3_600_000;
+    d.inner.lock().unwrap().started_ms = NOW_MS - 12 * hour;
+    d.inner.lock().unwrap().note_activity("toothbrush", NOW_MS - 7 * hour);
+    assert!(plain_step(&d, "2026-11-10 05:30", &none).is_empty(), "outside the window");
+    d.inner.lock().unwrap().note_activity("sink_humidity", NOW_MS - hour);
+    d.inner.lock().unwrap().fallback = None;
+    d.inner.lock().unwrap().note_activity("toothbrush", NOW_MS - 30 * 60_000);
+    assert!(plain_step(&d, "2026-11-10 06:30", &none).is_empty(), "an activity half an hour after another is no wake");
+    d.inner.lock().unwrap().last_activity_ms = Some(NOW_MS - 5 * hour);
+    d.inner.lock().unwrap().note_activity("bedroom_co2", NOW_MS);
+    assert_eq!(trigger(&plain_step(&d, "2026-11-10 06:30", &none)).as_deref(), Some("fallback:bedroom_co2"));
+    assert!(plain_step(&d, "2026-11-10 06:31", &none).is_empty());
+    let away = devices_of(dir.path(), DEVICES, &mock());
+    away.inner.lock().unwrap().started_ms = NOW_MS - 12 * hour;
+    away.inner.lock().unwrap().note_activity("toothbrush", NOW_MS);
+    let skipped = away.inner.lock().unwrap().wake_step(local("2026-11-11 06:40"), NOW_MS, true, true, &none);
+    assert!(matches!(skipped.as_slice(), [WakeStep::Away { .. }]));
+}
+
+#[test]
+fn ambient_sources_raise_the_fallback_only_on_a_real_jump_or_fall() {
+    let dir = tempfile::tempdir().unwrap();
+    let devices = format!("{DEVICES}[[devices]]\nnode = 14\nkind = 'air'\nrole = 'air'\nroom = 'a'\n");
+    let mut config = config(dir.path(), &devices);
+    config.sleep_room = Some("a".into());
+    let mock = mock();
+    let d = Devices::new(&config, mock.clone(), mock);
+    let row = |node: u64, cluster: u32, value: f64| DeviceReading { ts: 0, node, endpoint: 1, cluster, attribute: 0, kind: "attribute".into(), name: String::new(), value: Some(value), raw: String::new(), source: String::new() };
+    let min = 60_000;
+    let hour = 60 * min;
+    let mut inner = d.inner.lock().unwrap();
+    inner.started_ms = NOW_MS - 12 * hour;
+    inner.last_activity_ms = Some(NOW_MS - 11 * hour);
+    inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5000.0), NOW_MS - 30 * min);
+    inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5100.0), NOW_MS - 20 * min);
+    assert!(inner.fallback.is_none());
+    inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5500.0), NOW_MS - 10 * min);
+    assert_eq!(inner.fallback, Some("sink_humidity"));
+    inner.fallback = None;
+    inner.last_activity_ms = Some(NOW_MS - 11 * hour);
+    for (back, ppm) in [(300, 500.0), (240, 700.0), (120, 900.0), (30, 880.0), (20, 860.0), (10, 820.0)] {
+        inner.note_ambient(14, &row(14, CO2_CLUSTER, ppm), NOW_MS - back * min);
+    }
+    assert!(inner.fallback.is_none(), "a slow decline is no wake");
+    inner.note_ambient(14, &row(14, CO2_CLUSTER, 740.0), NOW_MS);
+    assert_eq!(inner.fallback, Some("bedroom_co2"));
 }
 
 #[test]
@@ -298,11 +400,11 @@ async fn failed_writes_are_retried_then_given_up_and_logged() {
     let (day, at) = ("2026-11-10".parse().unwrap(), local("2026-11-10 06:41"));
     let ok = mock();
     ok.fail_switch_on(2);
-    wake_attempts(ok.clone(), sink.clone(), plug.clone(), day, at, QUICK, never()).await;
+    wake_attempts(ok.clone(), sink.clone(), plug.clone(), day, at, "bedtime".into(), QUICK, never()).await;
     assert_eq!(ok.write_log(), vec![("on_off_on", 9, 1.0); 3]);
     let lost = mock();
     lost.fail_switch_on(1000);
-    wake_attempts(lost.clone(), sink.clone(), plug, day, at, QUICK, never()).await;
+    wake_attempts(lost.clone(), sink.clone(), plug, day, at, "bedtime".into(), QUICK, never()).await;
     let tries = lost.write_log().len();
     assert!((3..=6).contains(&tries) && lost.write_log().iter().all(|w| *w == ("on_off_on", 9, 1.0)), "{tries}");
     sink.flush().unwrap();
@@ -320,7 +422,7 @@ async fn a_stopping_heatd_starts_no_coffee_attempt() {
     let sink = Sink::open(LakeConfig::new(dir.path().join("lake"))).unwrap();
     let plug = CoffeePlug::from_config(&config(dir.path(), DEVICES).devices[0]).unwrap();
     let switch = mock();
-    wake_attempts(switch.clone(), sink.clone(), plug, "2026-11-10".parse().unwrap(), local("2026-11-10 06:41"), QUICK, Arc::new(|| true)).await;
+    wake_attempts(switch.clone(), sink.clone(), plug, "2026-11-10".parse().unwrap(), local("2026-11-10 06:41"), "bedtime".into(), QUICK, Arc::new(|| true)).await;
     assert!(switch.write_log().is_empty());
     sink.flush().unwrap();
     assert!(string_column(dir.path(), "events", "detail")[0].contains("heatd stopping"));
@@ -422,8 +524,12 @@ async fn nothing_but_one_on_command_ever_reaches_the_devices() {
         lake_rows(dir.path(), "device_readings") == ROWS
     })
     .await;
-    for (at, sleeping) in [("2026-11-10 05:00", true), ("2026-11-10 06:40", false), ("2026-11-10 06:50", true), ("2026-11-10 07:10", false), ("2026-11-10 23:00", true), ("2026-11-11 03:00", false)] {
-        state.devices.on_control(&state, local(at), true, sleeping, false);
+    state.devices.inner.lock().unwrap().started_ms -= 12 * 3600 * 1000;
+    for at in ["2026-11-10 05:00", "2026-11-10 06:40", "2026-11-10 07:10", "2026-11-10 23:00", "2026-11-11 03:00"] {
+        if at == "2026-11-10 06:40" {
+            state.devices.inner.lock().unwrap().note_activity("toothbrush", crate::storage::now_ms());
+        }
+        state.devices.on_control(&state, local(at), crate::storage::now_ms(), true, false);
     }
     until("coffee on", || on_offs(&mock) == 1).await;
     state.devices.health_tick(&state.sink, lake::now_us() + 10 * 3600 * 1_000_000).await;

@@ -234,6 +234,15 @@ impl Storage {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    pub fn bedtime_wake(&self, device: &str, since_ms: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT epoch_ms(ts) FROM (SELECT ts, received_at, bedtime, max(CASE WHEN bedtime THEN 1 ELSE 0 END) OVER (ORDER BY ts, received_at ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS seen              FROM device_state WHERE device = ? AND bedtime IS NOT NULL AND ts >= epoch_ms(?)) WHERE NOT bedtime AND seen = 1 ORDER BY ts, received_at LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![device, since_ms], |r| r.get::<_, i64>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn device_statuses(&self) -> Result<Vec<DeviceStatus>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -387,5 +396,30 @@ mod tests {
         assert_eq!((n, bssid.as_str()), (4, "aa:bb:cc:00:00:01"));
         let ids: i64 = copy.query_row("SELECT count(DISTINCT scan_id) FROM scans", [], |r| r.get(0)).unwrap();
         assert_eq!(ids, 2);
+    }
+
+    #[test]
+    fn bedtime_wake_is_the_first_awake_row_after_a_sleep_row_whatever_the_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("live.duckdb").to_str().unwrap()).unwrap();
+        let post = |ts: i64, received: i64, bedtime: Option<bool>| {
+            let mut scan = sample_scan(None);
+            scan.aps.clear();
+            scan.device = "pixel-watch".into();
+            scan.ts = ts;
+            scan.bedtime = bedtime;
+            storage.ingest(&scan, received, None).unwrap();
+        };
+        post(500, 600, Some(false));
+        assert_eq!(storage.bedtime_wake("pixel-watch", 0).unwrap(), None);
+        post(1_000, 90_000, Some(true));
+        post(2_000, 90_000, None);
+        assert_eq!(storage.bedtime_wake("pixel-watch", 0).unwrap(), None);
+        post(5_000, 90_001, Some(false));
+        post(3_000, 90_001, Some(false));
+        post(9_000, 90_002, Some(true));
+        assert_eq!(storage.bedtime_wake("pixel-watch", 0).unwrap(), Some(3_000));
+        assert_eq!(storage.bedtime_wake("pixel-watch", 3_001).unwrap(), None);
+        assert_eq!(storage.bedtime_wake("other", 0).unwrap(), None);
     }
 }

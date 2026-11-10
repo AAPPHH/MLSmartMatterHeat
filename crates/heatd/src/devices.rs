@@ -1,10 +1,10 @@
-use crate::boost::WakeEdge;
 use crate::config::{parse_minutes, Config, Room};
 use crate::http::AppState;
 use crate::lake::{self, kind, DeviceReading, Event, Label, Sink};
+use crate::storage::Motion;
 use crate::report::{dur, hhmm, midnight_us, open_lake, rows};
 use anyhow::{anyhow, bail, Result};
-use chrono::{NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Duration as Span, NaiveDate, NaiveDateTime, Timelike};
 use matter_controller::{
     CaptureItem, ANY_ATTRIBUTE, DeviceFeed, DeviceSubscription, FastSubscription, SwitchOn, TypedValue, AIR_QUALITY_CLUSTER, CO2_CLUSTER, ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER, ELECTRICAL_POWER_MEASUREMENT_CLUSTER,
     HUMIDITY_MEASUREMENT_CLUSTER, ON_OFF_CLUSTER, PM25_CLUSTER, POWER_SOURCE_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER,
@@ -67,6 +67,16 @@ const PLUG_PATHS: [(u32, u32); 5] = [
     (ELECTRICAL_POWER_MEASUREMENT_CLUSTER, 0x0004),
     (ELECTRICAL_ENERGY_MEASUREMENT_CLUSTER, 0x0001),
 ];
+const QUIET_BEFORE_WAKE_MS: i64 = 4 * 3600 * 1000;
+const NIGHT_START_HOUR: u32 = 18;
+const BEDTIME_SEARCHES: usize = 4;
+const HUMIDITY_JUMP: f64 = 300.0;
+const HUMIDITY_SPAN_MS: i64 = 20 * 60 * 1000;
+const CO2_FALL_PPM: f64 = 60.0;
+const CO2_FALL_SPAN_MS: i64 = 15 * 60 * 1000;
+const CO2_NIGHT_RISE_PPM: f64 = 200.0;
+const CO2_KEEP_MS: i64 = 8 * 3600 * 1000;
+const WATCH_MOTION_FRESH_MS: i64 = 10 * 60 * 1000;
 const READ_ALL_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 impl DeviceKind {
@@ -421,7 +431,7 @@ impl Default for LoopTiming {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WakeStep {
-    Attempt { plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime },
+    Attempt { plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime, trigger: String },
     Away { plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime },
 }
 
@@ -458,7 +468,13 @@ struct NodeState {
 struct Inner {
     configs: Vec<DeviceConfig>,
     nodes: BTreeMap<u64, NodeState>,
-    edge: WakeEdge,
+    started_ms: i64,
+    sleep_room: Option<String>,
+    last_activity_ms: Option<i64>,
+    fallback: Option<&'static str>,
+    on: BTreeMap<u64, bool>,
+    humidity: BTreeMap<u64, (i64, f64)>,
+    co2: BTreeMap<u64, VecDeque<(i64, f64)>>,
     done: BTreeMap<u64, NaiveDate>,
     away_logged: BTreeMap<u64, NaiveDate>,
     day_file: Option<PathBuf>,
@@ -503,17 +519,62 @@ impl Inner {
         }
     }
 
-    fn wake_step(&mut self, local: NaiveDateTime, presence_known: bool, sleep: bool, away: bool) -> Vec<WakeStep> {
-        if !presence_known || !self.edge.advance(sleep) {
+    fn candidates(&self, local: NaiveDateTime) -> Vec<CoffeePlug> {
+        let day = local.date();
+        self.configs.iter().filter_map(CoffeePlug::from_config).filter(|p| p.in_window(local) && self.done.get(&p.node) != Some(&day)).collect()
+    }
+
+    fn note_activity(&mut self, source: &'static str, now_ms: i64) {
+        let quiet = now_ms - self.last_activity_ms.unwrap_or(self.started_ms) >= QUIET_BEFORE_WAKE_MS;
+        if quiet && self.fallback.is_none() {
+            self.fallback = Some(source);
+        }
+        self.last_activity_ms = Some(now_ms);
+    }
+
+    fn note_onoff(&mut self, node: u64, on: bool, local: NaiveDateTime) {
+        let before = self.on.insert(node, on);
+        let Some(plug) = self.configs.iter().filter_map(CoffeePlug::from_config).find(|p| p.node == node) else { return };
+        if on && before == Some(false) && plug.in_window(local) && self.done.insert(node, local.date()) != Some(local.date()) {
+            self.persist();
+        }
+    }
+
+    fn note_ambient(&mut self, node: u64, row: &DeviceReading, now_ms: i64) {
+        let (Some(config), Some(value)) = (self.configs.iter().find(|c| c.node == node), row.value) else { return };
+        if row.kind != "attribute" || row.attribute != 0 {
+            return;
+        }
+        let (role, room) = (config.role.clone(), config.room.clone());
+        if row.cluster == HUMIDITY_MEASUREMENT_CLUSTER && role == "sink" {
+            let jumped = self.humidity.insert(node, (now_ms, value)).is_some_and(|(t, v)| now_ms - t <= HUMIDITY_SPAN_MS && value - v >= HUMIDITY_JUMP);
+            if jumped {
+                self.note_activity("sink_humidity", now_ms);
+            }
+        } else if row.cluster == CO2_CLUSTER && room.is_some() && room == self.sleep_room {
+            let samples = self.co2.entry(node).or_default();
+            samples.push_back((now_ms, value));
+            while samples.front().is_some_and(|s| now_ms - s.0 > CO2_KEEP_MS) {
+                samples.pop_front();
+            }
+            let recent = samples.iter().find(|s| now_ms - s.0 <= CO2_FALL_SPAN_MS).map_or(value, |s| s.1);
+            let (high, low) = samples.iter().fold((f64::MIN, f64::MAX), |(h, l), s| (h.max(s.1), l.min(s.1)));
+            if recent - value >= CO2_FALL_PPM && high - low >= CO2_NIGHT_RISE_PPM {
+                self.note_activity("bedroom_co2", now_ms);
+            }
+        }
+    }
+
+    fn wake_step(&mut self, local: NaiveDateTime, now_ms: i64, presence_known: bool, away: bool, bedtime: &BTreeMap<u64, i64>) -> Vec<WakeStep> {
+        let fallback = self.fallback.take();
+        if !presence_known {
             return Vec::new();
         }
         let day = local.date();
-        let plugs: Vec<CoffeePlug> = self.configs.iter().filter_map(CoffeePlug::from_config).filter(|p| p.in_window(local)).collect();
         let mut steps = Vec::new();
-        for plug in plugs {
-            if self.done.get(&plug.node) == Some(&day) {
-                continue;
-            }
+        for plug in self.candidates(local) {
+            let from_bed = bedtime.get(&plug.node).filter(|ts| plug.in_window(local_of(local, now_ms, **ts))).map(|_| "bedtime".to_string());
+            let Some(trigger) = from_bed.or_else(|| fallback.map(|f| format!("fallback:{f}"))) else { continue };
             if away {
                 if self.away_logged.insert(plug.node, day) != Some(day) {
                     steps.push(WakeStep::Away { plug, day, local });
@@ -521,7 +582,7 @@ impl Inner {
                 continue;
             }
             self.done.insert(plug.node, day);
-            steps.push(WakeStep::Attempt { plug, day, local });
+            steps.push(WakeStep::Attempt { plug, day, local, trigger });
         }
         if steps.iter().any(|s| matches!(s, WakeStep::Attempt { .. })) {
             self.persist();
@@ -591,6 +652,16 @@ pub fn reading_of(item: &CaptureItem, ts: i64) -> Option<DeviceReading> {
     }
 }
 
+fn local_of(local: NaiveDateTime, now_ms: i64, ts_ms: i64) -> NaiveDateTime {
+    local - Span::milliseconds(now_ms - ts_ms)
+}
+
+fn night_start_ms(local: NaiveDateTime, now_ms: i64) -> i64 {
+    let today = local.date().and_hms_opt(NIGHT_START_HOUR, 0, 0).unwrap_or(local);
+    let start = if today > local { today - Span::days(1) } else { today };
+    now_ms - (local - start).num_milliseconds()
+}
+
 fn log_row(what: &str, result: Result<()>) {
     if let Err(e) = result {
         eprintln!("{what}: {e:#}");
@@ -607,7 +678,7 @@ impl Devices {
             .map(|days| days.into_iter().filter_map(|(n, d)| Some((n.parse().ok()?, d.parse().ok()?))).collect())
             .unwrap_or_default();
         let nodes = config.devices.iter().map(|d| (d.node, NodeState { started_us: now_us, issued_us: now_us, retry_start_s: d.retry_start_s(), retry_s: d.retry_start_s(), ..Default::default() })).collect();
-        let inner = Inner { configs: config.devices.clone(), nodes, done, day_file: Some(day_file), ..Default::default() };
+        let inner = Inner { configs: config.devices.clone(), nodes, done, day_file: Some(day_file), started_ms: now_us / 1000, sleep_room: config.sleep_room.clone(), ..Default::default() };
         Self { inner: Arc::new(Mutex::new(inner)), feed: Some(feed), switch: Some(switch), wake_timing: None }
     }
 
@@ -627,7 +698,19 @@ impl Devices {
             CaptureItem::Attribute(_) | CaptureItem::Event(_) => {
                 let Some(row) = reading_of(&item, now_us).filter(|r| r.node == node) else { return };
                 let recovered = self.inner.lock().unwrap().report(node, std::slice::from_ref(&row), now_us);
-                let label = self.inner.lock().unwrap().edge_label(node, &row);
+                let label = {
+                    let mut inner = self.inner.lock().unwrap();
+                    let now_ms = now_us / 1000;
+                    if row.cluster == ON_OFF_CLUSTER && row.attribute == 0 && row.kind == "attribute" {
+                        inner.note_onoff(node, row.value == Some(1.0), chrono::Local::now().naive_local());
+                    }
+                    inner.note_ambient(node, &row, now_ms);
+                    let label = inner.edge_label(node, &row);
+                    if label.is_some() {
+                        inner.note_activity("toothbrush", now_ms);
+                    }
+                    label
+                };
                 log_row("device reading", sink.append(row));
                 if let Some(label) = label {
                     log_row("presence label", sink.append(label));
@@ -746,16 +829,45 @@ impl Devices {
         }
     }
 
-    pub fn on_control(&self, state: &AppState, now: NaiveDateTime, presence_known: bool, sleep: bool, away: bool) {
-        let steps = self.inner.lock().unwrap().wake_step(now, presence_known, sleep, away);
+    fn bedtime_wakes(&self, state: &AppState, plugs: &[CoffeePlug], local: NaiveDateTime, now_ms: i64) -> BTreeMap<u64, i64> {
+        let Ok(statuses) = state.storage.device_statuses() else { return BTreeMap::new() };
+        let mut found = BTreeMap::new();
+        for plug in plugs {
+            let mut since = night_start_ms(local, now_ms);
+            for _ in 0..BEDTIME_SEARCHES {
+                let wakes: Vec<i64> = statuses.iter().filter_map(|s| state.storage.bedtime_wake(&s.device, since).ok().flatten()).collect();
+                let Some(ts) = wakes.iter().copied().min() else { break };
+                let at = local_of(local, now_ms, ts);
+                if plug.in_window(at) {
+                    found.insert(plug.node, ts);
+                    break;
+                }
+                if at.hour() * 60 + at.minute() >= plug.window.0 {
+                    break;
+                }
+                since = ts + 1;
+            }
+        }
+        found
+    }
+
+    pub fn on_control(&self, state: &AppState, now: NaiveDateTime, now_ms: i64, presence_known: bool, away: bool) {
+        if let Ok(statuses) = state.storage.device_statuses() {
+            if statuses.iter().any(|s| s.motion == Some(Motion::Moving) && s.bedtime != Some(true) && now_ms - s.state_ts <= WATCH_MOTION_FRESH_MS) {
+                self.inner.lock().unwrap().note_activity("watch_motion", now_ms);
+            }
+        }
+        let plugs = self.inner.lock().unwrap().candidates(now);
+        let bedtime = if plugs.is_empty() { BTreeMap::new() } else { self.bedtime_wakes(state, &plugs, now, now_ms) };
+        let steps = self.inner.lock().unwrap().wake_step(now, now_ms, presence_known, away, &bedtime);
         for step in steps {
             match step {
                 WakeStep::Away { plug, day, local } => coffee_event(&state.sink, &plug, day, local, json!({"reason": "away", "ok": false})),
-                WakeStep::Attempt { plug, day, local } => {
+                WakeStep::Attempt { plug, day, local, trigger } => {
                     if let Some(switch) = self.switch.clone() {
                         let failsafe = state.failsafe.clone();
                         let stopping: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || failsafe.stopping());
-                        tokio::spawn(wake_attempts(switch, state.sink.clone(), plug, day, local, self.wake_timing.unwrap_or_default(), stopping));
+                        tokio::spawn(wake_attempts(switch, state.sink.clone(), plug, day, local, trigger, self.wake_timing.unwrap_or_default(), stopping));
                     }
                 }
             }
@@ -809,7 +921,7 @@ fn coffee_event(sink: &Sink, plug: &CoffeePlug, day: NaiveDate, local: NaiveDate
     log_row("coffee event", sink.append(Event::now(kind::COFFEE_ON, SOURCE_HEATD).with_node(plug.node).with_detail(detail)));
 }
 
-pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime, timing: WakeTiming, stopping: Arc<dyn Fn() -> bool + Send + Sync>) {
+pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePlug, day: NaiveDate, local: NaiveDateTime, trigger: String, timing: WakeTiming, stopping: Arc<dyn Fn() -> bool + Send + Sync>) {
     let started = Instant::now();
     let mut attempt = 0u32;
     let outcome = loop {
@@ -824,8 +936,8 @@ pub async fn wake_attempts(switch: Arc<dyn SwitchOn>, sink: Sink, plug: CoffeePl
         }
     };
     let extra = match outcome {
-        Ok(()) => json!({"reason": "wake", "attempt": attempt, "ok": true}),
-        Err(error) => json!({"reason": "gave_up", "attempt": attempt, "ok": false, "error": error}),
+        Ok(()) => json!({"reason": "wake", "trigger": trigger, "attempt": attempt, "ok": true}),
+        Err(error) => json!({"reason": "gave_up", "trigger": trigger, "attempt": attempt, "ok": false, "error": error}),
     };
     coffee_event(&sink, &plug, day, local, extra);
 }
@@ -936,7 +1048,13 @@ pub fn report_section(root: &Path, date: NaiveDate) -> Result<String> {
         let d: Value = detail.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null);
         let who = node.map_or(String::new(), |n| format!(" (Node {n})"));
         let line = match d["reason"].as_str() {
-            Some("wake") => format!("um {} UTC eingeschaltet, Schlafmodus der Uhr endete {} Ortszeit, Versuch {}", hhmm(*us), d["local_time"].as_str().unwrap_or("?"), d["attempt"]),
+            Some("wake") => {
+                let cause = match d["trigger"].as_str() {
+                    Some("bedtime") | None => "Schlafmodus der Uhr endete".to_string(),
+                    Some(other) => format!("Ausloeser {other}"),
+                };
+                format!("um {} UTC eingeschaltet, {cause} {} Ortszeit, Versuch {}", hhmm(*us), d["local_time"].as_str().unwrap_or("?"), d["attempt"])
+            }
             Some("gave_up") => format!("Einschalten fehlgeschlagen nach {} Versuchen ({}), fuer heute aufgegeben", d["attempt"], d["error"].as_str().unwrap_or("?")),
             Some("away") => "nicht eingeschaltet, Haus war abwesend".to_string(),
             other => other.unwrap_or("?").to_string(),
