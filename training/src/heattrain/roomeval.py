@@ -242,10 +242,11 @@ def tuned_trials(fold, full, docs, truth, rc, house):
     return recs[0], recs[gi], lw, lj, resets[gi], tuning
 
 
-def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=None):
+def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=None, shock=None):
     skill = Skill(list(ff.rfs[next(iter(ff.rfs))].Hs), rc["eval"]["floor"])
     wparts, resets, per_fold = [], 0, []
     for f in folds:
+        f = dict(f, shock=shock_defaults(rc, **shock)) if shock else f
         cal = None
         if "air" in parts and variants.sensor_start is not None and f["cut"] > variants.sensor_start:
             ref_docs = f["docs0"]
@@ -274,11 +275,14 @@ def rolling_origin(full, ff, variants, truth, rc, house):
     for f in folds:
         warm = run_fold(f, full, ff, truth, rc, warm)
     sensor = [f for f in folds if f["sensor"]]
-    ev = lambda fs, parts=(), effort=None: evaluate_variant(fs, full, ff, variants, truth, rc, house, parts, effort)
+    ev = lambda fs, parts=(), effort=None, shock=None: evaluate_variant(fs, full, ff, variants, truth, rc, house, parts, effort, shock)
     out = {"trv": ev(folds)}
     sel = rc["evidence"]["select"]
     if not sel["enabled"]:
         return folds, out, {"parts": ["air", "gas"], "effort": rc["evidence"]["effort"]}
+    for i, sh in enumerate(rc["eval"]["shock_variants"]):
+        out[f"shock_{i}"] = ev(folds, shock=sh)
+        out[f"shock_{i}"]["shock_fixed"] = sh
     cands = [(f"effort_{e['sigma']}_{e['steady_u']}", folds, "trv", (), e) for e in sel["effort"]]
     if sensor:
         out["trv_sensor"] = ev(sensor)
@@ -333,7 +337,7 @@ def fit_bundle(config, rooms, src, version=None):
     house_out = dict(house, night_hours=cfg["night_hours"], timezone=cfg["timezone"])
     bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out}
     pooled = {k: v for k, v in hold["trv"]["skill"]["pooled"].items()}
-    holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}} for k, v in hold.items()}, "chosen": chosen}
+    holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
     report = {"version": version, "flags": flags_all, "holdout": holdout, "criteria": criteria(rc, hold, by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,

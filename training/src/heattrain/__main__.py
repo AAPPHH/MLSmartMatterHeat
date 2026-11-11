@@ -56,7 +56,8 @@ CONFIG = {
                   "grid": {"q_calm": [0.003, 0.01, 0.03], "q_jump": [0.3, 0.5, 0.8, 1.2], "p_jump": [3e-5, 1e-4, 3e-4, 1e-3], "tau_l": [30.0, 60.0, 90.0, 180.0]},
                   "label": {"fa_cost": 20.0, "event_weight": 15.0, "pw_floor": 0.02},
                   "lambda_w_grid": [1.5, 2.0, 2.5, 3.0], "hit_min": 20, "pad_min": 30, "fa_weight": 1.0},
-        "eval": {"folds": [0.45, 0.6, 0.75], "sensor_split": 0.5, "min_sensor_min": 600, "warm_days": 3, "floor": 0.5 / 12 ** 0.5, "decay_lam": True, "pw_flag": 0.5, "min_episode_min": 5},
+        "eval": {"folds": [0.45, 0.6, 0.75], "sensor_split": 0.5, "min_sensor_min": 600, "warm_days": 3, "floor": 0.5 / 12 ** 0.5, "decay_lam": True, "pw_flag": 0.5, "min_episode_min": 5,
+                 "shock_variants": [{"q_calm": 0.003, "p_jump": 3e-4, "q_jump": 0.8, "tau_l": 90.0}]},
         "criteria": {"s1_h20": 0.08, "s1_h60": 0.10, "s2": 0.5, "s2_stretch": 0.2, "s4_resets": 20},
         "house": {"p_up": 0.02, "p_down": 0.001, "p_supply0": 0.95, "r_grid": 0.25 / 12.0, "reset_gap_min": 240.0, "reset_sigma": 8.0, "reset_n": 3, "boost_c": 24.0, "balance_seed": 1, "trv_grid": 0.5, "trv_floor": 0.25},
         "evidence": {"air": {"noise": 0.15, "offset": 0.0, "min_pairs": 60}, "effort": {"sigma": 0.06, "steady_u": 0.05},
@@ -133,7 +134,7 @@ def run_thermal(config, src, models_dir):
 
 def run_roommodel(config, src, models_dir):
     out, bundle, report = roommodel(config, src, models_dir)
-    print(out, {h: round(v["skill"], 3) for h, v in report["holdout"]["pooled"].items() if "skill" in v}, report["resets"], report["flags"])
+    print(out, {h: round(v["skill"], 3) for h, v in report["holdout"]["pooled"].items() if "skill" in v}, report["resets"], {k: v["pass"] for k, v in report["criteria"].items()}, report["flags"])
 
 
 def run_boiler(config, src, out_dir):
