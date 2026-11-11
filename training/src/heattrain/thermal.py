@@ -11,6 +11,7 @@ import pyarrow.ipc as ipc
 from scipy.optimize import least_squares
 
 TEMP, DEMAND, SETPOINT, MODE = 0, 8, 18, 28
+DEV_TEMP, DEV_RH, DEV_CO2 = 0x0402, 0x0405, 0x040D
 HEATING_CLUSTER = 513
 
 
@@ -122,6 +123,49 @@ def load_lake(path, exclude=("legacy",)):
     return tuple(merge_rows(*(x[i] for x in parts)) for i in range(3))
 
 
+def load_devices(path):
+    p = Path(path)
+    rows = []
+    t = read_arrows(p, "device_readings")
+    if t is not None:
+        c = {n: t.column(n).to_pylist() for n in ("node", "cluster", "attribute", "value")}
+        ts = epoch(t.column("ts").to_pylist())
+        rows += [(ts[i], c["node"][i], c["cluster"][i], float(c["value"][i])) for i in range(t.num_rows) if c["attribute"][i] == 0 and c["cluster"][i] in (DEV_TEMP, DEV_RH, DEV_CO2) and c["value"][i] is not None]
+    base = p / "parquet" / "device_readings"
+    if base.is_dir() and any(base.rglob("part.parquet")):
+        sql = f"SELECT epoch(ts), node, cluster, value FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true) WHERE attribute = 0 AND cluster IN ({DEV_TEMP},{DEV_RH},{DEV_CO2}) AND value IS NOT NULL"
+        rows += [(float(a), int(b), int(c), float(d)) for a, b, c, d in duckdb.connect().execute(sql).fetchall()]
+    return sorted(merge_rows(rows))
+
+
+def device_ext(devices, nodes, grid, bad, cfg):
+    by = {}
+    for ts, node, cluster, v in devices:
+        if node in nodes:
+            by.setdefault((node, cluster), []).append((ts, v))
+    by = {k: tuple(np.array(x) for x in zip(*sorted(v))) for k, v in by.items()}
+    dt, n = cfg["dt_s"], len(grid)
+    held = lambda key, scale: np.where(stale_mask(grid, by[key][0], cfg["device_stale_s"]), np.nan, ffill_at(by[key][0], by[key][1] / scale, grid))
+    ext = {"ya": [], "co2": np.full(n, np.nan), "rh": np.full(n, np.nan), "th": np.full(n, np.nan), "nodes": {"air": [], "co2": None, "hum": None}}
+    for node in sorted(nodes):
+        if (node, DEV_TEMP) in by:
+            t, v = by[(node, DEV_TEMP)]
+            v = v / 100.0
+            ok = (v > cfg["temp_valid"][0]) & (v < cfg["temp_valid"][1])
+            arr = np.full(n, np.nan)
+            arr[np.clip(np.rint((t[ok] - grid[0]) / dt).astype(int), 0, n - 1)] = v[ok]
+            arr[bad] = np.nan
+            if np.isfinite(arr).any():
+                ext["ya"].append(arr)
+                ext["nodes"]["air"].append(node)
+    for node in sorted(nodes):
+        if ext["nodes"]["co2"] is None and (node, DEV_CO2) in by:
+            ext["co2"], ext["nodes"]["co2"] = held((node, DEV_CO2), 1.0), node
+        if ext["nodes"]["hum"] is None and (node, DEV_RH) in by and (node, DEV_TEMP) in by:
+            ext["rh"], ext["th"], ext["nodes"]["hum"] = held((node, DEV_RH), 100.0), held((node, DEV_TEMP), 100.0), node
+    return ext
+
+
 def latest_meta(meta):
     best = {}
     for k, v, vf in meta:
@@ -177,6 +221,7 @@ class RoomData:
     info: dict = field(default_factory=dict)
     bad: np.ndarray = None
     yv: np.ndarray = None
+    ext: dict = None
 
     @property
     def n(self):
@@ -190,7 +235,8 @@ class RoomData:
         s = lambda x: x[a:b]
         return RoomData(self.room, self.node, self.t0 + a * self.dt, self.dt, s(self.y), s(self.yi), s(self.u), s(self.sp), s(self.tout), s(self.wind), s(self.rad), s(self.night),
                         {k: (s(n), s(m)) for k, (n, m) in self.nb.items()}, self.info,
-                        None if self.bad is None else s(self.bad), None if self.yv is None else s(self.yv))
+                        None if self.bad is None else s(self.bad), None if self.yv is None else s(self.yv),
+                        None if self.ext is None else {k: (v if k == "nodes" else [s(a) for a in v] if isinstance(v, list) else s(v)) for k, v in self.ext.items()})
 
 
 def night_mask(grid, cfg):
@@ -234,7 +280,7 @@ def stale_mask(grid, times, stale_s):
     return age > stale_s
 
 
-def build_rooms(reports, weather, meta, cfg, events=()):
+def build_rooms(reports, weather, meta, cfg, events=(), devices=()):
     series = {}
     for ts, node, attr, v in reports:
         series.setdefault((node, attr), []).append((ts, v))
@@ -246,6 +292,7 @@ def build_rooms(reports, weather, meta, cfg, events=()):
         room_nodes[r["name"]] = list(r.get("nodes", []))
         for n in r.get("nodes", []):
             node_room[n] = r["name"]
+    dev_room = {d["node"]: d["room"] for d in m.get("devices", []) if d.get("room") is not None}
     links = m.get("links") or [{"a": a, "b": b, "kind": "wall"} for a, b in m.get("adjacency", [])]
     nodes = sorted({n for n, a in series if a == TEMP})
     dt = cfg["dt_s"]
@@ -256,7 +303,7 @@ def build_rooms(reports, weather, meta, cfg, events=()):
         v = v / 100.0
         ok = (v > cfg["temp_valid"][0]) & (v < cfg["temp_valid"][1])
         t, v = t[ok], v[ok]
-        room = node_room.get(node, f"node{node}")
+        room = base_room = node_room.get(node, f"node{node}")
         if len(room_nodes.get(room, [])) > 1:
             room = f"{room}_{node}"
         if len(t) < 3 or (t[-1] - t[0]) / 3600 < cfg["min_hours"]:
@@ -302,7 +349,9 @@ def build_rooms(reports, weather, meta, cfg, events=()):
                     cnt += 1
                     tot += ni
         d = RoomData(room, node, float(grid[0]), float(dt), y, interp(t, v, grid), u, sp, tout, wind, rad, night_mask(grid, cfg), nb,
-                     {"n_invalid_demand": n_invalid, "n_temp_reports": int(len(t)), "n_demand_reports": int(good.sum()), "start": float(grid[0]), "end": float(grid[-1]), "n_masked": int(bad.sum()), "neighbour_nodes": nbn}, bad, yv)
+                     {"base_room": base_room, "n_invalid_demand": n_invalid, "n_temp_reports": int(len(t)), "n_demand_reports": int(good.sum()), "start": float(grid[0]), "end": float(grid[-1]), "n_masked": int(bad.sum()), "neighbour_nodes": nbn}, bad, yv)
+        if devices:
+            d.ext = device_ext(devices, {n for n, r in dev_room.items() if r == base_room}, grid, bad, cfg)
         out.append(d)
     return out, skipped
 

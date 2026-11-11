@@ -9,7 +9,8 @@ import numpy as np
 from scipy.optimize import least_squares
 from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, norm_cdf_np, run_batch, valve_lag
 from heattrain.roomimm import RoomPar, norm_cdf
-from heattrain.thermal import build_rooms, epoch, fit, load_events, load_lake, raw_batches
+from heattrain.roomobs import evidence_blocks
+from heattrain.thermal import build_rooms, epoch, fit, load_devices, load_events, load_lake, raw_batches
 
 ROOM_KEYS = ("a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night", "tau_v")
 
@@ -236,7 +237,7 @@ def base_doc(d, cfg, rc):
     f = rc["fit"]
     scale = f["valve_sigma_scale"]
     return {"node": d.node, "struct": "rc2", "neighbours": {k: sorted(set(d.info["neighbour_nodes"].get(k, []))) for k in d.nb}, "valve_gain": g, "sigma_u": sigma_u(d, g, rc) * (scale or 1.0),
-            "valve_obs": bool(scale), "noise_r": cfg["noise_r"], "p0": cfg["p0"], "q_r": f["q_r"], "q_a": f["q_a"], "q_um": f["q_um"], "q_ua": f["q_ua"]}
+            "valve_obs": bool(scale), "noise_r": cfg["noise_r"], "p0": cfg["p0"], "q_r": f["q_r"], "q_a": f["q_a"], "q_um": f["q_um"], "q_ua": f["q_ua"], **evidence_blocks(d.ext, rc["evidence"])}
 
 
 def shock_defaults(rc, **over):
@@ -440,7 +441,7 @@ def window_model_sigma(models_dir):
 def build_data(config, src):
     cfg = config["thermal"]
     reports, weather, meta = load_lake(src, cfg["exclude_sources"])
-    rooms, skipped = build_rooms(reports, weather, meta, cfg, load_events(src))
+    rooms, skipped = build_rooms(reports, weather, meta, cfg, load_events(src), load_devices(src))
     if not rooms:
         raise SystemExit(f"no usable rooms: {skipped}")
     return rooms, skipped

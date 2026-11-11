@@ -26,7 +26,7 @@ def test_regression_matches_old_kalman():
     ks, v, s, xs, ps = kalman(dict(TRUE), d, "rc2", CFG, collect=True)
     doc = {"params": dict(TRUE), "c": {}, "valve_gain": 0.5, "sigma_u": 0.2, "noise_r": CFG["noise_r"], "p0": CFG["p0"], "q_r": CFG["q_r"], "q_a": CFG["q_a"]}
     shock = dict(SHOCK, q_calm=0.0, q_jump=0.0, p_jump=0.0, p_l0=0.0)
-    house = dict(HOUSE, p_up=0.0, p_down=0.0, p_supply0=1.0, reset_gap_min=1e9, reset_sigma=1e9, r_grid=0.0, balance_seed=0)
+    house = dict(HOUSE, p_up=0.0, p_down=0.0, p_supply0=1.0, reset_gap_min=1e9, reset_sigma=1e9, r_grid=0.0, balance_seed=0, trv_grid=0.0)
     h = House({"r": doc}, shock, house)
     worst = 0.0
     for k in range(d.n):
@@ -99,7 +99,7 @@ def test_resets_are_logged_and_never_nan():
                 assert all(math.isfinite(o[x]) for x in ("m", "a", "lam", "lam_std", "p_window", "p_supply"))
     assert [(r["room"], r["cause"]) for r in h.resets] == [("kueche", "nan")]
     assert math.isnan(h.resets[0]["prior"][0]) or h.resets[0]["step"] == 200
-    docs, inputs, _ = simulate_house(500, seed=1, corrupt=(300, 6, 12.0), report_p=1.0)
+    docs, inputs, _ = simulate_house(500, seed=1, corrupt=(300, 6, 6.0), report_p=1.0)
     h, _ = run(docs, inputs)
     assert any(r["cause"] == "innovation" and r["room"] == NAMES[0] for r in h.resets)
     docs, inputs, _ = simulate_house(700, seed=2, gap=(200, 500))
@@ -227,14 +227,15 @@ def sim_grid(steps=1500, seed=7, **kw):
     g.names, g.n = list(NAMES), len(inputs)
     g.cols = {n: {k: np.array([getattr(r[n], k) for r in inputs], float) for k in ("y", "yv", "u", "sp", "tout", "wind", "rad")} for n in NAMES}
     for n in NAMES:
-        g.cols[n].update(night=np.array([float(r[n].night) for r in inputs]), ncnt=[np.array([r[n].ncnt[0] for r in inputs])], nsum=[np.array([r[n].nsum[0] for r in inputs])])
+        g.cols[n].update(night=np.array([float(r[n].night) for r in inputs]), ncnt=[np.array([r[n].ncnt[0] for r in inputs])], nsum=[np.array([r[n].nsum[0] for r in inputs])],
+                         ya=[np.array([r[n].ya[i] for r in inputs], float) for i in range(len(docs[n].get("air", [])))], **{k: np.array([getattr(r[n], k) for r in inputs], float) for k in ("co2", "rh", "th")})
     return docs, inputs, g
 
 
 def test_batched_filter_matches_the_reference_house_including_resets():
     shocks = [SHOCK, dict(SHOCK, q_calm=0.03), dict(SHOCK, p_jump=1e-2, q_jump=0.6, hold_min=10.0, tau_l=60.0)]
     causes = set()
-    for docs, inputs, g in (sim_grid(), sim_grid(500, seed=1, corrupt=(300, 6, 12.0), report_p=1.0)):
+    for docs, inputs, g in (sim_grid(), sim_grid(500, seed=1, corrupt=(300, 6, 6.0), report_p=1.0)):
         bh, rec = run_batch(g, docs, shocks, HOUSE, record=True)
         for gi, shock in enumerate(shocks):
             h, ref = run(docs, inputs, shock)
@@ -257,7 +258,7 @@ def test_fast_shock_fit_replays_the_reference_coordinate_descent():
     def ref_nll(vals):
         h = House(docs, shock_defaults(rc, **vals), rc["house"])
         for k, row in enumerate(inputs):
-            h.step({n: RoomIn(math.nan, math.nan, *list(vars(r).values())[2:]) if drop[n][k] else r for n, r in row.items()})
+            h.step({n: RoomIn(math.nan, math.nan, r.u, r.sp, r.tout, r.wind, r.rad, r.night, r.ncnt, r.nsum, tuple(math.nan for _ in r.ya), math.nan, math.nan, r.th) if drop[n][k] else r for n, r in row.items()})
         return -h.loglik
 
     best = dict(rc["shock"]["start"])

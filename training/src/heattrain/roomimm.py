@@ -1,5 +1,7 @@
 import math
+from collections import deque
 from dataclasses import dataclass
+from heattrain.roomobs import abs_hum, check_house, check_room_doc, effort_coeffs, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update
 
 SQRT2 = math.sqrt(2.0)
 HORIZON = 60
@@ -17,10 +19,6 @@ def erf_as(x):
 
 def norm_cdf(z):
     return 0.5 * (1.0 + erf_as(z / SQRT2))
-
-
-def lg_pdf(v, s):
-    return -0.5 * (v * v / s + math.log(2.0 * math.pi * s)) if s > 0 else math.nan
 
 
 def finite(*xs):
@@ -47,11 +45,13 @@ class RoomPar:
         self.a1, self.a2, self.b1, self.b2, self.b3, self.b4, self.w, self.ts, self.ts_night = (p[k] for k in ("a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night"))
         self.kinds = sorted(doc["c"])
         self.ck = [doc["c"][k] for k in self.kinds]
-        self.g, self.sigma_u, self.noise_r, self.p0, self.q_r, self.q_a = (doc[k] for k in ("valve_gain", "sigma_u", "noise_r", "p0", "q_r", "q_a"))
+        self.g, self.noise_r, self.p0, self.q_r, self.q_a = (doc[k] for k in ("valve_gain", "noise_r", "p0", "q_r", "q_a"))
         self.q_um, self.q_ua = doc.get("q_um", 0.0), doc.get("q_ua", 0.0)
         self.tau_v = p.get("tau_v", 0.0)
         self.alpha = 1.0 - math.exp(-1.0 / self.tau_v) if self.tau_v > 0 else 1.0
-        self.valve_obs = bool(doc.get("valve_obs", True))
+        check_room_doc("room", doc)
+        self.air = [(a["noise"] ** 2, a.get("offset", 0.0)) for a in doc.get("air") or []]
+        self.effort, self.co2, self.hum = doc.get("effort"), doc.get("co2"), doc.get("hum")
 
     def lag(self, state, u):
         if state is None or self.alpha == 1.0:
@@ -76,19 +76,6 @@ class RoomPar:
         return self.w * m + (1 - self.w) * a
 
 
-def obs_update(x, p, hrow, v, r):
-    ph = [p[3 * i] * hrow[0] + p[3 * i + 1] * hrow[1] + p[3 * i + 2] * hrow[2] for i in range(3)]
-    s = hrow[0] * ph[0] + hrow[1] * ph[1] + hrow[2] * ph[2] + r
-    if not s > 0:
-        return s
-    k = [q / s for q in ph]
-    for i in range(3):
-        x[i] += k[i] * v
-    q = [p[3 * i + j] - k[i] * ph[j] for i in range(3) for j in range(3)]
-    p[:] = [0.5 * (q[3 * i + j] + q[3 * j + i]) for i in range(3) for j in range(3)]
-    return s
-
-
 @dataclass
 class RoomIn:
     y: float = math.nan
@@ -101,6 +88,10 @@ class RoomIn:
     night: bool = False
     ncnt: tuple = ()
     nsum: tuple = ()
+    ya: tuple = ()
+    co2: float = math.nan
+    rh: float = math.nan
+    th: float = math.nan
 
 
 class RoomFilter:
@@ -122,6 +113,25 @@ class RoomFilter:
         self.events = []
         self.comps = []
         self.lag = None
+        self.hist = {k: deque(maxlen=int(g["win_min"]) + 1) for k, g in (("co2", par.co2), ("ah", par.hum)) if g}
+
+    def rate(self, key):
+        h = self.hist.get(key)
+        if h is None or len(h) < h.maxlen or not (math.isfinite(h[0]) and math.isfinite(h[-1])):
+            return math.nan
+        return (h[-1] - h[0]) / (h.maxlen - 1)
+
+    def gas_evidence(self, inp):
+        par, out = self.par, []
+        if par.co2:
+            excess, r = inp.co2 - par.co2["out"], self.rate("co2")
+            if finite(excess, r) and excess >= par.co2["min_excess"]:
+                out.append((excess, r, par.co2))
+        if par.hum:
+            excess, r = abs_hum(inp.th, inp.rh) - abs_hum(inp.tout, par.hum["rh_out"]), self.rate("ah")
+            if finite(excess, r) and excess >= par.hum["min_excess"]:
+                out.append((excess, r, par.hum))
+        return out
 
     def weights(self, w):
         return [w[j // 2] * self.nu[j // 2][j % 2] for j in range(4)]
@@ -155,6 +165,9 @@ class RoomFilter:
         par = self.par
         if math.isfinite(inp.u):
             self.lag = par.lag(self.lag, inp.u)
+        for key, v in (("co2", inp.co2), ("ah", abs_hum(inp.th, inp.rh))):
+            if key in self.hist:
+                self.hist[key].append(v)
         if not finite(inp.u, inp.tout, inp.wind, inp.rad, *inp.nsum):
             self.since_obs += 1
             return None
@@ -167,20 +180,38 @@ class RoomFilter:
         elif y_ok and self.since_obs > self.house["reset_gap_min"]:
             self.reset("gap", inp, w, step)
         self.skipped = False
-        v_ok = par.valve_obs and math.isfinite(inp.yv) and 0.0 < inp.yv < 1.0 and math.isfinite(inp.sp)
-        r1 = self.house["r_grid"] + par.noise_r ** 2
+        grid, noise_var = self.house.get("trv_grid", 0.0), par.noise_r ** 2
+        r1 = self.house["r_grid"] + noise_var
+        cn, cs = par.coupling(inp.ncnt, inp.nsum)
+        mu0 = self.weights(w)
+        ybar = sum(mu0[j] * par.sensor(self.x[j][0], self.x[j][1]) for j in range(4))
+        eff = par.effort if par.effort and finite(inp.yv, inp.sp, ybar) and 0.0 < inp.yv < 1.0 and par.g * abs(inp.sp - ybar) <= par.effort["steady_u"] else None
+        gas = self.gas_evidence(inp)
+        ts = par.ts_night if inp.night else par.ts
         ll = [0.0] * 4
         yhat = [0.0] * 4
         s1 = [0.0] * 4
         for j in range(4):
             x, p = self.x[j], self.p[j]
+            for (var, off), ya in zip(par.air, inp.ya):
+                if math.isfinite(ya):
+                    v = ya - off - x[1]
+                    ll[j] += lg_pdf(v, obs_update(x, p, (0.0, 1.0, 0.0), v, var))
             if y_ok:
                 yhat[j] = par.sensor(x[0], x[1])
-                s1[j] = obs_update(x, p, (par.w, 1 - par.w, 0.0), inp.y - yhat[j], r1)
-                ll[j] += lg_pdf(inp.y - yhat[j], s1[j])
-            if v_ok:
-                v = inp.yv - par.g * (inp.sp - par.sensor(x[0], x[1]))
-                ll[j] += lg_pdf(v, obs_update(x, p, (-par.g * par.w, -par.g * (1 - par.w), 0.0), v, par.sigma_u ** 2))
+                if grid > 0.0:
+                    l, s1[j] = trv_update(x, p, (par.w, 1 - par.w, 0.0), inp.y, yhat[j], noise_var, grid, self.house.get("trv_floor", 0.0), r1)
+                    ll[j] += l
+                else:
+                    s1[j] = obs_update(x, p, (par.w, 1 - par.w, 0.0), inp.y - yhat[j], r1)
+                    ll[j] += lg_pdf(inp.y - yhat[j], s1[j])
+            if eff:
+                if j >= 2:
+                    c0, c1 = effort_coeffs(par, x[0], x[1], ts, inp.wind, inp.tout, inp.rad, cn, cs)
+                    ll[j] += lam_update(x, p, c0, c1, inp.yv, eff["sigma"])
+            for excess, rate, g in gas:
+                c0, c1 = gas_coeffs(g["k"], g["gain"], excess)
+                ll[j] += gas_update(x, p, c0, c1, rate, g["sigma"], g["sigma_up"])
         if y_ok:
             mu = self.weights(w)
             mean = sum(mu[j] * yhat[j] for j in range(4))
@@ -267,6 +298,7 @@ class RoomFilter:
 
 class House:
     def __init__(self, rooms, shock, house):
+        check_house(house)
         self.shock = shock
         self.house = dict(house)
         pu, pd = house["p_up"], house["p_down"]

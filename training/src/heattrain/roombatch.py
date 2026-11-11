@@ -1,6 +1,7 @@
 import math
 import numpy as np
 from heattrain.roomimm import RoomPar
+from heattrain.roomobs import D_MIN, LOG_SQRT_2_OVER_PI, P_FLOOR, SQRT2, SQRT2PI, Z_MIN
 
 
 def valve_lag(u, alpha):
@@ -37,7 +38,7 @@ class Grid:
 
             nb = {k: (pad(np.asarray(d.nb[k][0], float)) if k in d.nb else np.zeros(self.n), pad(np.asarray(d.nb[k][1], float)) if k in d.nb else np.zeros(self.n)) for k in self.kinds[d.room]}
             self.cols[d.room] = {"y": pad(d.y), "yv": pad(d.yv), "u": pad(d.u), "sp": pad(d.sp), "tout": pad(d.tout), "wind": pad(d.wind), "rad": pad(d.rad), "night": pad(d.night.astype(float)), "yi": pad(d.yi),
-                                 "bad": pad(d.bad.astype(float), 1.0), "ncnt": [nb[k][0] for k in self.kinds[d.room]], "nsum": [nb[k][1] for k in self.kinds[d.room]]}
+                                 "bad": pad(d.bad.astype(float), 1.0), "ya": [pad(np.asarray(a, float)) for a in (d.ext or {}).get("ya", [])], **{k: pad(np.asarray((d.ext or {}).get(k, np.full(d.n, np.nan)), float)) for k in ("co2", "rh", "th")}, "ncnt": [nb[k][0] for k in self.kinds[d.room]], "nsum": [nb[k][1] for k in self.kinds[d.room]]}
         self.times = self.t0 + np.arange(self.n) * self.dt
 
     def tail(self, start):
@@ -68,6 +69,34 @@ def norm_cdf_np(z):
     return 0.5 * (1.0 + erf_np(z / math.sqrt(2.0)))
 
 
+def erfc_nr_np(x):
+    z = np.abs(x)
+    t = 1.0 / (1.0 + 0.5 * z)
+    r = t * np.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+    return np.where(x >= 0, r, 2.0 - r)
+
+
+def norm_sf_np(z):
+    return 0.5 * erfc_nr_np(z / SQRT2)
+
+
+def bin_prob_np(zlo, zhi):
+    return np.where(zlo >= 0.0, norm_sf_np(zlo) - norm_sf_np(zhi), np.where(zhi <= 0.0, norm_sf_np(-zhi) - norm_sf_np(-zlo), 1.0 - norm_sf_np(zhi) - norm_sf_np(-zlo)))
+
+
+def abs_hum_np(t, rh):
+    ok = np.isfinite(t) & np.isfinite(rh) & (t > -40.0)
+    tt = np.where(ok, t, 20.0)
+    return np.where(ok, 216.7 * (rh / 100.0 * 6.112 * np.exp(17.62 * tt / (243.12 + tt))) / (273.15 + tt), np.nan)
+
+
+def rate_np(x, win):
+    out = np.full(x.shape, np.nan)
+    if win < x.shape[-1]:
+        out[..., win:] = (x[..., win:] - x[..., :-win]) / win
+    return out
+
+
 def lg_pdf_np(v, s):
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.where(s > 0, -0.5 * (v * v / np.where(s > 0, s, 1.0) + np.log(2.0 * math.pi * np.where(s > 0, s, 1.0))), np.nan)
@@ -78,9 +107,24 @@ class Inputs:
         names = grid.names
         col = lambda k: np.array([grid.cols[n][k] for n in names], float)
         self.y, self.yv, self.u, self.sp, self.tout, self.wind, self.rad = (col(k) for k in ("y", "yv", "u", "sp", "tout", "wind", "rad"))
+        par = [RoomPar(docs[n]) for n in names]
+        self.A = max([len(q.air) for q in par] + [0])
+        ya = np.full((len(names), self.A, self.u.shape[1]), np.nan)
+        for i, (n, q) in enumerate(zip(names, par)):
+            for a, arr in enumerate(grid.cols[n]["ya"][:len(q.air)]):
+                ya[i, a] = arr
+        self.ya, self.co2, self.rh, self.th = ya, col("co2"), col("rh"), col("th")
         if drop is not None:
             hide = np.array([drop[n] for n in names], bool)
-            self.y, self.yv = np.where(hide, np.nan, self.y), np.where(hide, np.nan, self.yv)
+            self.y, self.yv, self.co2, self.rh = (np.where(hide, np.nan, v) for v in (self.y, self.yv, self.co2, self.rh))
+            self.ya = np.where(hide[:, None, :], np.nan, self.ya)
+        self.ah = abs_hum_np(self.th, self.rh)
+        self.rate_co2, self.rate_ah = np.full(self.co2.shape, np.nan), np.full(self.co2.shape, np.nan)
+        for i, q in enumerate(par):
+            if q.co2:
+                self.rate_co2[i] = rate_np(self.co2[i], int(q.co2["win_min"]))
+            if q.hum:
+                self.rate_ah[i] = rate_np(self.ah[i], int(q.hum["win_min"]))
         self.night = col("night") > 0.5
         self.cn, self.cs = np.zeros_like(self.u), np.zeros_like(self.u)
         nsum_ok = np.ones(self.u.shape, bool)
@@ -93,7 +137,6 @@ class Inputs:
         self.dyn = np.isfinite(self.u) & np.isfinite(self.tout) & np.isfinite(self.wind) & np.isfinite(self.rad) & nsum_ok
         self.n = self.u.shape[1]
         self.ue = np.array([valve_lag(self.u[i], RoomPar(docs[n]).alpha) for i, n in enumerate(names)]).reshape(self.u.shape)
-        self.valve_obs = np.array([RoomPar(docs[n]).valve_obs for n in names], bool)
 
 
 class BatchHouse:
@@ -104,7 +147,18 @@ class BatchHouse:
         par = [RoomPar(docs[n]) for n in names]
         vec = lambda f: np.array([f(p) for p in par], float)
         self.a1, self.a2, self.b1, self.b2, self.b3, self.b4, self.w, self.ts, self.ts_night = (vec(lambda p, k=k: getattr(p, k)) for k in ("a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night"))
-        self.g, self.sigma_u, self.noise_r, self.p0, self.q_r, self.q_a, self.q_um, self.q_ua = (vec(lambda p, k=k: getattr(p, k)) for k in ("g", "sigma_u", "noise_r", "p0", "q_r", "q_a", "q_um", "q_ua"))
+        self.g, self.noise_r, self.p0, self.q_r, self.q_a, self.q_um, self.q_ua = (vec(lambda p, k=k: getattr(p, k)) for k in ("g", "noise_r", "p0", "q_r", "q_a", "q_um", "q_ua"))
+        blk = lambda key, field: np.array([(getattr(p, key) or {}).get(field, 1.0) for p in par], float)
+        self.has_eff = np.array([p.effort is not None for p in par])
+        self.e_sigma, self.e_steady = blk("effort", "sigma"), blk("effort", "steady_u")
+        A = max([len(p.air) for p in par] + [0])
+        self.air_has, self.air_var, self.air_off = np.zeros((R, A), bool), np.ones((R, A)), np.zeros((R, A))
+        for r, p in enumerate(par):
+            for a, (var, off) in enumerate(p.air):
+                self.air_has[r, a], self.air_var[r, a], self.air_off[r, a] = True, var, off
+        self.gas = []
+        for key, base in (("co2", "out"), ("hum", "rh_out")):
+            self.gas.append({"has": np.array([getattr(p, key) is not None for p in par]), **{f: blk(key, f) for f in ("k", "gain", "sigma", "sigma_up", "min_excess", base)}, "base": base})
         sv = lambda k: np.array([s[k] for s in shocks], float)
         self.phi = np.exp(-1.0 / sv("tau_l"))
         pj, hold = sv("p_jump"), sv("hold_min")
@@ -177,6 +231,33 @@ class BatchHouse:
         pn = 0.5 * (q + np.swapaxes(q, -1, -2))
         return np.where(ok[..., None], xn, x), np.where(ok[..., None, None], pn, p), s
 
+    def lam_h(self, c1, x):
+        h = np.zeros(x.shape)
+        h[..., 2] = c1
+        return h
+
+    def trv(self, x, p, h, y, yhat, noise_var, r1, grid, floor, mask):
+        ph = np.einsum("...ij,...j->...i", p, h)
+        s = np.einsum("...i,...i->...", h, ph) + noise_var
+        pos = s > 0
+        sd = np.sqrt(np.where(pos, s, 1.0))
+        zlo, zhi = (y - 0.5 * grid - yhat) / sd, (y + 0.5 * grid - yhat) / sd
+        z = bin_prob_np(zlo, zhi)
+        ll = np.where(pos, np.log(np.maximum(z, P_FLOOR)), np.nan)
+        pa, pb = np.exp(-0.5 * zlo * zlo) / SQRT2PI, np.exp(-0.5 * zhi * zhi) / SQRT2PI
+        zs = np.where(z >= Z_MIN, z, 1.0)
+        r = (pa - pb) / zs
+        var_t = s * (1.0 + (zlo * pa - zhi * pb) / zs - r * r)
+        tr = mask & pos & (z >= Z_MIN) & np.isfinite(var_t) & (var_t > 0.0)
+        var_t = np.minimum(np.maximum(var_t, np.minimum(s, noise_var + floor * grid * grid / 12.0)), s)
+        xt = x + (ph / np.where(pos, s, 1.0)[..., None]) * (sd * r)[..., None]
+        c = (s - var_t) / (s * s)
+        q = p - c[..., None, None] * ph[..., :, None] * ph[..., None, :]
+        pt = 0.5 * (q + np.swapaxes(q, -1, -2))
+        fb = mask & ~tr & pos
+        xg, pg, _ = self.obs(x, p, h, np.where(fb, y - yhat, 0.0), r1, fb)
+        return np.where(tr[..., None], xt, xg), np.where(tr[..., None, None], pt, pg), s, ll
+
     def step(self, inp, k, record=False):
         hs = self.house
         dyn = np.broadcast_to(inp.dyn[:, k], (self.G, self.R))
@@ -187,22 +268,57 @@ class BatchHouse:
         self.log(gap, "gap", k, 0)
         self.seed(new | gap, inp, k)
         run = dyn & self.init
-        v_ok = inp.valve_obs & np.isfinite(inp.yv[:, k]) & (inp.yv[:, k] > 0.0) & (inp.yv[:, k] < 1.0) & np.isfinite(inp.sp[:, k])
-        r1 = hs["r_grid"] + self.noise_r ** 2
+        G, R = self.G, self.R
         x, p = self.x, self.p
         wv = self.w[None, :, None]
+        noise_var = (self.noise_r ** 2)[None, :, None]
+        r1 = hs["r_grid"] + noise_var
+        grid = hs.get("trv_grid", 0.0)
+        ones = np.ones(4, bool)
+        mu0 = self.mu(self.w_prior)
+        ybar = (mu0 * (wv * x[..., 0] + (1 - wv) * x[..., 1])).sum(-1)
+        run4 = run[..., None] & ones
+        ll = np.zeros((G, R, 4))
+        hair = np.broadcast_to(np.array([0.0, 1.0, 0.0]), x.shape)
+        for a in range(inp.A):
+            ya = inp.ya[:, a, k]
+            ma = run4 & (self.air_has[:, a] & np.isfinite(ya))[None, :, None]
+            v = ya[None, :, None] - self.air_off[None, :, a, None] - x[..., 1]
+            x, p, sa = self.obs(x, p, hair, np.where(ma, v, 0.0), self.air_var[None, :, a, None], ma)
+            ll = ll + np.where(ma, lg_pdf_np(v, sa), 0.0)
         yhat = wv * x[..., 0] + (1 - wv) * x[..., 1]
-        hy = np.stack([self.w, 1 - self.w, np.zeros(self.R)], -1)[None, :, None, :]
-        ym = (run & y_ok)[..., None] & np.ones(4, bool)
-        x, p, s1 = self.obs(x, p, np.broadcast_to(hy, x.shape), np.where(ym, y[None, :, None] - yhat, 0.0), r1[None, :, None], ym)
-        ll = np.where(ym, lg_pdf_np(y[None, :, None] - yhat, s1), 0.0)
-        vm = (run & v_ok[None, :])[..., None] & np.ones(4, bool)
-        sens = wv * x[..., 0] + (1 - wv) * x[..., 1]
-        g = self.g[None, :, None]
-        v = inp.yv[:, k][None, :, None] - g * (inp.sp[:, k][None, :, None] - sens)
-        hv = np.stack([-self.g * self.w, -self.g * (1 - self.w), np.zeros(self.R)], -1)[None, :, None, :]
-        x, p, sv = self.obs(x, p, np.broadcast_to(hv, x.shape), np.where(vm, v, 0.0), (self.sigma_u ** 2)[None, :, None], vm)
-        ll = ll + np.where(vm, lg_pdf_np(v, sv), 0.0)
+        hy = np.broadcast_to(np.stack([self.w, 1 - self.w, np.zeros(self.R)], -1)[None, :, None, :], x.shape)
+        ym = (run & y_ok)[..., None] & ones
+        yb = y[None, :, None]
+        if grid > 0.0:
+            x, p, s1, lt = self.trv(x, p, hy, yb, yhat, noise_var, r1, grid, hs.get("trv_floor", 0.0), ym)
+            ll = ll + np.where(ym, lt, 0.0)
+        else:
+            x, p, s1 = self.obs(x, p, hy, np.where(ym, yb - yhat, 0.0), r1, ym)
+            ll = ll + np.where(ym, lg_pdf_np(yb - yhat, s1), 0.0)
+        yv, sp = inp.yv[:, k], inp.sp[:, k]
+        gate = run & self.has_eff[None, :] & np.isfinite(yv + sp)[None, :] & np.isfinite(ybar) & (yv > 0.0)[None, :] & (yv < 1.0)[None, :] & (self.g[None, :] * np.abs(sp[None, :] - ybar) <= self.e_steady[None, :])
+        me = gate[..., None] & (self.st[None, None, :] > 0.5)
+        tout, wind, rad, cn, cs_ = (v[:, k][None, :, None] for v in (inp.tout, inp.wind, inp.rad, inp.cn, inp.cs))
+        ts = np.where(inp.night[:, k], self.ts_night, self.ts)[None, :, None]
+        a1, a2, b1, b2, b3, b4 = (v[None, :, None] for v in (self.a1, self.a2, self.b1, self.b2, self.b3, self.b4))
+        kq = a2 / (b1 * a1 * np.maximum(ts - x[..., 0], D_MIN))
+        c0, c1 = kq * (cn * x[..., 1] - cs_ - b4 * rad / 100.0), kq * (b2 + b3 * wind) * np.maximum(x[..., 1] - tout, 0.0)
+        v = yv[None, :, None] - (c0 + c1 * x[..., 2])
+        x, p, se = self.obs(x, p, self.lam_h(c1, x), np.where(me, v, 0.0), (self.e_sigma ** 2)[None, :, None], me)
+        ll = ll + np.where(me, lg_pdf_np(v, se), 0.0)
+        for g, (level, rate, excess) in zip(self.gas, ((inp.co2[:, k], inp.rate_co2[:, k], inp.co2[:, k] - self.gas[0]["out"]), (inp.ah[:, k], inp.rate_ah[:, k], inp.ah[:, k] - abs_hum_np(inp.tout[:, k], self.gas[1]["rh_out"])))):
+            ok_g = g["has"] & np.isfinite(excess) & np.isfinite(rate) & (excess >= g["min_excess"])
+            mg = run4 & ok_g[None, :, None]
+            ex = np.where(ok_g, excess, 0.0)[None, :, None]
+            c0, c1 = -g["k"][None, :, None] * (1.0 - g["gain"][None, :, None]) * ex, -g["k"][None, :, None] * g["gain"][None, :, None] * ex
+            v = np.where(ok_g, rate, 0.0)[None, :, None] - (c0 + c1 * x[..., 2])
+            q = c1 * c1 * p[..., 2, 2]
+            sg, su = g["sigma"][None, :, None], g["sigma_up"][None, :, None]
+            s_lo, s_hi = q + sg * sg, q + su * su
+            low = v < 0.0
+            x, p, _ = self.obs(x, p, self.lam_h(c1, x), np.where(mg, v, 0.0), np.where(low, sg, su) ** 2, mg)
+            ll = ll + np.where(mg, LOG_SQRT_2_OVER_PI - np.log(np.sqrt(s_lo) + np.sqrt(s_hi)) - 0.5 * v * v / np.where(low, s_lo, s_hi), 0.0)
         self.x, self.p = x, p
         mu0 = self.mu(self.w_prior)
         mean = (mu0 * yhat).sum(-1)
