@@ -1,6 +1,7 @@
 use crate::room_model::{bundle_candidates, Bundle, House, Out, ResetRec, RoomIn};
 use crate::room_plan::{plan, Env, PlanOut};
 use anyhow::{bail, Result};
+use matter_controller::{CO2_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -40,6 +41,14 @@ struct Feed {
     fresh_valve: Option<f64>,
 }
 
+#[derive(Debug, Default)]
+struct DevFeed {
+    temp: Option<(i64, f64)>,
+    rh: Option<(i64, f64)>,
+    co2: Option<(i64, f64)>,
+    fresh_temp: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RoomCtx {
     pub room: String,
@@ -64,6 +73,7 @@ struct Inner {
     house: Option<House>,
     cursor: Option<i64>,
     feeds: HashMap<u64, Feed>,
+    devs: HashMap<u64, DevFeed>,
     inputs: BTreeMap<String, RoomIn>,
     decided: HashMap<String, i64>,
     last_row: HashMap<String, (f64, i64, bool)>,
@@ -179,6 +189,22 @@ impl RoomModel {
         }
     }
 
+    pub fn observe_device(&self, node: u64, cluster: u32, attribute: u32, value: f64, ts_ms: i64) {
+        if attribute != 0 || !value.is_finite() {
+            return;
+        }
+        let mut inner = self.0.lock().unwrap();
+        match cluster {
+            TEMPERATURE_MEASUREMENT_CLUSTER if (TEMP_RANGE[0]..=TEMP_RANGE[1]).contains(&(value / 100.0)) => {
+                let feed = inner.devs.entry(node).or_default();
+                (feed.temp, feed.fresh_temp) = (Some((ts_ms, value / 100.0)), Some(value / 100.0));
+            }
+            HUMIDITY_MEASUREMENT_CLUSTER if (0.0..=10_000.0).contains(&value) => inner.devs.entry(node).or_default().rh = Some((ts_ms, value / 100.0)),
+            CO2_CLUSTER if (0.0..=100_000.0).contains(&value) => inner.devs.entry(node).or_default().co2 = Some((ts_ms, value)),
+            _ => {}
+        }
+    }
+
     pub fn view(&self, room: &str) -> serde_json::Value {
         self.0.lock().unwrap().views.get(room).cloned().unwrap_or(serde_json::Value::Null)
     }
@@ -229,6 +255,12 @@ impl RoomModel {
                 let (y, yv) = (feed.fresh_temp.take().unwrap_or(f64::NAN), feed.fresh_valve.take().map_or(f64::NAN, |v| v / 100.0));
                 let u = feed.valve.map_or(f64::NAN, |(_, v)| (v / 100.0).clamp(0.0, 1.0));
                 let sp = feed.setpoint.map_or(f64::NAN, |p| p.1);
+                let own = |wanted: Option<u64>| wanted.filter(|n| config.devices.iter().any(|d| d.node == *n && d.room.as_deref() == Some(name.as_str())));
+                let fresh = |p: Option<(i64, f64)>| p.filter(|(t, _)| now_ms - t <= stale_ms).map_or(f64::NAN, |(_, v)| v);
+                let ya: Vec<f64> = doc.air.iter().map(|a| own(a.node).and_then(|n| inner.devs.get_mut(&n)).and_then(|d| d.fresh_temp.take()).unwrap_or(f64::NAN)).collect();
+                let level = |g: &Option<crate::room_obs::GasDoc>, pick: &dyn Fn(&DevFeed) -> Option<(i64, f64)>| g.as_ref().and_then(|g| own(g.node)).and_then(|n| inner.devs.get(&n)).map_or(f64::NAN, |d| fresh(pick(d)));
+                let co2 = level(&doc.co2, &|d| d.co2);
+                let (rh, th) = (level(&doc.hum, &|d| d.rh), level(&doc.hum, &|d| d.temp));
                 let (mut ncnt, mut nsum) = (Vec::new(), Vec::new());
                 for kind in doc.c.keys() {
                     let (mut n, mut s) = (0.0, 0.0);
@@ -241,7 +273,7 @@ impl RoomModel {
                     ncnt.push(n);
                     nsum.push(s);
                 }
-                inputs.insert(name.clone(), RoomIn { y, yv, u, sp, tout: weather[0], wind, rad, night, ncnt, nsum });
+                inputs.insert(name.clone(), RoomIn { y, yv, u, sp, tout: weather[0], wind, rad, night, ncnt, nsum, ya, co2, rh, th });
             }
             house.step(&inputs);
             inner.inputs = inputs;

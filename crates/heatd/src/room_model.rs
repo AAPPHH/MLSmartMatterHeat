@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use crate::room_obs::{abs_hum, check_air, check_effort, check_gas, check_house, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update, AirDoc, EffortDoc, GasDoc, Mat};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 pub const KIND: &str = "room_model";
@@ -20,10 +21,6 @@ pub struct Params {
     pub tau_v: f64,
 }
 
-fn yes() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoomDoc {
     pub node: u64,
@@ -31,17 +28,22 @@ pub struct RoomDoc {
     pub c: BTreeMap<String, f64>,
     pub neighbours: BTreeMap<String, Vec<u64>>,
     pub valve_gain: f64,
-    pub sigma_u: f64,
     pub noise_r: f64,
     pub p0: f64,
     pub q_r: f64,
     pub q_a: f64,
-    #[serde(default = "yes")]
-    pub valve_obs: bool,
     #[serde(default)]
     pub q_um: f64,
     #[serde(default)]
     pub q_ua: f64,
+    #[serde(default)]
+    pub air: Vec<AirDoc>,
+    #[serde(default)]
+    pub effort: Option<EffortDoc>,
+    #[serde(default)]
+    pub co2: Option<GasDoc>,
+    #[serde(default)]
+    pub hum: Option<GasDoc>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +70,10 @@ pub struct HouseCfg {
     pub boost_c: f64,
     pub balance_seed: f64,
     pub night_hours: [f64; 2],
+    #[serde(default)]
+    pub trv_grid: f64,
+    #[serde(default)]
+    pub trv_floor: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,14 +118,18 @@ impl Bundle {
             || h.reset_n == 0
             || !h.balance_seed.is_finite()
             || h.night_hours.iter().any(|v| !v.is_finite())
+            || check_house(h.trv_grid, h.trv_floor).is_err()
         {
             bail!("room model bundle {}: invalid parameters", self.version);
         }
         for (name, r) in &self.rooms {
             let p = &r.params;
-            let values = [p.a1, p.a2, p.b1, p.b2, p.b3, p.b4, p.w, p.ts, p.ts_night, p.tau_v, r.valve_gain, r.sigma_u, r.noise_r, r.p0, r.q_r, r.q_a, r.q_um, r.q_ua];
-            if values.iter().any(|v| !v.is_finite()) || !(p.w >= 0.0 && p.w < 1.0) || p.tau_v < 0.0 || r.valve_gain <= 0.0 || r.sigma_u <= 0.0 || r.noise_r <= 0.0 || r.p0 <= 0.0 || r.q_r < 0.0 || r.q_a < 0.0 || r.q_um < 0.0 || r.q_ua < 0.0 || r.c.values().any(|v| !v.is_finite()) {
+            let values = [p.a1, p.a2, p.b1, p.b2, p.b3, p.b4, p.w, p.ts, p.ts_night, p.tau_v, r.valve_gain, r.noise_r, r.p0, r.q_r, r.q_a, r.q_um, r.q_ua];
+            if values.iter().any(|v| !v.is_finite()) || !(p.w >= 0.0 && p.w < 1.0) || p.tau_v < 0.0 || r.valve_gain <= 0.0 || r.noise_r <= 0.0 || r.p0 <= 0.0 || r.q_r < 0.0 || r.q_a < 0.0 || r.q_um < 0.0 || r.q_ua < 0.0 || r.c.values().any(|v| !v.is_finite()) {
                 bail!("room model bundle {}: invalid model for {name}", self.version);
+            }
+            if !r.air.iter().all(check_air) || !r.effort.as_ref().is_none_or(check_effort) || !r.co2.as_ref().is_none_or(|g| check_gas(g, false)) || !r.hum.as_ref().is_none_or(|g| check_gas(g, true)) {
+                bail!("room model bundle {}: invalid observation parameters for {name}", self.version);
             }
             if r.neighbours.keys().any(|k| !r.c.contains_key(k)) {
                 bail!("room model bundle {}: neighbours of {name} without coupling", self.version);
@@ -148,15 +158,9 @@ pub fn norm_cdf(z: f64) -> f64 {
     0.5 * (1.0 + erf_as(z / std::f64::consts::SQRT_2))
 }
 
-fn lg_pdf(v: f64, s: f64) -> f64 {
-    if s > 0.0 { -0.5 * (v * v / s + (2.0 * std::f64::consts::PI * s).ln()) } else { f64::NAN }
-}
-
 fn all_finite(xs: &[f64]) -> bool {
     xs.iter().all(|v| v.is_finite())
 }
-
-type Mat = [f64; 9];
 
 fn mat_mul(a: &Mat, b: &Mat) -> Mat {
     let mut c = [0.0; 9];
@@ -190,22 +194,36 @@ pub struct RoomPar {
     pub p: Params,
     pub ck: Vec<f64>,
     pub g: f64,
-    pub sigma_u: f64,
     pub noise_r: f64,
     pub p0: f64,
     pub q_r: f64,
     pub q_a: f64,
     pub alpha: f64,
-    pub valve_obs: bool,
     pub q_um: f64,
     pub q_ua: f64,
+    pub air: Vec<(f64, f64)>,
+    pub effort: Option<EffortDoc>,
+    pub co2: Option<GasDoc>,
+    pub hum: Option<GasDoc>,
 }
 
 impl RoomPar {
     pub fn new(doc: &RoomDoc) -> Self {
         let tau = doc.params.tau_v;
         let alpha = if tau > 0.0 { 1.0 - (-1.0 / tau).exp() } else { 1.0 };
-        Self { p: doc.params.clone(), ck: doc.c.values().copied().collect(), g: doc.valve_gain, sigma_u: doc.sigma_u, noise_r: doc.noise_r, p0: doc.p0, q_r: doc.q_r, q_a: doc.q_a, alpha, valve_obs: doc.valve_obs, q_um: doc.q_um, q_ua: doc.q_ua }
+        Self { p: doc.params.clone(), ck: doc.c.values().copied().collect(), g: doc.valve_gain,
+            noise_r: doc.noise_r,
+            p0: doc.p0,
+            q_r: doc.q_r,
+            q_a: doc.q_a,
+            alpha,
+            q_um: doc.q_um,
+            q_ua: doc.q_ua,
+            air: doc.air.iter().map(|a| (a.noise * a.noise, a.offset)).collect(),
+            effort: doc.effort.clone(),
+            co2: doc.co2.clone(),
+            hum: doc.hum.clone(),
+        }
     }
 
     pub fn lag(&self, state: Option<[f64; 2]>, u: f64) -> [f64; 2] {
@@ -236,36 +254,17 @@ impl RoomPar {
         [1.0 + h * (-(au + p.a2)), h * p.a2, h * p.b1, 1.0 + h * (-(p.b1 + (lam * amb + cn))), h * (au * ts), h * (lam * amb * tout + p.b4 * rad / 100.0 + cs), amb]
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn effort_coeffs(&self, m: f64, a: f64, ts: f64, wind: f64, tout: f64, rad: f64, cn: f64, cs: f64) -> (f64, f64) {
+        let p = &self.p;
+        let amb = p.b2 + p.b3 * wind;
+        let k = p.a2 / (p.b1 * p.a1 * (ts - m).max(crate::room_obs::D_MIN));
+        (k * (cn * a - cs - p.b4 * rad / 100.0), k * amb * (a - tout).max(0.0))
+    }
+
     pub fn sensor(&self, m: f64, a: f64) -> f64 {
         self.p.w * m + (1.0 - self.p.w) * a
     }
-}
-
-fn obs_update(x: &mut [f64; 3], p: &mut Mat, hrow: [f64; 3], v: f64, r: f64) -> f64 {
-    let mut ph = [0.0; 3];
-    for (i, q) in ph.iter_mut().enumerate() {
-        *q = p[3 * i] * hrow[0] + p[3 * i + 1] * hrow[1] + p[3 * i + 2] * hrow[2];
-    }
-    let s = hrow[0] * ph[0] + hrow[1] * ph[1] + hrow[2] * ph[2] + r;
-    if s.is_nan() || s <= 0.0 {
-        return s;
-    }
-    let k = [ph[0] / s, ph[1] / s, ph[2] / s];
-    for i in 0..3 {
-        x[i] += k[i] * v;
-    }
-    let mut q = [0.0; 9];
-    for i in 0..3 {
-        for j in 0..3 {
-            q[3 * i + j] = p[3 * i + j] - k[i] * ph[j];
-        }
-    }
-    for i in 0..3 {
-        for j in 0..3 {
-            p[3 * i + j] = 0.5 * (q[3 * i + j] + q[3 * j + i]);
-        }
-    }
-    s
 }
 
 #[derive(Debug, Clone)]
@@ -280,11 +279,15 @@ pub struct RoomIn {
     pub night: bool,
     pub ncnt: Vec<f64>,
     pub nsum: Vec<f64>,
+    pub ya: Vec<f64>,
+    pub co2: f64,
+    pub rh: f64,
+    pub th: f64,
 }
 
 impl RoomIn {
     pub fn blank(kinds: usize) -> Self {
-        Self { y: f64::NAN, yv: f64::NAN, u: f64::NAN, sp: f64::NAN, tout: 0.0, wind: 0.0, rad: 0.0, night: false, ncnt: vec![0.0; kinds], nsum: vec![0.0; kinds] }
+        Self { y: f64::NAN, yv: f64::NAN, u: f64::NAN, sp: f64::NAN, tout: 0.0, wind: 0.0, rad: 0.0, night: false, ncnt: vec![0.0; kinds], nsum: vec![0.0; kinds], ya: Vec::new(), co2: f64::NAN, rh: f64::NAN, th: f64::NAN }
     }
 
     fn dynamic_ok(&self) -> bool {
@@ -342,6 +345,7 @@ pub struct RoomFilter {
     pub comps: Vec<Comp>,
     pub last: Out,
     pub lag: Option<[f64; 2]>,
+    hist: [VecDeque<f64>; 2],
 }
 
 impl RoomFilter {
@@ -369,7 +373,34 @@ impl RoomFilter {
             comps: Vec::new(),
             last: Out::default(),
             lag: None,
+            hist: [VecDeque::new(), VecDeque::new()],
         }
+    }
+
+    fn rate(&self, i: usize, win: usize) -> f64 {
+        let h = &self.hist[i];
+        match (h.front(), h.back()) {
+            (Some(a), Some(b)) if h.len() == win + 1 && a.is_finite() && b.is_finite() => (b - a) / win as f64,
+            _ => f64::NAN,
+        }
+    }
+
+    fn gas_evidence(&self, inp: &RoomIn) -> Vec<(f64, f64, GasDoc)> {
+        let par = &self.par;
+        let mut out = Vec::new();
+        if let Some(g) = &par.co2 {
+            let (excess, r) = (inp.co2 - g.out.unwrap_or(f64::NAN), self.rate(0, g.window()));
+            if excess.is_finite() && r.is_finite() && excess >= g.min_excess {
+                out.push((excess, r, g.clone()));
+            }
+        }
+        if let Some(g) = &par.hum {
+            let (excess, r) = (abs_hum(inp.th, inp.rh) - abs_hum(inp.tout, g.rh_out.unwrap_or(f64::NAN)), self.rate(1, g.window()));
+            if excess.is_finite() && r.is_finite() && excess >= g.min_excess {
+                out.push((excess, r, g.clone()));
+            }
+        }
+        out
     }
 
     #[cfg(test)]
@@ -427,6 +458,14 @@ impl RoomFilter {
         if inp.u.is_finite() {
             self.lag = Some(self.par.lag(self.lag, inp.u));
         }
+        for (i, v) in [(0, inp.co2), (1, abs_hum(inp.th, inp.rh))] {
+            if let Some(win) = [&self.par.co2, &self.par.hum][i].as_ref().map(GasDoc::window) {
+                self.hist[i].push_back(v);
+                while self.hist[i].len() > win + 1 {
+                    self.hist[i].pop_front();
+                }
+            }
+        }
         if !inp.dynamic_ok() {
             self.since_obs += 1;
             return None;
@@ -443,20 +482,41 @@ impl RoomFilter {
         }
         self.skipped = false;
         let par = self.par.clone();
-        let v_ok = par.valve_obs && inp.yv.is_finite() && 0.0 < inp.yv && inp.yv < 1.0 && inp.sp.is_finite();
-        let r1 = self.house.r_grid + par.noise_r.powi(2);
+        let (grid, noise_var) = (self.house.trv_grid, par.noise_r.powi(2));
+        let r1 = self.house.r_grid + noise_var;
+        let (cn, cs) = par.coupling(&inp.ncnt, &inp.nsum);
+        let mu0 = self.weights(w);
+        let ybar = (0..4).fold(0.0, |acc, j| acc + mu0[j] * par.sensor(self.x[j][0], self.x[j][1]));
+        let eff = par.effort.as_ref().filter(|e| all_finite(&[inp.yv, inp.sp, ybar]) && 0.0 < inp.yv && inp.yv < 1.0 && par.g * (inp.sp - ybar).abs() <= e.steady_u);
+        let gas = self.gas_evidence(inp);
+        let ts = if inp.night { par.p.ts_night } else { par.p.ts };
         let (mut ll, mut yhat, mut s1) = ([0.0; 4], [0.0; 4], [0.0; 4]);
         for j in 0..4 {
             let (x, p) = (&mut self.x[j], &mut self.p[j]);
+            for (&(var, off), &ya) in par.air.iter().zip(&inp.ya) {
+                if ya.is_finite() {
+                    let v = ya - off - x[1];
+                    ll[j] += lg_pdf(v, obs_update(x, p, [0.0, 1.0, 0.0], v, var));
+                }
+            }
             if y_ok {
                 yhat[j] = par.sensor(x[0], x[1]);
-                s1[j] = obs_update(x, p, [par.p.w, 1.0 - par.p.w, 0.0], inp.y - yhat[j], r1);
-                ll[j] += lg_pdf(inp.y - yhat[j], s1[j]);
+                if grid > 0.0 {
+                    let (l, s) = trv_update(x, p, [par.p.w, 1.0 - par.p.w, 0.0], inp.y, yhat[j], noise_var, grid, self.house.trv_floor, r1);
+                    s1[j] = s;
+                    ll[j] += l;
+                } else {
+                    s1[j] = obs_update(x, p, [par.p.w, 1.0 - par.p.w, 0.0], inp.y - yhat[j], r1);
+                    ll[j] += lg_pdf(inp.y - yhat[j], s1[j]);
+                }
             }
-            if v_ok {
-                let v = inp.yv - par.g * (inp.sp - par.sensor(x[0], x[1]));
-                let s = obs_update(x, p, [-par.g * par.p.w, -par.g * (1.0 - par.p.w), 0.0], v, par.sigma_u.powi(2));
-                ll[j] += lg_pdf(v, s);
+            if let (Some(e), true) = (eff, j >= 2) {
+                let (c0, c1) = par.effort_coeffs(x[0], x[1], ts, inp.wind, inp.tout, inp.rad, cn, cs);
+                ll[j] += lam_update(x, p, c0, c1, inp.yv, e.sigma);
+            }
+            for (excess, rate, g) in &gas {
+                let (c0, c1) = gas_coeffs(g.k, g.gain, *excess);
+                ll[j] += gas_update(x, p, c0, c1, *rate, g.sigma, g.sigma_up);
             }
         }
         if y_ok {

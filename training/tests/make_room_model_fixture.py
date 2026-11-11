@@ -42,6 +42,11 @@ def edit(k, row):
     return row
 
 
+def evidence(doc):
+    node = lambda block, n: {**block, "node": n}
+    return {**({"air": [node(a, 11) for a in doc["air"]]} if "air" in doc else {}), **{key: node(doc[key], 12) for key in ("co2", "hum") if key in doc}, **({"effort": doc["effort"]} if "effort" in doc else {})}
+
+
 def checks():
     h, noise = (0.3, 0.7, 0.0), 0.15 ** 2
     cases = []
@@ -79,7 +84,7 @@ def build():
                 env = clean_env({**plan_env(row[n], k), "lag": h.rooms[n].lag, "y_last": last_report(inputs, n, k) if k % 20 else None})
                 p = plan(RoomPar(docs[n]), SHOCK, h.rooms[n].comps, h.w[1], env)
                 plans.append({"step": k, "room": n, "env": env, "out": {key: clean(p[key]) for key in PLAN_KEYS}})
-    bundle_rooms = {n: {"node": 5 + i, "struct": "rc2", **{key: docs[n][key] for key in ("params", "c", "valve_gain", "sigma_u", "noise_r", "p0", "q_r", "q_a")}, **{key: docs[n][key] for key in ("air", "effort", "co2", "hum") if key in docs[n]}, "q_um": docs[n].get("q_um", 0.0), "q_ua": docs[n].get("q_ua", 0.0), "neighbours": {"wall": [5 + (i + 1) % 3]}} for i, n in enumerate(NAMES)}
+    bundle_rooms = {n: {"node": 5 + i, "struct": "rc2", **{key: docs[n][key] for key in ("params", "c", "valve_gain", "sigma_u", "noise_r", "p0", "q_r", "q_a")}, **evidence(docs[n]), "q_um": docs[n].get("q_um", 0.0), "q_ua": docs[n].get("q_ua", 0.0), "neighbours": {"wall": [5 + (i + 1) % 3]}} for i, n in enumerate(NAMES)}
     return {
         "bundle": {"kind": "room_model", "version": "20261101T000000Z", "dt_s": 60.0, "rooms": bundle_rooms, "shock": SHOCK, "house": {**HOUSE, "night_hours": [22, 5], "timezone": "Europe/Berlin"}},
         "rooms": list(NAMES), "steps": STEPS,

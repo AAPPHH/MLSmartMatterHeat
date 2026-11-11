@@ -976,6 +976,9 @@ async fn capture_loop(state: AppState, feed: Arc<dyn DeviceFeed>, config: Device
                 backoff = timing.reconnect_start;
                 last_error.clear();
                 while let Some(item) = rx.recv().await {
+                    if let Some(row) = reading_of(&item, lake::now_us()).filter(|r| r.kind == "attribute") {
+                        state.room_model.observe_device(row.node, row.cluster, row.attribute, row.value.unwrap_or(f64::NAN), row.ts / 1000);
+                    }
                     state.devices.handle(&state.sink, config.node, item);
                 }
             }

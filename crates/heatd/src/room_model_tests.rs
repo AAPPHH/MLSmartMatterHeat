@@ -23,7 +23,10 @@ fn inputs(fx: &Value, k: usize) -> BTreeMap<String, RoomIn> {
             let i = &fx["inputs"][name];
             let at = |key: &str| num(&i[key][k]);
             let list = |key: &str| i[key][k].as_array().unwrap().iter().map(num).collect::<Vec<f64>>();
-            (name.to_string(), RoomIn { y: at("y"), yv: at("yv"), u: at("u"), sp: at("sp"), tout: at("tout"), wind: at("wind"), rad: at("rad"), night: at("night") > 0.5, ncnt: list("ncnt"), nsum: list("nsum") })
+            (
+                name.to_string(),
+                RoomIn { y: at("y"), yv: at("yv"), u: at("u"), sp: at("sp"), tout: at("tout"), wind: at("wind"), rad: at("rad"), night: at("night") > 0.5, ncnt: list("ncnt"), nsum: list("nsum"), ya: list("ya"), co2: at("co2"), rh: at("rh"), th: at("th") },
+            )
         })
         .collect()
 }
@@ -126,6 +129,31 @@ fn loader_rejects_bad_bundles() {
     let mut b = base_bundle();
     b["rooms"]["kueche"]["params"]["w"] = 1.5.into();
     assert!(Bundle::parse(&b.to_string()).is_err());
+    for (path, bad) in [
+        ("house/trv_grid", Value::from(-0.5)),
+        ("house/trv_floor", Value::Null),
+        ("rooms/kueche/air", serde_json::json!([{"node": 11, "noise": 0.0}])),
+        ("rooms/kueche/effort", serde_json::json!({"sigma": -1.0, "steady_u": 0.05})),
+        ("rooms/kueche/effort", serde_json::json!({"sigma": 0.1})),
+        ("rooms/schlafzimmer/co2/k", Value::from(-0.1)),
+        ("rooms/schlafzimmer/co2/win_min", Value::from(0.0)),
+        ("rooms/schlafzimmer/co2/win_min", Value::from(2.5)),
+        ("rooms/schlafzimmer/co2/out", Value::Null),
+        ("rooms/schlafzimmer/hum/rh_out", Value::from(120.0)),
+        ("rooms/schlafzimmer/hum/sigma_up", Value::Null),
+    ] {
+        let mut b = base_bundle();
+        *b.pointer_mut(&format!("/{path}")).unwrap() = bad.clone();
+        assert!(Bundle::parse(&b.to_string()).is_err(), "{path}={bad}");
+    }
+    let mut b = base_bundle();
+    for room in b["rooms"].as_object_mut().unwrap().values_mut() {
+        for key in ["air", "effort", "co2", "hum"] {
+            room.as_object_mut().unwrap().remove(key);
+        }
+    }
+    b["house"].as_object_mut().unwrap().remove("trv_grid");
+    assert!(Bundle::parse(&b.to_string()).is_ok(), "a bundle without observation blocks still loads");
     let mut b = base_bundle();
     b["rooms"] = serde_json::json!({});
     assert!(Bundle::parse(&b.to_string()).is_err());
@@ -143,6 +171,51 @@ fn newest_valid_bundle_wins_and_broken_ones_are_skipped() {
     assert_eq!(loaded.version, "20261101T000000Z");
     assert!(try_load(dir.join("missing").to_str().unwrap()).is_none());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn observation_primitives_match_the_python_checks() {
+    use crate::room_obs::{abs_hum, bin_prob, trv_update};
+    let fx = fixture();
+    let c = &fx["checks"];
+    for b in c["bin"].as_array().unwrap() {
+        near(bin_prob(num(&b[0]), num(&b[1])), num(&b[2]), 1e-12, "bin_prob");
+    }
+    for h in c["abs_hum"].as_array().unwrap() {
+        near(abs_hum(num(&h[0]), num(&h[1])), num(&h[2]), 1e-12, "abs_hum");
+    }
+    for t in c["trv"].as_array().unwrap() {
+        let (yhat, p0) = (num(&t["yhat"]), num(&t["p0"]));
+        let (mut x, mut p) = ([yhat, yhat, 1.0], [p0, 0.01, 0.0, 0.01, p0, 0.0, 0.0, 0.0, 0.02]);
+        let noise = 0.15f64.powi(2);
+        let (ll, s) = trv_update(&mut x, &mut p, [0.3, 0.7, 0.0], num(&t["y"]), yhat, noise, 0.5, 0.25, 0.5f64.powi(2) / 12.0 + noise);
+        near(ll, num(&t["ll"]), 1e-9, "trv ll");
+        near(s, num(&t["s"]), 1e-9, "trv s");
+        for i in 0..3 {
+            near(x[i], num(&t["x"][i]), 1e-9, "trv x");
+        }
+        for i in 0..9 {
+            near(p[i], num(&t["p"][i]), 1e-9, "trv p");
+        }
+    }
+}
+
+#[test]
+fn repeated_identical_readings_keep_the_sensor_variance_on_the_grid_scale() {
+    use crate::room_obs::{obs_update, trv_update};
+    let (w, noise) = (0.3, 0.15f64.powi(2));
+    let sd = |p: &[f64; 9]| (w * w * p[0] + 2.0 * w * (1.0 - w) * p[1] + (1.0 - w).powi(2) * p[4]).sqrt();
+    let (mut x, mut p) = ([20.0, 20.0, 1.0], [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.01]);
+    let (mut xg, mut pg) = (x, p);
+    let mut ll = 0.0;
+    for _ in 0..60 {
+        let yhat = w * x[0] + (1.0 - w) * x[1];
+        ll = trv_update(&mut x, &mut p, [w, 1.0 - w, 0.0], 20.0, yhat, noise, 0.5, 0.25, 0.25 / 12.0 + noise).0;
+        let innovation = 20.0 - (w * xg[0] + (1.0 - w) * xg[1]);
+        obs_update(&mut xg, &mut pg, [w, 1.0 - w, 0.0], innovation, 0.25 / 12.0 + noise);
+    }
+    let floor = (0.25f64 * 0.25 / 12.0).sqrt();
+    assert!(sd(&p) > 0.95 * floor && sd(&p) < 1.3 * floor && sd(&pg) < 0.5 * sd(&p) && ll > -0.2 && ll <= 0.0, "{} {} {ll}", sd(&p), sd(&pg));
 }
 
 #[test]

@@ -36,6 +36,7 @@ mod manual;
 mod manual_tests;
 mod restore;
 mod room_model;
+mod room_obs;
 mod room_plan;
 mod room_shadow;
 #[cfg(test)]

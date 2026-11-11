@@ -62,6 +62,77 @@ async fn shadow_never_writes_and_logs_a_sentence_per_room() {
     assert!(off.room_model.view("b").is_null());
 }
 
+const DEVICES: &str = "[[devices]]
+node = 11
+kind = 'climate'
+role = 'sink'
+room = 'b'
+[[devices]]
+node = 12
+kind = 'air'
+role = 'air'
+room = 'c'
+[[devices]]
+node = 13
+kind = 'climate'
+role = 'sink'
+room = 'a'
+";
+
+fn device_rig(dir: &std::path::Path, bundle: String) -> crate::http::AppState {
+    let mock = Arc::new(MockController::new(1));
+    [5, 6, 7].iter().for_each(|n| mock.add_node(*n, 19.0, 19.0));
+    let state = state_with(dir, mock, &format!("{ROOMS}{DEVICES}[room_model]
+enabled = true
+"));
+    state.status.outdoor_obs(crate::lake::now_us(), 4.0, Some(3.0));
+    state.room_model.set_bundle(Bundle::parse(&bundle).unwrap());
+    state
+}
+
+fn aligned() -> i64 {
+    T0 - T0.rem_euclid(5 * MIN)
+}
+
+fn device_run(state: &crate::http::AppState, minutes: i64, feed: bool) {
+    for minute in 0..minutes {
+        let t = aligned() + minute * MIN;
+        let drop = (minute - 60).max(0) as f64;
+        for (node, temp) in [(5u64, 20.6), (6, 20.2), (7, 20.4 - 0.05 * drop)] {
+            state.room_model.observe(node, crate::window::LOCAL_TEMPERATURE, temp, t);
+            state.room_model.observe(node, crate::window::PI_HEATING_DEMAND, if node == 7 && drop > 0.0 { 60.0 } else { 20.0 }, t);
+            state.room_model.observe(node, crate::window::OCCUPIED_SETPOINT, 21.0, t);
+        }
+        if feed {
+            state.room_model.observe_device(11, 0x0402, 0, 2060.0, t);
+            state.room_model.observe_device(13, 0x0402, 0, 2060.0, t);
+            state.room_model.observe_device(12, 0x040D, 0, (1400.0 - 30.0 * drop).max(500.0), t);
+            state.room_model.observe_device(12, 0x0402, 0, 2040.0 - 5.0 * drop, t);
+            state.room_model.observe_device(12, 0x0405, 0, 4500.0, t);
+        }
+        state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, &[]);
+    }
+}
+
+#[test]
+fn device_readings_reach_the_air_and_gas_evidence_of_their_own_room_only() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let fed = device_rig(a.path(), bundle_text());
+    let plain = device_rig(b.path(), bundle_text());
+    device_run(&fed, 120, true);
+    device_run(&plain, 120, false);
+    let air = |s: &crate::http::AppState, room: &str| {
+        s.room_model.step(&s.config, aligned() + 120 * MIN, [4.0, 3.0, 0.0], 12.0, &[crate::room_shadow::RoomCtx { room: room.into(), live: 21.0, target: 21.0, present: 1.0, sp_cur: Some(21.0), boost_ok: false, window_live: false, resid_live_k: None }]);
+        s.room_model.view(room)
+    };
+    let (kitchen, bedroom, kitchen_plain, bedroom_plain) = (air(&fed, "b"), air(&fed, "c"), air(&plain, "b"), air(&plain, "c"));
+    let a_c = |v: &Value| v["air_c"].as_f64().unwrap();
+    assert!(a_c(&kitchen) > a_c(&kitchen_plain) + 0.1, "{kitchen} {kitchen_plain}");
+    assert!(bedroom["loss_ratio"].as_f64().unwrap() > bedroom_plain["loss_ratio"].as_f64().unwrap() + 0.3, "{bedroom} {bedroom_plain}");
+    let wrong = air(&fed, "a");
+    assert!((a_c(&wrong) - a_c(&air(&plain, "a"))).abs() < 0.1, "a device of another room must not feed this room: {wrong}");
+}
+
 #[tokio::test]
 async fn a_cooling_room_raises_loss_and_window_probability_in_the_shadow() {
     let dir = tempfile::tempdir().unwrap();
