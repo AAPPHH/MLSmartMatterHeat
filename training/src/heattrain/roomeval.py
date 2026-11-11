@@ -308,10 +308,17 @@ def rolling_origin(full, ff, variants, truth, rc, house):
     return folds, out, chosen
 
 
-def criteria(rc, hold, final_resets, flags, edges):
-    c, p = rc["criteria"], hold["trv"]["skill"]["pooled"]
-    w = hold["trv"]["window"]
-    return {"S1": {"pass": bool(p["H20"]["skill"] >= c["s1_h20"] and p["H60"]["skill"] >= c["s1_h60"]), "basis": "causal", "h20": p["H20"]["skill"], "h60": p["H60"]["skill"], "oracle_valve": {"h20": p["H20"]["oracle_skill"], "h60": p["H60"]["oracle_skill"]}},
+def ship_key(chosen, hold):
+    e = chosen["effort"]
+    key = f"effort_{e['sigma']}_{e['steady_u']}" if e else "trv"
+    return key if key in hold else "trv"
+
+
+def criteria(rc, hold, key, final_resets, flags, edges):
+    c, p = rc["criteria"], hold[key]["skill"]["pooled"]
+    w, plain = hold[key]["window"], hold["trv"]["skill"]["pooled"]
+    return {"S1": {"pass": bool(p["H20"]["skill"] >= c["s1_h20"] and p["H60"]["skill"] >= c["s1_h60"]), "basis": "causal", "config": key, "selected_on_holdout": key != "trv", "h20": p["H20"]["skill"], "h60": p["H60"]["skill"],
+                   "oracle_valve": {"h20": p["H20"]["oracle_skill"], "h60": p["H60"]["oracle_skill"]}, "plain_trv": {"h20": plain["H20"]["skill"], "h60": plain["H60"]["skill"]}},
             "S2": {"pass": bool(w["false_per_room_day"] < c["s2"] and w["false_per_room_day"] < w["live_false_per_room_day"]), "stretch": bool(w["false_per_room_day"] < c["s2_stretch"]), "false_per_room_day": w["false_per_room_day"], "live_false_per_room_day": w["live_false_per_room_day"]},
             "S3": {"pass": bool(w["hits"] > w["live_hits"]), "hits": w["hits"], "live_hits": w["live_hits"], "opens": w["opens"]},
             "S4": {"pass": bool(not flags and not edges and max(final_resets.values()) < c["s4_resets"]), "resets_per_room": final_resets, "at_bound": flags, "shock_at_grid_edge": edges}}
@@ -354,7 +361,7 @@ def fit_bundle(config, rooms, src, version=None):
     holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
-    report = {"version": version, "flags": flags_all, "holdout": holdout, "criteria": criteria(rc, hold, by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
+    report = {"version": version, "flags": flags_all, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
               "resets": len(resets), "reset_list": reset_list(full, resets, truth, rec), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
               "loglik": float(run.loglik[0]), "minutes": full.n, "sensor_start": variants.sensor_start, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"folds": t_fold, "total": time.time() - t0},
               "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"]} for n, d in docs.items()}}

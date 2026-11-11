@@ -137,9 +137,10 @@ def test_s3_needs_strictly_more_hits_than_live():
     def hold(hits, live):
         sk = {"H20": {"skill": 0.1, "oracle_skill": 0.2}, "H60": {"skill": 0.2, "oracle_skill": 0.3}}
         return {"trv": {"skill": {"pooled": sk}, "window": {"hits": hits, "live_hits": live, "opens": 4, "false_per_room_day": 0.0, "live_false_per_room_day": 1.0}}}
-    s3 = lambda h, l: criteria(RC, hold(h, l), {"r": 1}, [], [])["S3"]["pass"]
+    s3 = lambda h, l: criteria(RC, hold(h, l), "trv", {"r": 1}, [], [])["S3"]["pass"]
     assert not s3(0, 0) and not s3(1, 1) and s3(2, 1)
-    assert criteria(RC, hold(1, 0), {"r": 1}, [], [])["S1"]["oracle_valve"]["h20"] == 0.2
+    s1 = criteria(RC, hold(1, 0), "trv", {"r": 1}, [], [])["S1"]
+    assert s1["oracle_valve"]["h20"] == 0.2 and s1["config"] == "trv" and not s1["selected_on_holdout"] and s1["plain_trv"]["h60"] == 0.2
 
 
 def test_unusable_rooms_flag_a_supply_temperature_below_the_setpoint_plus_margin():
