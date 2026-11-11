@@ -41,13 +41,16 @@ class Grid:
                                  "bad": pad(d.bad.astype(float), 1.0), "ya": [pad(np.asarray(a, float)) for a in (d.ext or {}).get("ya", [])], **{k: pad(np.asarray((d.ext or {}).get(k, np.full(d.n, np.nan)), float)) for k in ("co2", "rh", "th")}, "ncnt": [nb[k][0] for k in self.kinds[d.room]], "nsum": [nb[k][1] for k in self.kinds[d.room]]}
         self.times = self.t0 + np.arange(self.n) * self.dt
 
-    def tail(self, start):
+    def window(self, start, stop):
         g = object.__new__(Grid)
         g.__dict__.update(self.__dict__)
-        g.n = self.n - start
-        g.times = self.times[start:]
-        g.cols = {r: {k: ([x[start:] for x in v] if isinstance(v, list) else v[start:]) for k, v in c.items()} for r, c in self.cols.items()}
+        g.n = stop - start
+        g.times = self.times[start:stop]
+        g.cols = {r: {k: ([x[start:stop] for x in v] if isinstance(v, list) else v[start:stop]) for k, v in c.items()} for r, c in self.cols.items()}
         return g
+
+    def tail(self, start):
+        return self.window(start, self.n)
 
     def span_mask(self, spans):
         m = np.zeros(self.n, bool)

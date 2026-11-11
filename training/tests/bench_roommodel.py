@@ -3,7 +3,7 @@ import sys
 import time
 import numpy as np
 from heattrain.__main__ import CONFIG
-from heattrain.roomfit import fit_bundle
+from heattrain.roomeval import fit_bundle
 from test_thermal import simulate
 
 HOURS = int(sys.argv[2]) if len(sys.argv) > 2 else 48

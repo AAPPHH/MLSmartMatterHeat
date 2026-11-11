@@ -4,7 +4,8 @@ import math
 import numpy as np
 import pytest
 from heattrain.__main__ import CONFIG
-from heattrain.roomfit import fit_bundle, fit_shock, run_batch, shock_defaults, tune_windows
+from heattrain.roomeval import fit_bundle
+from heattrain.roomfit import fit_shock, run_batch, shock_defaults, tune_windows
 from heattrain.roomimm import House, RoomIn, RoomPar, plan, storage
 from heattrain.thermal import RoomData, build_rooms, kalman
 from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
@@ -220,6 +221,8 @@ def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
     rm = config["roommodel"]
     rm["shock"].update(days=1, passes=1, grid={"q_calm": [0.01, 0.03], "p_jump": [1e-3], "q_jump": [0.3]})
     rm["fit"].update(warm_min=120, max_nfev=40)
+    rm["eval"].update(folds=[0.5, 0.75], warm_days=0.5)
+    rm["evidence"]["select"]["enabled"] = False
     bundle, report = fit_bundle(config, rooms, tmp_path, version="20261101T000000Z")
     assert bundle["kind"] == "room_model" and set(bundle["rooms"]) == {"wohnzimmer", "kueche"}
     s = bundle["shock"]
@@ -230,7 +233,7 @@ def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
     json.dumps(bundle)
     pooled = report["holdout"]["pooled"]
     assert pooled["H20"]["n"] > 0 and pooled["H60"]["skill"] > 0.0
-    assert all(i["all"]["converged"] for i in report["fit"].values())
+    assert all(i["converged"] for i in report["fit"].values())
 
 
 def test_window_threshold_is_refused_without_hits_and_ties_prefer_fewer_false_alarms():
@@ -287,7 +290,7 @@ def test_fast_shock_fit_replays_the_reference_coordinate_descent():
     docs, inputs, g = sim_grid(600)
     rc = copy.deepcopy(CONFIG["roommodel"])
     rc["house"] = dict(HOUSE)
-    rc["shock"].update(passes=2, grid={"q_calm": [0.003, 0.03], "p_jump": [1e-4, 1e-2], "q_jump": [0.6]})
+    rc["shock"].update(passes=2, reset_cost=0.0, grid={"q_calm": [0.003, 0.03], "p_jump": [1e-4, 1e-2], "q_jump": [0.6]})
     drop = {n: np.arange(g.n) % 97 < 5 for n in NAMES}
 
     def ref_nll(vals):

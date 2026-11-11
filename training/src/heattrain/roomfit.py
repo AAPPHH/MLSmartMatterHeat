@@ -163,19 +163,19 @@ class RoomFit:
             x1, x2 = a11 * x1 + F12 * x2 + G1[k], F21 * x1 + a22 * x2 + G2[k]
         return M, A
 
-    def roll(self, p, coef, m, a, lam, sel):
+    def roll(self, p, coef, m, a, lam, sel, phi=1.0):
         F11, F12, F21, F22, G1, G2, amb, cn, cs, UE = coef
         js, h, out = self.js[sel], 1.0 / 60.0, {}
         tout = np.nan_to_num(self.c["tout"])[:, None]
         for s in range(max(self.Hs)):
             k = js + s
-            dl = h * (lam - 1.0) * amb[k]
+            dl = h * (lam - 1.0) * phi ** s * amb[k]
             m, a = F11[k] * m + F12 * a + G1[k], F21 * m + (F22[k] - dl) * a + G2[k] + dl * tout[k]
             if s + 1 in self.Hs:
                 out[s + 1] = p["w"] * m + (1 - p["w"]) * a
         return out
 
-    def errors(self, p, sel, doc, start=None):
+    def errors(self, p, sel, doc, start=None, phi=1.0):
         coef = self.coef(p)
         P = len(p["w"])
         if start is None:
@@ -183,7 +183,7 @@ class RoomFit:
             m, a, lam = M[sel], A[sel], 1.0
         else:
             m, a, lam = (np.repeat(np.asarray(x, float)[self.js[sel]][:, None], P, 1) for x in start)
-        pred = self.roll(p, coef, m, a, lam, sel)
+        pred = self.roll(p, coef, m, a, lam, sel, phi)
         shat = p["w"] * m + (1 - p["w"]) * a
         y, js, Pc = self.c["y"], self.js[sel], self.Pc[sel][:, None]
         return {H: (y[js + H][:, None] - Pc) - (pred[H] - shat) for H in self.Hs}, {H: y[js + H][:, None] - pred[H] for H in self.Hs}
@@ -232,12 +232,12 @@ def init_theta(rf, d, cfg, rc, ns):
     return np.clip(th, rf.lo + 0.05, rf.hi - 0.05)
 
 
-def base_doc(d, cfg, rc):
+def base_doc(d, cfg, rc, ext=True):
     g = valve_gain(d, cfg)
     f = rc["fit"]
     scale = f["valve_sigma_scale"]
     return {"node": d.node, "struct": "rc2", "neighbours": {k: sorted(set(d.info["neighbour_nodes"].get(k, []))) for k in d.nb}, "valve_gain": g, "sigma_u": sigma_u(d, g, rc) * (scale or 1.0),
-            "valve_obs": bool(scale), "noise_r": cfg["noise_r"], "p0": cfg["p0"], "q_r": f["q_r"], "q_a": f["q_a"], "q_um": f["q_um"], "q_ua": f["q_ua"], **evidence_blocks(d.ext, rc["evidence"])}
+            "valve_obs": bool(scale), "noise_r": cfg["noise_r"], "p0": cfg["p0"], "q_r": f["q_r"], "q_a": f["q_a"], "q_um": f["q_um"], "q_ua": f["q_ua"], **(evidence_blocks(d.ext, rc["evidence"]) if ext else {})}
 
 
 def shock_defaults(rc, **over):
@@ -245,9 +245,63 @@ def shock_defaults(rc, **over):
     return {"tau_l": s["tau_l"], "hold_min": s["hold_min"], "p_l0": s["p_l0"], "lambda_jump": s["lambda_jump"], "lambda_w": s["lambda_w"], **s["start"], **over}
 
 
+def load_live_alarms(path):
+    p = Path(path)
+    rows = []
+    for b in raw_batches(p, "events"):
+        if "detail" in b.schema.names:
+            rows += [(ts, d) for ts, k, d in zip(epoch(b.column("ts").to_pylist()), b.column("kind").to_pylist(), b.column("detail").to_pylist()) if k == "window_open" and d]
+    base = p / "parquet" / "events"
+    if base.is_dir() and any(base.rglob("part.parquet")):
+        sql = f"SELECT epoch(ts), detail FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true) WHERE kind::VARCHAR = 'window_open' AND detail IS NOT NULL"
+        rows += [(float(a), d) for a, d in duckdb.connect().execute(sql).fetchall()]
+    out = set()
+    for t, d in rows:
+        try:
+            j = json.loads(d)
+        except (TypeError, ValueError):
+            continue
+        if j.get("source") == "auto" and j.get("room"):
+            out.add((round(t, 3), j["room"]))
+    return sorted(out)
+
+
+class Truth:
+    def __init__(self, src, rc):
+        self.rc = rc
+        self.gt = load_ground_truth(src, rc["hold_min"])
+        self.labels = [x for x in load_window_labels(src) if x[0] > 1e6]
+        self.live = load_live_alarms(src)
+
+    def spans(self, rooms):
+        return window_spans(self.gt, self.labels, rooms, self.rc["shock"]["pad_min"] * 60)
+
+    def opens(self, rooms, lo=-math.inf, hi=math.inf):
+        out = [(r, a) for a, b, rs in self.gt for r in rs if r in rooms] + [(r, t) for t, r, o in self.labels if o and r in rooms]
+        return sorted((r, a) for r, a in out if lo <= a < hi)
+
+    def denials(self, rooms, lo=-math.inf, hi=math.inf):
+        return sorted((r, t) for t, r, o in self.labels if not o and r in rooms and lo <= t < hi)
+
+
+def label_loss(grid, rec, truth, rc):
+    s = rc["shock"]["label"]
+    spans, total = truth.spans(grid.names), 0.0
+    t0, t1 = grid.times[0], grid.times[-1]
+    ev = rc["eval"]
+    for r in grid.names:
+        pw = np.nan_to_num(rec[r]["p_window"])
+        total += s["fa_cost"] * sum(1 for a, b in episodes(pw > ev["pw_flag"], grid.times, ev["min_episode_min"]) if not any(x <= a <= y for x, y in spans[r]))
+        for room, a in truth.opens([r], t0, t1):
+            i0, i1 = np.searchsorted(grid.times, a - 300.0), np.searchsorted(grid.times, a + rc["shock"]["hit_min"] * 60.0, side="right")
+            peak = float(np.max(pw[i0:i1])) if i1 > i0 else 0.0
+            total -= s["event_weight"] * math.log(min(max(peak, s["pw_floor"]), 1.0))
+    return total
+
+
 class ShockScores:
-    def __init__(self, grid, docs, rc, drop):
-        self.grid, self.docs, self.rc = grid, docs, rc
+    def __init__(self, grid, docs, rc, drop=None, truth=None):
+        self.grid, self.docs, self.rc, self.truth = grid, docs, rc, truth
         self.inp = Inputs(grid, docs, drop)
         self.cache = {}
 
@@ -255,15 +309,18 @@ class ShockScores:
         key = lambda t: tuple(sorted(t.items()))
         todo = list({key(t): t for t in trials if key(t) not in self.cache}.values())
         if todo:
-            bh, _ = run_batch(self.grid, self.docs, [shock_defaults(self.rc, **t) for t in todo], self.rc["house"], inp=self.inp)
-            self.cache.update({key(t): float(-ll) for t, ll in zip(todo, bh.loglik)})
+            bh, recs = run_batch(self.grid, self.docs, [shock_defaults(self.rc, **t) for t in todo], self.rc["house"], inp=self.inp, record=self.truth is not None)
+            lab = [label_loss(self.grid, recs[i], self.truth, self.rc) if self.truth is not None else 0.0 for i in range(len(todo))]
+            cost = self.rc["shock"].get("reset_cost", 0.0)
+            nres = [sum(1 for e in bh.events if e[3] == i) for i in range(len(todo))]
+            self.cache.update({key(t): float(-ll) + x + cost * n for t, ll, x, n in zip(todo, bh.loglik, lab, nres)})
         return [self.cache[key(t)] for t in trials]
 
 
-def fit_shock(grid, docs, rc, drop):
+def fit_shock(grid, docs, rc, drop=None, truth=None):
     s = rc["shock"]
     best = dict(s["start"])
-    nll = ShockScores(grid, docs, rc, drop)
+    nll = ShockScores(grid, docs, rc, drop, truth)
     axes = [sorted(set(v) | {best[k]}) for k, v in s["grid"].items()]
     full = [dict(best, **dict(zip(s["grid"], c))) for c in itertools.product(*axes)]
     nll(full if len(full) <= s["batch_max"] else [best])
@@ -296,16 +353,15 @@ def window_spans(gt, labels, rooms, pad_s):
     return spans
 
 
-def episodes(flag, times):
+def episodes(flag, times, min_len=1):
     out, start = [], None
-    for i, f in enumerate(flag):
+    for i, f in enumerate(list(flag) + [False]):
         if f and start is None:
             start = i
         if not f and start is not None:
-            out.append((times[start], times[i - 1]))
+            if i - start >= min_len:
+                out.append((times[start], times[i - 1]))
             start = None
-    if start is not None:
-        out.append((times[start], times[-1]))
     return out
 
 
@@ -376,136 +432,41 @@ def tune_windows(grid, rec, rc, gt, labels):
     return best[2], lj, {"candidates": cands, "refused": False, "lambda_j_events": len(lam_j)}
 
 
-def rmse(x):
-    x = np.asarray(x, float)
-    return float(np.sqrt(np.mean(x ** 2))) if len(x) else None
+class FoldFit:
+    def __init__(self, rooms, full, cfg, rc):
+        self.rooms, self.full, self.cfg, self.rc = rooms, full, cfg, rc
+        self.rfs = {}
+        for d in rooms:
+            night = d.night
+            self.rfs[d.room] = RoomFit(full.cols[d.room], full.n, sorted(d.nb), rc, min(night.sum(), (~night).sum()) >= cfg["min_night_steps"])
+
+    def run(self, cut, warm=None, ext=False):
+        docs, th, info = {}, {}, {}
+        for d in self.rooms:
+            ns = max(cut - int(round((d.t0 - self.full.t0) / self.full.dt)), 0)
+            rf = self.rfs[d.room]
+            base = base_doc(d.slice(0, ns), self.cfg, self.rc, ext)
+            x0 = warm[d.room] if warm else init_theta(rf, d, self.cfg, self.rc, ns)
+            th[d.room], info[d.room] = rf.fit(x0, rf.js + max(rf.Hs) < cut, base)
+            docs[d.room] = rf.doc(th[d.room], base)
+            info[d.room]["names"] = rf.names
+        return docs, th, info
 
 
-def strata(rf, sel):
-    c, js, H = rf.c, rf.js[sel], 20
-    u, sp, y = np.nan_to_num(c["u"]), c["sp"], c["y"]
-    lead = lambda x, j0, j1: x[np.clip(np.arange(j0, j1), 0, rf.n - 1)]
-    mu = np.array([u[j:j + H].mean() for j in js])
-    umax = np.array([lead(u, j - 30, j + 1).max() for j in js])
-    umin = np.array([lead(u, j - 30, j + 1).min() for j in js])
-    spd = np.array([np.nanmax(lead(sp, j - 30, j + 1)) - sp[max(j - 30, 0)] if np.isfinite(sp[max(j - 30, 0)]) else 0.0 for j in js])
-    ysm = lambda j: np.nanmean(lead(y, j - 5, j + 1)) if np.isfinite(lead(y, j - 5, j + 1)).any() else np.nan
-    with np.errstate(invalid="ignore"):
-        dT = np.array([ysm(j) - ysm(j - 30) for j in js])
-        ramp, heat = (spd >= 0.4) | (u[js] - umin >= 0.1), mu > 0.02
-        cool = ~heat & (umax < 0.02) & (dT <= -0.25)
-    return np.where(ramp, "ramp", np.where(heat, "heating", np.where(cool, "cooling", "steady")))
-
-
-def holdout(rfs, thetas, docs, rec, cut):
-    errs, out = {}, {}
-    for r, rf in rfs.items():
-        p = rf.params(np.asarray(thetas[r])[None])
-        test = rf.js >= cut
-        imm, imm_raw = rf.errors(p, test, docs[r], (rec[r]["m"], rec[r]["a"], rec[r]["lam"]))
-        kf, _ = rf.errors(p, test, docs[r])
-        st = strata(rf, test)
-        y, js, Pc = rf.c["y"], rf.js[test], rf.Pc[test]
-        out[r] = {}
-        for H in rf.Hs:
-            ok = rf.valid[H][test] & np.isfinite(imm[H][:, 0]) & np.isfinite(kf[H][:, 0])
-            e = {"persistence": (y[js + H] - Pc)[ok], "imm_anchored": imm[H][ok, 0], "imm_raw": imm_raw[H][ok, 0], "kf_anchored": kf[H][ok, 0]}
-            for k, v in e.items():
-                errs.setdefault((H, k), []).append(v)
-            if H == 20:
-                for s in ("steady", "cooling", "heating", "ramp"):
-                    for k in ("persistence", "imm_anchored"):
-                        errs.setdefault(("strata", s, k), []).append(e[k][st[ok] == s])
-            m = {k: rmse(v) for k, v in e.items()}
-            out[r][f"H{H}"] = {"n": int(ok.sum()), **m, "skill": 1.0 - m["imm_anchored"] / m["persistence"] if m["persistence"] else None}
-    pooled = {}
-    for H in next(iter(rfs.values())).Hs:
-        m = {k: rmse(np.concatenate(errs[(H, k)])) for k in ("persistence", "imm_anchored", "imm_raw", "kf_anchored")}
-        pooled[f"H{H}"] = {"n": int(sum(len(x) for x in errs[(H, "persistence")])), **m, "skill": 1.0 - m["imm_anchored"] / m["persistence"]}
-    pooled["strata_H20"] = {s: {"n": int(sum(len(x) for x in errs[("strata", s, "persistence")])), **{k: rmse(np.concatenate(errs[("strata", s, k)])) for k in ("persistence", "imm_anchored")}} for s in ("steady", "cooling", "heating", "ramp")}
-    return {"rooms": out, "pooled": pooled}
-
-
-def window_model_sigma(models_dir):
-    base = Path(models_dir) / "window"
-    out = {}
-    for d in sorted(base.glob("*Z"), reverse=True) if base.is_dir() else []:
-        f = d / "bundle.json"
-        if f.is_file():
-            b = json.loads(f.read_text())
-            out = {r: m["sigma"] for r, m in b.get("rooms", {}).items() if "sigma" in m}
-            break
+def calibrate_air(grid, docs, rc, lo, hi, rec):
+    out, floor = {}, rc["evidence"]["air"]["noise"]
+    for r in grid.names:
+        arrs = grid.cols[r]["ya"]
+        if not arrs:
+            continue
+        blocks = []
+        for ya in arrs:
+            sel = np.isfinite(ya) & np.isfinite(rec[r]["a"]) & (np.arange(grid.n) >= lo) & (np.arange(grid.n) < hi)
+            if sel.sum() < rc["evidence"]["air"]["min_pairs"]:
+                break
+            res = ya[sel] - rec[r]["a"][sel]
+            off = float(np.median(res))
+            blocks.append({"offset": off, "noise": float(max(1.4826 * np.median(np.abs(res - off)), floor)), "pairs": int(sel.sum())})
+        else:
+            out[r] = blocks
     return out
-
-
-def build_data(config, src):
-    cfg = config["thermal"]
-    reports, weather, meta = load_lake(src, cfg["exclude_sources"])
-    rooms, skipped = build_rooms(reports, weather, meta, cfg, load_events(src), load_devices(src))
-    if not rooms:
-        raise SystemExit(f"no usable rooms: {skipped}")
-    return rooms, skipped
-
-
-def fit_rooms(rooms, full, cfg, rc, cut):
-    rfs, docs_tr, docs, th_tr, th_all, info = {}, {}, {}, {}, {}, {}
-    for d in rooms:
-        ns = max(cut - int(round((d.t0 - full.t0) / full.dt)), 0)
-        night = d.night[:ns]
-        rf = rfs[d.room] = RoomFit(full.cols[d.room], full.n, sorted(d.nb), rc, min(night.sum(), (~night).sum()) >= cfg["min_night_steps"])
-        base = base_doc(d.slice(0, ns), cfg, rc)
-        th_tr[d.room], i_tr = rf.fit(init_theta(rf, d, cfg, rc, ns), rf.js + max(rf.Hs) < cut, base)
-        docs_tr[d.room] = rf.doc(th_tr[d.room], base)
-        th_all[d.room], i_all = rf.fit(th_tr[d.room], np.ones(len(rf.js), bool), base_doc(d, cfg, rc))
-        docs[d.room] = rf.doc(th_all[d.room], base_doc(d, cfg, rc))
-        info[d.room] = {"train": i_tr, "all": i_all, "names": rf.names}
-    return rfs, docs_tr, docs, th_tr, info
-
-
-def fit_bundle(config, rooms, src, version=None):
-    t0 = time.time()
-    cfg, rc = config["thermal"], config["roommodel"]
-    full = Grid(rooms, {d.room: {"c": dict.fromkeys(d.nb, 0.0)} for d in rooms})
-    cut = int(full.n * rc["fit"]["train_frac"])
-    rfs, docs_tr, docs, th_tr, info = fit_rooms(rooms, full, cfg, rc, cut)
-    t_fit = time.time() - t0
-    run_tr, rec_tr = run_batch(full, docs_tr, [shock_defaults(rc)], rc["house"], record=True)
-    hold = holdout(rfs, th_tr, docs_tr, rec_tr[0], cut)
-    hold["resets_test"] = sum(1 for r in run_tr.resets(0) if r["step"] >= cut)
-    grid = full.tail(max(0, full.n - int(rc["shock"]["days"] * 1440)))
-    gt = load_ground_truth(src, rc["hold_min"])
-    labels = load_window_labels(src)
-    spans = window_spans(gt, labels, grid.names, rc["shock"]["pad_min"] * 60)
-    drop = {r: grid.span_mask(spans[r]) for r in grid.names}
-    best, nll, trace = fit_shock(grid, docs, rc, drop)
-    shock = shock_defaults(rc, **best)
-    run, recs = run_batch(full, docs, [shock], rc["house"], record=True)
-    rec, resets = recs[0], run.resets(0)
-    lw, lj, tuning = tune_windows(full, rec, rc, gt, labels)
-    shock = dict(shock, lambda_w=lw, lambda_jump=lj)
-    det = detection(full, rec, lw, gt, labels, rc)
-    flags = [f"{r}: at bound {','.join(i['all']['at_bound'])}" for r, i in info.items() if i["all"]["at_bound"]] + [f"{r}: fit not converged" for r, i in info.items() if not (i["all"]["converged"] and i["train"]["converged"])]
-    flags += [tuning["warning"]] if tuning and tuning["refused"] else []
-    version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    house = dict(rc["house"], night_hours=cfg["night_hours"], timezone=cfg["timezone"])
-    bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house}
-    by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
-    report = {"version": version, "flags": flags, "holdout": hold, "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": det,
-              "resets": len(resets), "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(gt), "labels": len(labels), "loglik": float(run.loglik[0]),
-              "minutes": full.n, "train_minutes": cut, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"fit": t_fit, "total": time.time() - t0},
-              "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"]} for n, d in docs.items()},
-              "params_train": {n: {**d["params"], "c": d["c"]} for n, d in docs_tr.items()}}
-    return bundle, report
-
-
-def roommodel(config, src, models_dir):
-    rooms, skipped = build_data(config, src)
-    bundle, report = fit_bundle(config, rooms, src)
-    out = Path(models_dir) / "room_model" / bundle["version"]
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "bundle.json").write_text(json.dumps(bundle, indent=1, default=float))
-    report["skipped"] = skipped
-    sigma = window_model_sigma(models_dir)
-    report["window_model_sigma"] = sigma
-    (out / "report.json").write_text(json.dumps(report, indent=1, default=float))
-    return out, bundle, report

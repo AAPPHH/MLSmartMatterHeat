@@ -115,7 +115,7 @@ def finite_nonneg(*xs):
 
 def evidence_blocks(ext, ev):
     nodes = (ext or {}).get("nodes", {})
-    out = {"effort": dict(ev["effort"])}
+    out = {"effort": dict(ev["effort"])} if ev.get("effort") else {}
     if nodes.get("air"):
         out["air"] = [{"node": n, **ev["air"]} for n in nodes["air"]]
     for key in ("co2", "hum"):

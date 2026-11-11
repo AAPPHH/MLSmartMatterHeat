@@ -187,12 +187,14 @@ def test_device_readings_become_air_sensors_and_gas_series_per_room(tmp_path):
 def test_fit_writes_the_observation_blocks_into_the_bundle(tmp_path):
     import copy
     from heattrain.__main__ import CONFIG
-    from heattrain.roomfit import fit_bundle
+    from heattrain.roomeval import fit_bundle
     from test_thermal import simulate
     config = copy.deepcopy(CONFIG)
     rm = config["roommodel"]
     rm["shock"].update(days=1, passes=1, grid={"q_calm": [0.01], "p_jump": [1e-3], "q_jump": [0.3]})
     rm["fit"].update(warm_min=120, max_nfev=20)
+    rm["eval"].update(folds=[0.5, 0.75], warm_days=0.5)
+    rm["evidence"]["select"]["enabled"] = False
     rooms = []
     for i, name in enumerate(("wohnzimmer", "kueche")):
         d, _, _ = simulate(hours=30, seed=i, report_p=0.4)

@@ -3,7 +3,7 @@ from pathlib import Path
 from heattrain.boiler import boiler
 from heattrain.boostlearn import boostcheck, boostlearn, boostmark
 from heattrain.thermal import thermal
-from heattrain.roomfit import roommodel
+from heattrain.roomeval import roommodel
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
 from heattrain.windowml import run_windowml, run_windowroom, window_bundle
@@ -52,10 +52,15 @@ CONFIG = {
                 "init": {"a1": 6.0, "a2": 2.0, "b1": 1.0, "b2": 0.15, "b3": 0.03, "b4": 0.01, "w": 0.5, "ts": 50.0, "ts_night": 45.0, "tau_v": 10.0, "c": 0.2},
                 "bounds": {"a1": [0.01, 300.0], "a2": [0.01, 300.0], "b1": [0.01, 300.0], "b2": [1e-3, 10.0], "b3": [1e-5, 3.0], "b4": [1e-5, 5.0], "w": [1e-3, 0.999], "ts": [20.0, 95.0], "ts_night": [15.0, 95.0],
                            "tau_v": [0.1, 120.0], "c": [1e-4, 20.0]}},
-        "shock": {"tau_l": 90.0, "hold_min": 20.0, "p_l0": 0.01, "lambda_jump": 3.0, "lambda_w": 2.0, "start": {"q_calm": 0.01, "p_jump": 1e-4, "q_jump": 0.3}, "passes": 2, "batch_max": 64, "days": 7,
-                  "grid": {"q_calm": [0.003, 0.01, 0.03]}, "lambda_w_grid": [1.5, 2.0, 2.5, 3.0], "hit_min": 20, "pad_min": 30, "fa_weight": 1.0},
+        "shock": {"tau_l": 90.0, "hold_min": 20.0, "p_l0": 0.01, "lambda_jump": 3.0, "lambda_w": 2.0, "start": {"q_calm": 0.01, "p_jump": 1e-4, "q_jump": 0.3, "tau_l": 90.0}, "passes": 2, "batch_max": 64, "days": 14, "reset_cost": 3.0,
+                  "grid": {"q_calm": [0.003, 0.01, 0.03], "q_jump": [0.3, 0.5, 0.8, 1.2], "p_jump": [3e-5, 1e-4, 3e-4, 1e-3], "tau_l": [30.0, 60.0, 90.0, 180.0]},
+                  "label": {"fa_cost": 20.0, "event_weight": 15.0, "pw_floor": 0.02},
+                  "lambda_w_grid": [1.5, 2.0, 2.5, 3.0], "hit_min": 20, "pad_min": 30, "fa_weight": 1.0},
+        "eval": {"folds": [0.45, 0.6, 0.75], "sensor_split": 0.5, "min_sensor_min": 600, "warm_days": 3, "floor": 0.5 / 12 ** 0.5, "decay_lam": True, "pw_flag": 0.5, "min_episode_min": 5},
+        "criteria": {"s1_h20": 0.08, "s1_h60": 0.10, "s2": 0.5, "s2_stretch": 0.2, "s4_resets": 20},
         "house": {"p_up": 0.02, "p_down": 0.001, "p_supply0": 0.95, "r_grid": 0.25 / 12.0, "reset_gap_min": 240.0, "reset_sigma": 8.0, "reset_n": 3, "boost_c": 24.0, "balance_seed": 1, "trv_grid": 0.5, "trv_floor": 0.25},
-        "evidence": {"air": {"noise": 0.15, "offset": 0.0}, "effort": {"sigma": 0.06, "steady_u": 0.05},
+        "evidence": {"air": {"noise": 0.15, "offset": 0.0, "min_pairs": 60}, "effort": {"sigma": 0.06, "steady_u": 0.05},
+                     "select": {"enabled": True, "min_gain": 0.003, "max_resets_up": 10, "effort": [{"sigma": 0.06, "steady_u": 0.05}, {"sigma": 0.25, "steady_u": 0.15}]},
                      "co2": {"out": 420.0, "min_excess": 150.0, "k": 0.004, "gain": 4.0, "sigma": 4.0, "sigma_up": 12.0, "win_min": 10},
                      "hum": {"rh_out": 85.0, "min_excess": 0.8, "k": 0.004, "gain": 4.0, "sigma": 0.03, "sigma_up": 0.3, "win_min": 10}},
     },
