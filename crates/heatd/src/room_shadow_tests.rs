@@ -59,6 +59,9 @@ async fn shadow_never_writes_and_logs_a_sentence_per_room() {
     assert!(["a: ", "b: ", "c: "].iter().all(|r| why.iter().any(|w| w.starts_with(r))), "{why:?}");
     let view = on.room_model.view("b");
     assert!(view["why"].as_str().unwrap().starts_with("b: ") && view["loss_ratio"].is_number() && view["p_supply"].is_number() && view["setpoint_shadow"].is_number(), "{view}");
+    assert!(view["storage"].as_str().unwrap().starts_with("b: Wände ") && view["coast_min"].is_number(), "{view}");
+    let storage = string_column(a.path(), "shadow_decisions", "storage");
+    assert!(storage.len() >= 3 && storage.iter().all(|w| w.contains("Wände") && w.contains("ohne Heizen")), "{storage:?}");
     assert!(off.room_model.view("b").is_null());
 }
 
@@ -166,6 +169,24 @@ fn open_window_sentence_says_cold_does_not_count() {
     let out = crate::room_model::Out { ok: true, lam: 6.0, p_window: p.p_window, p_supply: 1.0, ..Default::default() };
     let why = crate::room_shadow::sentence("b", &p, &out, 21.0, 24.0);
     assert_eq!(why.split(", spart").next().unwrap(), "b: Verlust 6x normal -> Fenster offen -> Kälte zählt nicht, Heizen wäre Verlust -> 7 °C", "{why}");
+}
+
+#[test]
+fn storage_sentence_reads_in_german() {
+    use crate::room_model_tests::{comps_at, preset_env, preset_rig};
+    let (par, shock) = preset_rig(6.0);
+    let p = crate::room_plan::plan(&par, &shock, &comps_at(30.0, 22.0, 1.0, 1e-4), 1.0, &preset_env());
+    let why = crate::room_shadow::storage_sentence("b", &with_storage(p.clone(), 20.8, 19.5, 220.0, Some(25.4)));
+    assert_eq!(why, "b: Wände 20,8 °C, Luft 19,5 °C – ohne Heizen noch 3 h 40 min über 20,5 °C, Speicher +25 Heizmin");
+    let under = crate::room_shadow::storage_sentence("b", &with_storage(p.clone(), 18.0, 18.0, 0.0, Some(-12.0)));
+    assert_eq!(under, "b: Wände 18 °C, Luft 18 °C – ohne Heizen schon unter 20,5 °C, Speicher -12 Heizmin");
+    let long = crate::room_shadow::storage_sentence("b", &with_storage(p, 22.0, 21.0, 1440.0, None));
+    assert_eq!(long, "b: Wände 22 °C, Luft 21 °C – ohne Heizen länger als 24 h über 20,5 °C");
+}
+
+fn with_storage(mut p: crate::room_plan::PlanOut, mass: f64, air: f64, coast: f64, stored: Option<f64>) -> crate::room_plan::PlanOut {
+    (p.mass, p.air, p.coast_min, p.stored_min) = (mass, air, coast, stored);
+    p
 }
 
 fn ctx(room: &str) -> crate::room_shadow::RoomCtx {

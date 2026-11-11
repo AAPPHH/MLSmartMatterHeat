@@ -1,7 +1,9 @@
 use crate::room_model::{norm_cdf, Comp, RoomPar, Shock};
 
 pub const HORIZON: usize = 60;
-pub const PROBES: [usize; 3] = [5, 10, 15];
+pub const PROBES: [usize; 3] = [10, 20, 30];
+pub const COAST_CAP: usize = 1440;
+const COAST_DROP: f64 = 0.5;
 pub const BOOSTS: [usize; 4] = [5, 10, 15, 20];
 pub const FORECAST_MIN: usize = 20;
 const EPS: f64 = 1e-9;
@@ -52,6 +54,8 @@ pub struct PlanOut {
     pub best_cost: f64,
     pub perfect_cost: f64,
     pub n_allowed: usize,
+    pub coast_min: f64,
+    pub stored_min: Option<f64>,
     pub energy_live: f64,
     pub target: f64,
 }
@@ -99,6 +103,28 @@ fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], 
 
 fn profile(first: f64, d: usize, then: f64) -> Vec<f64> {
     (0..HORIZON).map(|k| if k < d { first } else { then }).collect()
+}
+
+fn storage(par: &RoomPar, m: f64, a: f64, lam: f64, env: &Env, cn: f64, cs: f64) -> (f64, Option<f64>) {
+    let h = 1.0 / 60.0;
+    let amb = par.p.b2 + par.p.b3 * env.wind;
+    let loss = lam * amb + cn;
+    let drive = lam * amb * env.tout + par.p.b4 * env.rad / 100.0 + cs;
+    let w = par.p.w;
+    let m_eq = (env.target - (1.0 - w) * drive / (par.p.b1 + loss)) / (w + (1.0 - w) * par.p.b1 / (par.p.b1 + loss));
+    let a_eq = (par.p.b1 * m_eq + drive) / (par.p.b1 + loss);
+    let ts = if env.night { par.p.ts_night } else { par.p.ts };
+    let stored = (ts - m_eq > 0.5 && par.p.a1 > 0.0).then(|| ((m - m_eq) + par.p.a2 / par.p.b1 * (a - a_eq)) / (par.p.a1 * (ts - m_eq) / 60.0));
+    let floor = env.target - COAST_DROP;
+    let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, 0.0, env.tout, env.wind, env.rad, env.night, cn, cs, h);
+    let (mut x, mut y) = (m, a);
+    for k in 0..COAST_CAP {
+        if y < floor {
+            return (k as f64, stored);
+        }
+        (x, y) = (f11 * x + f12 * y + g1, f21 * x + f22 * y + g2);
+    }
+    (COAST_CAP as f64, stored)
 }
 
 pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &Env) -> PlanOut {
@@ -177,14 +203,18 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     }));
     let mut probe: Option<Cand> = None;
     let mut evoi_best = 0.0;
+    let back = if cands[best].kind == "boost" { target } else { cands[best].first };
     for d in PROBES {
-        let pr = evaluate(&format!("probe{d}"), "probe", profile(target, d, frost), target, None, Some(d));
+        if cands[best].kind == "frost" || back <= frost + EPS {
+            break;
+        }
+        let pr = evaluate(&format!("close{d}"), "probe", profile(frost, d, back), frost, None, Some(d));
         if pr.peak > limit {
             continue;
         }
         let sep = (pr.runs[1][0].sens[d - 1] - pr.runs[0][0].sens[d - 1]).abs() / sigma_obs;
         let rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0);
-        let evoi = rho * gain - (prefix(&pr, d) - prefix(&cands[best], d) + pr.raise - cands[best].raise).max(0.0);
+        let evoi = rho * gain - (prefix(&pr, d) - prefix(&cands[best], d)).max(0.0);
         if evoi > evoi_best + 1e-12 {
             evoi_best = evoi;
             probe = Some(pr);
@@ -195,6 +225,7 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let forecast = env.y_last.filter(|y| y.is_finite()).map_or(model_fc, |y| model_fc + (y - sensor0));
     let (cost_live, best_cost, n_allowed, energy_live) = (live.total, cands[best].total, allowed.len(), live.energy);
     let chosen = probe.as_ref().unwrap_or(&cands[best]);
+    let (coast_min, stored_min) = storage(par, m, a, lam_c, env, cn, cs);
     PlanOut {
         kind: chosen.kind,
         name: chosen.name.clone(),
@@ -218,6 +249,8 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
         best_cost,
         perfect_cost: perf,
         n_allowed,
+        coast_min,
+        stored_min,
         energy_live,
         target,
     }

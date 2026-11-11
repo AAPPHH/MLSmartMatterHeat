@@ -379,11 +379,15 @@ sensor_c: f64
 forecast_c: f64?
 resid_live_k: f64?
 kind: dict<utf8>
+coast_min: f64?
+stored_min: f64?
+storage: utf8?
 ```
 
 - `setpoint_live`: Sollwert, den die Live-Regeln gerade wollen; `setpoint_shadow`: Wahl der Kostenminimierung; `raise`: Schatten-Sollwert liegt ueber dem Geraete-Sollwert. Kosten in Heizminuten (Ventilminuten): `cost_energy` Energie, `cost_cold` = cold_cost_min x Kaelte (K min), `cost_raise` = raise_cost_min bei Erhoehung, `cost_live` Gesamtkosten des Live-Sollwerts im Modell.
 - `lambda`/`lambda_std`: Verlustverhaeltnis (1 = normal), `mass_c`/`air_c`: Heizkoerper-/Luftzustand, `p_supply`: Kessel liefert, `p_window`: P(Verlust > lambda_w), `p_window_live`: alter Detektor meldet offen. `sensor_c`: gefilterte Sensortemperatur, `forecast_c`: Modellprognose der Sensortemperatur in 20 min bei Live-Sollwert, `resid_live_k`: Residuum des Live-Fensterdetektors in K (Prognose minus Messung, positiv = kaelter als erwartet).
-- `why`: ein deutscher Satz. `kind`: gewaehlter Kandidat (`live`, `current`, `target`, `frost`, `minus`, `plus`, `boost`, `probe`).
+- `why`: ein deutscher Satz. `kind`: gewaehlter Kandidat (`live`, `current`, `target`, `frost`, `minus`, `plus`, `boost`, `probe`; `probe` = Ventil zu, `setpoint_shadow` = Frost, `probe_min` = Dauer).
+- Waermespeicher (additiv, in v8 ergaenzt, aeltere Zeilen null): `coast_min` Nachlaufzeit in Minuten bis die Luft ohne Heizen unter Ziel - 0,5 K faellt (0 = schon darunter, 1440 = Deckel 24 h), `stored_min` gespeicherte Waerme in Heizminuten gegenueber dem Zielgleichgewicht (negativ = Defizit; null wenn die Rechnung nicht definiert ist), `storage` ein deutscher Satz dazu (`mass_c`/`air_c` sind Waende/Luft).
 
 ## Abweichungen
 

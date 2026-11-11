@@ -846,6 +846,20 @@ pub fn shadow_section(root: &Path, date: NaiveDate) -> Result<String> {
             mine.iter().map(|s| s.cost_total).sum::<f64>()
         );
     }
+    let storage = rows(
+        c,
+        &format!(
+            "SELECT room, avg(coast_min), min(coast_min), avg(stored_min), count(coast_min), count(*) FILTER (WHERE kind = 'probe'), coalesce(sum(probe_min) FILTER (WHERE kind = 'probe'), 0), arg_max(storage, ts) FROM shadow_decisions WHERE {day} GROUP BY room ORDER BY room"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, f64>(6)?, r.get::<_, Option<String>>(7)?)),
+    )
+    .unwrap_or_default();
+    if !storage.is_empty() {
+        md.push_str("\nWaermespeicher und Proben (Nachlaufzeit = Minuten, bis die Luft ohne Heizen unter Ziel - 0,5 K faellt, Deckel 1440; Speicher = gespeicherte Waerme in Heizminuten gegenueber dem Zielgleichgewicht; Modellrechnung auf den Schattenzeilen; Probe = Ventil kurz zu, um zu pruefen, ob ein Fenster offen ist)\n\n| Raum | Nachlauf mittel min | Nachlauf kleinste min | Speicher mittel Heizmin | Proben | Probenminuten | letzter Stand |\n|---|---|---|---|---|---|---|\n");
+        for (room, coast, coast_min, stored, n, probes, probe_min, last) in &storage {
+            let _ = writeln!(md, "| {room} | {} | {} | {} | {probes} | {probe_min:.0} | {} |", opt(*coast, 0), opt(*coast_min, 0), opt(*stored, 0), if *n == 0 { "-".into() } else { last.clone().unwrap_or_default() });
+        }
+    }
     let _ = writeln!(md, "\nFilterresets: {}.", if resets.is_empty() { "0".into() } else { resets.iter().map(|(r, cause, n)| format!("{r} {cause} {n}")).collect::<Vec<_>>().join(", ") });
     Ok(md)
 }

@@ -184,6 +184,8 @@ impl Table {
                 fields.extend([fld("p_window_live", DataType::Boolean, false), fld("model_version", dict(), false), fld("why", DataType::Utf8, false), fld("sensor_c", DataType::Float64, false)]);
                 fields.extend(["forecast_c", "resid_live_k"].map(|n| fld(n, DataType::Float64, true)));
                 fields.push(fld("kind", dict(), false));
+                fields.extend(["coast_min", "stored_min"].map(|n| fld(n, DataType::Float64, true)));
+                fields.push(fld("storage", DataType::Utf8, true));
                 fields
             }
         };
@@ -575,6 +577,9 @@ pub struct ShadowDecision {
     pub forecast_c: Option<f64>,
     pub resid_live_k: Option<f64>,
     pub kind: String,
+    pub coast_min: Option<f64>,
+    pub stored_min: Option<f64>,
+    pub storage: Option<String>,
 }
 
 impl Row for ShadowDecision {
@@ -586,7 +591,7 @@ impl Row for ShadowDecision {
             prim::<Float64Type, _>(rows, |r| r.probe_min), prim::<Float64Type, _>(rows, |r| r.boost_min), f(|r| r.cost_energy), f(|r| r.cost_cold), f(|r| r.cost_raise), f(|r| r.cost_live),
             f(|r| r.lambda), f(|r| r.lambda_std), f(|r| r.mass_c), f(|r| r.air_c), f(|r| r.p_supply), f(|r| r.p_window), bool_col(rows, |r| Some(r.p_window_live)),
             dict_col(rows, |r| Some(&r.model_version)), str_col(rows, |r| Some(&r.why)), f(|r| r.sensor_c), prim::<Float64Type, _>(rows, |r| r.forecast_c), prim::<Float64Type, _>(rows, |r| r.resid_live_k),
-            dict_col(rows, |r| Some(&r.kind)),
+            dict_col(rows, |r| Some(&r.kind)), prim::<Float64Type, _>(rows, |r| r.coast_min), prim::<Float64Type, _>(rows, |r| r.stored_min), str_col(rows, |r| r.storage.as_deref()),
         ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }

@@ -92,6 +92,11 @@ fn filter_and_planner_match_the_python_fixture() {
             assert_eq!(got.probe_min.map(|v| v as f64), want["probe_min"].as_f64(), "{what}");
             assert_eq!(got.boost_min.map(|v| v as f64), want["boost_min"].as_f64(), "{what}");
             assert_eq!(got.n_allowed as f64, num(&want["n_allowed"]), "{what}");
+            near(got.coast_min, num(&want["coast_min"]), 5e-6, &format!("{what}.coast_min"));
+            match (got.stored_min, want["stored_min"].as_f64()) {
+                (Some(g), Some(w)) => near(g, w, 5e-6, &format!("{what}.stored_min")),
+                (g, w) => assert_eq!(g, w, "{what}.stored_min"),
+            }
             for (key, v) in [("setpoint", got.setpoint), ("energy", got.energy), ("cold", got.cold), ("raise_cost", got.raise_cost), ("cost_live", got.cost_live), ("total", got.total), ("p_window", got.p_window), ("lam_closed", got.lam_closed),
                              ("lam_open", got.lam_open), ("mass", got.mass), ("air", got.air), ("sensor", got.sensor), ("forecast", got.forecast), ("evoi", got.evoi)] {
                 near(v, num(&want[key]), 5e-6, &format!("{what}.{key}"));
@@ -283,9 +288,33 @@ fn preset_costs_drop_to_frost_for_an_open_window_and_heat_a_closed_cold_room() {
 fn half_window_probability_probes_and_certainty_does_not() {
     let (par, shock) = preset_rig(6.0);
     let half = plan(&par, &shock, &comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, &preset_env());
-    assert!((half.p_window - 0.5).abs() < 1e-6 && half.kind == "probe" && half.probe_min == Some(15) && half.setpoint == 21.0 && !half.raise && half.evoi > 1.0, "{half:?}");
+    assert!((half.p_window - 0.5).abs() < 1e-6 && half.kind == "probe" && matches!(half.probe_min, Some(10 | 20 | 30)) && half.setpoint == 7.0 && !half.raise && half.raise_cost == 0.0 && half.evoi > 1.0, "{half:?}");
     for lam in [1.0, 6.0] {
         let sure = plan(&par, &shock, &comps_at(17.0, 16.0, lam, 1e-4), 1.0, &preset_env());
         assert!(sure.kind != "probe" && sure.evoi == 0.0, "{sure:?}");
     }
+}
+
+#[test]
+fn close_probe_is_a_decrease_without_raise_penalty() {
+    let (par, shock) = preset_rig(6.0);
+    for cur in [21.0, 18.0] {
+        let env = Env { sp_cur: Some(cur), sp_live: cur, ..preset_env() };
+        let p = plan(&par, &shock, &comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, &env);
+        assert!(p.kind == "probe" && p.raise_cost == 0.0 && !p.raise && p.setpoint == 7.0, "{cur} {p:?}");
+    }
+}
+
+#[test]
+fn storage_coast_and_stored_heat() {
+    let (par, shock) = preset_rig(6.0);
+    let at = |m: f64, a: f64, env: &Env| plan(&par, &shock, &comps_at(m, a, 1.0, 1e-4), 1.0, env);
+    let cold = at(17.0, 17.0, &preset_env());
+    assert!(cold.coast_min == 0.0 && cold.stored_min.unwrap() < 0.0, "{cold:?}");
+    let warm = at(30.0, 22.0, &preset_env());
+    let hot = at(40.0, 25.0, &preset_env());
+    assert!(warm.coast_min > 0.0 && warm.stored_min.unwrap() > 0.0, "{warm:?}");
+    assert!(hot.coast_min > warm.coast_min && hot.stored_min.unwrap() > warm.stored_min.unwrap());
+    let mild = at(23.0, 21.0, &Env { tout: 21.0, wind: 0.0, ..preset_env() });
+    assert_eq!(mild.coast_min, crate::room_plan::COAST_CAP as f64, "{mild:?}");
 }

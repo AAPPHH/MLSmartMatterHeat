@@ -1,5 +1,5 @@
 use crate::room_model::{bundle_candidates, Bundle, House, Out, ResetRec, RoomIn};
-use crate::room_plan::{plan, Env, PlanOut};
+use crate::room_plan::{plan, Env, PlanOut, COAST_CAP};
 use anyhow::{bail, Result};
 use matter_controller::{CO2_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
 use serde::Deserialize;
@@ -113,6 +113,32 @@ pub(crate) fn sentence(room: &str, p: &PlanOut, out: &Out, live: f64, boost_c: f
         _ if p.setpoint < live - EPS => format!("{room}: Heizen lohnt kaum -> Soll {sp} °C statt {} °C", fmt_c(live)),
         _ => format!("{room}: Modell passt -> Soll {sp} °C bleibt"),
     }
+}
+
+fn fmt_de(x: f64) -> String {
+    fmt_c(x).replace('.', ",")
+}
+
+fn fmt_span(min: f64) -> String {
+    let m = min.round() as i64;
+    match (m / 60, m % 60) {
+        (0, r) => format!("{r} min"),
+        (h, 0) => format!("{h} h"),
+        (h, r) => format!("{h} h {r} min"),
+    }
+}
+
+pub(crate) fn storage_sentence(room: &str, p: &PlanOut) -> String {
+    let floor = fmt_de(p.target - 0.5);
+    let coast = if p.coast_min <= 0.0 {
+        format!("ohne Heizen schon unter {floor} °C")
+    } else if p.coast_min >= COAST_CAP as f64 {
+        format!("ohne Heizen länger als {} über {floor} °C", fmt_span(COAST_CAP as f64))
+    } else {
+        format!("ohne Heizen noch {} über {floor} °C", fmt_span(p.coast_min))
+    };
+    let stored = p.stored_min.map_or(String::new(), |v| format!(", Speicher {}{:.0} Heizmin", if v >= 0.5 { "+" } else { "" }, v));
+    format!("{room}: Wände {} °C, Luft {} °C – {coast}{stored}", fmt_de(p.mass), fmt_de(p.air))
 }
 
 fn json_prior(p: [f64; 3]) -> serde_json::Value {
@@ -312,10 +338,11 @@ impl RoomModel {
             };
             let p = plan(&filter.par, &bundle.shock, &filter.comps, filt.p_supply, &env);
             let why = sentence(&ctx.room, &p, &filt, ctx.live, bundle.house.boost_c);
+            let storage = storage_sentence(&ctx.room, &p);
             inner.views.insert(
                 ctx.room.clone(),
                 serde_json::json!({"loss_ratio": nan_null(filt.lam), "mass_c": nan_null(filt.m), "air_c": nan_null(filt.a), "p_supply": filt.p_supply, "p_window": filt.p_window, "setpoint_shadow": p.setpoint,
-                                    "setpoint_live": ctx.live, "kind": p.kind, "why": why, "model": bundle.version, "ts": now_ms}),
+                                    "setpoint_live": ctx.live, "kind": p.kind, "why": why, "coast_min": p.coast_min, "stored_min": p.stored_min.map_or(serde_json::Value::Null, nan_null), "storage": storage, "probe_min": p.probe_min, "model": bundle.version, "ts": now_ms}),
             );
             let flagged = filt.p_window >= 0.5;
             let due = inner.last_row.get(&ctx.room).is_none_or(|(sp, at, was)| (sp - p.setpoint).abs() > EPS || target - at >= ROW_EVERY_MIN || *was != flagged);
@@ -346,6 +373,9 @@ impl RoomModel {
                     forecast_c: Some(p.forecast).filter(|v| v.is_finite()),
                     resid_live_k: ctx.resid_live_k.filter(|v| v.is_finite()),
                     kind: p.kind.to_string(),
+                    coast_min: Some(p.coast_min),
+                    stored_min: p.stored_min.filter(|v| v.is_finite()),
+                    storage: Some(storage),
                 });
             }
         }
