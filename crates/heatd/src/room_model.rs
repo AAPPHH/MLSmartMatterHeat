@@ -44,6 +44,8 @@ pub struct RoomDoc {
     pub co2: Option<GasDoc>,
     #[serde(default)]
     pub hum: Option<GasDoc>,
+    #[serde(default)]
+    pub unusable: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +207,7 @@ pub struct RoomPar {
     pub effort: Option<EffortDoc>,
     pub co2: Option<GasDoc>,
     pub hum: Option<GasDoc>,
+    pub unusable: bool,
 }
 
 impl RoomPar {
@@ -223,6 +226,7 @@ impl RoomPar {
             effort: doc.effort.clone(),
             co2: doc.co2.clone(),
             hum: doc.hum.clone(),
+            unusable: doc.unusable,
         }
     }
 

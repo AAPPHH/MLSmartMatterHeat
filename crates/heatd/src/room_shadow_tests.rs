@@ -266,3 +266,80 @@ fn reload_resets_every_room_with_cause_reload() {
 fn room_model_is_off_by_default() {
     assert!(!crate::room_shadow::RoomModelSection::default().enabled);
 }
+
+fn states(out: &crate::room_shadow::StepOut) -> Vec<String> {
+    out.events.iter().filter(|e| e.kind == crate::lake::kind::SHADOW_STATE).filter_map(|e| e.detail.clone()).collect()
+}
+
+#[test]
+fn weather_older_than_the_cap_reports_no_weather() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _) = rig(dir.path(), true);
+    let nan = [f64::NAN; 3];
+    for minute in 0..10 {
+        feed(&state, minute, true);
+        state.room_model.step(&state.config, T0 + minute * MIN, [4.0, 3.0, 0.0], 12.0, &[]);
+    }
+    let inside = state.room_model.step(&state.config, T0 + 170 * MIN, nan, 12.0, &[]);
+    assert!(states(&inside).is_empty(), "{:?}", inside.events);
+    let beyond = state.room_model.step(&state.config, T0 + 200 * MIN, nan, 12.0, &[]);
+    assert!(states(&beyond).iter().any(|d| d.contains("no_weather")), "{:?}", beyond.events);
+}
+
+#[tokio::test]
+async fn a_panic_in_the_shadow_disables_it_and_never_touches_live_control() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (hit, mock_hit) = rig(a.path(), true);
+    let (off, mock_off) = rig(b.path(), false);
+    run(&hit, 40, 1000).await;
+    hit.room_model.panic_on_next_step();
+    run(&hit, 5, 1000).await;
+    run(&off, 40, 1000).await;
+    run(&off, 5, 1000).await;
+    hit.sink.flush().unwrap();
+    assert_eq!(mock_hit.setpoint_writes(), mock_off.setpoint_writes());
+    assert!(hit.room_model.view("a").is_null());
+    let first = hit.room_model.step(&hit.config, T0 + 500 * MIN, [4.0, 3.0, 0.0], 12.0, &[ctx("a")]);
+    assert!(first.rows.is_empty() && first.events.is_empty());
+    hit.room_model.observe(5, crate::window::LOCAL_TEMPERATURE, 20.0, T0);
+    assert!(hit.room_model.version().is_some());
+    let events = string_column(a.path(), "events", "detail");
+    assert!(events.iter().any(|d| d.contains("\"error\"")), "{events:?}");
+}
+
+#[test]
+fn probe_sentence_names_the_closed_valve_and_the_cooling_that_shows_it() {
+    use crate::room_model_tests::{comps_at, preset_env, preset_rig};
+    let (par, shock) = preset_rig(6.0);
+    let p = crate::room_plan::plan(&par, &shock, &comps_at(21.0, 20.5, 2.0, 1e-2), 1.0, &preset_env());
+    assert_eq!(p.kind, "probe");
+    let out = crate::room_model::Out { ok: true, lam: 2.0, p_window: p.p_window, p_supply: 1.0, ..Default::default() };
+    let d = p.probe_min.unwrap();
+    assert_eq!(crate::room_shadow::sentence("b", &p, &out, 21.0, 24.0), format!("b: Fenster noch offen? Ventil {d} min zu, die Abkühlung zeigt es -> 7 °C"));
+    assert_eq!(crate::room_shadow::probe_end_sentence("b", "end", 10), "b: Probe nach 10 min zu Ende");
+}
+
+#[test]
+fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
+    use crate::room_model::{House, RoomIn};
+    use crate::room_plan::{plan, Env};
+    let bundle = Bundle::parse(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/room_model_real_bundle.json")).unwrap()).unwrap();
+    assert_eq!(bundle.rooms.keys().map(String::as_str).collect::<Vec<_>>(), ["bad", "kueche", "schlafzimmer", "wohnzimmer"]);
+    let mut house = House::new(&bundle);
+    let input = |room: &str| RoomIn { y: 20.5, yv: f64::NAN, u: 0.2, sp: 21.0, tout: 5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![1.0; bundle.rooms[room].c.len()], nsum: vec![20.0; bundle.rooms[room].c.len()], ya: vec![], co2: f64::NAN, rh: f64::NAN, th: f64::NAN };
+    for _ in 0..40 {
+        let outs = house.step(&bundle.rooms.keys().map(|r| (r.clone(), input(r))).collect());
+        assert!(outs.values().all(|o| !o.ok || (o.m.is_finite() && o.a.is_finite() && o.lam.is_finite())));
+    }
+    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, now_min: 0, probe: None };
+    for (room, f) in &house.rooms {
+        let kinds = bundle.rooms[room].c.len();
+        let e = Env { ncnt: vec![1.0; kinds], nsum: vec![20.0; kinds], ..env(false, 22.0) };
+        let p = plan(&f.par, &bundle.shock, &f.comps, 1.0, &e);
+        assert!(p.total.is_finite() && p.cold.is_finite() && p.setpoint.is_finite(), "{room} {p:?}");
+        assert_eq!(p.unusable, room == "bad", "{room} {p:?}");
+    }
+    let f = &house.rooms["schlafzimmer"];
+    let night = plan(&f.par, &bundle.shock, &f.comps, 1.0, &Env { ncnt: vec![1.0], nsum: vec![20.0], ..env(true, 18.0) });
+    assert!(night.unusable && night.kind == "fit_unusable", "{night:?}");
+}

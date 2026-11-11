@@ -10,6 +10,7 @@ COAST_CAP = 1440
 COAST_DROP = 0.5
 BOOSTS = (5, 10, 15, 20)
 FORECAST_MIN = 20
+PEAK_MARGIN = 0.5
 EPS = 1e-9
 
 
@@ -49,6 +50,7 @@ class RoomPar:
         self.ck = [doc["c"][k] for k in self.kinds]
         self.g, self.noise_r, self.p0, self.q_r, self.q_a = (doc[k] for k in ("valve_gain", "noise_r", "p0", "q_r", "q_a"))
         self.q_um, self.q_ua = doc.get("q_um", 0.0), doc.get("q_ua", 0.0)
+        self.unusable = bool(doc.get("unusable", False))
         self.tau_v = p.get("tau_v", 0.0)
         self.alpha = 1.0 - math.exp(-1.0 / self.tau_v) if self.tau_v > 0 else 1.0
         check_room_doc("room", doc)
@@ -340,6 +342,23 @@ class House:
         return outs
 
 
+def recovery_rate(par, m, a, lam, s, env):
+    h = 1.0 / 60.0
+    start = par.sensor(m, a)
+    for _ in range(FORECAST_MIN):
+        f11, f12, f21, f22, g1, g2, _ = par.terms(lam, s, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], h)
+        m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2
+    return (par.sensor(m, a) - start) / FORECAST_MIN
+
+
+def terminal_cold(par, m, a, lam, env):
+    deficit = max(0.0, env["target"] - par.sensor(m, a))
+    if deficit <= 0.0 or env["present"] <= 0.0:
+        return 0.0
+    rate = recovery_rate(par, m, a, lam, 1.0, env)
+    return 0.5 * deficit * min(deficit / rate if rate > 1e-12 else COAST_CAP, COAST_CAP) * env["present"]
+
+
 def rollout(par, m, a, lam, s, sp, env):
     h = 1.0 / 60.0
     en, co, sens = [], [], []
@@ -352,7 +371,7 @@ def rollout(par, m, a, lam, s, sp, env):
         sens.append(par.sensor(m, a))
         en.append(u * s)
         co.append(max(0.0, env["target"] - sens[-1]) * env["present"])
-    return en, co, sens
+    return en, co, sens, terminal_cold(par, m, a, lam, env)
 
 
 def profile(first, d, then):
@@ -384,6 +403,11 @@ def storage(par, m, a, lam, env):
     return float(coast), stored
 
 
+def separation_minutes(pr, sigma_obs):
+    closed, opened = pr["runs"][0][0][2], pr["runs"][1][0][2]
+    return next((k + 1 for k in range(HORIZON) if abs(opened[k] - closed[k]) >= 2.0 * sigma_obs), HORIZON)
+
+
 def plan(par, shock, comps, p_supply, env):
     lam_w = shock["lambda_w"]
     mu = [c[0] for c in comps]
@@ -401,15 +425,17 @@ def plan(par, shock, comps, p_supply, env):
     calm = (1.0, 0.0)
     target, frost, cur, cold_w = env["target"], env["frost"], env["sp_cur"], env["cold_cost"]
     sensor0 = par.sensor(m, a)
-    limit = max(target + 0.5, sensor0) + EPS
+    limit = max(target + PEAK_MARGIN, sensor0) + EPS
+    memo, now = env.get("probe"), env.get("now_min", 0)
 
     def evaluate(name, kind, sp, first, **meta):
         runs = [[rollout(par, m, a, lam, s, sp, env) for s, _ in supplies] for _, lam in modes]
-        mode_cost = [sum(supplies[si][1] * (sum(r[si][0]) + calm[mi] * cold_w * sum(r[si][1])) for si in range(2)) for mi, r in enumerate(runs)]
+        cold_of = lambda r: sum(r[1]) + r[3]
+        mode_cost = [sum(supplies[si][1] * (sum(r[si][0]) + calm[mi] * cold_w * cold_of(r[si])) for si in range(2)) for mi, r in enumerate(runs)]
         rz = cur is not None and first > cur + EPS
         raise_c = env["raise_cost"] if rz else 0.0
         energy = sum(modes[mi][0] * supplies[si][1] * sum(runs[mi][si][0]) for mi in range(2) for si in range(2))
-        cold = sum(modes[0][0] * supplies[si][1] * sum(runs[0][si][1]) for si in range(2))
+        cold = sum(modes[0][0] * supplies[si][1] * cold_of(runs[0][si]) for si in range(2))
         return {"name": name, "kind": kind, "first": first, "runs": runs, "mode_cost": [c + raise_c for c in mode_cost], "energy": energy, "cold": cold_w * cold, "raise": raise_c, "raise_flag": rz,
                 "total": sum(modes[mi][0] * mode_cost[mi] for mi in range(2)) + raise_c, "peak": max(runs[0][0][2]), "boost_min": None, "probe_min": None, **meta}
 
@@ -432,23 +458,40 @@ def plan(par, shock, comps, p_supply, env):
     perf = sum(modes[mi][0] * min(c["mode_cost"][mi] for c in allowed) for mi in range(2))
     gain = max(best["total"] - perf, 0.0)
     sigma_obs = math.sqrt(env["r_grid"] + par.noise_r ** 2)
-    chosen, evoi_best = best, 0.0
     back = target if best["kind"] == "boost" else best["first"]
-    for d in PROBES if best["kind"] != "frost" and back > frost + EPS else ():
-        pr = evaluate(f"close{d}", "probe", profile(frost, d, back), frost, probe_min=d)
-        if pr["peak"] > limit:
-            continue
-        sep = abs(pr["runs"][1][0][2][d - 1] - pr["runs"][0][0][2][d - 1]) / sigma_obs
-        rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0)
-        prefix = lambda c: sum(modes[mi][0] * supplies[si][1] * (sum(c["runs"][mi][si][0][:d]) + calm[mi] * cold_w * sum(c["runs"][mi][si][1][:d])) for mi in range(2) for si in range(2))
-        evoi = rho * gain - max(0.0, prefix(pr) - prefix(best))
-        if evoi > evoi_best + 1e-12:
-            chosen, evoi_best = pr, evoi
+    full = lambda c: c["total"] - c["raise"]
+    unusable = par.unusable or (par.ts_night if env["night"] else par.ts) < target + PEAK_MARGIN
+    running = memo is not None and not memo["ended"] and now < memo["start"] + memo["d"]
+    event, probed, new_memo = None, 0, memo
+    if memo is not None and not memo["ended"]:
+        if running and (abs(memo["target"] - target) > EPS or abs(memo["present"] - env["present"]) > EPS or gain <= env["raise_cost"] or unusable):
+            event, probed, new_memo, running = "abort", now - memo["start"], dict(memo, d=now - memo["start"], ended=True), False
+        elif not running:
+            event, probed, new_memo = "end", memo["d"], dict(memo, ended=True)
+    chosen, evoi_best = best, 0.0
+    if running:
+        left = memo["start"] + memo["d"] - now
+        chosen = evaluate(f"close{left}", "probe", profile(frost, left, back), frost, probe_min=left)
+    elif not unusable and (new_memo is None or now >= new_memo["block_until"]):
+        for d in PROBES if best["kind"] != "frost" and back > frost + EPS else ():
+            pr = evaluate(f"close{d}", "probe", profile(frost, d, back), frost, probe_min=d)
+            if pr["peak"] > limit:
+                continue
+            sep = abs(pr["runs"][1][0][2][d - 1] - pr["runs"][0][0][2][d - 1]) / sigma_obs
+            rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0)
+            evoi = rho * gain - max(0.0, full(pr) - full(best))
+            if evoi > max(evoi_best, env["raise_cost"]) + 1e-12:
+                chosen, evoi_best = pr, evoi
+                new_memo = {"start": now, "d": d, "block_until": now + 2 * d + separation_minutes(pr, sigma_obs), "target": target, "present": env["present"], "ended": False}
+                event = "start"
     fc = sum(modes[mi][0] * supplies[si][1] * live["runs"][mi][si][2][FORECAST_MIN - 1] for mi in range(2) for si in range(2))
     y_last = env.get("y_last")
     if y_last is not None and math.isfinite(y_last):
         fc += y_last - sensor0
     coast, stored = storage(par, m, a, lam_c, env)
-    return {"coast_min": coast, "stored_min": stored, "kind": chosen["kind"], "name": chosen["name"], "setpoint": chosen["first"], "raise": chosen["raise_flag"], "probe_min": chosen["probe_min"], "boost_min": chosen["boost_min"],
-            "energy": chosen["energy"], "cold": chosen["cold"], "raise_cost": chosen["raise"], "cost_live": live["total"], "total": chosen["total"], "p_window": pw, "lam_closed": lam_c, "lam_open": lam_o,
-            "mass": m, "air": a, "sensor": sensor0, "forecast": fc, "evoi": evoi_best, "best_cost": best["total"], "perfect_cost": perf, "n_allowed": len(allowed)}
+    if unusable:
+        chosen = live
+    return {"coast_min": coast, "stored_min": stored, "kind": "fit_unusable" if unusable else chosen["kind"], "name": "fit_unusable" if unusable else chosen["name"], "setpoint": chosen["first"], "raise": False if unusable else chosen["raise_flag"],
+            "probe_min": chosen["probe_min"], "boost_min": chosen["boost_min"], "energy": chosen["energy"], "cold": chosen["cold"], "raise_cost": 0.0 if unusable else chosen["raise"], "cost_live": live["total"], "total": chosen["total"],
+            "p_window": pw, "lam_closed": lam_c, "lam_open": lam_o, "mass": m, "air": a, "sensor": sensor0, "forecast": fc, "evoi": evoi_best, "best_cost": best["total"], "perfect_cost": perf, "n_allowed": len(allowed),
+            "probe_event": event, "probed_min": probed, "probe_memo": new_memo, "unusable": unusable}

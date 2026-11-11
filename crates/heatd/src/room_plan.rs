@@ -6,7 +6,18 @@ pub const COAST_CAP: usize = 1440;
 const COAST_DROP: f64 = 0.5;
 pub const BOOSTS: [usize; 4] = [5, 10, 15, 20];
 pub const FORECAST_MIN: usize = 20;
+pub const PEAK_MARGIN: f64 = 0.5;
 const EPS: f64 = 1e-9;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeMemo {
+    pub start: i64,
+    pub d: usize,
+    pub block_until: i64,
+    pub target: f64,
+    pub present: f64,
+    pub ended: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -28,6 +39,8 @@ pub struct Env {
     pub r_grid: f64,
     pub lag: Option<[f64; 2]>,
     pub y_last: Option<f64>,
+    pub now_min: i64,
+    pub probe: Option<ProbeMemo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,12 +71,23 @@ pub struct PlanOut {
     pub stored_min: Option<f64>,
     pub energy_live: f64,
     pub target: f64,
+    pub probe_event: Option<&'static str>,
+    pub probed_min: usize,
+    pub probe_memo: Option<ProbeMemo>,
+    pub unusable: bool,
 }
 
 struct Run {
     en: Vec<f64>,
     co: Vec<f64>,
     sens: Vec<f64>,
+    term: f64,
+}
+
+impl Run {
+    fn cold(&self) -> f64 {
+        self.co.iter().fold(0.0, |x, v| x + v) + self.term
+    }
 }
 
 struct Cand {
@@ -83,9 +107,25 @@ struct Cand {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn terminal_cold(par: &RoomPar, m: f64, a: f64, lam: f64, env: &Env, cn: f64, cs: f64) -> f64 {
+    let deficit = (env.target - par.sensor(m, a)).max(0.0);
+    if deficit <= 0.0 || env.present <= 0.0 {
+        return 0.0;
+    }
+    let h = 1.0 / 60.0;
+    let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, 1.0, env.tout, env.wind, env.rad, env.night, cn, cs, h);
+    let (mut x, mut y) = (m, a);
+    for _ in 0..FORECAST_MIN {
+        (x, y) = (f11 * x + f12 * y + g1, f21 * x + f22 * y + g2);
+    }
+    let rate = (par.sensor(x, y) - par.sensor(m, a)) / FORECAST_MIN as f64;
+    0.5 * deficit * (if rate > 1e-12 { deficit / rate } else { COAST_CAP as f64 }).min(COAST_CAP as f64) * env.present
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64) -> Run {
     let h = 1.0 / 60.0;
-    let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new() };
+    let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new(), term: 0.0 };
     let mut lag = env.lag;
     for &set in sp.iter().take(HORIZON) {
         let u = (par.g * (set - par.sensor(m, a))).clamp(0.0, 1.0);
@@ -98,6 +138,7 @@ fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], 
         run.en.push(u * s);
         run.co.push((env.target - sens).max(0.0) * env.present);
     }
+    run.term = terminal_cold(par, m, a, lam, env, cn, cs);
     run
 }
 
@@ -127,6 +168,11 @@ fn storage(par: &RoomPar, m: f64, a: f64, lam: f64, env: &Env, cn: f64, cs: f64)
     (COAST_CAP as f64, stored)
 }
 
+fn separation_minutes(pr: &Cand, sigma_obs: f64) -> usize {
+    let (closed, opened) = (&pr.runs[0][0].sens, &pr.runs[1][0].sens);
+    (0..HORIZON).find(|&k| (opened[k] - closed[k]).abs() >= 2.0 * sigma_obs).map_or(HORIZON, |k| k + 1)
+}
+
 pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &Env) -> PlanOut {
     let lam_w = shock.lambda_w;
     let n = comps.len();
@@ -145,19 +191,21 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let (target, frost, cold_w) = (env.target, env.frost, env.cold_cost);
     let cur = env.sp_cur;
     let sensor0 = par.sensor(m, a);
-    let limit = (target + 0.5).max(sensor0) + EPS;
+    let limit = (target + PEAK_MARGIN).max(sensor0) + EPS;
+    let now = env.now_min;
+    let unusable = par.unusable || (if env.night { par.p.ts_night } else { par.p.ts }) < target + PEAK_MARGIN;
     let evaluate = |name: &str, kind: &'static str, sp: Vec<f64>, first: f64, boost_min: Option<usize>, probe_min: Option<usize>| -> Cand {
         let run = |mi: usize, si: usize| rollout(par, m, a, modes[mi].1, supplies[si].0, &sp, env, cn, cs);
         let runs = [[run(0, 0), run(0, 1)], [run(1, 0), run(1, 1)]];
         let mut mode_cost = [0.0; 2];
         for (mi, mc) in mode_cost.iter_mut().enumerate() {
-            *mc = (0..2).fold(0.0, |acc, si| acc + supplies[si].1 * (runs[mi][si].en.iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * runs[mi][si].co.iter().fold(0.0, |x, v| x + v)));
+            *mc = (0..2).fold(0.0, |acc, si| acc + supplies[si].1 * (runs[mi][si].en.iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * runs[mi][si].cold()));
         }
         let raise_flag = cur.is_some_and(|c| first > c + EPS);
         let raise = if raise_flag { env.raise_cost } else { 0.0 };
         let both = |f: &dyn Fn(&Run) -> f64| (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * f(&runs[mi][si])));
         let energy = both(&|r| r.en.iter().fold(0.0, |x, v| x + v));
-        let cold = (0..2).fold(0.0, |acc, si| acc + modes[0].0 * supplies[si].1 * runs[0][si].co.iter().fold(0.0, |x, v| x + v));
+        let cold = (0..2).fold(0.0, |acc, si| acc + modes[0].0 * supplies[si].1 * runs[0][si].cold());
         let total = (0..2).fold(0.0, |acc, mi| acc + modes[mi].0 * mode_cost[mi]) + raise;
         let peak = runs[0][0].sens.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         Cand { name: name.to_string(), kind, first, mode_cost: [mode_cost[0] + raise, mode_cost[1] + raise], energy, cold: cold_w * cold, raise, raise_flag, total, peak, boost_min, probe_min, runs }
@@ -197,45 +245,60 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let perf = (0..2).fold(0.0, |acc, mi| acc + modes[mi].0 * allowed.iter().map(|&i| cands[i].mode_cost[mi]).fold(f64::INFINITY, f64::min));
     let gain = (cands[best].total - perf).max(0.0);
     let sigma_obs = (env.r_grid + par.noise_r.powi(2)).sqrt();
-    let prefix = |c: &Cand, d: usize| (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| {
-        let r = &c.runs[mi][si];
-        acc2 + modes[mi].0 * supplies[si].1 * (r.en[..d].iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * r.co[..d].iter().fold(0.0, |x, v| x + v))
-    }));
-    let mut probe: Option<Cand> = None;
-    let mut evoi_best = 0.0;
     let back = if cands[best].kind == "boost" { target } else { cands[best].first };
-    for d in PROBES {
-        if cands[best].kind == "frost" || back <= frost + EPS {
-            break;
+    let full = |c: &Cand| c.total - c.raise;
+    let memo = env.probe.clone();
+    let mut running = memo.as_ref().is_some_and(|mm| !mm.ended && now < mm.start + mm.d as i64);
+    let (mut event, mut probed, mut new_memo): (Option<&'static str>, usize, Option<ProbeMemo>) = (None, 0, memo.clone());
+    if let Some(mm) = memo.as_ref().filter(|mm| !mm.ended) {
+        if running && ((mm.target - target).abs() > EPS || (mm.present - env.present).abs() > EPS || gain <= env.raise_cost || unusable) {
+            let spent = (now - mm.start) as usize;
+            (event, probed, new_memo, running) = (Some("abort"), spent, Some(ProbeMemo { d: spent, ended: true, ..mm.clone() }), false);
+        } else if !running {
+            (event, probed, new_memo) = (Some("end"), mm.d, Some(ProbeMemo { ended: true, ..mm.clone() }));
         }
-        let pr = evaluate(&format!("close{d}"), "probe", profile(frost, d, back), frost, None, Some(d));
-        if pr.peak > limit {
-            continue;
-        }
-        let sep = (pr.runs[1][0].sens[d - 1] - pr.runs[0][0].sens[d - 1]).abs() / sigma_obs;
-        let rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0);
-        let evoi = rho * gain - (prefix(&pr, d) - prefix(&cands[best], d)).max(0.0);
-        if evoi > evoi_best + 1e-12 {
-            evoi_best = evoi;
-            probe = Some(pr);
+    }
+    let mut probe: Option<Cand> = None;
+    let mut evoi_best: f64 = 0.0;
+    if running {
+        let left = (memo.as_ref().map_or(0, |mm| mm.start + mm.d as i64) - now) as usize;
+        probe = Some(evaluate(&format!("close{left}"), "probe", profile(frost, left, back), frost, None, Some(left)));
+    } else if !unusable && new_memo.as_ref().is_none_or(|mm| now >= mm.block_until) {
+        for d in PROBES {
+            if cands[best].kind == "frost" || back <= frost + EPS {
+                break;
+            }
+            let pr = evaluate(&format!("close{d}"), "probe", profile(frost, d, back), frost, None, Some(d));
+            if pr.peak > limit {
+                continue;
+            }
+            let sep = (pr.runs[1][0].sens[d - 1] - pr.runs[0][0].sens[d - 1]).abs() / sigma_obs;
+            let rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0);
+            let evoi = rho * gain - (full(&pr) - full(&cands[best])).max(0.0);
+            if evoi > evoi_best.max(env.raise_cost) + 1e-12 {
+                evoi_best = evoi;
+                new_memo = Some(ProbeMemo { start: now, d, block_until: now + 2 * d as i64 + separation_minutes(&pr, sigma_obs) as i64, target, present: env.present, ended: false });
+                event = Some("start");
+                probe = Some(pr);
+            }
         }
     }
     let live = &cands[0];
     let model_fc = (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * live.runs[mi][si].sens[FORECAST_MIN - 1]));
     let forecast = env.y_last.filter(|y| y.is_finite()).map_or(model_fc, |y| model_fc + (y - sensor0));
     let (cost_live, best_cost, n_allowed, energy_live) = (live.total, cands[best].total, allowed.len(), live.energy);
-    let chosen = probe.as_ref().unwrap_or(&cands[best]);
+    let chosen = if unusable { live } else { probe.as_ref().unwrap_or(&cands[best]) };
     let (coast_min, stored_min) = storage(par, m, a, lam_c, env, cn, cs);
     PlanOut {
-        kind: chosen.kind,
-        name: chosen.name.clone(),
+        kind: if unusable { "fit_unusable" } else { chosen.kind },
+        name: if unusable { "fit_unusable".to_string() } else { chosen.name.clone() },
         setpoint: chosen.first,
-        raise: chosen.raise_flag,
+        raise: !unusable && chosen.raise_flag,
         probe_min: chosen.probe_min,
         boost_min: chosen.boost_min,
         energy: chosen.energy,
         cold: chosen.cold,
-        raise_cost: chosen.raise,
+        raise_cost: if unusable { 0.0 } else { chosen.raise },
         cost_live,
         total: chosen.total,
         p_window: pw,
@@ -253,5 +316,9 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
         stored_min,
         energy_live,
         target,
+        probe_event: event,
+        probed_min: probed,
+        probe_memo: new_memo,
+        unusable,
     }
 }

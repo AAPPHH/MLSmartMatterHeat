@@ -48,7 +48,7 @@ CONFIG = {
     "roommodel": {
         "hold_min": 20.0, "valve": {"sigma_u_min": 0.05, "sigma_u_default": 0.25},
         "fit": {"horizons": [5, 20, 60], "weights": [1.0, 1.0, 0.5], "stride": 5, "warm_min": 1440, "train_frac": 0.6, "report_age_min": 5, "max_nfev": 200, "tol": 1e-6, "diff_step": 1e-3, "bound_tol": 0.01,
-                "prior_sigma": {"default": 3.0, "ts": 0.3, "ts_night": 0.3}, "q_r": 0.5, "q_a": 0.3, "q_um": 8.0, "q_ua": 0.0, "valve_sigma_scale": 0.0, "init_onestep": True, "init_w": [0.05, 0.95],
+                "prior_sigma": {"default": 3.0, "ts": 0.3, "ts_night": 0.3}, "q_r": 0.5, "q_a": 0.3, "q_um": 8.0, "q_ua": 0.0, "valve_sigma_scale": 0.0, "init_onestep": True, "init_w": [0.05, 0.95], "pool": ["ts", "ts_night"], "setpoint_pct": 95.0, "min_setpoint_n": 60,
                 "init": {"a1": 6.0, "a2": 2.0, "b1": 1.0, "b2": 0.15, "b3": 0.03, "b4": 0.01, "w": 0.5, "ts": 50.0, "ts_night": 45.0, "tau_v": 10.0, "c": 0.2},
                 "bounds": {"a1": [0.01, 300.0], "a2": [0.01, 300.0], "b1": [0.01, 300.0], "b2": [1e-3, 10.0], "b3": [1e-5, 3.0], "b4": [1e-5, 5.0], "w": [1e-3, 0.999], "ts": [20.0, 95.0], "ts_night": [15.0, 95.0],
                            "tau_v": [0.1, 120.0], "c": [1e-4, 20.0]}},

@@ -8,7 +8,7 @@ import duckdb
 import numpy as np
 from scipy.optimize import least_squares
 from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, norm_cdf_np, run_batch, valve_lag, valve_lag_states
-from heattrain.roomimm import RoomPar, norm_cdf
+from heattrain.roomimm import PEAK_MARGIN, RoomPar, norm_cdf
 from heattrain.roomobs import evidence_blocks
 from heattrain.thermal import build_rooms, epoch, fit, load_devices, load_events, load_lake, raw_batches
 
@@ -78,6 +78,7 @@ class RoomFit:
         self.lo, self.hi = np.log([bnd(k)[0] for k in self.names]), np.log([bnd(k)[1] for k in self.names])
         self.prior = np.clip(np.log([f["init"]["c" if k.startswith("c_") else k] for k in self.names]), self.lo, self.hi)
         self.prior_sd = np.array([f["prior_sigma"].get(k, f["prior_sigma"]["default"]) for k in self.names])
+        self.prior_now = self.prior
         y = c["y"]
         fin = np.isfinite(y)
         last = np.maximum.accumulate(np.where(fin, np.arange(n), -1))
@@ -227,9 +228,17 @@ class RoomFit:
     def residuals(self, th, sel, doc):
         e, _ = self.errors(self.params(th), sel, doc)
         parts = [wt * np.where(self.valid[H][sel][:, None] & np.isfinite(e[H]), e[H], 0.0) / self.sd[H] for H, wt in zip(self.Hs, self.wts)]
-        return np.concatenate(parts + [((np.asarray(th) - self.prior) / self.prior_sd).T])
+        return np.concatenate(parts + [((np.asarray(th) - self.prior_now) / self.prior_sd).T])
 
-    def fit(self, theta_init, sel, doc):
+    def pooled(self, centres):
+        out = self.prior.copy()
+        for k, v in centres.items():
+            if k in self.names:
+                out[self.names.index(k)] = np.clip(v, self.lo[self.names.index(k)], self.hi[self.names.index(k)])
+        return out
+
+    def fit(self, theta_init, sel, doc, prior=None):
+        self.prior_now = self.prior if prior is None else prior
         y = self.c["y"]
         for H in self.Hs:
             e = (y[self.js + H] - self.Pc)[sel & self.valid[H]]
@@ -476,17 +485,49 @@ class FoldFit:
             night = d.night
             self.rfs[d.room] = RoomFit(full.cols[d.room], full.n, sorted(d.nb), rc, min(night.sum(), (~night).sum()) >= cfg["min_night_steps"])
 
+    def centres(self, th):
+        out = {}
+        for k in self.rc["fit"]["pool"]:
+            vals = [th[r][rf.names.index(k)] for r, rf in self.rfs.items() if k in rf.names and r in th]
+            if len(vals) >= 2:
+                out[k] = float(np.median(vals))
+        return out
+
     def run(self, cut, warm=None, ext=False):
-        docs, th, info = {}, {}, {}
+        docs, th, info, bases, sels = {}, {}, {}, {}, {}
+        centres = self.centres(warm) if warm else {}
         for d in self.rooms:
             ns = max(cut - int(round((d.t0 - self.full.t0) / self.full.dt)), 0)
             rf = self.rfs[d.room]
-            base = base_doc(d.slice(0, ns), self.cfg, self.rc, ext)
+            bases[d.room], sels[d.room] = base_doc(d.slice(0, ns), self.cfg, self.rc, ext), rf.js + max(rf.Hs) < cut
             x0 = warm[d.room] if warm else init_theta(rf, d, self.cfg, self.rc, ns)
-            th[d.room], info[d.room] = rf.fit(x0, rf.js + max(rf.Hs) < cut, base)
-            docs[d.room] = rf.doc(th[d.room], base)
+            th[d.room], info[d.room] = rf.fit(x0, sels[d.room], bases[d.room], rf.pooled(centres) if centres else None)
+        if not warm:
+            centres = self.centres(th)
+            for d in self.rooms:
+                rf = self.rfs[d.room]
+                th[d.room], info[d.room] = rf.fit(th[d.room], sels[d.room], bases[d.room], rf.pooled(centres) if centres else None)
+        for d in self.rooms:
+            rf = self.rfs[d.room]
+            docs[d.room] = rf.doc(th[d.room], bases[d.room])
             info[d.room]["names"] = rf.names
+            info[d.room]["pooled"] = {k: float(math.exp(v)) for k, v in centres.items() if k in rf.names}
         return docs, th, info
+
+
+def unusable_rooms(grid, docs, rc):
+    out = {}
+    for r, doc in docs.items():
+        sp, night = grid.cols[r]["sp"], grid.cols[r]["night"] > 0.5
+        why = []
+        for label, mask, key in (("day", ~night, "ts"), ("night", night, "ts_night")):
+            v = sp[mask & np.isfinite(sp)]
+            need = float(np.percentile(v, rc["fit"]["setpoint_pct"])) + PEAK_MARGIN if len(v) >= rc["fit"]["min_setpoint_n"] else None
+            if need is not None and doc["params"][key] < need:
+                why.append(f"{key} {doc['params'][key]:.1f} cannot reach the {label} setpoint {need - PEAK_MARGIN:.1f} + {PEAK_MARGIN}")
+        if why:
+            out[r] = why
+    return out
 
 
 def calibrate_air(grid, docs, rc, lo, hi, rec):

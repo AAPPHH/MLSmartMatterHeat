@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 from heattrain.roombatch import Grid, norm_cdf_np, run_batch
-from heattrain.roomfit import FoldFit, Truth, base_doc, calibrate_air, episodes, fit_shock, shock_defaults, tune_windows
+from heattrain.roomfit import FoldFit, Truth, base_doc, calibrate_air, episodes, fit_shock, shock_defaults, tune_windows, unusable_rooms
 from heattrain.roomobs import evidence_blocks
 from heattrain.thermal import build_rooms, load_devices, load_events, load_lake
 
@@ -335,6 +335,9 @@ def fit_bundle(config, rooms, src, version=None):
         _, rref, _ = run_range(full, docs0, [shock], house, max(0, variants.sensor_start - 600), full.n)
         cal = calibrate_air(full, docs0, rc, variants.sensor_start, full.n, rref[0])
     docs = variants.docs(docs0, chosen["parts"], cal, chosen["effort"])
+    bad = unusable_rooms(full, docs, rc)
+    for r in bad:
+        docs[r]["unusable"] = True
     run, recs = run_batch(full, docs, [shock], house, record=True)
     lw, lj, tuning = tune_windows(full, recs[0], rc, truth.gt, truth.labels)
     shock = dict(shock, lambda_w=lw, lambda_jump=lj)
@@ -343,7 +346,7 @@ def fit_bundle(config, rooms, src, version=None):
     by_room = {r: sum(1 for x in resets if x["room"] == r) for r in full.names}
     flags = [f"{r}: at bound {','.join(i['at_bound'])}" for r, i in info.items() if i["at_bound"]]
     unconverged = [f"{r}: fit not converged" for r, i in info.items() if not i["converged"]]
-    flags_all = flags + unconverged + ([tuning["warning"]] if tuning and tuning.get("refused") else [])
+    flags_all = flags + unconverged + [f"{r}: fit unusable, {'; '.join(w)}" for r, w in bad.items()] + ([tuning["warning"]] if tuning and tuning.get("refused") else [])
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     house_out = dict(house, night_hours=cfg["night_hours"], timezone=cfg["timezone"])
     bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out}

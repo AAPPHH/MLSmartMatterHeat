@@ -142,17 +142,19 @@ def test_plan_with_preset_costs_drops_to_frost_for_an_open_window_and_heats_a_cl
 def test_plan_at_half_window_probability_probes_instead_of_guessing():
     par = light_par()
     shock = dict(SHOCK, lambda_jump=6.0)
-    half = plan(par, shock, comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, plan_env())
+    half = plan(par, shock, comps_at(20.0, 19.5, 2.0, 1e-2), 1.0, plan_env())
     assert abs(half["p_window"] - 0.5) < 1e-6
     assert half["kind"] == "probe" and half["probe_min"] in (10, 20, 30) and half["setpoint"] == 7.0 and not half["raise"]
-    assert half["evoi"] > 1.0
+    assert half["evoi"] > 15.0
+    cold = plan(par, shock, comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, plan_env())
+    assert cold["kind"] != "probe" and cold["setpoint"] > 7.0
 
 
 def test_close_probe_costs_no_raise_and_is_a_decrease():
     par = light_par()
     shock = dict(SHOCK, lambda_jump=6.0)
     for cur in (21.0, 18.0):
-        p = plan(par, shock, comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, plan_env(sp_cur=cur, sp_live=cur))
+        p = plan(par, shock, comps_at(20.0, 19.5, 2.0, 1e-2), 1.0, plan_env(sp_cur=cur, sp_live=cur))
         assert p["kind"] == "probe" and p["raise_cost"] == 0.0 and not p["raise"] and p["setpoint"] == 7.0
 
 
@@ -197,12 +199,12 @@ def test_plan_raise_cost_blocks_small_raises_and_no_supply_blocks_heating():
 def test_plan_probe_is_chosen_only_with_value_of_information():
     par = light_par()
     shock = dict(SHOCK, lambda_jump=6.0)
-    mixed = [(0.5, [17.0, 16.0, 1.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4]), (0.5, [17.0, 16.0, 6.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4])]
+    mixed = [(0.5, [20.0, 19.5, 1.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4]), (0.5, [20.0, 19.5, 6.0], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-4])]
     p = plan(par, shock, mixed, 1.0, plan_env())
     assert 0.4 < p["p_window"] < 0.6 and p["kind"] == "probe" and p["evoi"] > 1.0
     assert p["best_cost"] - p["perfect_cost"] > p["evoi"]
     for lam in (1.0, 6.0):
-        sure = plan(par, shock, comps_at(17.0, 16.0, lam), 1.0, plan_env())
+        sure = plan(par, shock, comps_at(20.0, 19.5, lam), 1.0, plan_env())
         assert sure["kind"] != "probe" and sure["evoi"] == 0.0
         assert sure["best_cost"] - sure["perfect_cost"] < 1e-9
 
@@ -348,9 +350,66 @@ def test_causal_roll_equals_the_planner_rollout_from_the_origin():
     for i in (0, len(js) // 2, len(js) - 1):
         j = js[i]
         env = {"tout": c["tout"][j], "wind": 3.0, "rad": 40.0, "night": False, "cn": 0.0, "cs": 0.0, "target": 21.0, "present": 1.0, "lag": [lag[0][j], lag[1][j]]}
-        _, _, sens = rollout(par, 21.0, 19.5, 1.0, 1, [c["sp"][j]] * 60, env)
+        _, _, sens, _ = rollout(par, 21.0, 19.5, 1.0, 1, [c["sp"][j]] * 60, env)
         assert abs(out[20][i, 0] - sens[19]) < 1e-9 and abs(out[60][i, 0] - sens[59]) < 1e-9
     held = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
     c["sp"][:] = 17.0
     changed = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
     assert not np.allclose(held[20], changed[20])
+
+
+def probe_script(par, steps):
+    memo, out = None, []
+    for t, comps, over in steps:
+        p = plan(par, SHOCK, comps, 1.0, plan_env(now_min=t, probe=memo, **over))
+        memo = p["probe_memo"]
+        out.append(p)
+    return out
+
+
+def half_comps(m=21.0, a=20.5):
+    return [(0.5, [m, a, lam], [0.01, 0, 0, 0, 0.01, 0, 0, 0, 1e-2]) for lam in (1.0, 6.0)]
+
+
+def probe_par():
+    return RoomPar(room_doc(False, 0.3, w=0.3, b1=2.0, a1=3.0, ts=35.0, ts_night=35.0, tau_v=3.0, b2=0.15))
+
+
+def test_probe_runs_to_its_end_is_reported_once_and_is_not_repeated_immediately():
+    par, half = probe_par(), half_comps()
+    seq = probe_script(par, [(t, half, {}) for t in range(0, 61, 5)])
+    kinds = [(p["kind"], p["probe_event"], p["probe_min"]) for p in seq]
+    assert kinds[0] == ("probe", "start", 10) and kinds[1] == ("probe", None, 5) and kinds[2][1:] == ("end", None) and kinds[2][0] != "probe"
+    assert seq[2]["probed_min"] == 10 and seq[3]["kind"] != "probe"
+    starts = [i for i, p in enumerate(seq) if p["probe_event"] == "start"]
+    assert starts[1] - starts[0] >= 4
+    assert sum(p["probed_min"] for p in seq if p["probe_event"] in ("end", "abort")) <= 10 * len(starts)
+
+
+def test_probe_stops_when_target_changes_or_the_window_resolves_or_the_fit_is_unusable():
+    par, half = probe_par(), half_comps()
+    sure = half_comps()
+    sure = [(0.5, [x[0], x[1], 1.0], p) for _, x, p in sure]
+    for over, comps in (({"target": 19.0}, half), ({}, sure), ({"target": 40.0}, half), ({"present": 0.0}, half)):
+        seq = probe_script(par, [(0, half, {}), (5, comps, over), (10, comps, over)])
+        assert seq[0]["probe_event"] == "start" and seq[1]["probe_event"] == "abort" and seq[1]["probed_min"] == 5 and seq[1]["kind"] != "probe" and seq[2]["probe_event"] is None
+
+
+def test_terminal_cost_keeps_an_occupied_cold_room_off_frost_and_an_empty_one_on_frost():
+    par = probe_par()
+    cold = comps_at(17.0, 16.0, 1.0)
+    full = plan(par, SHOCK, cold, 1.0, plan_env(now_min=0))
+    empty = plan(par, SHOCK, cold, 1.0, plan_env(now_min=0, present=0.0))
+    assert full["kind"] != "frost" and full["setpoint"] > 7.0
+    assert empty["kind"] == "frost" and empty["cold"] == 0.0
+    no_heat = plan(par, SHOCK, cold, 0.0, plan_env(now_min=0))
+    assert math.isfinite(no_heat["total"]) and math.isfinite(no_heat["cold"])
+
+
+def test_fit_is_unusable_when_the_supply_temperature_cannot_reach_the_target():
+    par = RoomPar(room_doc(False, 0.3, w=0.3, b1=2.0, a1=3.0, ts=21.2, ts_night=21.2))
+    p = plan(par, SHOCK, comps_at(17.0, 16.0, 1.0), 1.0, plan_env(now_min=0))
+    assert p["kind"] == "fit_unusable" and p["unusable"] and p["setpoint"] == 21.0 and not p["raise"] and p["probe_min"] is None
+    doc = room_doc(False, 0.3, w=0.3, b1=2.0, a1=3.0)
+    doc["unusable"] = True
+    assert plan(RoomPar(doc), SHOCK, comps_at(17.0, 16.0, 1.0), 1.0, plan_env(now_min=0))["kind"] == "fit_unusable"

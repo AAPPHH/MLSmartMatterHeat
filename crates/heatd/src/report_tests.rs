@@ -499,6 +499,7 @@ fn shadow_lake(root: &Path) {
     }
     sink.append(ShadowDecision { raise: true, coast_min: Some(100.0), stored_min: Some(10.0), storage: Some("a: Wände 21 °C, Luft 20 °C".into()), ..shadow_row(400, "a", 0.1, 0.99) }).unwrap();
     sink.append(ShadowDecision { kind: "probe".into(), probe_min: Some(20.0), coast_min: Some(50.0), stored_min: Some(-4.0), storage: Some("a: letzter Stand".into()), ..shadow_row(420, "a", 0.5, 0.99) }).unwrap();
+    sink.append(ShadowDecision { kind: "probe_end".into(), probe_min: Some(12.0), ..shadow_row(432, "a", 0.5, 0.99) }).unwrap();
     sink.append(shadow_row(410, "a", 0.9, 0.99)).unwrap();
     sink.append(shadow_row(790, "a", 0.8, 0.99)).unwrap();
     for minute in [500, 520, 540] {
@@ -533,9 +534,9 @@ fn shadow_section_reports_forecast_detection_supply_raises_and_resets() {
 {md}");
     assert!(md.contains("Schatten-Kesselstillstaende (p_supply < 0,5 laenger als 20 min) 1, Live-Erkennung (`supply`-Events mit Ende) 1, davon ueberlappend 1"), "supply
 {md}");
-    assert!(md.contains("| a | 1 | 1 | 11 | 44 | 33 |"), "raises
+    assert!(md.contains("| a | 1 | 1 | 12 | 48 | 36 |"), "raises
 {md}");
-    assert!(md.contains("| a | 75 | 50 | 3 | 1 | 20 | a: letzter Stand |"), "storage
+    assert!(md.contains("| a | 75 | 50 | 3 | 1 | 12 | a: letzter Stand |"), "storage
 {md}");
     assert!(md.contains("Filterresets: a nan 1."), "resets
 {md}");

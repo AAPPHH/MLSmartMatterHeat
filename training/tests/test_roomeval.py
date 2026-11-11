@@ -140,3 +140,26 @@ def test_s3_needs_strictly_more_hits_than_live():
     s3 = lambda h, l: criteria(RC, hold(h, l), {"r": 1}, [], [])["S3"]["pass"]
     assert not s3(0, 0) and not s3(1, 1) and s3(2, 1)
     assert criteria(RC, hold(1, 0), {"r": 1}, [], [])["S1"]["oracle_valve"]["h20"] == 0.2
+
+
+def test_unusable_rooms_flag_a_supply_temperature_below_the_setpoint_plus_margin():
+    from heattrain.roomfit import unusable_rooms
+    n = 400
+    g = G(["ok", "low", "night"], n)
+    night = np.arange(n) % 24 >= 16
+    for r in g.names:
+        g.cols[r].update(sp=np.where(night, 17.0, 21.0), night=night.astype(float))
+    docs = {"ok": {"params": {"ts": 40.0, "ts_night": 30.0}}, "low": {"params": {"ts": 21.2, "ts_night": 30.0}}, "night": {"params": {"ts": 40.0, "ts_night": 16.0}}}
+    out = unusable_rooms(g, docs, RC)
+    assert set(out) == {"low", "night"} and "ts 21.2" in out["low"][0] and "ts_night" in out["night"][0]
+
+
+def test_pooled_prior_moves_only_the_pooled_parameters_and_stays_inside_the_bounds():
+    from heattrain.roomfit import RoomFit
+    n = 300
+    c = {"y": np.full(n, 20.0), "yv": np.zeros(n), "u": np.zeros(n), "sp": np.full(n, 21.0), "tout": np.full(n, 5.0), "wind": np.full(n, 3.0), "rad": np.zeros(n), "night": np.zeros(n), "yi": np.full(n, 20.0), "bad": np.zeros(n), "ncnt": [], "nsum": []}
+    rf = RoomFit(c, n, [], RC, True)
+    out = rf.pooled({"ts": math.log(40.0), "ts_night": math.log(500.0), "nothing": 1.0})
+    assert abs(out[rf.names.index("ts")] - math.log(40.0)) < 1e-12 and out[rf.names.index("ts_night")] == rf.hi[rf.names.index("ts_night")]
+    keep = [i for i, k in enumerate(rf.names) if k not in ("ts", "ts_night")]
+    assert np.allclose(out[keep], rf.prior[keep])

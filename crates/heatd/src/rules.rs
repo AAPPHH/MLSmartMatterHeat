@@ -860,7 +860,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
     }
 }
 
-const WEATHER_MAX_AGE_US: i64 = 10_800_000_000;
+const WEATHER_MAX_AGE_US: i64 = crate::room_shadow::WEATHER_MAX_AGE_MIN * 60_000_000;
 
 fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_ms: i64, away: bool, sleep: bool, window_busy: &HashSet<String>) {
     if !state.config.room_model.enabled {

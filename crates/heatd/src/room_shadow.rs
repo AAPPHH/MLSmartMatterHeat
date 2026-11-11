@@ -1,11 +1,12 @@
 use crate::room_model::{bundle_candidates, Bundle, House, Out, ResetRec, RoomIn};
-use crate::room_plan::{plan, Env, PlanOut, COAST_CAP};
+use crate::room_plan::{plan, Env, PlanOut, ProbeMemo, COAST_CAP, PEAK_MARGIN};
 use anyhow::{bail, Result};
 use matter_controller::{CO2_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const EPS: f64 = 1e-9;
 
@@ -29,6 +30,7 @@ const TICK_MIN: i64 = 5;
 const ROW_EVERY_MIN: i64 = 30;
 const RELOAD_MIN: f64 = 10.0;
 const MAX_CATCHUP_MIN: i64 = 30;
+pub const WEATHER_MAX_AGE_MIN: i64 = 180;
 const TEMP_RANGE: [f64; 2] = [0.0, 45.0];
 const VALVE_RANGE: [f64; 2] = [0.0, 100.0];
 
@@ -76,13 +78,16 @@ struct Inner {
     devs: HashMap<u64, DevFeed>,
     inputs: BTreeMap<String, RoomIn>,
     decided: HashMap<String, i64>,
-    last_row: HashMap<String, (f64, i64, bool)>,
+    last_row: HashMap<String, (f64, i64, bool, &'static str)>,
     views: BTreeMap<String, serde_json::Value>,
     pending: Vec<crate::lake::Event>,
     away_since: Option<i64>,
     returned: Option<i64>,
-    weather: [Option<f64>; 3],
+    weather: [Option<(i64, f64)>; 3],
+    probes: HashMap<String, ProbeMemo>,
     state: Option<&'static str>,
+    #[cfg(test)]
+    panic_next: bool,
 }
 
 #[derive(Clone, Default)]
@@ -107,12 +112,24 @@ pub(crate) fn sentence(room: &str, p: &PlanOut, out: &Out, live: f64, boost_c: f
         return format!("{room}: Kessel liefert nicht -> Anheben bringt nichts -> {sp} °C");
     }
     match p.kind {
-        "probe" => format!("{room}: Fenster noch offen? Probe {} min bei {sp} °C", p.probe_min.unwrap_or(0)),
+        "probe" => format!("{room}: Fenster noch offen? Ventil {} min zu, die Abkühlung zeigt es -> {sp} °C", p.probe_min.unwrap_or(0)),
         "boost" => format!("{room}: Boost {} min bei {} °C -> schneller auf {} °C", p.boost_min.unwrap_or(0), fmt_c(boost_c), fmt_c(p.target)),
         _ if p.raise => format!("{room}: zu kalt bei Anwesenheit -> Soll auf {sp} °C anheben"),
         _ if p.setpoint < live - EPS => format!("{room}: Heizen lohnt kaum -> Soll {sp} °C statt {} °C", fmt_c(live)),
         _ => format!("{room}: Modell passt -> Soll {sp} °C bleibt"),
     }
+}
+
+pub(crate) fn probe_end_sentence(room: &str, event: &str, probed: usize) -> String {
+    if event == "abort" {
+        format!("{room}: Probe nach {probed} min abgebrochen, die Lage ist geklärt oder hat sich geändert")
+    } else {
+        format!("{room}: Probe nach {probed} min zu Ende")
+    }
+}
+
+pub(crate) fn unusable_sentence(room: &str, ts: f64, p: &PlanOut) -> String {
+    format!("{room}: Modell unbrauchbar (Vorlauf {} °C reicht nicht für {} °C) -> keine Empfehlung, Soll {} °C bleibt", fmt_de(ts), fmt_de(p.target + PEAK_MARGIN), fmt_de(p.setpoint))
 }
 
 fn fmt_de(x: f64) -> String {
@@ -167,8 +184,17 @@ impl Inner {
 }
 
 impl RoomModel {
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_on_next_step(&self) {
+        self.lock().panic_next = true;
+    }
+
     pub fn set_bundle(&self, bundle: Bundle) {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.lock();
         if let Some(house) = inner.house.take() {
             let events = house_resets(&house, "reload", crate::lake::now_us() / 1000);
             inner.pending.extend(events);
@@ -181,7 +207,7 @@ impl RoomModel {
     }
 
     pub fn homecoming_open(&self, away: bool, now_ms: i64, min_away_min: f64) -> bool {
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.lock();
         match (away, inner.away_since) {
             (true, None) => inner.away_since = Some(now_ms),
             (false, Some(since)) => {
@@ -194,7 +220,7 @@ impl RoomModel {
     }
 
     pub fn version(&self) -> Option<String> {
-        self.0.lock().unwrap().bundle.as_ref().map(|b| b.version.clone())
+        self.lock().bundle.as_ref().map(|b| b.version.clone())
     }
 
     pub fn observe(&self, node: u64, attribute: &str, value: f64, ts_ms: i64) {
@@ -206,7 +232,7 @@ impl RoomModel {
         if !value.is_finite() || value < range[0] || value > range[1] {
             return;
         }
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.lock();
         let feed = inner.feeds.entry(node).or_default();
         match attribute {
             crate::window::LOCAL_TEMPERATURE => (feed.temp, feed.fresh_temp) = (Some((ts_ms, value)), Some(value)),
@@ -219,7 +245,7 @@ impl RoomModel {
         if attribute != 0 || !value.is_finite() {
             return;
         }
-        let mut inner = self.0.lock().unwrap();
+        let mut inner = self.lock();
         match cluster {
             TEMPERATURE_MEASUREMENT_CLUSTER if (TEMP_RANGE[0]..=TEMP_RANGE[1]).contains(&(value / 100.0)) => {
                 let feed = inner.devs.entry(node).or_default();
@@ -232,20 +258,38 @@ impl RoomModel {
     }
 
     pub fn view(&self, room: &str) -> serde_json::Value {
-        self.0.lock().unwrap().views.get(room).cloned().unwrap_or(serde_json::Value::Null)
+        self.lock().views.get(room).cloned().unwrap_or(serde_json::Value::Null)
     }
 
     pub fn step(&self, config: &crate::config::Config, now_ms: i64, weather: [f64; 3], local_hour: f64, ctxs: &[RoomCtx]) -> StepOut {
+        if self.lock().state == Some("error") {
+            return StepOut::default();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.step_inner(config, now_ms, weather, local_hour, ctxs))).unwrap_or_else(|_| {
+            eprintln!("room model: panic in the shadow step, shadow disabled until restart");
+            let mut out = StepOut::default();
+            let mut inner = self.lock();
+            inner.views.clear();
+            inner.set_state("error", &mut out);
+            out
+        })
+    }
+
+    fn step_inner(&self, config: &crate::config::Config, now_ms: i64, weather: [f64; 3], local_hour: f64, ctxs: &[RoomCtx]) -> StepOut {
         let cfg = &config.room_model;
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.lock();
         let inner = &mut *guard;
+        #[cfg(test)]
+        if inner.panic_next {
+            panic!("room model test panic");
+        }
         let mut out = StepOut { events: std::mem::take(&mut inner.pending), ..Default::default() };
         for (slot, v) in inner.weather.iter_mut().zip(weather) {
             if v.is_finite() {
-                *slot = Some(v);
+                *slot = Some((now_ms, v));
             }
         }
-        let weather = inner.weather.map(|v| v.unwrap_or(f64::NAN));
+        let weather = inner.weather.map(|slot| slot.filter(|(t, _)| now_ms - t <= WEATHER_MAX_AGE_MIN * MIN_MS).map_or(f64::NAN, |(_, v)| v));
         if inner.bundle.is_none() {
             inner.set_state("no_model", &mut out);
             return out;
@@ -335,26 +379,38 @@ impl RoomModel {
                 r_grid: bundle.house.r_grid,
                 lag: filter.lag,
                 y_last: nodes.get(&ctx.room).and_then(|n| inner.feeds.get(n)).and_then(|f| f.temp).filter(|(t, _)| now_ms - t <= stale_ms).map(|(_, v)| v),
+                now_min: target,
+                probe: inner.probes.get(&ctx.room).cloned(),
             };
             let p = plan(&filter.par, &bundle.shock, &filter.comps, filt.p_supply, &env);
-            let why = sentence(&ctx.room, &p, &filt, ctx.live, bundle.house.boost_c);
+            if let Some(memo) = &p.probe_memo {
+                inner.probes.insert(ctx.room.clone(), memo.clone());
+            }
+            let ts_now = if input.night { filter.par.p.ts_night } else { filter.par.p.ts };
+            let why = match (p.unusable, p.probe_event) {
+                (true, _) => unusable_sentence(&ctx.room, ts_now, &p),
+                (_, Some(event @ ("end" | "abort"))) => probe_end_sentence(&ctx.room, event, p.probed_min),
+                _ => sentence(&ctx.room, &p, &filt, ctx.live, bundle.house.boost_c),
+            };
             let storage = storage_sentence(&ctx.room, &p);
             inner.views.insert(
                 ctx.room.clone(),
                 serde_json::json!({"loss_ratio": nan_null(filt.lam), "mass_c": nan_null(filt.m), "air_c": nan_null(filt.a), "p_supply": filt.p_supply, "p_window": filt.p_window, "setpoint_shadow": p.setpoint,
-                                    "setpoint_live": ctx.live, "kind": p.kind, "why": why, "coast_min": p.coast_min, "stored_min": p.stored_min.map_or(serde_json::Value::Null, nan_null), "storage": storage, "probe_min": p.probe_min, "model": bundle.version, "ts": now_ms}),
+                                    "setpoint_live": ctx.live, "kind": p.kind, "why": why, "coast_min": p.coast_min, "stored_min": p.stored_min.map_or(serde_json::Value::Null, nan_null), "storage": storage, "probe_min": p.probe_min, "shadow_state": if p.unusable { "fit_unusable" } else { inner.state.unwrap_or("running") }, "model": bundle.version, "ts": now_ms}),
             );
             let flagged = filt.p_window >= 0.5;
-            let due = inner.last_row.get(&ctx.room).is_none_or(|(sp, at, was)| (sp - p.setpoint).abs() > EPS || target - at >= ROW_EVERY_MIN || *was != flagged);
+            let ending = matches!(p.probe_event, Some("end" | "abort"));
+            let running_probe = p.kind == "probe" && p.probe_event.is_none();
+            let due = !running_probe && (ending || inner.last_row.get(&ctx.room).is_none_or(|(sp, at, was, kind)| (sp - p.setpoint).abs() > EPS || target - at >= ROW_EVERY_MIN || *was != flagged || *kind != p.kind));
             if due {
-                inner.last_row.insert(ctx.room.clone(), (p.setpoint, target, flagged));
+                inner.last_row.insert(ctx.room.clone(), (p.setpoint, target, flagged, p.kind));
                 out.rows.push(crate::lake::ShadowDecision {
                     ts: crate::lake::now_us(),
                     room: ctx.room.clone(),
                     setpoint_live: ctx.live,
                     setpoint_shadow: p.setpoint,
                     raise: p.raise,
-                    probe_min: p.probe_min.map(|v| v as f64),
+                    probe_min: if ending { Some(p.probed_min as f64) } else { p.probe_min.map(|v| v as f64) },
                     boost_min: p.boost_min.map(|v| v as f64),
                     cost_energy: p.energy,
                     cost_cold: p.cold,
@@ -372,7 +428,7 @@ impl RoomModel {
                     sensor_c: p.sensor,
                     forecast_c: Some(p.forecast).filter(|v| v.is_finite()),
                     resid_live_k: ctx.resid_live_k.filter(|v| v.is_finite()),
-                    kind: p.kind.to_string(),
+                    kind: if ending { "probe_end".to_string() } else { p.kind.to_string() },
                     coast_min: Some(p.coast_min),
                     stored_min: p.stored_min.filter(|v| v.is_finite()),
                     storage: Some(storage),
