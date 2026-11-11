@@ -54,6 +54,12 @@ fn schema_decisions() {
 }
 
 #[test]
+fn schema_shadow_decisions() {
+    let row = ShadowDecision { ts: 1, room: "bad".into(), why: "x".into(), kind: "frost".into(), model_version: "v".into(), forecast_c: Some(19.0), ..Default::default() };
+    check_schema(Table::ShadowDecisions, ShadowDecision::to_batch(&[row]).unwrap());
+}
+
+#[test]
 fn schema_labels() {
     let row = Label { ts: 1, from_ts: Some(0), to_ts: Some(2), room: "bad".into(), source: "watch".into(), answer: Some("yes".into()), via: Some("page".into()), ..Default::default() };
     check_schema(Table::Labels, Label::to_batch(&[row]).unwrap());
@@ -93,8 +99,9 @@ pub(crate) fn device_reading(node: u64, i: i64) -> DeviceReading {
 fn schema_device_readings() {
     check_schema(Table::DeviceReadings, DeviceReading::to_batch(&[device_reading(9, 1)]).unwrap());
     assert!(Table::DeviceReadings.node_partitioned());
-    assert_eq!(SCHEMA_VERSION, 7);
+    assert_eq!(SCHEMA_VERSION, 8);
     assert!(Table::ALL.contains(&Table::DeviceReadings));
+    assert!(Table::ALL.contains(&Table::ShadowDecisions));
 }
 
 #[test]
@@ -119,7 +126,7 @@ fn device_readings_roll_by_node_and_a_v6_lake_opens_unchanged() {
     assert_eq!(parquet_rows(&dir.join("node=11/part.parquet")), 2);
     assert_eq!(parquet_rows(&env.parquet(Table::Ambient, "2026-11-08").join("part.parquet")), 1);
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(dir.join("node=11/part.parquet")).unwrap()).unwrap();
-    assert_eq!(builder.schema().metadata()["schema_version"], "7");
+    assert_eq!(builder.schema().metadata()["schema_version"], "8");
     assert_eq!(builder.schema().fields().len(), Table::DeviceReadings.schema().fields().len());
 }
 

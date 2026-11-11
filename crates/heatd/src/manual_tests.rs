@@ -47,6 +47,7 @@ fn env() -> Env {
         boost: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         devices: Default::default(),
+        room_model: Default::default(),
     };
     Env { state, mock, dir, t: now_ms() }
 }

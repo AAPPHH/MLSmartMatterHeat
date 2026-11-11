@@ -513,6 +513,11 @@ impl Windows {
         last.map(|t| ((now - t).max(0)) as f64 / MIN_MS as f64)
     }
 
+    pub fn live_residual_k(&self, room: &str) -> Option<f64> {
+        let z = self.rooms.get(room)?.z?;
+        Some(z * self.det.bundle()?.rooms.get(room)?.sigma)
+    }
+
     pub fn open_rooms(&self) -> HashSet<String> {
         self.rooms.iter().filter(|(_, r)| r.active.is_some()).map(|(n, _)| n.clone()).collect()
     }

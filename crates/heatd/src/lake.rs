@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 pub const COMMIT: &str = env!("HEATD_COMMIT");
 pub const ROW_GROUP_ROWS: usize = 65_536;
 pub const EOS: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
@@ -62,10 +62,12 @@ pub mod kind {
     pub const COFFEE_ON: &str = "coffee_on";
     pub const DEVICE_LINK: &str = "device_link";
     pub const MANUAL_SETPOINT: &str = "manual_setpoint";
-    pub const ALL: [&str; 32] = [
+    pub const FILTER_RESET: &str = "filter_reset";
+    pub const SHADOW_STATE: &str = "shadow_state";
+    pub const ALL: [&str; 34] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
         ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
-        WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED, BOOST_CYCLE, FAILSAFE, BR_WATCHDOG, SUPPLY, PI_RESET, WINDOW_EPISODE, NODE_HEALTH, COFFEE_ON, DEVICE_LINK, MANUAL_SETPOINT,
+        WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED, BOOST_CYCLE, FAILSAFE, BR_WATCHDOG, SUPPLY, PI_RESET, WINDOW_EPISODE, NODE_HEALTH, COFFEE_ON, DEVICE_LINK, MANUAL_SETPOINT, FILTER_RESET, SHADOW_STATE,
     ];
 }
 
@@ -95,10 +97,11 @@ pub enum Table {
     WatchInference,
     Ambient,
     DeviceReadings,
+    ShadowDecisions,
 }
 
 impl Table {
-    pub const ALL: [Table; 11] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference, Table::Ambient, Table::DeviceReadings];
+    pub const ALL: [Table; 12] = [Table::AttributeReports, Table::Events, Table::Decisions, Table::Labels, Table::WatchRaw, Table::Weather, Table::Meta, Table::WatchSensors, Table::WatchInference, Table::Ambient, Table::DeviceReadings, Table::ShadowDecisions];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -113,6 +116,7 @@ impl Table {
             Table::WatchInference => "watch_inference",
             Table::Ambient => "ambient",
             Table::DeviceReadings => "device_readings",
+            Table::ShadowDecisions => "shadow_decisions",
         }
     }
 
@@ -171,6 +175,17 @@ impl Table {
                 tsf("ts", false), fld("node", DataType::UInt64, false), fld("endpoint", DataType::UInt16, false), fld("cluster", DataType::UInt32, false), fld("attribute", DataType::UInt32, false),
                 fld("kind", dict(), false), fld("name", dict(), false), fld("value", DataType::Float64, true), fld("raw", DataType::Utf8, false), fld("source", dict(), false),
             ],
+            Table::ShadowDecisions => {
+                let mut fields = vec![tsf("ts", false), fld("room", dict(), false)];
+                fields.extend(["setpoint_live", "setpoint_shadow"].map(|n| fld(n, DataType::Float64, false)));
+                fields.push(fld("raise", DataType::Boolean, false));
+                fields.extend(["probe_min", "boost_min"].map(|n| fld(n, DataType::Float64, true)));
+                fields.extend(["cost_energy", "cost_cold", "cost_raise", "cost_live", "lambda", "lambda_std", "mass_c", "air_c", "p_supply", "p_window"].map(|n| fld(n, DataType::Float64, false)));
+                fields.extend([fld("p_window_live", DataType::Boolean, false), fld("model_version", dict(), false), fld("why", DataType::Utf8, false), fld("sensor_c", DataType::Float64, false)]);
+                fields.extend(["forecast_c", "resid_live_k"].map(|n| fld(n, DataType::Float64, true)));
+                fields.push(fld("kind", dict(), false));
+                fields
+            }
         };
         let metadata = HashMap::from([("schema_version".to_string(), SCHEMA_VERSION.to_string()), ("heatd_commit".to_string(), COMMIT.to_string()), ("table".to_string(), self.name().to_string())]);
         Arc::new(Schema::new_with_metadata(fields, metadata))
@@ -529,6 +544,49 @@ impl Row for WatchSensor {
         let cols = vec![
             ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.sensor_name)), prim::<Int32Type, _>(rows, |r| Some(r.android_type)), dict_col(rows, |r| r.vendor.as_deref()),
             prim::<Float32Type, _>(rows, |r| r.resolution), prim::<Float32Type, _>(rows, |r| r.max_range), dict_col(rows, |r| r.app_version.as_deref()),
+        ];
+        Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShadowDecision {
+    pub ts: i64,
+    pub room: String,
+    pub setpoint_live: f64,
+    pub setpoint_shadow: f64,
+    pub raise: bool,
+    pub probe_min: Option<f64>,
+    pub boost_min: Option<f64>,
+    pub cost_energy: f64,
+    pub cost_cold: f64,
+    pub cost_raise: f64,
+    pub cost_live: f64,
+    pub lambda: f64,
+    pub lambda_std: f64,
+    pub mass_c: f64,
+    pub air_c: f64,
+    pub p_supply: f64,
+    pub p_window: f64,
+    pub p_window_live: bool,
+    pub model_version: String,
+    pub why: String,
+    pub sensor_c: f64,
+    pub forecast_c: Option<f64>,
+    pub resid_live_k: Option<f64>,
+    pub kind: String,
+}
+
+impl Row for ShadowDecision {
+    const TABLE: Table = Table::ShadowDecisions;
+    fn to_batch(rows: &[Self]) -> Result<RecordBatch> {
+        let f = |get: fn(&Self) -> f64| prim::<Float64Type, _>(rows, move |r| Some(get(r)));
+        let cols = vec![
+            ts_col(rows, |r| Some(r.ts)), dict_col(rows, |r| Some(&r.room)), f(|r| r.setpoint_live), f(|r| r.setpoint_shadow), bool_col(rows, |r| Some(r.raise)),
+            prim::<Float64Type, _>(rows, |r| r.probe_min), prim::<Float64Type, _>(rows, |r| r.boost_min), f(|r| r.cost_energy), f(|r| r.cost_cold), f(|r| r.cost_raise), f(|r| r.cost_live),
+            f(|r| r.lambda), f(|r| r.lambda_std), f(|r| r.mass_c), f(|r| r.air_c), f(|r| r.p_supply), f(|r| r.p_window), bool_col(rows, |r| Some(r.p_window_live)),
+            dict_col(rows, |r| Some(&r.model_version)), str_col(rows, |r| Some(&r.why)), f(|r| r.sensor_c), prim::<Float64Type, _>(rows, |r| r.forecast_c), prim::<Float64Type, _>(rows, |r| r.resid_live_k),
+            dict_col(rows, |r| Some(&r.kind)),
         ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }

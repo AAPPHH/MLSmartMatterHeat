@@ -1,0 +1,868 @@
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+pub const KIND: &str = "room_model";
+pub const HORIZON: usize = 60;
+pub const PROBES: [usize; 3] = [5, 10, 15];
+pub const BOOSTS: [usize; 4] = [5, 10, 15, 20];
+pub const FORECAST_MIN: usize = 20;
+const EPS: f64 = 1e-9;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Params {
+    pub a1: f64,
+    pub a2: f64,
+    pub b1: f64,
+    pub b2: f64,
+    pub b3: f64,
+    pub b4: f64,
+    pub w: f64,
+    pub ts: f64,
+    pub ts_night: f64,
+    #[serde(default)]
+    pub tau_v: f64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoomDoc {
+    pub node: u64,
+    pub params: Params,
+    pub c: BTreeMap<String, f64>,
+    pub neighbours: BTreeMap<String, Vec<u64>>,
+    pub valve_gain: f64,
+    pub sigma_u: f64,
+    pub noise_r: f64,
+    pub p0: f64,
+    pub q_r: f64,
+    pub q_a: f64,
+    #[serde(default = "yes")]
+    pub valve_obs: bool,
+    #[serde(default)]
+    pub q_um: f64,
+    #[serde(default)]
+    pub q_ua: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Shock {
+    pub tau_l: f64,
+    pub q_calm: f64,
+    pub q_jump: f64,
+    pub p_jump: f64,
+    pub hold_min: f64,
+    pub lambda_jump: f64,
+    pub lambda_w: f64,
+    pub p_l0: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HouseCfg {
+    pub p_up: f64,
+    pub p_down: f64,
+    pub p_supply0: f64,
+    pub r_grid: f64,
+    pub reset_gap_min: f64,
+    pub reset_sigma: f64,
+    pub reset_n: u32,
+    pub boost_c: f64,
+    pub balance_seed: f64,
+    pub night_hours: [f64; 2],
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Bundle {
+    pub version: String,
+    pub dt_s: f64,
+    pub rooms: BTreeMap<String, RoomDoc>,
+    pub shock: Shock,
+    pub house: HouseCfg,
+}
+
+impl Bundle {
+    pub fn parse(text: &str) -> Result<Self> {
+        let raw: serde_json::Value = serde_json::from_str(text).context("room model bundle")?;
+        let kind = raw.get("kind").and_then(|k| k.as_str()).unwrap_or("none");
+        if kind != KIND {
+            bail!("room model bundle {} has kind {kind}, expected {KIND}", raw.get("version").and_then(|v| v.as_str()).unwrap_or("?"));
+        }
+        let b: Self = serde_json::from_value(raw).context("room model bundle")?;
+        b.validate()?;
+        Ok(b)
+    }
+
+    pub fn load(dir: &Path) -> Result<Self> {
+        Self::parse(&std::fs::read_to_string(dir.join("bundle.json")).with_context(|| format!("read {}", dir.join("bundle.json").display()))?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let (s, h) = (&self.shock, &self.house);
+        let prob = |p: f64| p.is_finite() && p > 0.0 && p < 1.0;
+        let positive = [self.dt_s, s.tau_l, s.hold_min, h.reset_gap_min, h.reset_sigma, h.r_grid + 1.0, h.boost_c];
+        let nonneg = [s.q_calm, s.q_jump, s.p_l0];
+        if self.rooms.is_empty()
+            || !(prob(s.p_jump) && prob(h.p_up) && prob(h.p_down) && prob(h.p_supply0))
+            || positive.iter().any(|v| !v.is_finite() || *v <= 0.0)
+            || nonneg.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || !s.lambda_w.is_finite()
+            || s.lambda_w <= 1.0
+            || !s.lambda_jump.is_finite()
+            || s.lambda_jump <= 1.0
+            || s.hold_min < 1.0
+            || h.reset_n == 0
+            || !h.balance_seed.is_finite()
+            || h.night_hours.iter().any(|v| !v.is_finite())
+        {
+            bail!("room model bundle {}: invalid parameters", self.version);
+        }
+        for (name, r) in &self.rooms {
+            let p = &r.params;
+            let values = [p.a1, p.a2, p.b1, p.b2, p.b3, p.b4, p.w, p.ts, p.ts_night, p.tau_v, r.valve_gain, r.sigma_u, r.noise_r, r.p0, r.q_r, r.q_a, r.q_um, r.q_ua];
+            if values.iter().any(|v| !v.is_finite()) || !(p.w >= 0.0 && p.w < 1.0) || p.tau_v < 0.0 || r.valve_gain <= 0.0 || r.sigma_u <= 0.0 || r.noise_r <= 0.0 || r.p0 <= 0.0 || r.q_r < 0.0 || r.q_a < 0.0 || r.q_um < 0.0 || r.q_ua < 0.0 || r.c.values().any(|v| !v.is_finite()) {
+                bail!("room model bundle {}: invalid model for {name}", self.version);
+            }
+            if r.neighbours.keys().any(|k| !r.c.contains_key(k)) {
+                bail!("room model bundle {}: neighbours of {name} without coupling", self.version);
+            }
+        }
+        Ok(())
+    }
+
+}
+
+pub fn bundle_candidates(base: &Path) -> Vec<(String, std::path::PathBuf)> {
+    crate::window_model::bundle_candidates(base)
+}
+
+pub fn try_load(base: &str) -> Option<Bundle> {
+    bundle_candidates(Path::new(base)).into_iter().find_map(|(_, path)| Bundle::load(&path).ok())
+}
+
+pub fn erf_as(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-x * x).exp();
+    if x >= 0.0 { y } else { -y }
+}
+
+pub fn norm_cdf(z: f64) -> f64 {
+    0.5 * (1.0 + erf_as(z / std::f64::consts::SQRT_2))
+}
+
+fn lg_pdf(v: f64, s: f64) -> f64 {
+    if s > 0.0 { -0.5 * (v * v / s + (2.0 * std::f64::consts::PI * s).ln()) } else { f64::NAN }
+}
+
+fn all_finite(xs: &[f64]) -> bool {
+    xs.iter().all(|v| v.is_finite())
+}
+
+type Mat = [f64; 9];
+
+fn mat_mul(a: &Mat, b: &Mat) -> Mat {
+    let mut c = [0.0; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            c[3 * i + j] = (a[3 * i] * b[j] + a[3 * i + 1] * b[3 + j]) + a[3 * i + 2] * b[6 + j];
+        }
+    }
+    c
+}
+
+fn mat_t(a: &Mat) -> Mat {
+    let mut c = [0.0; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            c[3 * i + j] = a[3 * j + i];
+        }
+    }
+    c
+}
+
+fn psd_ok(p: &Mat) -> bool {
+    if (0..3).any(|i| p[4 * i] < -1e-12) {
+        return false;
+    }
+    (0..3).all(|i| (i + 1..3).all(|j| p[3 * i + j].powi(2) <= p[4 * i] * p[4 * j] * (1.0 + 1e-6) + 1e-12))
+}
+
+#[derive(Debug, Clone)]
+pub struct RoomPar {
+    pub p: Params,
+    pub ck: Vec<f64>,
+    pub g: f64,
+    pub sigma_u: f64,
+    pub noise_r: f64,
+    pub p0: f64,
+    pub q_r: f64,
+    pub q_a: f64,
+    pub alpha: f64,
+    pub valve_obs: bool,
+    pub q_um: f64,
+    pub q_ua: f64,
+}
+
+impl RoomPar {
+    pub fn new(doc: &RoomDoc) -> Self {
+        let tau = doc.params.tau_v;
+        let alpha = if tau > 0.0 { 1.0 - (-1.0 / tau).exp() } else { 1.0 };
+        Self { p: doc.params.clone(), ck: doc.c.values().copied().collect(), g: doc.valve_gain, sigma_u: doc.sigma_u, noise_r: doc.noise_r, p0: doc.p0, q_r: doc.q_r, q_a: doc.q_a, alpha, valve_obs: doc.valve_obs, q_um: doc.q_um, q_ua: doc.q_ua }
+    }
+
+    pub fn lag(&self, state: Option<[f64; 2]>, u: f64) -> [f64; 2] {
+        match state {
+            Some([s1, s2]) if self.alpha != 1.0 => {
+                let v1 = s1 + self.alpha * (u - s1);
+                [v1, s2 + self.alpha * (v1 - s2)]
+            }
+            _ => [u, u],
+        }
+    }
+
+    pub fn coupling(&self, ncnt: &[f64], nsum: &[f64]) -> (f64, f64) {
+        let (mut cn, mut cs) = (0.0, 0.0);
+        for ((c, n), s) in self.ck.iter().zip(ncnt).zip(nsum) {
+            cn += c * n;
+            cs += c * s;
+        }
+        (cn, cs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn terms(&self, lam: f64, ueff: f64, tout: f64, wind: f64, rad: f64, night: bool, cn: f64, cs: f64, h: f64) -> [f64; 7] {
+        let p = &self.p;
+        let au = p.a1 * ueff;
+        let ts = if night { p.ts_night } else { p.ts };
+        let amb = p.b2 + p.b3 * wind;
+        [1.0 + h * (-(au + p.a2)), h * p.a2, h * p.b1, 1.0 + h * (-(p.b1 + (lam * amb + cn))), h * (au * ts), h * (lam * amb * tout + p.b4 * rad / 100.0 + cs), amb]
+    }
+
+    pub fn sensor(&self, m: f64, a: f64) -> f64 {
+        self.p.w * m + (1.0 - self.p.w) * a
+    }
+}
+
+fn obs_update(x: &mut [f64; 3], p: &mut Mat, hrow: [f64; 3], v: f64, r: f64) -> f64 {
+    let mut ph = [0.0; 3];
+    for (i, q) in ph.iter_mut().enumerate() {
+        *q = p[3 * i] * hrow[0] + p[3 * i + 1] * hrow[1] + p[3 * i + 2] * hrow[2];
+    }
+    let s = hrow[0] * ph[0] + hrow[1] * ph[1] + hrow[2] * ph[2] + r;
+    if s.is_nan() || s <= 0.0 {
+        return s;
+    }
+    let k = [ph[0] / s, ph[1] / s, ph[2] / s];
+    for i in 0..3 {
+        x[i] += k[i] * v;
+    }
+    let mut q = [0.0; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            q[3 * i + j] = p[3 * i + j] - k[i] * ph[j];
+        }
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            p[3 * i + j] = 0.5 * (q[3 * i + j] + q[3 * j + i]);
+        }
+    }
+    s
+}
+
+#[derive(Debug, Clone)]
+pub struct RoomIn {
+    pub y: f64,
+    pub yv: f64,
+    pub u: f64,
+    pub sp: f64,
+    pub tout: f64,
+    pub wind: f64,
+    pub rad: f64,
+    pub night: bool,
+    pub ncnt: Vec<f64>,
+    pub nsum: Vec<f64>,
+}
+
+impl RoomIn {
+    pub fn blank(kinds: usize) -> Self {
+        Self { y: f64::NAN, yv: f64::NAN, u: f64::NAN, sp: f64::NAN, tout: 0.0, wind: 0.0, rad: 0.0, night: false, ncnt: vec![0.0; kinds], nsum: vec![0.0; kinds] }
+    }
+
+    fn dynamic_ok(&self) -> bool {
+        all_finite(&[self.u, self.tout, self.wind, self.rad]) && all_finite(&self.nsum) && all_finite(&self.ncnt)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Out {
+    pub ok: bool,
+    pub m: f64,
+    pub a: f64,
+    pub sensor: f64,
+    pub lam: f64,
+    pub lam_std: f64,
+    pub p_window: f64,
+    pub p_supply: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResetRec {
+    pub room: String,
+    pub cause: &'static str,
+    pub step: u64,
+    pub prior: [f64; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct Comp {
+    pub mu: f64,
+    pub x: [f64; 3],
+    pub p: Mat,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoomFilter {
+    name: String,
+    pub par: RoomPar,
+    shock: Shock,
+    house: HouseCfg,
+    ts_tr: [[f64; 2]; 2],
+    phi: f64,
+    tm: [[f64; 2]; 2],
+    q_l: [f64; 2],
+    x: [[f64; 3]; 4],
+    p: [Mat; 4],
+    nu: [[f64; 2]; 2],
+    init: bool,
+    since_obs: u64,
+    hot: u32,
+    flag: Option<&'static str>,
+    skipped: bool,
+    pending: Option<[f64; 4]>,
+    events: Vec<ResetRec>,
+    pub comps: Vec<Comp>,
+    pub last: Out,
+    pub lag: Option<[f64; 2]>,
+}
+
+impl RoomFilter {
+    pub fn new(name: &str, doc: &RoomDoc, shock: &Shock, house: &HouseCfg) -> Self {
+        let hold = 1.0 / shock.hold_min;
+        Self {
+            name: name.to_string(),
+            par: RoomPar::new(doc),
+            shock: shock.clone(),
+            house: house.clone(),
+            ts_tr: [[1.0 - house.p_up, house.p_up], [house.p_down, 1.0 - house.p_down]],
+            phi: (-1.0 / shock.tau_l).exp(),
+            tm: [[1.0 - shock.p_jump, shock.p_jump], [hold, 1.0 - hold]],
+            q_l: [shock.q_calm.powi(2), shock.q_jump.powi(2)],
+            x: [[0.0, 0.0, 1.0]; 4],
+            p: [[0.0; 9]; 4],
+            nu: [[1.0, 0.0], [1.0, 0.0]],
+            init: false,
+            since_obs: 0,
+            hot: 0,
+            flag: None,
+            skipped: true,
+            pending: None,
+            events: Vec::new(),
+            comps: Vec::new(),
+            last: Out::default(),
+            lag: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn corrupt_for_test(&mut self) {
+        self.x[0][1] = f64::NAN;
+    }
+
+    fn weights(&self, w: [f64; 2]) -> [f64; 4] {
+        [w[0] * self.nu[0][0], w[0] * self.nu[0][1], w[1] * self.nu[1][0], w[1] * self.nu[1][1]]
+    }
+
+    fn seed(&mut self, y: f64, inp: &RoomIn) {
+        let (mut m, mut a) = (y, y);
+        if self.house.balance_seed != 0.0 && inp.dynamic_ok() {
+            let par = &self.par;
+            let (cn, cs) = par.coupling(&inp.ncnt, &inp.nsum);
+            let amb = par.p.b2 + par.p.b3 * inp.wind;
+            let d = ((amb + cn) * y - amb * inp.tout - cs - par.p.b4 * inp.rad / 100.0) / (par.p.b1 + (amb + cn) * par.p.w);
+            a = y - par.p.w * d;
+            m = a + d;
+        }
+        for j in 0..4 {
+            self.x[j] = [m, a, 1.0];
+            self.p[j] = [self.par.p0, 0.0, 0.0, 0.0, self.par.p0, 0.0, 0.0, 0.0, self.shock.p_l0];
+        }
+        self.nu = [[1.0, 0.0], [1.0, 0.0]];
+        self.init = true;
+        self.since_obs = 0;
+        self.hot = 0;
+    }
+
+    fn reset(&mut self, cause: &'static str, inp: &RoomIn, w: [f64; 2], step: u64) {
+        let mu = self.weights(w);
+        let prior = if self.init {
+            let mut s = [0.0; 3];
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = (0..4).fold(0.0, |acc, j| acc + mu[j] * self.x[j][i]);
+            }
+            s
+        } else {
+            [f64::NAN; 3]
+        };
+        self.events.push(ResetRec { room: self.name.clone(), cause, step, prior });
+        if inp.y.is_finite() {
+            self.seed(inp.y, inp);
+        } else {
+            self.init = false;
+        }
+    }
+
+    fn update(&mut self, inp: &RoomIn, w: [f64; 2], step: u64) -> Option<([f64; 2], f64)> {
+        self.pending = None;
+        self.flag = None;
+        self.skipped = true;
+        if inp.u.is_finite() {
+            self.lag = Some(self.par.lag(self.lag, inp.u));
+        }
+        if !inp.dynamic_ok() {
+            self.since_obs += 1;
+            return None;
+        }
+        let y_ok = inp.y.is_finite();
+        if !self.init {
+            if !y_ok {
+                self.since_obs += 1;
+                return None;
+            }
+            self.seed(inp.y, inp);
+        } else if y_ok && self.since_obs as f64 > self.house.reset_gap_min {
+            self.reset("gap", inp, w, step);
+        }
+        self.skipped = false;
+        let par = self.par.clone();
+        let v_ok = par.valve_obs && inp.yv.is_finite() && 0.0 < inp.yv && inp.yv < 1.0 && inp.sp.is_finite();
+        let r1 = self.house.r_grid + par.noise_r.powi(2);
+        let (mut ll, mut yhat, mut s1) = ([0.0; 4], [0.0; 4], [0.0; 4]);
+        for j in 0..4 {
+            let (x, p) = (&mut self.x[j], &mut self.p[j]);
+            if y_ok {
+                yhat[j] = par.sensor(x[0], x[1]);
+                s1[j] = obs_update(x, p, [par.p.w, 1.0 - par.p.w, 0.0], inp.y - yhat[j], r1);
+                ll[j] += lg_pdf(inp.y - yhat[j], s1[j]);
+            }
+            if v_ok {
+                let v = inp.yv - par.g * (inp.sp - par.sensor(x[0], x[1]));
+                let s = obs_update(x, p, [-par.g * par.p.w, -par.g * (1.0 - par.p.w), 0.0], v, par.sigma_u.powi(2));
+                ll[j] += lg_pdf(v, s);
+            }
+        }
+        if y_ok {
+            let mu = self.weights(w);
+            let mean = (0..4).fold(0.0, |acc, j| acc + mu[j] * yhat[j]);
+            let var = (0..4).fold(0.0, |acc, j| acc + mu[j] * (s1[j] + (yhat[j] - mean).powi(2)));
+            let z = if var.is_finite() && var > 0.0 { (inp.y - mean).abs() / var.sqrt() } else { f64::INFINITY };
+            self.hot = if z > self.house.reset_sigma { self.hot + 1 } else { 0 };
+            self.since_obs = 0;
+        } else {
+            self.since_obs += 1;
+        }
+        if !all_finite(&ll) {
+            self.flag = Some("nan");
+            return None;
+        }
+        let top = ll.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut e = [0.0; 4];
+        for j in 0..4 {
+            e[j] = (ll[j] - top).exp();
+        }
+        self.pending = Some(e);
+        let lik = |s: usize| (0..2).fold(0.0, |acc, m| acc + self.nu[s][m] * e[2 * s + m]);
+        Some(([lik(0), lik(1)], top))
+    }
+
+    fn finish(&mut self, inp: &RoomIn, w: [f64; 2], step: u64) -> Out {
+        if self.skipped {
+            return Out::default();
+        }
+        if let Some(e) = self.pending {
+            for s in 0..2 {
+                let t = [self.nu[s][0] * e[2 * s], self.nu[s][1] * e[2 * s + 1]];
+                let z = t[0] + t[1];
+                self.nu[s] = if z > 0.0 { [t[0] / z, t[1] / z] } else { [1.0, 0.0] };
+            }
+        }
+        let mut bad = self.flag;
+        if bad.is_none() {
+            let finite = self.x.iter().all(|x| all_finite(x)) && self.p.iter().all(|p| all_finite(p)) && self.nu.iter().all(|n| all_finite(n)) && all_finite(&w);
+            if !finite {
+                bad = Some("nan");
+            } else if !self.p.iter().all(psd_ok) {
+                bad = Some("psd");
+            } else {
+                let mu = self.weights(w);
+                let lam = (0..4).fold(0.0, |acc, j| acc + mu[j] * self.x[j][2]);
+                bad = if !(0.5..=8.0).contains(&lam) {
+                    Some("lambda")
+                } else if self.hot >= self.house.reset_n {
+                    Some("innovation")
+                } else {
+                    None
+                };
+            }
+        }
+        if let Some(cause) = bad {
+            self.reset(cause, inp, w, step);
+            if !self.init {
+                return Out::default();
+            }
+        }
+        let out = self.report(w);
+        self.advance(inp, w);
+        out
+    }
+
+    fn report(&mut self, w: [f64; 2]) -> Out {
+        let lam_w = self.shock.lambda_w;
+        let mu = self.weights(w);
+        let comp = |i: usize| (0..4).fold(0.0, |acc, j| acc + mu[j] * self.x[j][i]);
+        let (m, a, lam) = (comp(0), comp(1), comp(2));
+        let var = (0..4).fold(0.0, |acc, j| acc + mu[j] * (self.p[j][8] + (self.x[j][2] - lam).powi(2)));
+        let pw = (0..4).fold(0.0, |acc, j| acc + mu[j] * (1.0 - norm_cdf((lam_w - self.x[j][2]) / self.p[j][8].max(1e-18).sqrt())));
+        self.comps = (0..4).map(|j| Comp { mu: mu[j], x: self.x[j], p: self.p[j] }).collect();
+        self.last = Out { ok: true, m, a, sensor: self.par.sensor(m, a), lam, lam_std: var.sqrt(), p_window: pw, p_supply: w[1] };
+        self.last
+    }
+
+    fn advance(&mut self, inp: &RoomIn, w: [f64; 2]) {
+        let (par, h) = (&self.par, 1.0 / 60.0);
+        let mu = self.weights(w);
+        let (cn, cs) = par.coupling(&inp.ncnt, &inp.nsum);
+        let ue = self.lag.map_or(inp.u, |l| l[1]);
+        let (mut new_x, mut new_p, mut new_nu) = ([[0.0; 3]; 4], [[0.0; 9]; 4], [[0.0; 2]; 2]);
+        for jt in 0..4 {
+            let (st, mt) = (jt / 2, jt % 2);
+            let om: Vec<f64> = (0..4).map(|j| self.ts_tr[j / 2][st] * self.tm[j % 2][mt] * mu[j]).collect();
+            let c = om.iter().fold(0.0, |acc, v| acc + v);
+            let (xb, pb) = if c > 0.0 {
+                let mut xb = [0.0; 3];
+                for (i, v) in xb.iter_mut().enumerate() {
+                    *v = (0..4).fold(0.0, |acc, j| acc + om[j] * self.x[j][i]) / c;
+                }
+                let mut pb = [0.0; 9];
+                for i in 0..3 {
+                    for k in 0..3 {
+                        pb[3 * i + k] = (0..4).fold(0.0, |acc, j| acc + om[j] * (self.p[j][3 * i + k] + (self.x[j][i] - xb[i]) * (self.x[j][k] - xb[k]))) / c;
+                    }
+                }
+                (xb, pb)
+            } else {
+                (self.x[jt], self.p[jt])
+            };
+            new_nu[st][mt] = c;
+            let [f11, f12, f21, f22, g1, g2, amb] = par.terms(xb[2], ue * st as f64, inp.tout, inp.wind, inp.rad, inp.night, cn, cs, h);
+            let fm = [f11, f12, 0.0, f21, f22, h * amb * (inp.tout - xb[1]), 0.0, 0.0, self.phi];
+            let mut fp = mat_mul(&mat_mul(&fm, &pb), &mat_t(&fm));
+            let ug = ue * st as f64;
+            fp[0] += (par.q_r + par.q_um * ug) * h;
+            fp[4] += (par.q_a + par.q_ua * ug) * h;
+            fp[8] += self.q_l[mt];
+            new_x[jt] = [f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2, 1.0 + self.phi * (xb[2] - 1.0)];
+            for i in 0..3 {
+                for k in 0..3 {
+                    new_p[jt][3 * i + k] = 0.5 * (fp[3 * i + k] + fp[3 * k + i]);
+                }
+            }
+        }
+        for n in new_nu.iter_mut() {
+            let t = n[0] + n[1];
+            *n = if t > 0.0 { [n[0] / t, n[1] / t] } else { [1.0, 0.0] };
+        }
+        self.x = new_x;
+        self.p = new_p;
+        self.nu = new_nu;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct House {
+    pub rooms: BTreeMap<String, RoomFilter>,
+    ts_tr: [[f64; 2]; 2],
+    w_prior: [f64; 2],
+    pub w: [f64; 2],
+    pub loglik: f64,
+    step_n: u64,
+    pub resets: Vec<ResetRec>,
+}
+
+impl House {
+    pub fn new(bundle: &Bundle) -> Self {
+        let h = &bundle.house;
+        let prior = [1.0 - h.p_supply0, h.p_supply0];
+        Self {
+            rooms: bundle.rooms.iter().map(|(n, d)| (n.clone(), RoomFilter::new(n, d, &bundle.shock, h))).collect(),
+            ts_tr: [[1.0 - h.p_up, h.p_up], [h.p_down, 1.0 - h.p_down]],
+            w_prior: prior,
+            w: prior,
+            loglik: 0.0,
+            step_n: 0,
+            resets: Vec::new(),
+        }
+    }
+
+    pub fn step(&mut self, inputs: &BTreeMap<String, RoomIn>) -> BTreeMap<String, Out> {
+        let n = self.step_n;
+        self.step_n += 1;
+        let blank = RoomIn::blank(0);
+        let mut wp = self.w_prior;
+        let mut scale = 0.0;
+        for (name, f) in self.rooms.iter_mut() {
+            if let Some((lik, top)) = f.update(inputs.get(name).unwrap_or(&blank), self.w_prior, n) {
+                wp = [wp[0] * lik[0], wp[1] * lik[1]];
+                scale += top;
+            }
+        }
+        let tot = wp[0] + wp[1];
+        if tot > 0.0 && tot.is_finite() {
+            self.loglik += scale + tot.ln();
+            self.w = [wp[0] / tot, wp[1] / tot];
+        } else {
+            self.w = self.w_prior;
+            for f in self.rooms.values_mut() {
+                f.flag = if f.skipped { None } else { Some("nan") };
+            }
+        }
+        let mut outs = BTreeMap::new();
+        for (name, f) in self.rooms.iter_mut() {
+            outs.insert(name.clone(), f.finish(inputs.get(name).unwrap_or(&blank), self.w, n));
+            self.resets.append(&mut f.events);
+        }
+        let tr = self.ts_tr;
+        self.w_prior = [self.w[0] * tr[0][0] + self.w[1] * tr[1][0], self.w[0] * tr[0][1] + self.w[1] * tr[1][1]];
+        outs
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Env {
+    pub tout: f64,
+    pub wind: f64,
+    pub rad: f64,
+    pub night: bool,
+    pub ncnt: Vec<f64>,
+    pub nsum: Vec<f64>,
+    pub target: f64,
+    pub present: f64,
+    pub sp_cur: Option<f64>,
+    pub sp_live: f64,
+    pub frost: f64,
+    pub boost_c: f64,
+    pub boost_ok: bool,
+    pub raise_cost: f64,
+    pub cold_cost: f64,
+    pub r_grid: f64,
+    pub lag: Option<[f64; 2]>,
+    pub y_last: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanOut {
+    pub kind: &'static str,
+    pub name: String,
+    pub setpoint: f64,
+    pub raise: bool,
+    pub probe_min: Option<usize>,
+    pub boost_min: Option<usize>,
+    pub energy: f64,
+    pub cold: f64,
+    pub raise_cost: f64,
+    pub cost_live: f64,
+    pub total: f64,
+    pub p_window: f64,
+    pub lam_closed: f64,
+    pub lam_open: f64,
+    pub mass: f64,
+    pub air: f64,
+    pub sensor: f64,
+    pub forecast: f64,
+    pub evoi: f64,
+    pub best_cost: f64,
+    pub perfect_cost: f64,
+    pub n_allowed: usize,
+    pub energy_live: f64,
+    pub target: f64,
+}
+
+struct Run {
+    en: Vec<f64>,
+    co: Vec<f64>,
+    sens: Vec<f64>,
+}
+
+struct Cand {
+    name: String,
+    kind: &'static str,
+    first: f64,
+    runs: [[Run; 2]; 2],
+    mode_cost: [f64; 2],
+    energy: f64,
+    cold: f64,
+    raise: f64,
+    raise_flag: bool,
+    total: f64,
+    peak: f64,
+    boost_min: Option<usize>,
+    probe_min: Option<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64) -> Run {
+    let h = 1.0 / 60.0;
+    let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new() };
+    let mut lag = env.lag;
+    for &set in sp.iter().take(HORIZON) {
+        let u = (par.g * (set - par.sensor(m, a))).clamp(0.0, 1.0);
+        let l = par.lag(lag, u);
+        lag = Some(l);
+        let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, l[1] * s, env.tout, env.wind, env.rad, env.night, cn, cs, h);
+        (m, a) = (f11 * m + f12 * a + g1, f21 * m + f22 * a + g2);
+        let sens = par.sensor(m, a);
+        run.sens.push(sens);
+        run.en.push(u * s);
+        run.co.push((env.target - sens).max(0.0) * env.present);
+    }
+    run
+}
+
+fn profile(first: f64, d: usize, then: f64) -> Vec<f64> {
+    (0..HORIZON).map(|k| if k < d { first } else { then }).collect()
+}
+
+pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &Env) -> PlanOut {
+    let lam_w = shock.lambda_w;
+    let n = comps.len();
+    let sum = |f: &dyn Fn(usize) -> f64| (0..n).fold(0.0, |acc, j| acc + f(j));
+    let (m, a) = (sum(&|j| comps[j].mu * comps[j].x[0]), sum(&|j| comps[j].mu * comps[j].x[1]));
+    let q: Vec<f64> = comps.iter().map(|c| 1.0 - norm_cdf((lam_w - c.x[2]) / c.p[8].max(1e-18).sqrt())).collect();
+    let pw = sum(&|j| comps[j].mu * q[j]);
+    let wt: Vec<f64> = (0..n).map(|j| comps[j].mu * (1.0 - q[j])).collect();
+    let wsum = wt.iter().fold(0.0, |acc, v| acc + v);
+    let lam_c = if wsum > 0.0 { sum(&|j| wt[j] * comps[j].x[2].min(lam_w)) / wsum } else { 1.0 };
+    let lam_o = if pw > 0.0 { shock.lambda_jump.max(sum(&|j| comps[j].mu * q[j] * comps[j].x[2]) / pw) } else { shock.lambda_jump };
+    let (cn, cs) = par.coupling(&env.ncnt, &env.nsum);
+    let modes = [(1.0 - pw, lam_c), (pw, lam_o)];
+    let supplies = [(1.0, p_supply), (0.0, 1.0 - p_supply)];
+    let calm = [1.0, 0.0];
+    let (target, frost, cold_w) = (env.target, env.frost, env.cold_cost);
+    let cur = env.sp_cur;
+    let sensor0 = par.sensor(m, a);
+    let limit = (target + 0.5).max(sensor0) + EPS;
+    let evaluate = |name: &str, kind: &'static str, sp: Vec<f64>, first: f64, boost_min: Option<usize>, probe_min: Option<usize>| -> Cand {
+        let run = |mi: usize, si: usize| rollout(par, m, a, modes[mi].1, supplies[si].0, &sp, env, cn, cs);
+        let runs = [[run(0, 0), run(0, 1)], [run(1, 0), run(1, 1)]];
+        let mut mode_cost = [0.0; 2];
+        for (mi, mc) in mode_cost.iter_mut().enumerate() {
+            *mc = (0..2).fold(0.0, |acc, si| acc + supplies[si].1 * (runs[mi][si].en.iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * runs[mi][si].co.iter().fold(0.0, |x, v| x + v)));
+        }
+        let raise_flag = cur.is_some_and(|c| first > c + EPS);
+        let raise = if raise_flag { env.raise_cost } else { 0.0 };
+        let both = |f: &dyn Fn(&Run) -> f64| (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * f(&runs[mi][si])));
+        let energy = both(&|r| r.en.iter().fold(0.0, |x, v| x + v));
+        let cold = (0..2).fold(0.0, |acc, si| acc + modes[0].0 * supplies[si].1 * runs[0][si].co.iter().fold(0.0, |x, v| x + v));
+        let total = (0..2).fold(0.0, |acc, mi| acc + modes[mi].0 * mode_cost[mi]) + raise;
+        let peak = runs[0][0].sens.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        Cand { name: name.to_string(), kind, first, mode_cost: [mode_cost[0] + raise, mode_cost[1] + raise], energy, cold: cold_w * cold, raise, raise_flag, total, peak, boost_min, probe_min, runs }
+    };
+    let base: [(&'static str, Option<f64>); 6] = [("live", Some(env.sp_live)), ("current", cur), ("target", Some(target)), ("frost", Some(frost)), ("minus", Some(target - 0.5)), ("plus", Some(target + 0.5))];
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut seen: Vec<f64> = Vec::new();
+    for (name, v) in base {
+        let Some(v) = v else { continue };
+        if seen.iter().any(|s| (v - s).abs() < EPS) {
+            continue;
+        }
+        seen.push(v);
+        cands.push(evaluate(name, name, profile(v, HORIZON, v), v, None, None));
+    }
+    if env.boost_ok {
+        for d in BOOSTS {
+            cands.push(evaluate(&format!("boost{d}"), "boost", profile(env.boost_c, d, target), env.boost_c, Some(d), None));
+        }
+    }
+    let mut allowed: Vec<usize> = (0..cands.len()).filter(|&i| cands[i].kind == "frost" || cands[i].peak <= limit).collect();
+    if allowed.is_empty() {
+        let mut best = 0;
+        for i in 1..cands.len() {
+            if cands[i].peak < cands[best].peak {
+                best = i;
+            }
+        }
+        allowed.push(best);
+    }
+    let mut best = allowed[0];
+    for &i in &allowed[1..] {
+        if cands[i].total < cands[best].total - 1e-12 {
+            best = i;
+        }
+    }
+    let perf = (0..2).fold(0.0, |acc, mi| acc + modes[mi].0 * allowed.iter().map(|&i| cands[i].mode_cost[mi]).fold(f64::INFINITY, f64::min));
+    let gain = (cands[best].total - perf).max(0.0);
+    let sigma_obs = (env.r_grid + par.noise_r.powi(2)).sqrt();
+    let prefix = |c: &Cand, d: usize| (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| {
+        let r = &c.runs[mi][si];
+        acc2 + modes[mi].0 * supplies[si].1 * (r.en[..d].iter().fold(0.0, |x, v| x + v) + calm[mi] * cold_w * r.co[..d].iter().fold(0.0, |x, v| x + v))
+    }));
+    let mut probe: Option<Cand> = None;
+    let mut evoi_best = 0.0;
+    for d in PROBES {
+        let pr = evaluate(&format!("probe{d}"), "probe", profile(target, d, frost), target, None, Some(d));
+        if pr.peak > limit {
+            continue;
+        }
+        let sep = (pr.runs[1][0].sens[d - 1] - pr.runs[0][0].sens[d - 1]).abs() / sigma_obs;
+        let rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0);
+        let evoi = rho * gain - (prefix(&pr, d) - prefix(&cands[best], d) + pr.raise - cands[best].raise).max(0.0);
+        if evoi > evoi_best + 1e-12 {
+            evoi_best = evoi;
+            probe = Some(pr);
+        }
+    }
+    let live = &cands[0];
+    let model_fc = (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * live.runs[mi][si].sens[FORECAST_MIN - 1]));
+    let forecast = env.y_last.filter(|y| y.is_finite()).map_or(model_fc, |y| model_fc + (y - sensor0));
+    let (cost_live, best_cost, n_allowed, energy_live) = (live.total, cands[best].total, allowed.len(), live.energy);
+    let chosen = probe.as_ref().unwrap_or(&cands[best]);
+    PlanOut {
+        kind: chosen.kind,
+        name: chosen.name.clone(),
+        setpoint: chosen.first,
+        raise: chosen.raise_flag,
+        probe_min: chosen.probe_min,
+        boost_min: chosen.boost_min,
+        energy: chosen.energy,
+        cold: chosen.cold,
+        raise_cost: chosen.raise,
+        cost_live,
+        total: chosen.total,
+        p_window: pw,
+        lam_closed: lam_c,
+        lam_open: lam_o,
+        mass: m,
+        air: a,
+        sensor: sensor0,
+        forecast,
+        evoi: evoi_best,
+        best_cost,
+        perfect_cost: perf,
+        n_allowed,
+        energy_live,
+        target,
+    }
+}

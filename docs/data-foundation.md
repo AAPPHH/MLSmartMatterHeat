@@ -23,9 +23,9 @@ Notation in schema blocks: `name: type`, trailing `?` = nullable, `dict<utf8>` =
 
 ## Schema metadata and versioning
 
-Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `7`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
+Every Arrow schema (IPC stream, Parquet footer key/value) carries `schema_version` (integer as string, currently `8`), `heatd_commit` (git short hash from the build; env `HEATD_COMMIT` overrides, e.g. Docker build arg; fallback `unknown`) and `table`. Parquet files carry the metadata of the heatd build that rolled them; a raw segment carries that of the build that wrote it.
 
-Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`; v4: `labels` columns `label_id`, `voided_label_id`; v5: `labels` column `window_open`; v6: `labels` columns `answer`, `via`; v7: new table `device_readings`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
+Additive migration rules: columns are only ever appended at the end of the schema, as nullable; nothing is renamed, retyped, reordered or removed; every addition bumps `schema_version` (v2: `watch_raw` columns `elapsed_ns` .. `unit`, new tables `watch_sensors` and `watch_inference`; v3: new table `ambient`; v4: `labels` columns `label_id`, `voided_label_id`; v5: `labels` column `window_open`; v6: `labels` columns `answer`, `via`; v7: new table `device_readings`; v8: new table `shadow_decisions`). The struct `decisions.inputs` is frozen in v1 (new inputs go into `inputs.extra` as JSON, or become a new top-level nullable column). New dictionary values (event kinds, rules, sources) are not schema changes. The roller conforms older raw segments to the current schema (missing columns become null) and fails the table (`roll_failed`) if a raw segment has a column the running build does not know or a changed type; it never drops data. Schema changes requested by phase 2 go through `docs/schema-requests.md`.
 
 ## Hot path (raw Arrow IPC streams)
 
@@ -150,6 +150,9 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 | coffee_on | Wake-on der Kaffeemaschine (Plug mit Rolle coffee, `[[devices]] wake_on`): einmal je Ortszeit-Tag beim Ende des Schlafmodus der Uhr im Fenster `wake_window`; ein Eintrag je Ergebnis (wake, gave_up, away; Abbruch beim Herunterfahren als gave_up); das Signal ist allein der Schlafmodus der Uhr (bedtime) | heatd | yes | day, local_time, window, reason (wake, gave_up, away), attempt, ok, error |
 | device_link | Verbindung eines Zusatzgeraets (`[[devices]]`, nie ein Thermostat): subscription_lost / resubscribed / silent (niedrige Prioritaet, kein Alarm) | heatd | yes | role, kind, state, silent_s, resubscribes |
 | manual_setpoint | Manuelle Raumvorgabe (`POST /api/setpoint`, `DELETE /api/setpoint?room=`): Sollwert mit Haltedauer gesetzt oder vorzeitig beendet (`cleared`); beim Neustart werden aktive Vorgaben aus diesen Zeilen wiederhergestellt; node = erster Knoten des Raums | heatd | no | room, target, hold_min, source (api, watch), until_ts (epoch ms), cleared |
+
+| filter_reset | Raummodell-Filter (`docs/room-model.md`) wurde zurueckgesetzt: nicht endlicher Zustand (`nan`), Kovarianz nicht positiv semidefinit (`psd`), Verlustverhaeltnis ausserhalb 0,5..8 (`lambda`), wiederholt > reset_sigma Innovation (`innovation`), Messluecke > reset_gap_min (`gap`) oder Neustartluecke des Dienstes (`restart_gap`) | heatd | no | room, cause, step_ms, prior: {mass_c, air_c, lambda} (null wenn nicht endlich) |
+| shadow_state | Raummodell-Schatten wechselt seinen Betriebszustand: `running` (rechnet), `no_model` (kein Bundle geladen), `no_weather` (noch nie Aussentemperatur gesehen; danach gilt der letzte bekannte Wert); nur bei Wechsel | heatd | no | state |
 | node_health | Thermostat-Gesundheit (`docs/node-health.md`): aspect link = Zustandswechsel ok / degraded / silent / unreachable; aspect setpoint = Neuschreiben eines nicht uebernommenen Sollwerts (action rewrite) oder Alarm an/aus | heatd | no | link: from, to, silent_s, episode_s, attempts, subscription, last_action, last_error; setpoint: target, device, rewrites, error bzw. alert, consecutive_failures, last_error |
 | supply | Kessel liefert nicht (`no_supply`): Ventil >= 90 % seit >= 45 min ohne Temperaturanstieg am Heizkoerper; Start/Ende je Raum | heatd | no | room, state (start / end), since_ms; bei end: duration_min |
 | pi_reset | Ueberschwing-Reset: Raumtemperatur >= Sollwert + 1 K bei Ventil >= 50 % seit >= 15 min, Sollwert kurz auf Frost gesetzt und danach wiederhergestellt | heatd | no | room, state (start / end), temp, setpoint, valve |
@@ -346,6 +349,41 @@ source: dict<utf8>
 - `value`: the number for int, float and bool (0/1) values, else null (lists, structs, strings, unnamed attributes). `raw`: the exact printed value text (chip-tool prints decoded values only, see "Abweichungen"), event rows carry the full printed event incl. number and priority.
 - `source`: `subscription` or `poll`. `value` of power attributes is in the unit the cluster defines (ActivePower mW, Voltage mV, ActiveCurrent mA; temperature 0.01 C, humidity 0.01 %, CO2 ppm and PM2.5 ug/m3 as floats).
 - Only reports that the device sends are rows (Matter subscriptions report changes and no row is created for an unchanged value); gaps are normal for quiet attributes.
+
+### shadow_decisions
+
+Producer: Raummodell im Schattenbetrieb (`crates/heatd/src/room_model.rs`, `docs/room-model.md`). Eine Zeile je Raum bei Wechsel des Schatten-Sollwerts, bei Wechsel von P(Fenster) ueber/unter 0,5 oder spaetestens alle 30 min; schreibt nie an Thermostate oder Uhr und ersetzt `decisions` nicht (Soll/Ist- und Raise-Auswertungen bleiben unberuehrt). Partitioned by date.
+
+```schema shadow_decisions
+ts: timestamp[us,UTC]
+room: dict<utf8>
+setpoint_live: f64
+setpoint_shadow: f64
+raise: bool
+probe_min: f64?
+boost_min: f64?
+cost_energy: f64
+cost_cold: f64
+cost_raise: f64
+cost_live: f64
+lambda: f64
+lambda_std: f64
+mass_c: f64
+air_c: f64
+p_supply: f64
+p_window: f64
+p_window_live: bool
+model_version: dict<utf8>
+why: utf8
+sensor_c: f64
+forecast_c: f64?
+resid_live_k: f64?
+kind: dict<utf8>
+```
+
+- `setpoint_live`: Sollwert, den die Live-Regeln gerade wollen; `setpoint_shadow`: Wahl der Kostenminimierung; `raise`: Schatten-Sollwert liegt ueber dem Geraete-Sollwert. Kosten in Heizminuten (Ventilminuten): `cost_energy` Energie, `cost_cold` = cold_cost_min x Kaelte (K min), `cost_raise` = raise_cost_min bei Erhoehung, `cost_live` Gesamtkosten des Live-Sollwerts im Modell.
+- `lambda`/`lambda_std`: Verlustverhaeltnis (1 = normal), `mass_c`/`air_c`: Heizkoerper-/Luftzustand, `p_supply`: Kessel liefert, `p_window`: P(Verlust > lambda_w), `p_window_live`: alter Detektor meldet offen. `sensor_c`: gefilterte Sensortemperatur, `forecast_c`: Modellprognose der Sensortemperatur in 20 min bei Live-Sollwert, `resid_live_k`: Residuum des Live-Fensterdetektors in K (Prognose minus Messung, positiv = kaelter als erwartet).
+- `why`: ein deutscher Satz. `kind`: gewaehlter Kandidat (`live`, `current`, `target`, `frost`, `minus`, `plus`, `boost`, `probe`).
 
 ## Abweichungen
 

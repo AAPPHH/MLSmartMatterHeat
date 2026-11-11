@@ -15,7 +15,7 @@ from skl2onnx import convert_sklearn, update_registered_converter
 from skl2onnx.common.data_types import FloatTensorType
 from skl2onnx.common.shape_calculator import calculate_linear_regressor_output_shapes
 from xgboost import XGBRegressor
-from heattrain.thermal import build_rooms, fit, fit_room, kalman, load_lake, read_arrows, step_terms, valve_gain
+from heattrain.thermal import build_rooms, fit, fit_room, kalman, load_events, load_lake, read_arrows, step_terms, valve_gain
 
 update_registered_converter(XGBRegressor, "XGBoostXGBRegressor", calculate_linear_regressor_output_shapes, convert_xgboost)
 
@@ -658,7 +658,7 @@ def build_bundle(config, rooms_data, ambient, out_root, version=None, src=""):
 def thermalml(config, src, models_dir):
     tcfg = config["thermal"]
     reports, weather, meta = load_lake(src, tcfg["exclude_sources"])
-    rooms, skipped = build_rooms(reports, weather, meta, tcfg)
+    rooms, skipped = build_rooms(reports, weather, meta, tcfg, load_events(src))
     if not rooms:
         raise SystemExit(f"no usable rooms: {skipped}")
     out, bundle, _ = build_bundle(config, rooms, load_ambient(src), Path(models_dir) / "thermal", src=src)

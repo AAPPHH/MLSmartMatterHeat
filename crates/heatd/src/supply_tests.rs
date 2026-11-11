@@ -38,6 +38,7 @@ fn env(extra: &str) -> Env {
         explorer: Arc::new(Mutex::new(crate::explore::Explorer::new(1))),
         tracker: Default::default(),
         boost: Default::default(),
+        room_model: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         devices: Default::default(),
     };

@@ -860,6 +860,45 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
     }
 }
 
+const WEATHER_MAX_AGE_US: i64 = 10_800_000_000;
+
+fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_ms: i64, away: bool, sleep: bool, window_busy: &HashSet<String>) {
+    if !state.config.room_model.enabled {
+        return;
+    }
+    let boost = &state.config.boost;
+    let hour = f64::from(now.hour()) + f64::from(now.minute()) / 60.0;
+    let wake = !sleep && (boost.morning_hours[0]..boost.morning_hours[1]).contains(&hour);
+    let gate = wake || state.room_model.homecoming_open(away, now_ms, boost.homecoming_min_away_min);
+    let (ctxs, weather): (Vec<crate::room_shadow::RoomCtx>, [f64; 3]) = {
+        let windows = state.windows.lock().unwrap();
+        let commands = state.commanded.lock().unwrap();
+        let ctxs = state
+            .config
+            .rooms
+            .iter()
+            .filter_map(|room| {
+                let want = wants.iter().find(|w| w.room == room.name)?;
+                let after_window = windows.open_ago_min(&room.name, now_ms).is_none_or(|a| a > boost.after_window_min);
+                Some(crate::room_shadow::RoomCtx {
+                    room: room.name.clone(),
+                    live: want.setpoint,
+                    target: want.base,
+                    present: if want.occupancy == "away" { 0.0 } else { 1.0 },
+                    sp_cur: commands.device.get(&want.node).copied().or(commands.target(want.node)),
+                    boost_ok: gate && after_window && want.occupancy != "away" && !window_busy.contains(&room.name),
+                    window_live: window_busy.contains(&room.name),
+                    resid_live_k: windows.live_residual_k(&room.name),
+                })
+            })
+            .collect();
+        (ctxs, state.status.weather_within(lake::now_us(), WEATHER_MAX_AGE_US))
+    };
+    let out = state.room_model.step(&state.config, now_ms, weather, hour, &ctxs);
+    out.rows.into_iter().for_each(|row| log("shadow decision", state.sink.append(row)));
+    out.events.into_iter().for_each(|event| log("filter reset", state.sink.append(event)));
+}
+
 pub(crate) async fn send_setpoint(state: &AppState, node: u64, setpoint: f64) -> matter_controller::Result<()> {
     let target = || Some(setpoint);
     if setpoint > state.failsafe.max_c() {
@@ -918,6 +957,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
             want.setpoint = clamp_boost(&readings, want.node, want.setpoint, state.failsafe.boost_max_c());
         }
     }
+    room_model_step(state, &wants, now, now_ms, away, presence.as_ref().is_some_and(|p| p.sleep), window_busy);
     state.boost.settle(&wants.iter().map(|w| (w.room.as_str(), w.reason)).collect::<Vec<_>>(), now_ms);
     let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().dialed(&r.nodes), away })).collect();
     state.windows.lock().unwrap().set_context(contexts);
@@ -1056,6 +1096,7 @@ pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     state.windows.lock().unwrap().touch(&state.config, report.node, now_ms);
     if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND, crate::window::OCCUPIED_SETPOINT].contains(&report.attribute.as_str()) {
         state.windows.lock().unwrap().observe(&state.config, report.node, &report.attribute, report.value, now_ms);
+        state.room_model.observe(report.node, &report.attribute, report.value, now_ms);
     }
     if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND].contains(&report.attribute.as_str()) {
         state.boost.observe(report.node, &report.attribute, report.value, now_ms);

@@ -3,6 +3,7 @@ from pathlib import Path
 from heattrain.boiler import boiler
 from heattrain.boostlearn import boostcheck, boostlearn, boostmark
 from heattrain.thermal import thermal
+from heattrain.roomfit import roommodel
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
 from heattrain.windowml import run_windowml, run_windowroom, window_bundle
@@ -27,6 +28,7 @@ CONFIG = {
         "timezone": "Europe/Berlin", "dt_s": 60.0, "night_hours": [22, 5], "min_night_steps": 120, "temp_valid": [0.0, 45.0],
         "min_hours": 3.0, "exclude_sources": ["legacy"], "holdout_frac": 0.25, "min_holdout_hours": 3.0, "horizon_min": 30, "origin_stride": 5,
         "noise_r": 0.15, "q_r": 0.5, "q_a": 0.05, "p0": 1.0, "prior_sigma": 3.0, "max_nfev": 60, "mc_samples": 8, "mc_seed": 0, "std_max": 1.0, "rc2_margin": 1.02,
+        "outage": {"silence_min": 30, "restart_pad_min": 5, "stale_s": 3600.0},
         "min_valve_std": 0.03, "gain_err_max": 5.0, "valve_gain_default": 0.5, "valve_gain_bounds": [0.05, 2.0],
         "params": {"a1": [6.0, 0.05, 40.0], "a2": [2.0, 0.05, 30.0], "b1": [1.0, 0.02, 30.0], "b2": [0.15, 0.005, 3.0], "b3": [0.03, 1e-4, 1.0],
                    "b4": [0.01, 1e-4, 0.5], "w": [0.7, 0.05, 0.99], "ts": [50.0, 25.0, 75.0], "ts_night": [45.0, 20.0, 75.0], "c": [0.2, 1e-3, 5.0]},
@@ -42,6 +44,17 @@ CONFIG = {
         "cycle_closed_min": 30, "cycle_window_min": 240, "cycle_min_len": 60, "target_tol": 0.3,
         "horizon_min": 300, "toff_max": 180, "toff_step": 1, "overshoot_tol": 0.3, "boost_setpoint": 28.0,
         "parity_rows": 400, "parity_tol": 1e-4, "parity_nan_frac": 0.05,
+    },
+    "roommodel": {
+        "hold_min": 20.0, "valve": {"sigma_u_min": 0.05, "sigma_u_default": 0.25},
+        "fit": {"horizons": [5, 20, 60], "weights": [1.0, 1.0, 0.5], "stride": 5, "warm_min": 1440, "train_frac": 0.6, "report_age_min": 5, "max_nfev": 200, "tol": 1e-6, "diff_step": 1e-3, "bound_tol": 0.01,
+                "prior_sigma": {"default": 3.0, "ts": 0.3, "ts_night": 0.3}, "q_r": 0.5, "q_a": 0.3, "q_um": 8.0, "q_ua": 0.0, "valve_sigma_scale": 0.0, "init_onestep": True, "init_w": [0.05, 0.95],
+                "init": {"a1": 6.0, "a2": 2.0, "b1": 1.0, "b2": 0.15, "b3": 0.03, "b4": 0.01, "w": 0.5, "ts": 50.0, "ts_night": 45.0, "tau_v": 10.0, "c": 0.2},
+                "bounds": {"a1": [0.01, 300.0], "a2": [0.01, 300.0], "b1": [0.01, 300.0], "b2": [1e-3, 10.0], "b3": [1e-5, 3.0], "b4": [1e-5, 5.0], "w": [1e-3, 0.999], "ts": [20.0, 95.0], "ts_night": [15.0, 95.0],
+                           "tau_v": [0.1, 120.0], "c": [1e-4, 20.0]}},
+        "shock": {"tau_l": 90.0, "hold_min": 20.0, "p_l0": 0.01, "lambda_jump": 3.0, "lambda_w": 2.0, "start": {"q_calm": 0.01, "p_jump": 1e-4, "q_jump": 0.3}, "passes": 2, "batch_max": 64, "days": 7,
+                  "grid": {"q_calm": [0.003, 0.01, 0.03]}, "lambda_w_grid": [1.5, 2.0, 2.5, 3.0], "hit_min": 20, "pad_min": 30, "fa_weight": 1.0},
+        "house": {"p_up": 0.02, "p_down": 0.001, "p_supply0": 0.95, "r_grid": 0.25 / 12.0, "reset_gap_min": 240.0, "reset_sigma": 8.0, "reset_n": 3, "boost_c": 24.0, "balance_seed": 1},
     },
     "window": {
         "lake": "data/lake",
@@ -110,6 +123,11 @@ def run_thermal(config, src, models_dir):
     print(out)
 
 
+def run_roommodel(config, src, models_dir):
+    out, bundle, report = roommodel(config, src, models_dir)
+    print(out, {h: round(v["skill"], 3) for h, v in report["holdout"]["pooled"].items() if "skill" in v}, report["resets"], report["flags"])
+
+
 def run_boiler(config, src, out_dir):
     doc, out = boiler(config, src, out_dir)
     print(out, doc["belastbar"], len(doc["befunde"]))
@@ -143,7 +161,7 @@ def run_boostmark(config, models_dir, status):
     print(boostmark(config, models_dir, status == "ok"))
 
 
-COMMANDS = {"boostmark": run_boostmark, "boostlearn": run_boost, "boostcheck": run_boostcheck, "window": run_window_export, "windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
+COMMANDS = {"roommodel": run_roommodel, "boostmark": run_boostmark, "boostlearn": run_boost, "boostcheck": run_boostcheck, "window": run_window_export, "windowml": run_window, "watchroom": run_train, "eval": run_eval, "thermal": run_thermal, "thermalml": run_thermalml, "boiler": run_boiler}
 
 
 def main(argv):
@@ -154,7 +172,7 @@ def main(argv):
     if len(argv) == 5 and argv[1] == "boostlearn":
         return run_boost(CONFIG, argv[2], argv[3], argv[4] == "validate")
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | boostmark <models_dir> ok|fail | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | roommodel <lake> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | boostmark <models_dir> ok|fail | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 

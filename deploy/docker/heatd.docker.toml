@@ -207,3 +207,9 @@ kind = "air"
 role = "air"
 name = "Luftqualitaet"
 room = "schlafzimmer"
+
+[room_model]
+enabled = true
+model_dir = "/models/room_model"
+raise_cost_min = 15.0
+cold_cost_min = 1.0
