@@ -7,7 +7,7 @@ from pathlib import Path
 import duckdb
 import numpy as np
 from scipy.optimize import least_squares
-from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, norm_cdf_np, run_batch, valve_lag
+from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, norm_cdf_np, run_batch, valve_lag, valve_lag_states
 from heattrain.roomimm import RoomPar, norm_cdf
 from heattrain.roomobs import evidence_blocks
 from heattrain.thermal import build_rooms, epoch, fit, load_devices, load_events, load_lake, raw_batches
@@ -93,6 +93,8 @@ class RoomFit:
         self.at = np.full(n, -1)
         self.at[js] = np.arange(len(js))
         self.sd = {H: 1.0 for H in self.Hs}
+        self.sp_ok = np.isfinite(c["sp"][js])
+        self.lags = {}
 
     def params(self, th):
         p = dict(zip(self.names, np.exp(np.asarray(th)).T))
@@ -175,15 +177,49 @@ class RoomFit:
                 out[s + 1] = p["w"] * m + (1 - p["w"]) * a
         return out
 
-    def errors(self, p, sel, doc, start=None, phi=1.0):
+    def lag_at(self, tau, js):
+        key = float(tau)
+        if key not in self.lags:
+            self.lags[key] = valve_lag_states(self.c["u"], lag_alpha(key))
+        return self.lags[key][:, js]
+
+    def roll_causal(self, p, doc, m, a, lam, sel, phi, p_sup):
+        c, h, js = self.c, 1.0 / 60.0, self.js[sel]
+        at = lambda x: np.asarray(x, float)[js][:, None]
+        tout, wind, rad, sp = at(c["tout"]), at(c["wind"]), at(c["rad"]), at(c["sp"])
+        P = len(p["w"])
+        cn = sum((p[f"c_{k}"] * at(a_) for k, a_ in zip(self.kinds, c["ncnt"])), np.zeros((len(js), P)))
+        cs = sum((p[f"c_{k}"] * at(b_) for k, b_ in zip(self.kinds, c["nsum"])), np.zeros((len(js), P)))
+        amb = p["b2"] + p["b3"] * wind
+        ts = np.where(at(c["night"]) > 0.5, p["ts_night"], p["ts"])
+        g2 = h * (amb * tout + p["b4"] * rad / 100.0 + cs)
+        alpha = np.where(p["tau_v"] > 0, 1.0 - np.exp(-1.0 / np.maximum(p["tau_v"], 1e-12)), 1.0)
+        v0 = np.stack([self.lag_at(t, js) for t in p["tau_v"]], -1)
+        w, g = p["w"], doc["valve_gain"]
+        out = {H: 0.0 for H in self.Hs}
+        for sup, wt in ((1.0, p_sup), (0.0, 1.0 - p_sup)):
+            x, y, v1, v2 = m, a, v0[0], v0[1]
+            for s in range(max(self.Hs)):
+                u = np.clip(g * (sp - (w * x + (1 - w) * y)), 0.0, 1.0)
+                v1 = np.where(alpha == 1.0, u, v1 + alpha * (u - v1))
+                v2 = np.where(alpha == 1.0, u, v2 + alpha * (v1 - v2))
+                au = p["a1"] * v2 * sup
+                dl = h * (lam - 1.0) * phi ** s * amb
+                x, y = (1.0 - h * (au + p["a2"])) * x + h * p["a2"] * y + h * au * ts, h * p["b1"] * x + (1.0 - h * (p["b1"] + amb + cn) - dl) * y + g2 + dl * tout
+                if s + 1 in self.Hs:
+                    out[s + 1] = out[s + 1] + wt * (w * x + (1 - w) * y)
+        return out
+
+    def errors(self, p, sel, doc, start=None, phi=1.0, causal=False):
         coef = self.coef(p)
         P = len(p["w"])
         if start is None:
             M, A = self.states(p, coef, int(self.js[sel].max()) + 1 if sel.any() else 0, doc)
-            m, a, lam = M[sel], A[sel], 1.0
+            m, a, lam, p_sup = M[sel], A[sel], 1.0, 1.0
         else:
-            m, a, lam = (np.repeat(np.asarray(x, float)[self.js[sel]][:, None], P, 1) for x in start)
-        pred = self.roll(p, coef, m, a, lam, sel, phi)
+            m, a, lam = (np.repeat(np.asarray(x, float)[self.js[sel]][:, None], P, 1) for x in start[:3])
+            p_sup = np.repeat(np.asarray(start[3], float)[self.js[sel]][:, None], P, 1) if len(start) > 3 else 1.0
+        pred = self.roll_causal(p, doc, m, a, lam, sel, phi, p_sup) if causal else self.roll(p, coef, m, a, lam, sel, phi)
         shat = p["w"] * m + (1 - p["w"]) * a
         y, js, Pc = self.c["y"], self.js[sel], self.Pc[sel][:, None]
         return {H: (y[js + H][:, None] - Pc) - (pred[H] - shat) for H in self.Hs}, {H: y[js + H][:, None] - pred[H] for H in self.Hs}

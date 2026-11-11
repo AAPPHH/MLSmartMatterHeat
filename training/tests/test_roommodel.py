@@ -5,8 +5,9 @@ import numpy as np
 import pytest
 from heattrain.__main__ import CONFIG
 from heattrain.roomeval import fit_bundle
-from heattrain.roomfit import fit_shock, run_batch, shock_defaults, tune_windows
-from heattrain.roomimm import House, RoomIn, RoomPar, plan, storage
+from heattrain.roombatch import valve_lag_states
+from heattrain.roomfit import RoomFit, fit_shock, run_batch, shock_defaults, tune_windows
+from heattrain.roomimm import House, RoomIn, RoomPar, plan, rollout, storage
 from heattrain.thermal import RoomData, build_rooms, kalman
 from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
 from test_thermal import CFG, T0, simulate
@@ -232,7 +233,8 @@ def test_fit_on_synthetic_rooms_writes_a_loadable_bundle(tmp_path):
         assert all(math.isfinite(v) for v in r["params"].values()) and r["sigma_u"] > 0 and r["valve_obs"] is False
     json.dumps(bundle)
     pooled = report["holdout"]["pooled"]
-    assert pooled["H20"]["n"] > 0 and pooled["H60"]["skill"] > 0.0
+    assert pooled["H20"]["n"] > 0 and pooled["H60"]["oracle_skill"] > 0.0 and math.isfinite(pooled["H60"]["skill"])
+    assert report["criteria"]["S1"]["basis"] == "causal" and "oracle_valve" in report["criteria"]["S1"]
     assert all(i["converged"] for i in report["fit"].values())
 
 
@@ -316,3 +318,39 @@ def test_fast_shock_fit_replays_the_reference_coordinate_descent():
         assert fb == best and abs(fs - score) < 1e-9 * abs(score)
         assert [t for t, _ in ft] == [t for t, _ in trace]
         np.testing.assert_allclose([s for _, s in ft], [s for _, s in trace], rtol=1e-12)
+
+
+TRUE_P = {k: TRUE[k] for k in TRUE} | {"tau_v": 6.0, "w": 0.3}
+
+
+def rf_alpha(tau):
+    return 1.0 - math.exp(-1.0 / tau)
+
+
+def test_causal_roll_equals_the_planner_rollout_from_the_origin():
+    n, tau = 400, 6.0
+    rng = np.random.default_rng(3)
+    doc = room_doc(coupling=False, tau_v=tau, w=0.3)
+    par = RoomPar(doc)
+    u = np.repeat(rng.choice([0.0, 0.3, 1.0], n // 20 + 1), 20)[:n]
+    c = {"y": 20.0 + 0.5 * np.sin(np.arange(n) / 50.0), "yv": u.copy(), "u": u, "sp": np.where(np.arange(n) < 200, 21.0, 17.0), "tout": 4.0 + np.sin(np.arange(n) / 90.0), "wind": np.full(n, 3.0), "rad": np.full(n, 40.0),
+         "night": np.zeros(n), "yi": np.full(n, 20.0), "bad": np.zeros(n), "ncnt": [], "nsum": []}
+    rc = copy.deepcopy(CONFIG["roommodel"])
+    rc["fit"].update(warm_min=10, stride=7)
+    rf = RoomFit(c, n, [], rc, False)
+    th = np.log([TRUE_P[k] if k in TRUE_P else 1.0 for k in rf.names])[None]
+    p = rf.params(th)
+    sel = (rf.js > 50) & (rf.js < 150)
+    js = rf.js[sel]
+    m0, a0 = np.full(len(js), 21.0), np.full(len(js), 19.5)
+    out = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
+    lag = valve_lag_states(u, rf_alpha(tau))
+    for i in (0, len(js) // 2, len(js) - 1):
+        j = js[i]
+        env = {"tout": c["tout"][j], "wind": 3.0, "rad": 40.0, "night": False, "cn": 0.0, "cs": 0.0, "target": 21.0, "present": 1.0, "lag": [lag[0][j], lag[1][j]]}
+        _, _, sens = rollout(par, 21.0, 19.5, 1.0, 1, [c["sp"][j]] * 60, env)
+        assert abs(out[20][i, 0] - sens[19]) < 1e-9 and abs(out[60][i, 0] - sens[59]) < 1e-9
+    held = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
+    c["sp"][:] = 17.0
+    changed = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
+    assert not np.allclose(held[20], changed[20])

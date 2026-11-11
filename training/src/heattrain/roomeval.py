@@ -10,7 +10,7 @@ from heattrain.roomfit import FoldFit, Truth, base_doc, calibrate_air, episodes,
 from heattrain.roomobs import evidence_blocks
 from heattrain.thermal import build_rooms, load_devices, load_events, load_lake
 
-KINDS = ("persistence", "imm_anchored", "imm_raw", "kf_anchored")
+KINDS = ("persistence", "imm_anchored", "imm_oracle", "imm_raw", "kf_anchored")
 STRATA = ("steady", "heating_start", "heating", "setpoint_change", "cooling", "airing")
 
 
@@ -79,8 +79,8 @@ class Skill:
     def block(self, key):
         m = {k: rmse(np.concatenate(self.e[key + (k,)])) if key + (k,) in self.e else None for k in KINDS}
         n = int(sum(len(x) for x in self.e.get(key + ("persistence",), [])))
-        skill = 1.0 - m["imm_anchored"] / m["persistence"] if n and m["persistence"] else None
-        return {"n": n, **m, "skill": skill}
+        skill = lambda k: 1.0 - m[k] / m["persistence"] if n and m["persistence"] and m[k] is not None else None
+        return {"n": n, **m, "skill": skill("imm_anchored"), "oracle_skill": skill("imm_oracle")}
 
     def report(self, rooms):
         out = {"pooled": {}, "rooms": {r: {} for r in rooms}}
@@ -108,21 +108,22 @@ def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q):
     phi = math.exp(-1.0 / fold["shock"]["tau_l"]) if rc["eval"]["decay_lam"] else 1.0
     for r, rf in rfs.items():
         p = rf.params(np.asarray(fold["th"][r])[None])
-        start = (rec[r]["m"], rec[r]["a"], rec[r]["lam"])
+        start = (rec[r]["m"], rec[r]["a"], rec[r]["lam"], rec[r]["p_supply"])
         test = (rf.js >= fold["cut"]) & (rf.js < fold["hi"])
         train = rf.js + max(rf.Hs) < fold["cut"]
-        e_te, raw_te = rf.errors(p, test, docs[r], start, phi)
-        kf, _ = rf.errors(p, test, docs[r])
-        e_tr, _ = rf.errors(p, train, docs[r], start, phi)
+        e_te, raw_te = rf.errors(p, test, docs[r], start, phi, True)
+        e_or, _ = rf.errors(p, test, docs[r], start, phi)
+        kf, _ = rf.errors(p, test, docs[r], causal=True)
+        e_tr, _ = rf.errors(p, train, docs[r], start, phi, True)
         st = strata(rf, rf.js[test], spans[r])
         y, js_te, Pc = rf.c["y"], rf.js[test], rf.Pc[test]
         for H in rf.Hs:
-            tr_ok = rf.valid[H][train] & np.isfinite(e_tr[H][:, 0])
+            tr_ok = rf.valid[H][train] & rf.sp_ok[train] & np.isfinite(e_tr[H][:, 0])
             sd_i = rmse(e_tr[H][tr_ok, 0]) or 1.0
             sd_p = rmse((y[rf.js[train] + H] - rf.Pc[train])[tr_ok]) or 1.0
-            ok = rf.valid[H][test] & np.isfinite(e_te[H][:, 0]) & np.isfinite(kf[H][:, 0])
+            ok = rf.valid[H][test] & rf.sp_ok[test] & np.isfinite(e_te[H][:, 0]) & np.isfinite(e_or[H][:, 0]) & np.isfinite(kf[H][:, 0])
             yh = y[js_te + H][ok]
-            errs = {"persistence": (y[js_te + H] - Pc)[ok], "imm_anchored": e_te[H][ok, 0], "imm_raw": raw_te[H][ok, 0], "kf_anchored": kf[H][ok, 0]}
+            errs = {"persistence": (y[js_te + H] - Pc)[ok], "imm_anchored": e_te[H][ok, 0], "imm_oracle": e_or[H][ok, 0], "imm_raw": raw_te[H][ok, 0], "kf_anchored": kf[H][ok, 0]}
             lp = {"persistence": interval_logscore(yh, Pc[ok], sd_p, grid_q), "imm_anchored": interval_logscore(yh, yh - errs["imm_anchored"], sd_i, grid_q)}
             skill.add(r, H, errs, st[ok], lp)
 
@@ -131,41 +132,51 @@ def flag_series(pw, level):
     return np.nan_to_num(pw) > level
 
 
+def live_episodes(truth, room, merge_s):
+    out = []
+    for t in sorted(t for t, r in truth.live if r == room):
+        if out and t - out[-1][1] <= merge_s:
+            out[-1] = (out[-1][0], t)
+        else:
+            out.append((t, t))
+    return out
+
+
+def touching(eps, a, b):
+    return [e for e in eps if e[0] <= b and e[1] >= a]
+
+
 def window_metrics(grid, rec, truth, lo, hi, rc):
     ev, hit_s = rc["eval"], rc["shock"]["hit_min"] * 60.0
     names, spans = grid.names, truth.spans(grid.names)
     t = grid.times
     res = {"opens": 0, "hits": 0, "latency_min": [], "missed": [], "false_episodes": 0, "valid_min": 0, "denials": 0, "denials_flagged": 0, "per_room": {}, "live_opens": 0, "live_hits": 0, "live_false": 0, "live_denials_flagged": 0}
     for r in names:
-        pw = rec[r]["p_window"][lo:hi]
         tt = t[lo:hi]
-        fl = flag_series(pw, ev["pw_flag"])
+        eps = episodes(flag_series(rec[r]["p_window"][lo:hi], ev["pw_flag"]), tt, ev["min_episode_min"])
+        leps = live_episodes(truth, r, rc["hold_min"] * 60.0)
         valid = int(np.isfinite(rec[r]["lam"][lo:hi]).sum())
-        mine = {"false": 0, "valid_min": valid}
-        for a, b in episodes(fl, tt, ev["min_episode_min"]):
-            if not any(x <= a <= y for x, y in spans[r]):
-                mine["false"] += 1
+        outside = lambda e: not any(x <= e[0] <= y for x, y in spans[r])
+        false = sum(1 for e in eps if outside(e))
+        live_false = sum(1 for e in leps if t[lo] <= e[0] < t[hi - 1] and outside(e))
         for room, a in truth.opens([r], t[lo], t[hi - 1]):
+            mine = touching(eps, a, a + hit_s)
             res["opens"] += 1
-            i0, i1 = np.searchsorted(tt, a), np.searchsorted(tt, a + hit_s, side="right")
-            idx = np.nonzero(fl[i0:i1])[0]
-            if len(idx):
+            res["live_opens"] += 1
+            res["live_hits"] += int(bool(touching(leps, a, a + hit_s)))
+            if mine:
                 res["hits"] += 1
-                res["latency_min"].append(float(idx[0]) * grid.dt / 60.0)
+                res["latency_min"].append(max(mine[0][0] - a, 0.0) / 60.0)
             else:
                 res["missed"].append([r, a])
-            res["live_opens"] += 1
-            res["live_hits"] += int(any(a <= ta <= a + hit_s for ta, rr in truth.live if rr == r))
         for room, a in truth.denials([r], t[lo], t[hi - 1]):
-            i0, i1 = np.searchsorted(tt, a - hit_s), np.searchsorted(tt, a + hit_s, side="right")
             res["denials"] += 1
-            res["denials_flagged"] += int(fl[i0:i1].any())
-            res["live_denials_flagged"] += int(any(a - hit_s <= ta <= a + hit_s for ta, rr in truth.live if rr == r))
-        live_false = sum(1 for ta, rr in truth.live if rr == r and t[lo] <= ta < t[hi - 1] and not any(x <= ta <= y for x, y in spans[r]))
-        res["false_episodes"] += mine["false"]
+            res["denials_flagged"] += int(bool(touching(eps, a - hit_s, a + hit_s)))
+            res["live_denials_flagged"] += int(bool(touching(leps, a - hit_s, a + hit_s)))
+        res["false_episodes"] += false
         res["valid_min"] += valid
         res["live_false"] += live_false
-        res["per_room"][r] = {**mine, "live_false": live_false}
+        res["per_room"][r] = {"false": false, "valid_min": valid, "live_false": live_false}
     return res
 
 
@@ -300,9 +311,9 @@ def rolling_origin(full, ff, variants, truth, rc, house):
 def criteria(rc, hold, final_resets, flags, edges):
     c, p = rc["criteria"], hold["trv"]["skill"]["pooled"]
     w = hold["trv"]["window"]
-    return {"S1": {"pass": bool(p["H20"]["skill"] >= c["s1_h20"] and p["H60"]["skill"] >= c["s1_h60"]), "h20": p["H20"]["skill"], "h60": p["H60"]["skill"]},
+    return {"S1": {"pass": bool(p["H20"]["skill"] >= c["s1_h20"] and p["H60"]["skill"] >= c["s1_h60"]), "basis": "causal", "h20": p["H20"]["skill"], "h60": p["H60"]["skill"], "oracle_valve": {"h20": p["H20"]["oracle_skill"], "h60": p["H60"]["oracle_skill"]}},
             "S2": {"pass": bool(w["false_per_room_day"] < c["s2"] and w["false_per_room_day"] < w["live_false_per_room_day"]), "stretch": bool(w["false_per_room_day"] < c["s2_stretch"]), "false_per_room_day": w["false_per_room_day"], "live_false_per_room_day": w["live_false_per_room_day"]},
-            "S3": {"pass": bool(w["hits"] >= w["live_hits"]), "hits": w["hits"], "live_hits": w["live_hits"], "opens": w["opens"]},
+            "S3": {"pass": bool(w["hits"] > w["live_hits"]), "hits": w["hits"], "live_hits": w["live_hits"], "opens": w["opens"]},
             "S4": {"pass": bool(not flags and not edges and max(final_resets.values()) < c["s4_resets"]), "resets_per_room": final_resets, "at_bound": flags, "shock_at_grid_edge": edges}}
 
 
@@ -337,14 +348,30 @@ def fit_bundle(config, rooms, src, version=None):
     house_out = dict(house, night_hours=cfg["night_hours"], timezone=cfg["timezone"])
     bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out}
     pooled = {k: v for k, v in hold["trv"]["skill"]["pooled"].items()}
-    holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
+    holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
     report = {"version": version, "flags": flags_all, "holdout": holdout, "criteria": criteria(rc, hold, by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
-              "resets": len(resets), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
+              "resets": len(resets), "reset_list": reset_list(full, resets, truth, rec), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
               "loglik": float(run.loglik[0]), "minutes": full.n, "sensor_start": variants.sensor_start, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"folds": t_fold, "total": time.time() - t0},
               "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"]} for n, d in docs.items()}}
     return bundle, report
+
+
+def last_lambda(lam, step):
+    seen = lam[max(step - 30, 0):step]
+    seen = seen[np.isfinite(seen)]
+    return float(seen[-1]) if len(seen) else None
+
+
+def reset_list(full, resets, truth, rec):
+    opens = truth.opens(full.names)
+    out = []
+    for x in resets:
+        t = float(full.times[x["step"]])
+        near = [(a - t) / 60.0 for r, a in opens if r == x["room"]]
+        out.append({"room": x["room"], "cause": x["cause"], "time": datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%MZ"), "lambda_before": last_lambda(rec[x["room"]]["lam"], x["step"]), "min_to_next_open": min(near, key=lambda d: abs(d)) if near else None})
+    return out
 
 
 def window_model_sigma(models_dir):

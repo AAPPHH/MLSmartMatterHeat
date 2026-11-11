@@ -4,8 +4,8 @@ from heattrain.roomimm import RoomPar
 from heattrain.roomobs import D_MIN, LOG_SQRT_2_OVER_PI, P_FLOOR, SQRT2, SQRT2PI, Z_MIN
 
 
-def valve_lag(u, alpha):
-    out = np.full(len(u), np.nan)
+def valve_lag_states(u, alpha):
+    out = np.full((2, len(u)), np.nan)
     v1 = v2 = None
     for k, x in enumerate(np.asarray(u, float).tolist()):
         if x == x:
@@ -15,8 +15,12 @@ def valve_lag(u, alpha):
                 v1 = v1 + alpha * (x - v1)
                 v2 = v2 + alpha * (v1 - v2)
         if v2 is not None:
-            out[k] = v2
+            out[0, k], out[1, k] = v1, v2
     return out
+
+
+def valve_lag(u, alpha):
+    return valve_lag_states(u, alpha)[1]
 
 
 class Grid:

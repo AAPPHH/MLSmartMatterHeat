@@ -4,7 +4,7 @@ import math
 import numpy as np
 from heattrain.__main__ import CONFIG
 from heattrain.roombatch import Grid
-from heattrain.roomeval import Skill, interval_logscore, merge_windows, rmse, window_metrics
+from heattrain.roomeval import Skill, criteria, interval_logscore, live_episodes, merge_windows, rmse, window_metrics
 from heattrain.roomfit import Truth, calibrate_air, episodes, label_loss, load_live_alarms
 
 RC = CONFIG["roommodel"]
@@ -117,3 +117,26 @@ def test_live_alarms_read_auto_window_open_events_only(tmp_path):
             w.write_table(tbl)
     out = load_live_alarms(tmp_path)
     assert len(out) == 1 and out[0][1] == "bad"
+
+
+def test_live_alarms_become_episodes_and_short_model_flags_do_not_hit():
+    g = G(["r"], 600)
+    t0 = g.times[0]
+    gt = [(t0 + 300 * 60.0, t0 + 330 * 60.0, ["r"])]
+    live = [(t0 + 100 * 60.0, "r"), (t0 + 108 * 60.0, "r"), (t0 + 115 * 60.0, "r"), (t0 + 400 * 60.0, "r")]
+    assert live_episodes(truth(gt, live=live), "r", RC["hold_min"] * 60.0) == [(t0 + 100 * 60.0, t0 + 115 * 60.0), (t0 + 400 * 60.0, t0 + 400 * 60.0)]
+    pw = np.zeros(600)
+    pw[305:308] = 0.9
+    m = window_metrics(g, rec(600, pw), truth(gt, live=live), 0, 600, RC)
+    assert m["hits"] == 0 and m["false_episodes"] == 0 and m["live_false"] == 2 and m["live_hits"] == 0
+    pw[305:312] = 0.9
+    assert window_metrics(g, rec(600, pw), truth(gt, live=live), 0, 600, RC)["hits"] == 1
+
+
+def test_s3_needs_strictly_more_hits_than_live():
+    def hold(hits, live):
+        sk = {"H20": {"skill": 0.1, "oracle_skill": 0.2}, "H60": {"skill": 0.2, "oracle_skill": 0.3}}
+        return {"trv": {"skill": {"pooled": sk}, "window": {"hits": hits, "live_hits": live, "opens": 4, "false_per_room_day": 0.0, "live_false_per_room_day": 1.0}}}
+    s3 = lambda h, l: criteria(RC, hold(h, l), {"r": 1}, [], [])["S3"]["pass"]
+    assert not s3(0, 0) and not s3(1, 1) and s3(2, 1)
+    assert criteria(RC, hold(1, 0), {"r": 1}, [], [])["S1"]["oracle_valve"]["h20"] == 0.2
