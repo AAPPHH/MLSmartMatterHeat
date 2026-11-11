@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from heattrain.thermal import RoomIn, RoomPar
+from heattrain.roomimm import RoomIn, RoomPar
 
 TRUE = {"a1": 6.0, "a2": 2.0, "b1": 1.0, "b2": 0.15, "b3": 0.03, "b4": 0.01, "w": 0.7, "ts": 50.0, "ts_night": 50.0}
 SHOCK = {"tau_l": 90.0, "q_calm": 0.01, "q_jump": 0.3, "p_jump": 1e-3, "hold_min": 20.0, "lambda_jump": 3.0, "lambda_w": 2.0, "p_l0": 0.01}

@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from heattrain.__main__ import CONFIG
 from heattrain.roomfit import fit_bundle, fit_shock, run_batch, shock_defaults, tune_windows
-from heattrain.thermal import House, RoomData, RoomIn, RoomPar, build_rooms, kalman, plan
+from heattrain.roomimm import House, RoomIn, RoomPar, plan
+from heattrain.thermal import RoomData, build_rooms, kalman
 from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
 from test_thermal import CFG, T0, simulate
 

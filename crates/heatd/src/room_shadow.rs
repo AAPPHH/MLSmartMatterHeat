@@ -1,4 +1,5 @@
-use crate::room_model::{bundle_candidates, plan, Bundle, Env, House, Out, PlanOut, ResetRec, RoomIn};
+use crate::room_model::{bundle_candidates, Bundle, House, Out, ResetRec, RoomIn};
+use crate::room_plan::{plan, Env, PlanOut};
 use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};

@@ -1,4 +1,5 @@
 use crate::room_model::*;
+use crate::room_plan::*;
 use std::collections::BTreeMap;
 use serde_json::Value;
 

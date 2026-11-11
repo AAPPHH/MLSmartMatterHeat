@@ -91,7 +91,7 @@ fn restart_gap_becomes_filter_reset_events() {
 fn open_window_sentence_says_cold_does_not_count() {
     use crate::room_model_tests::{comps_at, preset_env, preset_rig};
     let (par, shock) = preset_rig(6.0);
-    let p = crate::room_model::plan(&par, &shock, &comps_at(17.0, 16.0, 6.0, 1e-4), 1.0, &preset_env());
+    let p = crate::room_plan::plan(&par, &shock, &comps_at(17.0, 16.0, 6.0, 1e-4), 1.0, &preset_env());
     let out = crate::room_model::Out { ok: true, lam: 6.0, p_window: p.p_window, p_supply: 1.0, ..Default::default() };
     let why = crate::room_shadow::sentence("b", &p, &out, 21.0, 24.0);
     assert_eq!(why.split(", spart").next().unwrap(), "b: Verlust 6x normal -> Fenster offen -> Kälte zählt nicht, Heizen wäre Verlust -> 7 °C", "{why}");

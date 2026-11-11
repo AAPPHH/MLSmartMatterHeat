@@ -1,7 +1,7 @@
 import json
 import math
 from pathlib import Path
-from heattrain.thermal import House, RoomIn, RoomPar, plan
+from heattrain.roomimm import House, RoomIn, RoomPar, plan
 from room_sim import HOUSE, NAMES, SHOCK, simulate_house
 
 OUT = Path(__file__).resolve().parents[2] / "crates" / "heatd" / "testdata" / "room_model_parity.json"
