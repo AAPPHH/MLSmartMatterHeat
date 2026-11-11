@@ -11,6 +11,7 @@ COAST_DROP = 0.5
 BOOSTS = (5, 10, 15, 20)
 FORECAST_MIN = 20
 PEAK_MARGIN = 0.5
+LAMBDA_BOUNDS = (0.5, 8.0)
 EPS = 1e-9
 
 
@@ -249,9 +250,9 @@ class RoomFilter:
             elif not all(psd_ok(p) for p in self.p):
                 bad = "psd"
             else:
-                mu = self.weights(w)
-                lam = sum(mu[j] * self.x[j][2] for j in range(4))
-                bad = "lambda" if lam < 0.5 or lam > 8.0 else "innovation" if self.hot >= self.house["reset_n"] else None
+                for j in range(4):
+                    self.x[j][2] = min(max(self.x[j][2], LAMBDA_BOUNDS[0]), LAMBDA_BOUNDS[1])
+                bad = "innovation" if self.hot >= self.house["reset_n"] else None
         if bad is not None:
             self.reset(bad, inp, w, step)
             if not self.init:

@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from heattrain.roomimm import RoomPar
+from heattrain.roomimm import LAMBDA_BOUNDS, RoomPar
 from heattrain.roomobs import D_MIN, LOG_SQRT_2_OVER_PI, P_FLOOR, SQRT2, SQRT2PI, Z_MIN
 
 
@@ -363,14 +363,14 @@ class BatchHouse:
         for i, j in ((0, 1), (0, 2), (1, 2)):
             psd &= pd[..., i, j] ** 2 <= pd[..., i, i] * pd[..., j, j] * (1.0 + 1e-6) + 1e-12
         psd = psd.all(-1)
-        lam = (mu * self.x[..., 2]).sum(-1)
         bad_nan = run & (flag | ~allfin)
         bad_psd = run & ~bad_nan & ~psd
-        bad_lam = run & ~bad_nan & ~bad_psd & ((lam < 0.5) | (lam > 8.0))
-        bad_hot = run & ~bad_nan & ~bad_psd & ~bad_lam & (self.hot >= hs["reset_n"])
-        bad = bad_nan | bad_psd | bad_lam | bad_hot
+        keep = run & ~bad_nan & ~bad_psd
+        self.x[..., 2] = np.where(keep[..., None], np.clip(self.x[..., 2], LAMBDA_BOUNDS[0], LAMBDA_BOUNDS[1]), self.x[..., 2])
+        bad_hot = keep & (self.hot >= hs["reset_n"])
+        bad = bad_nan | bad_psd | bad_hot
         if bad.any():
-            for mask, cause in ((bad_nan, "nan"), (bad_psd, "psd"), (bad_lam, "lambda"), (bad_hot, "innovation")):
+            for mask, cause in ((bad_nan, "nan"), (bad_psd, "psd"), (bad_hot, "innovation")):
                 self.log(mask, cause, k, 1)
             self.seed(bad & y_ok, inp, k)
             self.init &= ~(bad & ~y_ok)

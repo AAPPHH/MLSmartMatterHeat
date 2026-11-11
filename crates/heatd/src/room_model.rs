@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 pub const KIND: &str = "room_model";
+pub const LAMBDA_BOUNDS: [f64; 2] = [0.5, 8.0];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Params {
@@ -566,15 +567,10 @@ impl RoomFilter {
             } else if !self.p.iter().all(psd_ok) {
                 bad = Some("psd");
             } else {
-                let mu = self.weights(w);
-                let lam = (0..4).fold(0.0, |acc, j| acc + mu[j] * self.x[j][2]);
-                bad = if !(0.5..=8.0).contains(&lam) {
-                    Some("lambda")
-                } else if self.hot >= self.house.reset_n {
-                    Some("innovation")
-                } else {
-                    None
-                };
+                for x in self.x.iter_mut() {
+                    x[2] = x[2].clamp(LAMBDA_BOUNDS[0], LAMBDA_BOUNDS[1]);
+                }
+                bad = if self.hot >= self.house.reset_n { Some("innovation") } else { None };
             }
         }
         if let Some(cause) = bad {

@@ -287,7 +287,7 @@ def test_batched_filter_matches_the_reference_house_including_resets():
             for n in NAMES:
                 for key in ("p_window", "lam", "p_supply", "a"):
                     np.testing.assert_allclose(rec[gi][n][key], ref[n][key], rtol=0, atol=1e-9, equal_nan=True)
-    assert causes >= {"gap", "innovation", "lambda"}
+    assert causes >= {"gap", "innovation"} and "lambda" not in causes
 
 
 def test_fast_shock_fit_replays_the_reference_coordinate_descent():
@@ -352,6 +352,8 @@ def test_causal_roll_equals_the_planner_rollout_from_the_origin():
         env = {"tout": c["tout"][j], "wind": 3.0, "rad": 40.0, "night": False, "cn": 0.0, "cs": 0.0, "target": 21.0, "present": 1.0, "lag": [lag[0][j], lag[1][j]]}
         _, _, sens, _ = rollout(par, 21.0, 19.5, 1.0, 1, [c["sp"][j]] * 60, env)
         assert abs(out[20][i, 0] - sens[19]) < 1e-9 and abs(out[60][i, 0] - sens[59]) < 1e-9
+    res = rf.residuals(np.vstack([th, th + 0.01]), sel, dict(doc, q_um=0.0, q_ua=0.0, valve_obs=False))
+    assert np.isfinite(res).all() and res.shape[1] == 2
     held = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
     c["sp"][:] = 17.0
     changed = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)

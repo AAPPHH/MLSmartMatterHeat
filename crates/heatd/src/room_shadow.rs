@@ -204,6 +204,7 @@ impl RoomModel {
         inner.cursor = None;
         inner.inputs.clear();
         inner.decided.clear();
+        inner.probes.clear();
     }
 
     pub fn homecoming_open(&self, away: bool, now_ms: i64, min_away_min: f64) -> bool {
@@ -310,6 +311,7 @@ impl RoomModel {
         if target - cursor > MAX_CATCHUP_MIN {
             out.events.extend(house_resets(house, "restart_gap", now_ms));
             *house = House::new(&bundle);
+            inner.probes.clear();
             cursor = target - 1;
         }
         let [night_from, night_to] = bundle.house.night_hours;

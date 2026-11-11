@@ -90,11 +90,11 @@ class RoomFit:
         self.Pc = np.where((last[js] >= 0) & (js - last[js] <= f["report_age_min"]), y[np.maximum(last[js], 0)], np.nan)
         badc = np.concatenate([[0], np.cumsum(c["bad"] > 0.5)])
         dync = np.concatenate([[0], np.cumsum(~self.dyn)])
-        self.valid = {H: np.isfinite(self.Pc) & fin[js + H] & (badc[js + H + 1] - badc[js] == 0) & (dync[js + H] - dync[js] == 0) for H in self.Hs}
+        self.sp_ok = np.isfinite(c["sp"][js])
+        self.valid = {H: np.isfinite(self.Pc) & self.sp_ok & fin[js + H] & (badc[js + H + 1] - badc[js] == 0) & (dync[js + H] - dync[js] == 0) for H in self.Hs}
         self.at = np.full(n, -1)
         self.at[js] = np.arange(len(js))
         self.sd = {H: 1.0 for H in self.Hs}
-        self.sp_ok = np.isfinite(c["sp"][js])
         self.lags = {}
 
     def params(self, th):
@@ -199,6 +199,8 @@ class RoomFit:
         w, g = p["w"], doc["valve_gain"]
         out = {H: 0.0 for H in self.Hs}
         for sup, wt in ((1.0, p_sup), (0.0, 1.0 - p_sup)):
+            if np.all(np.asarray(wt) == 0.0):
+                continue
             x, y, v1, v2 = m, a, v0[0], v0[1]
             for s in range(max(self.Hs)):
                 u = np.clip(g * (sp - (w * x + (1 - w) * y)), 0.0, 1.0)
