@@ -15,7 +15,7 @@ SCENARIO = {"window": {"kueche": (400, 520, 4.0), "schlafzimmer": (1000, 1080, 4
 SATURATED = {"kueche": [(800, 840, 1.0), (860, 880, 0.0)]}
 AIR_DROPOUT = ("kueche", 300, 450)
 OUTPUT_KEYS = ("m", "a", "lam", "lam_std", "p_window", "p_supply")
-PLAN_KEYS = ("name", "kind", "setpoint", "raise", "probe_min", "boost_min", "energy", "cold", "raise_cost", "cost_live", "total", "p_window", "lam_closed", "lam_open", "mass", "air", "sensor", "forecast", "evoi", "n_allowed")
+PLAN_KEYS = ("name", "kind", "setpoint", "raise", "probe_min", "boost_min", "energy", "cold", "raise_cost", "cost_live", "total", "p_window", "lam_closed", "lam_open", "mass", "air", "sensor", "forecast", "evoi", "n_allowed", "coast_min", "stored_min")
 
 
 def clean(x):

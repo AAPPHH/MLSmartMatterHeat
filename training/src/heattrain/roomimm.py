@@ -5,7 +5,9 @@ from heattrain.roomobs import abs_hum, check_house, check_room_doc, effort_coeff
 
 SQRT2 = math.sqrt(2.0)
 HORIZON = 60
-PROBES = (5, 10, 15)
+PROBES = (10, 20, 30)
+COAST_CAP = 1440
+COAST_DROP = 0.5
 BOOSTS = (5, 10, 15, 20)
 FORECAST_MIN = 20
 EPS = 1e-9
@@ -357,6 +359,31 @@ def profile(first, d, then):
     return [first] * d + [then] * (HORIZON - d)
 
 
+def storage(par, m, a, lam, env):
+    h = 1.0 / 60.0
+    cn, cs = env["cn"], env["cs"]
+    amb = par.b2 + par.b3 * env["wind"]
+    loss = lam * amb + cn
+    drive = lam * amb * env["tout"] + par.b4 * env["rad"] / 100.0 + cs
+    w = par.w
+    m_eq = (env["target"] - (1.0 - w) * drive / (par.b1 + loss)) / (w + (1.0 - w) * par.b1 / (par.b1 + loss))
+    a_eq = (par.b1 * m_eq + drive) / (par.b1 + loss)
+    ts = par.ts_night if env["night"] else par.ts
+    stored = None
+    if ts - m_eq > 0.5 and par.a1 > 0.0:
+        stored = ((m - m_eq) + par.a2 / par.b1 * (a - a_eq)) / (par.a1 * (ts - m_eq) / 60.0)
+    floor = env["target"] - COAST_DROP
+    coast = COAST_CAP
+    x, y = m, a
+    f11, f12, f21, f22, g1, g2, _ = par.terms(lam, 0.0, env["tout"], env["wind"], env["rad"], env["night"], cn, cs, h)
+    for k in range(COAST_CAP):
+        if y < floor:
+            coast = k
+            break
+        x, y = f11 * x + f12 * y + g1, f21 * x + f22 * y + g2
+    return float(coast), stored
+
+
 def plan(par, shock, comps, p_supply, env):
     lam_w = shock["lambda_w"]
     mu = [c[0] for c in comps]
@@ -406,20 +433,22 @@ def plan(par, shock, comps, p_supply, env):
     gain = max(best["total"] - perf, 0.0)
     sigma_obs = math.sqrt(env["r_grid"] + par.noise_r ** 2)
     chosen, evoi_best = best, 0.0
-    for d in PROBES:
-        pr = evaluate(f"probe{d}", "probe", profile(target, d, frost), target, probe_min=d)
+    back = target if best["kind"] == "boost" else best["first"]
+    for d in PROBES if best["kind"] != "frost" and back > frost + EPS else ():
+        pr = evaluate(f"close{d}", "probe", profile(frost, d, back), frost, probe_min=d)
         if pr["peak"] > limit:
             continue
         sep = abs(pr["runs"][1][0][2][d - 1] - pr["runs"][0][0][2][d - 1]) / sigma_obs
         rho = 1.0 - 2.0 * norm_cdf(-sep / 2.0)
         prefix = lambda c: sum(modes[mi][0] * supplies[si][1] * (sum(c["runs"][mi][si][0][:d]) + calm[mi] * cold_w * sum(c["runs"][mi][si][1][:d])) for mi in range(2) for si in range(2))
-        evoi = rho * gain - max(0.0, prefix(pr) - prefix(best) + pr["raise"] - best["raise"])
+        evoi = rho * gain - max(0.0, prefix(pr) - prefix(best))
         if evoi > evoi_best + 1e-12:
             chosen, evoi_best = pr, evoi
     fc = sum(modes[mi][0] * supplies[si][1] * live["runs"][mi][si][2][FORECAST_MIN - 1] for mi in range(2) for si in range(2))
     y_last = env.get("y_last")
     if y_last is not None and math.isfinite(y_last):
         fc += y_last - sensor0
-    return {"kind": chosen["kind"], "name": chosen["name"], "setpoint": chosen["first"], "raise": chosen["raise_flag"], "probe_min": chosen["probe_min"], "boost_min": chosen["boost_min"],
+    coast, stored = storage(par, m, a, lam_c, env)
+    return {"coast_min": coast, "stored_min": stored, "kind": chosen["kind"], "name": chosen["name"], "setpoint": chosen["first"], "raise": chosen["raise_flag"], "probe_min": chosen["probe_min"], "boost_min": chosen["boost_min"],
             "energy": chosen["energy"], "cold": chosen["cold"], "raise_cost": chosen["raise"], "cost_live": live["total"], "total": chosen["total"], "p_window": pw, "lam_closed": lam_c, "lam_open": lam_o,
             "mass": m, "air": a, "sensor": sensor0, "forecast": fc, "evoi": evoi_best, "best_cost": best["total"], "perfect_cost": perf, "n_allowed": len(allowed)}

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from heattrain.__main__ import CONFIG
 from heattrain.roomfit import fit_bundle, fit_shock, run_batch, shock_defaults, tune_windows
-from heattrain.roomimm import House, RoomIn, RoomPar, plan
+from heattrain.roomimm import House, RoomIn, RoomPar, plan, storage
 from heattrain.thermal import RoomData, build_rooms, kalman
 from room_sim import HOUSE, NAMES, SHOCK, TRUE, room_doc, simulate_house
 from test_thermal import CFG, T0, simulate
@@ -142,8 +142,43 @@ def test_plan_at_half_window_probability_probes_instead_of_guessing():
     shock = dict(SHOCK, lambda_jump=6.0)
     half = plan(par, shock, comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, plan_env())
     assert abs(half["p_window"] - 0.5) < 1e-6
-    assert half["kind"] == "probe" and half["probe_min"] == 15 and half["setpoint"] == 21.0 and not half["raise"]
+    assert half["kind"] == "probe" and half["probe_min"] in (10, 20, 30) and half["setpoint"] == 7.0 and not half["raise"]
     assert half["evoi"] > 1.0
+
+
+def test_close_probe_costs_no_raise_and_is_a_decrease():
+    par = light_par()
+    shock = dict(SHOCK, lambda_jump=6.0)
+    for cur in (21.0, 18.0):
+        p = plan(par, shock, comps_at(17.0, 16.0, 2.0, 1e-2), 1.0, plan_env(sp_cur=cur, sp_live=cur))
+        assert p["kind"] == "probe" and p["raise_cost"] == 0.0 and not p["raise"] and p["setpoint"] == 7.0
+
+
+def test_storage_coast_and_stored_heat():
+    par = light_par()
+    warm = plan(par, SHOCK, comps_at(30.0, 22.0, 1.0), 1.0, plan_env())
+    cold = plan(par, SHOCK, comps_at(17.0, 17.0, 1.0), 1.0, plan_env())
+    assert cold["coast_min"] == 0.0 and cold["stored_min"] < 0.0
+    assert warm["coast_min"] > 0.0 and warm["stored_min"] > 0.0
+    hot = plan(par, SHOCK, comps_at(40.0, 25.0, 1.0), 1.0, plan_env())
+    assert hot["coast_min"] > warm["coast_min"] and hot["stored_min"] > warm["stored_min"]
+    mild = plan(par, SHOCK, comps_at(23.0, 21.0, 1.0), 1.0, plan_env(tout=21.0, wind=0.0))
+    assert mild["coast_min"] == 1440.0
+
+
+def test_stored_heat_is_zero_at_the_target_equilibrium():
+    par = light_par()
+    env = plan_env()
+    env["cn"], env["cs"] = par.coupling((), ())
+    amb = par.b2 + par.b3 * env["wind"]
+    drive = amb * env["tout"] + par.b4 * env["rad"] / 100.0
+    m_eq = (21.0 - (1 - par.w) * drive / (par.b1 + amb)) / (par.w + (1 - par.w) * par.b1 / (par.b1 + amb))
+    a_eq = (par.b1 * m_eq + drive) / (par.b1 + amb)
+    assert abs(par.sensor(m_eq, a_eq) - 21.0) < 1e-9
+    _, stored = storage(par, m_eq, a_eq, 1.0, env)
+    assert abs(stored) < 1e-9
+    _, more = storage(par, m_eq + 1.0, a_eq, 1.0, env)
+    assert more > 0.0
 
 
 def test_plan_raise_cost_blocks_small_raises_and_no_supply_blocks_heating():
