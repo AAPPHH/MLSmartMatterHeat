@@ -70,6 +70,9 @@ const CO2_FALL_SPAN_MS: i64 = 15 * 60 * 1000;
 const CO2_NIGHT_RISE_PPM: f64 = 200.0;
 const CO2_KEEP_MS: i64 = 8 * 3600 * 1000;
 const WATCH_MOTION_FRESH_MS: i64 = 10 * 60 * 1000;
+const COFFEE_ACTIVE_MW: i64 = 20_000;
+const CO2_HOME_RISE_PPM: f64 = 50.0;
+const CO2_HOME_SPAN_MS: i64 = 15 * 60 * 1000;
 const READ_ALL_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 impl DeviceKind {
@@ -493,6 +496,8 @@ struct Inner {
     away_logged: BTreeMap<u64, NaiveDate>,
     day_file: Option<PathBuf>,
     detectors: BTreeMap<u64, EdgeDetector>,
+    home: BTreeMap<&'static str, i64>,
+    coffee_power: BTreeMap<u64, i64>,
 }
 
 impl Inner {
@@ -505,6 +510,7 @@ impl Inner {
         }
         let (edge, ts) = self.detectors.entry(node).or_insert_with(|| EdgeDetector::new(rule)).push(row.ts, row.value?.round() as i64)?;
         let (answer, _) = rule.answer(edge);
+        self.note_home(rule.source, ts / 1000);
         Some(Label {
             ts,
             from_ts: Some(ts - LABEL_HALF_WINDOW_US),
@@ -546,8 +552,29 @@ impl Inner {
         self.last_activity_ms = Some(now_ms);
     }
 
-    fn note_onoff(&mut self, node: u64, on: bool, local: NaiveDateTime) {
+    fn note_home(&mut self, source: &'static str, now_ms: i64) {
+        self.home.insert(source, now_ms);
+    }
+
+    fn is_coffee(&self, node: u64) -> bool {
+        self.configs.iter().any(|c| c.node == node && c.role == ROLE_COFFEE)
+    }
+
+    fn note_power(&mut self, node: u64, row: &DeviceReading, now_ms: i64) {
+        if row.cluster != ELECTRICAL_POWER_MEASUREMENT_CLUSTER || row.attribute != POWER_ATTRIBUTE || row.kind != "attribute" || !self.is_coffee(node) {
+            return;
+        }
+        let Some(milliwatts) = row.value.map(|v| v.round() as i64) else { return };
+        if self.coffee_power.insert(node, milliwatts).is_some_and(|before| (before >= COFFEE_ACTIVE_MW) != (milliwatts >= COFFEE_ACTIVE_MW)) {
+            self.note_home("coffee_power", now_ms);
+        }
+    }
+
+    fn note_onoff(&mut self, node: u64, on: bool, local: NaiveDateTime, now_ms: i64) {
         let before = self.on.insert(node, on);
+        if before.is_some_and(|b| b != on) && self.is_coffee(node) {
+            self.note_home("coffee_plug", now_ms);
+        }
         let Some(plug) = self.configs.iter().filter_map(CoffeePlug::from_config).find(|p| p.node == node) else { return };
         if on && before == Some(false) && plug.in_window(local) && self.done.insert(node, local.date()) != Some(local.date()) {
             self.persist();
@@ -563,6 +590,7 @@ impl Inner {
         if row.cluster == HUMIDITY_MEASUREMENT_CLUSTER && role == "sink" {
             let jumped = self.humidity.insert(node, (now_ms, value)).is_some_and(|(t, v)| now_ms - t <= HUMIDITY_SPAN_MS && value - v >= HUMIDITY_JUMP);
             if jumped {
+                self.note_home("sink_humidity", now_ms);
                 self.note_activity("sink_humidity", now_ms);
             }
         } else if row.cluster == CO2_CLUSTER && room.is_some() && room == self.sleep_room {
@@ -573,6 +601,11 @@ impl Inner {
             }
             let recent = samples.iter().find(|s| now_ms - s.0 <= CO2_FALL_SPAN_MS).map_or(value, |s| s.1);
             let (high, low) = samples.iter().fold((f64::MIN, f64::MAX), |(h, l), s| (h.max(s.1), l.min(s.1)));
+            let floor = samples.iter().filter(|s| now_ms - s.0 <= CO2_HOME_SPAN_MS).fold(value, |l, s| l.min(s.1));
+            let risen = value - floor > CO2_HOME_RISE_PPM;
+            if risen {
+                self.note_home("bedroom_co2", now_ms);
+            }
             if recent - value >= CO2_FALL_PPM && high - low >= CO2_NIGHT_RISE_PPM {
                 self.note_activity("bedroom_co2", now_ms);
             }
@@ -717,9 +750,10 @@ impl Devices {
                     let mut inner = self.inner.lock().unwrap();
                     let now_ms = now_us / 1000;
                     if row.cluster == ON_OFF_CLUSTER && row.attribute == 0 && row.kind == "attribute" {
-                        inner.note_onoff(node, row.value == Some(1.0), chrono::Local::now().naive_local());
+                        inner.note_onoff(node, row.value == Some(1.0), chrono::Local::now().naive_local(), now_ms);
                     }
                     inner.note_ambient(node, &row, now_ms);
+                    inner.note_power(node, &row, now_ms);
                     let label = inner.edge_label(node, &row);
                     if label.is_some() {
                         inner.note_activity("toothbrush", now_ms);
@@ -756,6 +790,10 @@ impl Devices {
                 }
             }
         }
+    }
+
+    pub fn home_activity(&self, now_ms: i64, within_ms: i64) -> Option<&'static str> {
+        self.inner.lock().unwrap().home.iter().filter(|(_, at)| now_ms - **at <= within_ms).max_by_key(|(_, at)| **at).map(|(source, _)| *source)
     }
 
     fn break_edge_link(&self, node: u64) {

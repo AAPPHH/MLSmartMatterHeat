@@ -1,4 +1,4 @@
-use crate::experiment::{report_section, schedule, Doors, Here, Messfahrt, Phase, RoomIn, Tick, COOLDOWN_MIN, TOTAL_MIN};
+use crate::experiment::{report_section, schedule, Doors, Here, Homecoming, Messfahrt, Phase, RoomIn, Tick, COOLDOWN_MIN, TOTAL_MIN};
 use crate::lake::kind;
 use crate::manual_tests::{call, env, env_with, Env};
 use axum::http::StatusCode;
@@ -10,11 +10,11 @@ const MIN: i64 = 60_000;
 const DATE: &str = "2026-11-09";
 
 fn rooms<'a>(names: &[&'a str], held: &[&str], window: &[&str], temp: Option<f64>) -> Vec<RoomIn<'a>> {
-    names.iter().map(|n| RoomIn { room: n, held: held.contains(n), window: window.contains(n), temp }).collect()
+    names.iter().map(|n| RoomIn { room: n, held: held.contains(n), window: window.contains(n), no_supply: false, temp }).collect()
 }
 
 fn tick(m: &mut Messfahrt, now_ms: i64, here: Here, night: bool, list: &[RoomIn]) -> crate::experiment::Out {
-    m.tick(&Tick { now_ms, date: DATE, here, night, cap_c: 23.0, rooms: list })
+    m.tick(&Tick { now_ms, date: DATE, here, night, cap_c: 23.0, rooms: list, activity: None, away_fresh: true, homecoming_ms: None })
 }
 
 fn running(names: &[&str]) -> (Messfahrt, i64) {
@@ -268,6 +268,7 @@ async fn state_of_view(e: &Env) -> String {
 async fn an_open_window_and_a_manual_hold_win_over_the_run() {
     let mut e = env();
     call(&e.state, "POST", "/api/setpoint", Some(json!({"room": "bad", "celsius": 22.0}))).await;
+    e.step(35).await;
     arm(&e, "open").await;
     away_scan(&e).await;
     e.step(1).await;
@@ -315,8 +316,8 @@ fn the_report_lists_runs_with_planned_and_executed_steps_per_room() {
     let mut m = Messfahrt::default();
     let mut events = vec![m.arm(Doors::Open, "chat", b + 480 * MIN).unwrap()];
     for k in 0..40 {
-        let list = [RoomIn { room: "wohnzimmer", held: false, window: false, temp: Some(17.0 + k as f64 * 0.1) }];
-        events.extend(m.tick(&Tick { now_ms: t0 + k * 5 * MIN, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list }).events);
+        let list = [RoomIn { room: "wohnzimmer", held: false, window: false, no_supply: false, temp: Some(17.0 + k as f64 * 0.1) }];
+        events.extend(m.tick(&Tick { now_ms: t0 + k * 5 * MIN, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_fresh: true, homecoming_ms: None }).events);
     }
     events.extend(m.cancel(t0 + 200 * MIN));
     for e in events {
@@ -364,4 +365,191 @@ async fn an_arming_event_from_the_middle_day_of_the_lookback_is_restored() {
     let now = armed_ms + 23 * 60 * MIN;
     assert_eq!(crate::experiment::restore(&e.state, now).unwrap(), "armed");
     assert_eq!(e.state.commanded.lock().unwrap().messfahrt.view(now)["doors"], "open");
+}
+
+fn tick_with(m: &mut Messfahrt, now_ms: i64, here: Here, activity: Option<&'static str>, away_fresh: bool, homecoming_ms: Option<i64>) -> crate::experiment::Out {
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    m.tick(&Tick { now_ms, date: DATE, here, night: false, cap_c: 23.0, rooms: &list, activity, away_fresh, homecoming_ms })
+}
+
+#[test]
+fn recent_home_activity_blocks_the_start_and_ends_a_running_run() {
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    for source in ["coffee_plug", "toothbrush", "manual_setpoint", "watch_scan"] {
+        let out = tick_with(&mut m, MIN, Here::Away, Some(source), true, None);
+        assert!(out.events.is_empty() && state_of(&m, MIN) == "armed", "{source}");
+    }
+    tick_with(&mut m, 2 * MIN, Here::Away, None, true, None);
+    assert_eq!(state_of(&m, 2 * MIN), "running");
+    let out = tick_with(&mut m, 40 * MIN, Here::Away, Some("sink_humidity"), true, None);
+    assert!(out.calls.is_empty());
+    let view = m.view(40 * MIN);
+    assert_eq!((view["state"].as_str(), view["reason"].as_str()), (Some("aborted"), Some("home_activity")));
+    let ended = out.events.iter().find(|e| e.kind == kind::EXPERIMENT_ENDED).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(ended.detail.as_deref().unwrap()).unwrap()["activity"], "sink_humidity");
+    assert!(!m.running_in("a"));
+}
+
+#[test]
+fn a_start_needs_a_fresh_positive_away_signal_not_just_stale_contact() {
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 10 * MIN).unwrap();
+    m.note_departure(5 * MIN);
+    tick_with(&mut m, 11 * MIN, Here::Away, None, false, None);
+    assert_eq!(state_of(&m, 11 * MIN), "armed", "a departure from before the arming does not count");
+    m.note_departure(12 * MIN);
+    tick_with(&mut m, 13 * MIN, Here::Away, None, false, None);
+    assert_eq!(state_of(&m, 13 * MIN), "running");
+    let mut n = Messfahrt::default();
+    n.arm(Doors::Open, "chat", 0).unwrap();
+    tick_with(&mut n, MIN, Here::Away, None, true, None);
+    assert_eq!(state_of(&n, MIN), "running");
+}
+
+#[test]
+fn a_run_must_finish_thirty_minutes_before_the_usual_homecoming_and_ends_there() {
+    let total = TOTAL_MIN * MIN;
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    let late_start = 2 * MIN;
+    let too_soon = late_start + total + 29 * MIN;
+    let out = tick_with(&mut m, late_start, Here::Away, None, true, Some(too_soon));
+    assert!(out.events.is_empty() && state_of(&m, late_start) == "armed");
+    assert_eq!(m.view(late_start)["homecoming_ms"].as_i64(), Some(too_soon));
+    let fine = late_start + total + 31 * MIN;
+    tick_with(&mut m, late_start, Here::Away, None, true, Some(fine));
+    let view = m.view(late_start);
+    assert_eq!((view["state"].as_str(), view["planned_end_ms"].as_i64()), (Some("running"), Some(late_start + total)));
+    let earlier = late_start + 100 * MIN + 30 * MIN;
+    tick_with(&mut m, late_start + 60 * MIN, Here::Away, None, true, Some(earlier));
+    assert_eq!(m.view(0)["planned_end_ms"].as_i64(), Some(late_start + 100 * MIN));
+    assert_eq!(state_of(&m, 0), "running");
+    let out = tick_with(&mut m, late_start + 100 * MIN, Here::Away, None, true, Some(earlier));
+    assert!(out.calls.is_empty());
+    assert_eq!((m.view(0)["state"].as_str(), m.view(0)["reason"].as_str()), (Some("aborted"), Some("planned_homecoming")));
+}
+
+#[test]
+fn a_run_ends_when_the_sleep_window_begins() {
+    let (mut m, _) = running(&["a"]);
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    let out = m.tick(&Tick { now_ms: 20 * MIN, date: DATE, here: Here::Away, night: true, cap_c: 23.0, rooms: &list, activity: None, away_fresh: true, homecoming_ms: None });
+    assert!(out.calls.is_empty());
+    assert_eq!((m.view(0)["state"].as_str(), m.view(0)["reason"].as_str()), (Some("aborted"), Some("night")));
+}
+
+#[test]
+fn a_known_boiler_no_supply_turns_on_pulses_off_and_logs_it_once_per_step() {
+    let on = schedule("a", Doors::Closed, DATE).into_iter().find(|s| s.on).unwrap();
+    let (mut m, t0) = running(&["a"]);
+    let at = t0 + on.from_min * MIN;
+    let starved = |m: &mut Messfahrt, now: i64, no_supply: bool| {
+        let list = [RoomIn { room: "a", held: false, window: false, no_supply, temp: Some(19.0) }];
+        m.tick(&Tick { now_ms: now, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_fresh: true, homecoming_ms: None })
+    };
+    let first = starved(&mut m, at, true);
+    assert!(!first.calls["a"].on);
+    let flagged = |out: &crate::experiment::Out| out.events.iter().filter(|e| e.detail.as_deref().unwrap().contains("\"no_supply\":true")).count();
+    assert_eq!(flagged(&first), 1);
+    let again = starved(&mut m, at + MIN, true);
+    assert!(!again.calls["a"].on && flagged(&again) == 0);
+    assert!(starved(&mut m, at + 2 * MIN, false).calls["a"].on);
+}
+
+#[test]
+fn the_usual_homecoming_is_the_median_of_the_next_arrival_per_day_type_with_three_samples() {
+    let at = |day: u32, h: u32, m: u32| NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap();
+    let learned = Homecoming::from_arrivals(&[at(2, 17, 30), at(3, 18, 0), at(4, 18, 30), at(5, 12, 0), at(5, 19, 0), at(7, 15, 0), at(8, 16, 0)]);
+    assert_eq!(learned.next_after(false, 10 * 60), Some(17 * 60 + 45));
+    assert_eq!(learned.next_after(false, 13 * 60), Some(18 * 60 + 15));
+    assert_eq!(learned.next_after(false, 20 * 60), None);
+    assert_eq!(learned.next_after(true, 10 * 60), None, "two weekend days are not enough");
+    let more = Homecoming::from_arrivals(&[at(7, 15, 0), at(8, 16, 0), at(14, 17, 0)]);
+    assert_eq!(more.next_after(true, 10 * 60), Some(16 * 60));
+}
+
+#[test]
+fn the_planned_homecoming_is_anchored_at_the_run_start_not_at_the_clock() {
+    let at = |day: u32, h: u32, m: u32| NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap();
+    let mut m = Messfahrt::default();
+    assert!(!m.learn_due(0));
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    assert!(m.learn_due(0));
+    m.learned(Homecoming::from_arrivals(&[at(2, 17, 0), at(3, 17, 0), at(4, 17, 0)]), 0);
+    assert!(!m.learn_due(MIN));
+    let t0 = 1_000_000;
+    assert_eq!(m.homecoming_ms(at(9, 12, 0), t0), Some(t0 + 300 * MIN));
+    tick(&mut m, t0, Here::Away, false, &rooms(&["a"], &[], &[], Some(19.0)));
+    assert_eq!(m.started_ms(), Some(t0));
+    assert_eq!(m.homecoming_ms(at(9, 17, 30), t0 + 330 * MIN), Some(t0 + 300 * MIN));
+    assert!(Messfahrt::default().homecoming_ms(at(9, 12, 0), t0).is_none());
+}
+
+fn arrivals(e: &Env, hour: u32, minute: u32) {
+    let mut day = chrono::Local::now().date_naive();
+    let mut left = 4;
+    while left > 0 {
+        day = day.pred_opt().unwrap();
+        if chrono::Datelike::weekday(&day).number_from_monday() > 5 {
+            continue;
+        }
+        let at = day.and_hms_opt(hour, minute, 0).unwrap();
+        let us = chrono::TimeZone::from_local_datetime(&chrono::Local, &at).earliest().unwrap().timestamp_micros();
+        let event = crate::lake::Event { ts: us, ..crate::lake::Event::now(kind::PRESENCE_ARRIVE, "heatd") };
+        e.state.sink.append_on(crate::lake::date_of_us(us), event).unwrap();
+        left -= 1;
+    }
+    e.state.sink.flush().unwrap();
+}
+
+#[tokio::test]
+async fn the_usual_homecoming_from_the_lake_blocks_a_start_that_would_not_finish_in_time() {
+    let mut e = env();
+    arrivals(&e, 14, 0);
+    arm(&e, "closed").await;
+    away_scan(&e).await;
+    e.step(1).await;
+    let view = call(&e.state, "GET", "/api/experiment", None).await.1;
+    let expected = e.t + 120 * MIN;
+    assert_eq!((view["state"].as_str(), view["homecoming_ms"].as_i64()), (Some("armed"), Some(expected)));
+    let mut e = env();
+    arrivals(&e, 18, 0);
+    arm(&e, "closed").await;
+    away_scan(&e).await;
+    e.step(1).await;
+    let view = call(&e.state, "GET", "/api/experiment", None).await.1;
+    assert_eq!((view["state"].as_str(), view["planned_end_ms"].as_i64()), (Some("running"), view["started_ms"].as_i64().map(|s| s + TOTAL_MIN * MIN)));
+    assert_eq!(view["homecoming_ms"].as_i64(), Some(e.t + 360 * MIN));
+    let state = call(&e.state, "GET", "/api/state", None).await.1;
+    assert_eq!(state["experiment"]["planned_end_ms"], view["planned_end_ms"]);
+}
+
+#[tokio::test]
+async fn a_manual_setpoint_within_thirty_minutes_keeps_the_run_from_starting() {
+    let mut e = env();
+    arm(&e, "closed").await;
+    call(&e.state, "POST", "/api/setpoint", Some(json!({"room": "bad", "celsius": 22.0}))).await;
+    away_scan(&e).await;
+    e.step(1).await;
+    assert_eq!(state_of_view(&e).await, "armed");
+    away_scan(&e).await;
+    e.step(31).await;
+    assert_eq!(state_of_view(&e).await, "running");
+}
+
+#[test]
+fn the_on_setpoint_is_the_boost_bundle_setpoint_when_it_lies_below_the_cap() {
+    let e = env_with("[failsafe]\nboost_max_c = 28.5\n");
+    e.state.boost.set_model(crate::boostlearn::tests::light_model());
+    let bundle = e.state.boost.boost_setpoint().unwrap();
+    assert!(bundle < e.state.failsafe.boost_max_c());
+    let want = |on: bool| {
+        let mut out = crate::experiment::Out::default();
+        out.calls.insert("wohnzimmer".into(), crate::experiment::Call { on, rule: "experiment_takt" });
+        let mut wants = vec![crate::rules::Desired { node: 5, room: "wohnzimmer".into(), setpoint: 20.0, reason: "schedule", rule: "base", base: 20.0, occupancy: "away", source: "", sleep: false, window_open: false, experiment_id: None }];
+        crate::experiment::apply_calls(&e.state, &out, &mut wants, &[]);
+        wants[0].setpoint
+    };
+    assert_eq!((want(true), want(false)), (bundle, 8.0));
 }

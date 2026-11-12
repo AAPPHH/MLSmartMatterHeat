@@ -224,6 +224,7 @@ pub struct Commands {
     resets: HashMap<u64, i64>,
     last_reset: HashMap<u64, i64>,
     occ: Occ,
+    last_manual_ms: Option<i64>,
     pub messfahrt: crate::experiment::Messfahrt,
 }
 
@@ -298,7 +299,12 @@ impl Commands {
         nodes.iter().any(|n| self.holds.get(n).is_some_and(|h| !h.explicit()))
     }
 
+    pub fn last_manual_ms(&self) -> Option<i64> {
+        self.last_manual_ms
+    }
+
     pub fn set_manual(&mut self, nodes: &[u64], value: f64, since_ms: i64, until_ms: i64, source: HoldSource) {
+        self.last_manual_ms = self.last_manual_ms.max(Some(since_ms));
         for &node in nodes {
             self.holds.insert(node, Hold { value, since_ms, until_ms, source });
         }
@@ -883,6 +889,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         return Ok(Vec::new());
     }
     for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes) {
+        if matches!(transition, Transition::Left { .. }) {
+            state.commanded.lock().unwrap().messfahrt.note_departure(now_ms);
+        }
         log("presence event", state.sink.append(presence_event(&device, transition)));
     }
     let presence = current_presence(state, now_ms).unwrap_or_else(|e| {
@@ -1056,6 +1065,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     }
     let previous = sent.acked.unwrap_or(sent.target);
     commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
+    commands.last_manual_ms = commands.last_manual_ms.max(Some(now_ms));
     let replaced = commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, until_ms: now_ms + (state.config.manual_hold_minutes * 60_000.0) as i64, source: HoldSource::Dial });
     Some((previous, replaced.filter(Hold::explicit)))
 }

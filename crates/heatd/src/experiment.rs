@@ -7,7 +7,7 @@ use crate::report::{hhmm, midnight_us, open_lake, rows};
 use crate::rules::{clamp_boost, clamp_setpoint, in_sleep_hours, Desired, Occupancy, Presence};
 use anyhow::Result;
 use axum::http::StatusCode;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
@@ -17,6 +17,12 @@ pub const COOLDOWN_MIN: i64 = 75;
 pub const TOTAL_MIN: i64 = 225;
 pub const EXPIRY_MS: i64 = 24 * 3_600_000;
 pub const CAP_MARGIN_K: f64 = 2.0;
+pub const HOMECOMING_MARGIN_MIN: i64 = 30;
+pub const ACTIVITY_MS: i64 = 30 * 60_000;
+pub const AWAY_FRESH_MS: i64 = 3 * 3_600_000;
+const HOMECOMING_DAYS: i64 = 42;
+const HOMECOMING_MIN_DAYS: usize = 3;
+const HOMECOMING_REFRESH_MS: i64 = 6 * 3_600_000;
 const MIN_MS: i64 = 60_000;
 const LOOKBACK_MS: i64 = 48 * 3_600_000;
 const STEP_MINUTES: u32 = 4;
@@ -156,13 +162,15 @@ struct RoomRun {
     entered: Option<usize>,
     executed: u32,
     capped: Option<usize>,
+    starved: Option<usize>,
+    starving: bool,
     min: Option<f64>,
     max: Option<f64>,
 }
 
 impl RoomRun {
     fn new(room: &str, doors: Doors, date: &str) -> Self {
-        Self { room: room.into(), segs: schedule(room, doors, date), end: None, entered: None, executed: 0, capped: None, min: None, max: None }
+        Self { room: room.into(), segs: schedule(room, doors, date), end: None, entered: None, executed: 0, capped: None, starved: None, starving: false, min: None, max: None }
     }
 
     fn seen(&mut self, temp: Option<f64>) {
@@ -192,6 +200,7 @@ pub struct Run {
     ended_ms: Option<i64>,
     reason: Option<String>,
     date: String,
+    homecoming_ms: Option<i64>,
     rooms: Vec<RoomRun>,
 }
 
@@ -200,8 +209,16 @@ impl Run {
         self.armed_ms + EXPIRY_MS
     }
 
-    fn planned_end_ms(&self) -> Option<i64> {
+    fn nominal_end_ms(&self) -> Option<i64> {
         self.started_ms.map(|s| s + TOTAL_MIN * MIN_MS)
+    }
+
+    fn cutoff_ms(&self) -> Option<i64> {
+        self.homecoming_ms.map(|h| h - HOMECOMING_MARGIN_MIN * MIN_MS)
+    }
+
+    fn planned_end_ms(&self) -> Option<i64> {
+        self.nominal_end_ms().map(|n| self.cutoff_ms().map_or(n, |c| n.min(c)))
     }
 
     fn event(&self, name: &str, now_ms: i64, detail: Value) -> Event {
@@ -217,11 +234,19 @@ impl Run {
     }
 
     fn finish(&mut self, status: Status, reason: &str, now_ms: i64) -> Event {
+        self.finish_with(status, reason, now_ms, Value::Null)
+    }
+
+    fn finish_with(&mut self, status: Status, reason: &str, now_ms: i64, extra: Value) -> Event {
         self.status = status;
         self.reason = Some(reason.into());
         self.ended_ms = Some(now_ms);
         let rooms: Map<String, Value> = self.rooms.iter().map(|r| (r.room.clone(), r.summary())).collect();
-        self.event(kind::EXPERIMENT_ENDED, now_ms, json!({"reason": reason, "status": status.name(), "source": self.source, "armed_ms": self.armed_ms, "started_ms": self.started_ms, "ended_ms": now_ms, "rooms": rooms}))
+        let mut detail = json!({"reason": reason, "status": status.name(), "source": self.source, "armed_ms": self.armed_ms, "started_ms": self.started_ms, "ended_ms": now_ms, "rooms": rooms});
+        if let Some(extra) = extra.as_object() {
+            extra.iter().for_each(|(k, v)| detail[k] = v.clone());
+        }
+        self.event(kind::EXPERIMENT_ENDED, now_ms, detail)
     }
 
     fn start(&mut self, rooms: &[&str], now_ms: i64, date: &str) -> Event {
@@ -230,13 +255,13 @@ impl Run {
         self.date = date.into();
         self.rooms = rooms.iter().map(|r| RoomRun::new(r, self.doors, date)).collect();
         let end = self.planned_end_ms();
-        self.event(kind::EXPERIMENT_STARTED, now_ms, json!({"source": self.source, "date": date, "started_ms": now_ms, "planned_end_ms": end, "cooldown_min": COOLDOWN_MIN, "total_min": TOTAL_MIN, "schedule": self.schedule_json()}))
+        self.event(kind::EXPERIMENT_STARTED, now_ms, json!({"source": self.source, "date": date, "started_ms": now_ms, "planned_end_ms": end, "homecoming_ms": self.homecoming_ms, "cooldown_min": COOLDOWN_MIN, "total_min": TOTAL_MIN, "schedule": self.schedule_json()}))
     }
 
-    fn step_event(&self, now_ms: i64, room: &RoomRun, idx: usize, temp: Option<f64>, capped: bool) -> Event {
+    fn step_event(&self, now_ms: i64, room: &RoomRun, idx: usize, temp: Option<f64>, capped: bool, starved: bool) -> Event {
         let seg = room.segs[idx];
         let until = self.started_ms.unwrap_or(now_ms) + seg.to_min * MIN_MS;
-        self.event(kind::EXPERIMENT_STEP, now_ms, json!({"room": room.room, "phase": seg.phase.name(), "step": idx, "steps": room.segs.len(), "on": seg.on && !capped, "capped": capped, "until_ms": until, "temp": temp}))
+        self.event(kind::EXPERIMENT_STEP, now_ms, json!({"room": room.room, "phase": seg.phase.name(), "step": idx, "steps": room.segs.len(), "on": seg.on && !capped && !starved, "capped": capped, "no_supply": starved, "until_ms": until, "temp": temp}))
     }
 
     fn view(&self, now_ms: i64) -> Value {
@@ -247,11 +272,11 @@ impl Run {
             .iter()
             .map(|r| {
                 let idx = elapsed.filter(|_| running && r.end.is_none()).map(|e| r.index(e));
-                json!({"room": r.room, "step": idx, "steps": r.segs.len(), "on": idx.map(|i| r.segs[i].on && r.capped != Some(i)), "ended": r.end, "executed": r.executed, "min": r.min, "max": r.max, "schedule": r.segs.iter().map(|s| json!({"from_min": s.from_min, "to_min": s.to_min, "on": s.on, "phase": s.phase.name()})).collect::<Vec<_>>()})
+                json!({"room": r.room, "step": idx, "steps": r.segs.len(), "on": idx.map(|i| r.segs[i].on && r.capped != Some(i) && !r.starving), "ended": r.end, "executed": r.executed, "min": r.min, "max": r.max, "schedule": r.segs.iter().map(|s| json!({"from_min": s.from_min, "to_min": s.to_min, "on": s.on, "phase": s.phase.name()})).collect::<Vec<_>>()})
             })
             .collect();
         let phase = elapsed.filter(|_| running).map(Phase::of);
-        json!({"id": self.id, "state": self.status.name(), "doors": self.doors.name(), "doors_label": self.doors.label(), "source": self.source, "phase": phase.map(Phase::name), "phase_label": phase.map(Phase::label), "step_min": elapsed.filter(|_| running), "armed_ms": self.armed_ms, "expires_ms": (self.status == Status::Armed).then(|| self.expires_ms()), "started_ms": self.started_ms, "planned_end_ms": self.planned_end_ms(), "ended_ms": self.ended_ms, "reason": self.reason, "rooms": rooms})
+        json!({"id": self.id, "state": self.status.name(), "doors": self.doors.name(), "doors_label": self.doors.label(), "source": self.source, "phase": phase.map(Phase::name), "phase_label": phase.map(Phase::label), "step_min": elapsed.filter(|_| running), "armed_ms": self.armed_ms, "expires_ms": (self.status == Status::Armed).then(|| self.expires_ms()), "started_ms": self.started_ms, "planned_end_ms": self.planned_end_ms(), "homecoming_ms": self.homecoming_ms, "ended_ms": self.ended_ms, "reason": self.reason, "rooms": rooms})
     }
 }
 
@@ -259,6 +284,7 @@ pub struct RoomIn<'a> {
     pub room: &'a str,
     pub held: bool,
     pub window: bool,
+    pub no_supply: bool,
     pub temp: Option<f64>,
 }
 
@@ -269,6 +295,9 @@ pub struct Tick<'a> {
     pub night: bool,
     pub cap_c: f64,
     pub rooms: &'a [RoomIn<'a>],
+    pub activity: Option<&'static str>,
+    pub away_fresh: bool,
+    pub homecoming_ms: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -284,8 +313,37 @@ pub struct Call {
 }
 
 #[derive(Debug, Default)]
+pub struct Homecoming {
+    days: Vec<(bool, Vec<u32>)>,
+    loaded_ms: Option<i64>,
+}
+
+impl Homecoming {
+    pub fn from_arrivals(local: &[NaiveDateTime]) -> Self {
+        let mut days: BTreeMap<NaiveDate, Vec<u32>> = BTreeMap::new();
+        for at in local {
+            days.entry(at.date()).or_default().push(at.hour() * 60 + at.minute());
+        }
+        let days = days.into_iter().map(|(d, mut v)| (d.weekday().number_from_monday() > 5, { v.sort_unstable(); v })).collect();
+        Self { days, loaded_ms: None }
+    }
+
+    pub fn next_after(&self, weekend: bool, minute: u32) -> Option<u32> {
+        let mut next: Vec<u32> = self.days.iter().filter(|(w, _)| *w == weekend).filter_map(|(_, v)| v.iter().copied().find(|m| *m > minute)).collect();
+        if next.len() < HOMECOMING_MIN_DAYS {
+            return None;
+        }
+        next.sort_unstable();
+        let mid = next.len() / 2;
+        Some(if next.len() % 2 == 1 { next[mid] } else { (next[mid - 1] + next[mid]) / 2 })
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct Messfahrt {
     run: Option<Run>,
+    departed_ms: Option<i64>,
+    learned: Homecoming,
 }
 
 impl Messfahrt {
@@ -293,7 +351,7 @@ impl Messfahrt {
         if self.run.as_ref().is_some_and(|r| r.status == Status::Running) {
             return Err("Eine Messfahrt läuft schon – erst abbrechen");
         }
-        let run = Run { id: format!("mf-{now_ms}"), doors, source: source.into(), status: Status::Armed, armed_ms: now_ms, started_ms: None, ended_ms: None, reason: None, date: String::new(), rooms: Vec::new() };
+        let run = Run { id: format!("mf-{now_ms}"), doors, source: source.into(), status: Status::Armed, armed_ms: now_ms, started_ms: None, ended_ms: None, reason: None, date: String::new(), homecoming_ms: None, rooms: Vec::new() };
         let event = run.event(kind::EXPERIMENT_ARMED, now_ms, json!({"source": source, "armed_ms": now_ms, "expires_ms": run.expires_ms()}));
         self.run = Some(run);
         Ok(event)
@@ -304,8 +362,37 @@ impl Messfahrt {
         Some(run.finish(Status::Aborted, "cancel", now_ms))
     }
 
+    pub fn note_departure(&mut self, now_ms: i64) {
+        self.departed_ms = Some(now_ms);
+    }
+
+    pub fn started_ms(&self) -> Option<i64> {
+        self.run.as_ref().filter(|r| r.status == Status::Running).and_then(|r| r.started_ms)
+    }
+
     pub fn running_in(&self, room: &str) -> bool {
         self.run.as_ref().is_some_and(|r| r.status == Status::Running && r.rooms.iter().any(|x| x.room == room && x.end.is_none()))
+    }
+
+    pub fn active(&self) -> bool {
+        self.run.as_ref().is_some_and(|r| matches!(r.status, Status::Armed | Status::Running))
+    }
+
+    pub fn learn_due(&self, now_ms: i64) -> bool {
+        self.active() && self.learned.loaded_ms.is_none_or(|t| now_ms - t >= HOMECOMING_REFRESH_MS)
+    }
+
+    pub fn learned(&mut self, mut learned: Homecoming, now_ms: i64) {
+        learned.loaded_ms = Some(now_ms);
+        self.learned = learned;
+    }
+
+    pub fn homecoming_ms(&self, now: NaiveDateTime, now_ms: i64) -> Option<i64> {
+        let reference = self.started_ms().unwrap_or(now_ms);
+        let local = now - chrono::Duration::milliseconds(now_ms - reference);
+        let minute = local.hour() * 60 + local.minute();
+        let next = self.learned.next_after(local.weekday().number_from_monday() > 5, minute)?;
+        Some(reference + (i64::from(next) - i64::from(minute)) * MIN_MS)
     }
 
     pub fn view(&self, now_ms: i64) -> Value {
@@ -315,12 +402,17 @@ impl Messfahrt {
     pub fn tick(&mut self, t: &Tick) -> Out {
         let mut out = Out::default();
         let Some(run) = self.run.as_mut() else { return out };
+        if matches!(run.status, Status::Armed | Status::Running) {
+            run.homecoming_ms = t.homecoming_ms;
+        }
         if run.status == Status::Armed {
             if t.now_ms >= run.expires_ms() {
                 out.events.push(run.finish(Status::Aborted, "expired", t.now_ms));
                 return out;
             }
-            if t.here != Here::Away || t.night {
+            let departed = self.departed_ms.is_some_and(|d| d >= run.armed_ms);
+            let too_late = run.cutoff_ms().is_some_and(|c| t.now_ms + TOTAL_MIN * MIN_MS > c);
+            if t.here != Here::Away || t.night || t.activity.is_some() || !(t.away_fresh || departed) || too_late {
                 return out;
             }
             let rooms: Vec<&str> = t.rooms.iter().map(|r| r.room).collect();
@@ -333,8 +425,20 @@ impl Messfahrt {
             out.events.push(run.finish(Status::Aborted, "homecoming", t.now_ms));
             return out;
         }
-        if run.planned_end_ms().is_some_and(|e| t.now_ms >= e) {
+        if let Some(source) = t.activity {
+            out.events.push(run.finish_with(Status::Aborted, "home_activity", t.now_ms, json!({"activity": source})));
+            return out;
+        }
+        if t.night {
+            out.events.push(run.finish(Status::Aborted, "night", t.now_ms));
+            return out;
+        }
+        if run.nominal_end_ms().is_some_and(|e| t.now_ms >= e) {
             out.events.push(run.finish(Status::Done, "completed", t.now_ms));
+            return out;
+        }
+        if run.cutoff_ms().is_some_and(|c| t.now_ms >= c) {
+            out.events.push(run.finish(Status::Aborted, "planned_homecoming", t.now_ms));
             return out;
         }
         let elapsed = (t.now_ms - run.started_ms.unwrap_or(t.now_ms)) / MIN_MS;
@@ -362,15 +466,21 @@ impl Messfahrt {
             if new_cap {
                 run.rooms[i].capped = Some(idx);
             }
-            if run.rooms[i].entered != Some(idx) || new_cap {
+            let starved = seg.on && input.is_some_and(|r| r.no_supply);
+            run.rooms[i].starving = starved;
+            let new_starved = starved && run.rooms[i].starved != Some(idx);
+            if new_starved {
+                run.rooms[i].starved = Some(idx);
+            }
+            if run.rooms[i].entered != Some(idx) || new_cap || new_starved {
                 if run.rooms[i].entered != Some(idx) {
                     run.rooms[i].executed += 1;
                 }
                 run.rooms[i].entered = Some(idx);
                 let capped = run.rooms[i].capped == Some(idx);
-                out.events.push(run.step_event(t.now_ms, &run.rooms[i], idx, temp, capped));
+                out.events.push(run.step_event(t.now_ms, &run.rooms[i], idx, temp, capped, starved));
             }
-            let on = seg.on && run.rooms[i].capped != Some(idx) && temp.is_some();
+            let on = seg.on && run.rooms[i].capped != Some(idx) && !starved && temp.is_some();
             out.calls.insert(run.rooms[i].room.clone(), Call { on, rule: seg.phase.rule() });
         }
         out
@@ -382,12 +492,13 @@ impl Messfahrt {
             let id = d["id"].as_str().unwrap_or_default().to_string();
             let doors = d["doors"].as_str().and_then(Doors::parse);
             match (k.as_str(), doors) {
-                (kind::EXPERIMENT_ARMED, Some(doors)) => run = Some(Run { id, doors, source: d["source"].as_str().unwrap_or("chat").into(), status: Status::Armed, armed_ms: d["armed_ms"].as_i64().unwrap_or(*ts), started_ms: None, ended_ms: None, reason: None, date: String::new(), rooms: Vec::new() }),
+                (kind::EXPERIMENT_ARMED, Some(doors)) => run = Some(Run { id, doors, source: d["source"].as_str().unwrap_or("chat").into(), status: Status::Armed, armed_ms: d["armed_ms"].as_i64().unwrap_or(*ts), started_ms: None, ended_ms: None, reason: None, date: String::new(), homecoming_ms: None, rooms: Vec::new() }),
                 (kind::EXPERIMENT_STARTED, _) => {
                     let Some(r) = run.as_mut().filter(|r| r.id == id) else { continue };
                     let names: Vec<String> = d["schedule"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
                     let names: Vec<&str> = names.iter().map(String::as_str).collect();
                     r.start(&names, d["started_ms"].as_i64().unwrap_or(*ts), d["date"].as_str().unwrap_or_default());
+                    r.homecoming_ms = d["homecoming_ms"].as_i64();
                 }
                 (kind::EXPERIMENT_STEP, _) => {
                     let Some(r) = run.as_mut().filter(|r| r.id == id && r.status == Status::Running) else { continue };
@@ -427,7 +538,7 @@ impl Messfahrt {
                 events.push(r.finish(Status::Aborted, reason, now_ms));
             }
         }
-        (Self { run }, events)
+        (Self { run, ..Default::default() }, events)
     }
 }
 
@@ -459,17 +570,54 @@ fn rooms_with_nodes(state: &AppState) -> Vec<&Room> {
     state.config.rooms.iter().filter(|r| !r.nodes.is_empty()).collect()
 }
 
+fn learn_homecoming(state: &AppState, now_ms: i64) {
+    let rows = crate::restore::records(state.sink.root(), Table::Events, now_ms - HOMECOMING_DAYS * 86_400_000, now_ms, &["kind"], &[], &[]).unwrap_or_else(|e| {
+        eprintln!("homecoming history: {e:#}");
+        Vec::new()
+    });
+    let arrivals: Vec<NaiveDateTime> = rows.iter().filter(|r| r.text[0].as_deref() == Some(kind::PRESENCE_ARRIVE)).filter_map(|r| Some(chrono::DateTime::from_timestamp_millis(r.ts)?.with_timezone(&chrono::Local).naive_local())).collect();
+    state.commanded.lock().unwrap().messfahrt.learned(Homecoming::from_arrivals(&arrivals), now_ms);
+}
+
+fn home_activity(state: &AppState, now_ms: i64) -> Option<&'static str> {
+    let recent = |ms: i64| now_ms - ms <= ACTIVITY_MS;
+    if let Some(source) = state.devices.home_activity(now_ms, ACTIVITY_MS) {
+        return Some(source);
+    }
+    if state.commanded.lock().unwrap().last_manual_ms().is_some_and(recent) {
+        return Some("manual_setpoint");
+    }
+    match state.storage.device_statuses() {
+        Ok(statuses) => statuses.iter().any(|s| !s.away && recent(s.state_ts)).then_some("watch_scan"),
+        Err(_) => Some("status_unreadable"),
+    }
+}
+
+fn away_fresh(state: &AppState, now_ms: i64) -> bool {
+    let tracker = state.tracker.lock().unwrap();
+    state.storage.device_statuses().unwrap_or_default().iter().any(|s| s.away && tracker.confirmed(&s.device) && now_ms - s.state_ts <= AWAY_FRESH_MS)
+}
+
 pub(crate) fn tick(state: &AppState, now: NaiveDateTime, now_ms: i64, windows: &HashSet<String>, presence: Option<&Presence>) -> Out {
+    if state.commanded.lock().unwrap().messfahrt.learn_due(now_ms) {
+        learn_homecoming(state, now_ms);
+    }
+    if !state.commanded.lock().unwrap().messfahrt.active() {
+        return Out::default();
+    }
     let rooms = rooms_with_nodes(state);
     let temps: Vec<Option<f64>> = {
         let w = state.windows.lock().unwrap();
         rooms.iter().map(|r| r.nodes.iter().find_map(|&n| w.local_temp(n, now_ms, state.config.stale.after_ms()))).collect()
     };
+    let no_supply = state.windows.lock().unwrap().no_supply_rooms();
     let date = now.format("%Y-%m-%d").to_string();
+    let (activity, away_fresh) = (home_activity(state, now_ms), away_fresh(state, now_ms));
     let mut out = {
         let mut commands = state.commanded.lock().unwrap();
-        let inputs: Vec<RoomIn> = rooms.iter().zip(&temps).map(|(r, t)| RoomIn { room: &r.name, held: commands.holding(&r.nodes), window: windows.contains(&r.name), temp: *t }).collect();
-        let tick = Tick { now_ms, date: &date, here: Here::of(state, presence), night: in_sleep_hours(&state.config, now), cap_c: state.config.occupied_setpoint + CAP_MARGIN_K, rooms: &inputs };
+        let inputs: Vec<RoomIn> = rooms.iter().zip(&temps).map(|(r, t)| RoomIn { room: &r.name, held: commands.holding(&r.nodes), window: windows.contains(&r.name), no_supply: no_supply.contains(&r.name), temp: *t }).collect();
+        let homecoming_ms = commands.messfahrt.homecoming_ms(now, now_ms);
+        let tick = Tick { now_ms, date: &date, here: Here::of(state, presence), night: in_sleep_hours(&state.config, now), cap_c: state.config.occupied_setpoint + CAP_MARGIN_K, rooms: &inputs, activity, away_fresh, homecoming_ms };
         commands.messfahrt.tick(&tick)
     };
     std::mem::take(&mut out.events).into_iter().for_each(|e| log(state, e));

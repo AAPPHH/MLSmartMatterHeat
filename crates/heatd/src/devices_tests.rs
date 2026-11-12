@@ -272,13 +272,13 @@ fn a_manual_on_in_the_window_marks_the_day_done_but_a_priming_report_does_not() 
     let dir = tempfile::tempdir().unwrap();
     let d = devices_of(dir.path(), DEVICES, &mock());
     let at = local("2026-11-10 06:30");
-    d.inner.lock().unwrap().note_onoff(9, true, at);
+    d.inner.lock().unwrap().note_onoff(9, true, at, NOW_MS);
     assert!(d.inner.lock().unwrap().done.is_empty());
-    d.inner.lock().unwrap().note_onoff(9, false, at);
-    d.inner.lock().unwrap().note_onoff(9, true, local("2026-11-10 05:00"));
+    d.inner.lock().unwrap().note_onoff(9, false, at, NOW_MS);
+    d.inner.lock().unwrap().note_onoff(9, true, local("2026-11-10 05:00"), NOW_MS);
     assert!(d.inner.lock().unwrap().done.is_empty());
-    d.inner.lock().unwrap().note_onoff(9, false, at);
-    d.inner.lock().unwrap().note_onoff(9, true, at);
+    d.inner.lock().unwrap().note_onoff(9, false, at, NOW_MS);
+    d.inner.lock().unwrap().note_onoff(9, true, at, NOW_MS);
     assert!(plain_step(&d, "2026-11-10 06:40", &wakes(9, "2026-11-10 06:40", "2026-11-10 06:35")).is_empty());
     assert_eq!(std::fs::read_to_string(dir.path().join(DAY_FILE)).unwrap(), r#"{"9":"2026-11-10"}"#);
 }
@@ -792,6 +792,8 @@ fn an_edge_becomes_a_high_confidence_room_label_with_a_three_minute_window() {
         labels.extend(devices.inner.lock().unwrap().edge_label(10, &power(30 * min + i * 10_000_000, 4500.0)));
     }
     assert_eq!(labels.len(), 1);
+    assert_eq!(devices.home_activity(30 * 60_000 + 10 * 60_000, 30 * 60_000), Some("toothbrush"));
+    assert_eq!(devices.home_activity(30 * 60_000 + 31 * 60_000, 30 * 60_000), None);
     let label = &labels[0];
     assert_eq!((label.ts, label.from_ts, label.to_ts), (30 * min, Some(27 * min), Some(33 * min)));
     assert_eq!((label.room.as_str(), label.source.as_str(), label.confidence, label.answer.as_deref()), ("a", "toothbrush", Some(1.0), Some("charge_start")));
@@ -881,4 +883,57 @@ fn at_most_six_edges_per_day() {
         edges.extend(feed(&mut d, 1200 + round * 3000, &[level; 100]));
     }
     assert_eq!(edges.len(), 6);
+}
+
+#[test]
+fn coffee_plug_changes_and_power_edges_ambient_jumps_and_co2_rises_mark_someone_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let devices = format!("{DEVICES}[[devices]]
+node = 14
+kind = 'air'
+role = 'air'
+room = 'a'
+");
+    let mut config = config(dir.path(), &devices);
+    config.sleep_room = Some("a".into());
+    let mock = mock();
+    let d = Devices::new(&config, mock.clone(), mock);
+    let (min, window) = (60_000, 30 * 60_000);
+    let row = |node: u64, cluster: u32, value: f64| DeviceReading { ts: 0, node, endpoint: 1, cluster, attribute: 0, kind: "attribute".into(), name: String::new(), value: Some(value), raw: String::new(), source: String::new() };
+    let power = |node: u64, mw: f64| DeviceReading { attribute: 8, ..row(node, 0x90, mw) };
+    let at = local("2026-11-10 10:00");
+    assert_eq!(d.home_activity(NOW_MS, window), None);
+    d.inner.lock().unwrap().note_onoff(9, false, at, NOW_MS - 100 * min);
+    d.inner.lock().unwrap().note_onoff(9, false, at, NOW_MS - 90 * min);
+    assert_eq!(d.home_activity(NOW_MS, window), None, "a priming report and an unchanged state are no activity");
+    d.inner.lock().unwrap().note_onoff(9, true, at, NOW_MS - 20 * min);
+    assert_eq!(d.home_activity(NOW_MS, window), Some("coffee_plug"));
+    assert_eq!(d.home_activity(NOW_MS + 11 * min, window), None);
+    let mut inner = d.inner.lock().unwrap();
+    inner.note_power(9, &power(9, 1000.0), NOW_MS - 60 * min);
+    inner.note_power(9, &power(9, 1200.0), NOW_MS - 50 * min);
+    inner.note_power(12, &power(12, 5000.0), NOW_MS - 45 * min);
+    inner.note_power(12, &power(12, 90000.0), NOW_MS - 44 * min);
+    drop(inner);
+    assert_eq!(d.home_activity(NOW_MS, window), Some("coffee_plug"));
+    d.inner.lock().unwrap().note_power(9, &power(9, 1_243_100.0), NOW_MS - 5 * min);
+    assert_eq!(d.home_activity(NOW_MS, window), Some("coffee_power"));
+    d.inner.lock().unwrap().home.clear();
+    d.inner.lock().unwrap().note_power(9, &power(9, 1_241_900.0), NOW_MS - 4 * min);
+    d.inner.lock().unwrap().note_power(9, &power(9, 1_243_100.0), NOW_MS - 3 * min);
+    assert_eq!(d.home_activity(NOW_MS, window), None, "a wobble while the machine runs is no edge");
+    let mut inner = d.inner.lock().unwrap();
+    inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5000.0), NOW_MS - 3 * min);
+    inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5500.0), NOW_MS - 2 * min);
+    drop(inner);
+    assert_eq!(d.home_activity(NOW_MS, window), Some("sink_humidity"));
+    let other = self::mock();
+    let d = Devices::new(&config, other.clone(), other);
+    let mut inner = d.inner.lock().unwrap();
+    for (back, ppm) in [(14, 500.0), (10, 530.0), (5, 545.0)] {
+        inner.note_ambient(14, &row(14, CO2_CLUSTER, ppm), NOW_MS - back * min);
+    }
+    assert!(inner.home.is_empty(), "45 ppm in 14 minutes is not enough");
+    inner.note_ambient(14, &row(14, CO2_CLUSTER, 552.0), NOW_MS);
+    assert!(inner.home.contains_key("bedroom_co2"));
 }
