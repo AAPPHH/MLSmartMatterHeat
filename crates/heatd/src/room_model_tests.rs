@@ -60,12 +60,12 @@ fn env(e: &Value) -> Env {
         now_min: e["now_min"].as_i64().unwrap_or(0),
         q_net: e["q_net"].as_f64(),
         pcnn_active: e["pcnn_active"].as_bool().unwrap_or(false),
-        probe: e["probe"].as_object().map(|m| ProbeMemo { start: m["start"].as_i64().unwrap(), d: m["d"].as_u64().unwrap() as usize, block_until: m["block_until"].as_i64().unwrap(), target: num(&m["target"]), present: num(&m["present"]), ended: m["ended"].as_bool().unwrap() }),
+        probe: e["probe"].as_object().map(|m| ProbeMemo { start: m["start"].as_i64().unwrap(), d: m["d"].as_u64().unwrap() as usize, base: m["base"].as_i64().unwrap(), block_until: m["block_until"].as_i64().unwrap(), target: num(&m["target"]), present: num(&m["present"]), ended: m["ended"].as_bool().unwrap(), unc: num(&m["unc"]), strikes: m["strikes"].as_i64().unwrap() }),
     }
 }
 
 fn memo_json(m: &Option<ProbeMemo>) -> Value {
-    m.as_ref().map_or(Value::Null, |m| serde_json::json!({"start": m.start, "d": m.d, "block_until": m.block_until, "target": m.target, "present": m.present, "ended": m.ended}))
+    m.as_ref().map_or(Value::Null, |m| serde_json::json!({"start": m.start, "d": m.d, "base": m.base, "block_until": m.block_until, "target": m.target, "present": m.present, "ended": m.ended, "unc": m.unc, "strikes": m.strikes}))
 }
 
 fn compare_plan(got: &PlanOut, want: &Value, what: &str) {

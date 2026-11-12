@@ -13,10 +13,13 @@ const EPS: f64 = 1e-9;
 pub struct ProbeMemo {
     pub start: i64,
     pub d: usize,
+    pub base: i64,
     pub block_until: i64,
     pub target: f64,
     pub present: f64,
     pub ended: bool,
+    pub unc: f64,
+    pub strikes: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -114,18 +117,28 @@ struct Cand {
 
 #[allow(clippy::too_many_arguments)]
 fn terminal_cold(par: &RoomPar, m: f64, a: f64, lam: f64, env: &Env, cn: f64, cs: f64) -> f64 {
-    let deficit = (env.target - par.sensor(m, a)).max(0.0);
-    if deficit <= 0.0 || env.present <= 0.0 {
+    if env.present <= 0.0 || env.target - par.sensor(m, a) <= 0.0 {
         return 0.0;
     }
-    let h = 1.0 / 60.0;
-    let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, 1.0, env.tout, env.wind, env.rad, env.night, cn, cs, h);
-    let (mut x, mut y) = (m, a);
-    for _ in 0..FORECAST_MIN {
+    let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, 1.0, env.tout, env.wind, env.rad, env.night, cn, cs, 1.0 / 60.0);
+    let (mut x, mut y, mut total) = (m, a, 0.0);
+    for _ in 0..COAST_CAP {
+        let deficit = env.target - par.sensor(x, y);
+        if deficit <= 0.0 {
+            break;
+        }
+        total += deficit;
         (x, y) = (f11 * x + f12 * y + g1, f21 * x + f22 * y + g2);
     }
-    let rate = (par.sensor(x, y) - par.sensor(m, a)) / FORECAST_MIN as f64;
-    0.5 * deficit * (if rate > 1e-12 { deficit / rate } else { COAST_CAP as f64 }).min(COAST_CAP as f64) * env.present
+    total * env.present
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reach(par: &RoomPar, lam: f64, env: &Env, cn: f64, cs: f64) -> f64 {
+    let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, 1.0, env.tout, env.wind, env.rad, env.night, cn, cs, 1.0 / 60.0);
+    let (p, q, r, t) = (1.0 - f11, -f12, -f21, 1.0 - f22);
+    let det = p * t - q * r;
+    par.sensor((t * g1 - q * g2) / det, (p * g2 - r * g1) / det)
 }
 
 fn valve_demand(par: &RoomPar, env: &Env, sens0: f64, setpoint: f64, sens: f64) -> f64 {
@@ -211,7 +224,7 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let q_net = env.q_net.filter(|q| q.is_finite());
     let net_on = env.pcnn_active && q_net.is_some();
     let q_use = if net_on { q_net.unwrap_or(0.0) } else { 0.0 };
-    let unusable = par.unusable || (if env.night { par.p.ts_night } else { par.p.ts }) < target + PEAK_MARGIN;
+    let unusable = par.unusable || (if env.night { par.p.ts_night } else { par.p.ts }).min(reach(par, lam_c, env, cn, cs)) < target + PEAK_MARGIN;
     let evaluate = |name: &str, kind: &'static str, sp: Vec<f64>, first: f64, boost_min: Option<usize>, probe_min: Option<usize>| -> Cand {
         let run = |mi: usize, si: usize| rollout(par, m, a, modes[mi].1, supplies[si].0, &sp, env, cn, cs, q_use);
         let runs = [[run(0, 0), run(0, 1)], [run(1, 0), run(1, 1)]];
@@ -265,6 +278,7 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let sigma_obs = (env.r_grid + par.noise_r.powi(2)).sqrt();
     let back = if cands[best].kind == "boost" { target } else { cands[best].first };
     let full = |c: &Cand| c.total - c.raise;
+    let uncertainty = pw.min(1.0 - pw);
     let memo = env.probe.clone();
     let mut running = memo.as_ref().is_some_and(|mm| !mm.ended && now < mm.start + mm.d as i64);
     let (mut event, mut probed, mut new_memo): (Option<&'static str>, usize, Option<ProbeMemo>) = (None, 0, memo.clone());
@@ -273,7 +287,8 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
             let spent = (now - mm.start) as usize;
             (event, probed, new_memo, running) = (Some("abort"), spent, Some(ProbeMemo { d: spent, ended: true, ..mm.clone() }), false);
         } else if !running {
-            (event, probed, new_memo) = (Some("end"), mm.d, Some(ProbeMemo { ended: true, ..mm.clone() }));
+            let strikes = if uncertainty >= mm.unc { mm.strikes + 1 } else { 0 };
+            (event, probed, new_memo) = (Some("end"), mm.d, Some(ProbeMemo { ended: true, strikes, block_until: mm.start + mm.base * (1 + strikes), ..mm.clone() }));
         }
     }
     let mut probe: Option<Cand> = None;
@@ -295,7 +310,9 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
             let evoi = rho * gain - (full(&pr) - full(&cands[best])).max(0.0);
             if evoi > evoi_best.max(env.raise_cost) + 1e-12 {
                 evoi_best = evoi;
-                new_memo = Some(ProbeMemo { start: now, d, block_until: now + 2 * d as i64 + separation_minutes(&pr, sigma_obs) as i64, target, present: env.present, ended: false });
+                let base = 2 * d as i64 + separation_minutes(&pr, sigma_obs) as i64;
+                let strikes = new_memo.as_ref().map_or(0, |mm| mm.strikes);
+                new_memo = Some(ProbeMemo { start: now, d, base, block_until: now + base * (1 + strikes), target, present: env.present, ended: false, unc: uncertainty, strikes });
                 event = Some("start");
                 probe = Some(pr);
             }

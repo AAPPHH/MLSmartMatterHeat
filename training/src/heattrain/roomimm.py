@@ -350,21 +350,25 @@ class House:
         return outs
 
 
-def recovery_rate(par, m, a, lam, s, env):
-    h = 1.0 / 60.0
-    start = par.sensor(m, a)
-    for _ in range(FORECAST_MIN):
-        f11, f12, f21, f22, g1, g2, _ = par.terms(lam, s, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], h)
-        m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2
-    return (par.sensor(m, a) - start) / FORECAST_MIN
-
-
 def terminal_cold(par, m, a, lam, env):
-    deficit = max(0.0, env["target"] - par.sensor(m, a))
-    if deficit <= 0.0 or env["present"] <= 0.0:
+    if env["present"] <= 0.0 or env["target"] - par.sensor(m, a) <= 0.0:
         return 0.0
-    rate = recovery_rate(par, m, a, lam, 1.0, env)
-    return 0.5 * deficit * min(deficit / rate if rate > 1e-12 else COAST_CAP, COAST_CAP) * env["present"]
+    f11, f12, f21, f22, g1, g2, _ = par.terms(lam, 1.0, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], 1.0 / 60.0)
+    total = 0.0
+    for _ in range(COAST_CAP):
+        deficit = env["target"] - par.sensor(m, a)
+        if deficit <= 0.0:
+            break
+        total += deficit
+        m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2
+    return total * env["present"]
+
+
+def reach(par, lam, env):
+    f11, f12, f21, f22, g1, g2, _ = par.terms(lam, 1.0, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], 1.0 / 60.0)
+    p, q, r, t = 1.0 - f11, -f12, -f21, 1.0 - f22
+    det = p * t - q * r
+    return par.sensor((t * g1 - q * g2) / det, (p * g2 - r * g1) / det)
 
 
 def valve_demand(par, env, sens0, setpoint, sens):
@@ -481,14 +485,16 @@ def plan(par, shock, comps, p_supply, env):
     sigma_obs = math.sqrt(env["r_grid"] + par.noise_r ** 2)
     back = target if best["kind"] == "boost" else best["first"]
     full = lambda c: c["total"] - c["raise"]
-    unusable = par.unusable or (par.ts_night if env["night"] else par.ts) < target + PEAK_MARGIN
+    unusable = par.unusable or min(par.ts_night if env["night"] else par.ts, reach(par, lam_c, env)) < target + PEAK_MARGIN
+    uncertainty = min(pw, 1.0 - pw)
     running = memo is not None and not memo["ended"] and now < memo["start"] + memo["d"]
     event, probed, new_memo = None, 0, memo
     if memo is not None and not memo["ended"]:
         if running and (abs(memo["target"] - target) > EPS or abs(memo["present"] - env["present"]) > EPS or gain <= env["raise_cost"] or unusable):
             event, probed, new_memo, running = "abort", now - memo["start"], dict(memo, d=now - memo["start"], ended=True), False
         elif not running:
-            event, probed, new_memo = "end", memo["d"], dict(memo, ended=True)
+            strikes = memo["strikes"] + 1 if uncertainty >= memo["unc"] else 0
+            event, probed, new_memo = "end", memo["d"], dict(memo, ended=True, strikes=strikes, block_until=memo["start"] + memo["base"] * (1 + strikes))
     chosen, evoi_best = best, 0.0
     if running:
         left = memo["start"] + memo["d"] - now
@@ -503,7 +509,9 @@ def plan(par, shock, comps, p_supply, env):
             evoi = rho * gain - max(0.0, full(pr) - full(best))
             if evoi > max(evoi_best, env["raise_cost"]) + 1e-12:
                 chosen, evoi_best = pr, evoi
-                new_memo = {"start": now, "d": d, "block_until": now + 2 * d + separation_minutes(pr, sigma_obs), "target": target, "present": env["present"], "ended": False}
+                base = 2 * d + separation_minutes(pr, sigma_obs)
+                strikes = new_memo["strikes"] if new_memo is not None else 0
+                new_memo = {"start": now, "d": d, "base": base, "block_until": now + base * (1 + strikes), "target": target, "present": env["present"], "ended": False, "unc": uncertainty, "strikes": strikes}
                 event = "start"
     y_last = env.get("y_last")
     anchor = y_last - sensor0 if y_last is not None and math.isfinite(y_last) else 0.0

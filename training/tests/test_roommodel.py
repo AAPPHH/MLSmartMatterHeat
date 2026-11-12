@@ -413,6 +413,33 @@ def test_terminal_cost_keeps_an_occupied_cold_room_off_frost_and_an_empty_one_on
     assert math.isfinite(no_heat["total"]) and math.isfinite(no_heat["cold"])
 
 
+def test_terminal_cost_never_falls_when_the_room_is_colder_even_if_full_valve_cannot_reach_the_target():
+    from heattrain.roomimm import reach, terminal_cold
+    par = RoomPar(room_doc(False, 0.3, w=0.3, b1=2.0, a1=0.3, ts=23.0, ts_night=23.0, tau_v=3.0, b2=0.6))
+    env = dict(plan_env(now_min=0, tout=-5.0), cn=0.0, cs=0.0)
+    assert reach(par, 1.0, env) < 21.0
+    costs = [terminal_cold(par, x + 0.5, x, 1.0, env) for x in (20.4, 19.0, 17.0, 12.0, 7.0)]
+    assert all(b > a for a, b in zip(costs, costs[1:]))
+    comps = comps_at(20.4, 20.3, 1.0)
+    assert plan(par, SHOCK, comps, 1.0, plan_env(now_min=0, tout=-5.0))["kind"] != "frost"
+
+
+def test_fit_is_unusable_when_full_valve_cannot_reach_the_target_even_with_a_hot_supply():
+    from heattrain.roomimm import reach
+    par = RoomPar(room_doc(False, 0.3, w=0.3, b1=2.0, a1=0.3, ts=23.0, ts_night=23.0, tau_v=3.0, b2=0.6))
+    assert reach(par, 1.0, dict(plan_env(now_min=0, tout=-5.0), cn=0.0, cs=0.0)) < 21.5
+    p = plan(par, SHOCK, comps_at(20.4, 20.3, 1.0), 1.0, plan_env(now_min=0, tout=-5.0))
+    assert p["kind"] == "fit_unusable" and not p["raise"] and p["probe_min"] is None
+
+
+def test_an_unresolved_probe_blocks_longer_each_time():
+    par, half = probe_par(), half_comps()
+    seq = probe_script(par, [(t, half, {}) for t in range(0, 1200, 5)])
+    starts = [i * 5 for i, p in enumerate(seq) if p["probe_event"] == "start"]
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert len(gaps) >= 2 and all(y > x for x, y in zip(gaps, gaps[1:]))
+
+
 def test_fit_is_unusable_when_the_supply_temperature_cannot_reach_the_target():
     par = RoomPar(room_doc(False, 0.3, w=0.3, b1=2.0, a1=3.0, ts=21.2, ts_night=21.2))
     p = plan(par, SHOCK, comps_at(17.0, 16.0, 1.0), 1.0, plan_env(now_min=0))
