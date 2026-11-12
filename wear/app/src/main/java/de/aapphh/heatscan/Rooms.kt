@@ -150,3 +150,62 @@ object BoostText {
 
     fun plain(reason: String): String = RULES.firstOrNull { reason.contains(it.first) }?.second ?: FALLBACK
 }
+
+
+data class MessfahrtState(val state: String, val doors: String?, val phase: String?, val plannedEnd: Long?, val reason: String?) {
+    val active: Boolean get() = state == Messfahrt.ARMED || state == Messfahrt.RUNNING
+
+    fun json(): String = JSONObject().put("state", state).put("doors", doors ?: JSONObject.NULL).put("phase_label", phase ?: JSONObject.NULL).put("planned_end_ms", plannedEnd ?: JSONObject.NULL).put("reason", reason ?: JSONObject.NULL).toString()
+}
+
+object Messfahrt {
+    const val PATH = "/api/experiment"
+    const val ARMED = "armed"
+    const val RUNNING = "running"
+    const val CLOSED = "Türen zu"
+    const val OPEN = "Türen offen"
+    const val START = "Starten"
+    const val CANCEL = "Abbrechen"
+    const val HEADER = "Messfahrt"
+    val IDLE = MessfahrtState("idle", null, null, null, null)
+
+    fun doorsLabel(doors: String): String = if (doors == "open") OPEN else CLOSED
+
+    fun body(doors: String): String = JSONObject().put("doors", doors).put("source", "watch").toString()
+
+    fun cancelBody(): String = JSONObject().put("cancel", true).toString()
+
+    fun question(doors: String): String = "Messfahrt mit ${doorsLabel(doors)} vorbereiten? Sie startet erst, wenn du weg bist."
+
+    private fun str(o: JSONObject, k: String): String? = if (o.isNull(k)) null else o.optString(k).takeIf { it.isNotEmpty() }
+
+    private fun fromObject(o: JSONObject): MessfahrtState = MessfahrtState(o.optString("state", "idle"), str(o, "doors"), str(o, "phase_label"), if (o.isNull("planned_end_ms")) null else o.optLong("planned_end_ms"), str(o, "reason"))
+
+    fun fromJson(text: String?): MessfahrtState = try { fromObject(JSONObject(text ?: "")) } catch (e: Exception) { IDLE }
+
+    fun parse(text: String): MessfahrtState? = try { fromObject(JSONObject(text).getJSONObject("experiment")) } catch (e: Exception) { null }
+
+    fun status(s: MessfahrtState): String = when (s.state) {
+        ARMED -> "bereit – startet, wenn du weg bist"
+        RUNNING -> "läuft: ${s.phase ?: "Takte"}" + (s.plannedEnd?.let { ", bis " + RoomView.clock(it) } ?: "")
+        "done" -> "fertig"
+        "aborted" -> when (s.reason) {
+            "homecoming" -> "beendet: du bist zurück"
+            "cancel" -> "abgebrochen"
+            "expired" -> "abgelaufen: du warst nicht weg"
+            else -> "beendet"
+        }
+        else -> "keine Messfahrt geplant"
+    }
+
+    fun result(code: Int, text: String): BoostResult = try {
+        val o = JSONObject(text)
+        val state = o.optJSONObject("experiment")?.let { fromObject(it) } ?: IDLE
+        when {
+            code in 200..299 && o.optBoolean("ok") -> BoostResult(true, status(state))
+            code == 409 -> BoostResult(false, "Läuft schon – erst abbrechen")
+            code == 400 -> BoostResult(false, "Dieser Wert ist nicht erlaubt")
+            else -> BoostResult(false, "Gerade nicht möglich")
+        }
+    } catch (e: Exception) { BoostResult(false, if (code <= 0) "Server nicht erreichbar" else "Antwort unlesbar ($code)") }
+}

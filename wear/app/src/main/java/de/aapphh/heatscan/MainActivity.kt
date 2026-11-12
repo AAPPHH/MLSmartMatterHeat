@@ -208,7 +208,7 @@ class MainActivity : ComponentActivity() {
             }
             composable(Routes.DETAIL) { DetailRoute(store, detail, boostFirst, report, ui) }
             composable(Routes.ALERTS) { AlertsRoute(store) { nav.navigate(Routes.ASK) } }
-            composable(Routes.TECH) { TechRoute(store) { nav.navigate(Routes.DATA) } }
+            composable(Routes.TECH) { TechRoute(store, ui) { nav.navigate(Routes.DATA) } }
             composable(Routes.DATA) { DataRoute(store) }
             composable(Routes.ASK) { AskRoute(store, show, leave, ui) }
             composable(Routes.SAVED) {
@@ -268,8 +268,12 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun TechRoute(store: Store, onData: () -> Unit) {
+    private fun TechRoute(store: Store, ui: (() -> Unit) -> Unit, onData: () -> Unit) {
         val version = storeVersion(store)
+        var confirm by remember { mutableStateOf<String?>(null) }
+        var busy by remember { mutableStateOf(false) }
+        var line by remember { mutableStateOf<BoostResult?>(null) }
+        LaunchedEffect(Unit) { Remote.refresh(this@MainActivity, true) }
         var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
         val holdUntil = version.let { store.wifiHoldUntil }
         val holdOn = WifiHold.active(holdUntil, now)
@@ -284,7 +288,16 @@ class MainActivity : ComponentActivity() {
             Learn.chip(learning, store.progress), learning, WifiHold.chip(holdUntil, now), holdOn,
             Footer.line(store.postHm, store.postOk, ScanQueue.get(this).size, store.paused, Footer.fresh(store.lastFreshAt), store.rejected)
         )
-        TechScreen(state, onData, { ScanService.instance?.setLearning(!learning) }, { ScanService.instance?.toggleWifiHold() })
+        val sent = { r: BoostResult -> ui { line = r; busy = false; Remote.refresh(this, true) } }
+        confirm?.let { doors ->
+            return MessfahrtConfirmScreen(doors, { confirm = null; busy = true; line = null; Remote.experiment(this, Messfahrt.body(doors), sent) }) { confirm = null }
+        }
+        val mess = version.let { store.messfahrt }
+        TechScreen(TechState(state.learnChip, state.learning, state.holdChip, state.holdOn, state.footer, MessfahrtUi(Messfahrt.status(mess), mess.doors, mess.active, busy, line)), onData, { ScanService.instance?.setLearning(!learning) }, { ScanService.instance?.toggleWifiHold() }, { confirm = it }) {
+            busy = true
+            line = null
+            Remote.experiment(this, Messfahrt.cancelBody(), sent)
+        }
     }
 
     @Composable

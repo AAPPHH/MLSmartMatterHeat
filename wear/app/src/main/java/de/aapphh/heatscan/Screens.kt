@@ -236,6 +236,17 @@ internal fun BoostConfirmScreen(room: String, onStart: () -> Unit, onCancel: () 
 }
 
 @Composable
+internal fun MessfahrtConfirmScreen(doors: String, onStart: () -> Unit, onCancel: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    val type = MaterialTheme.typography
+    ListScreen(edge = EdgeAction(Messfahrt.START, onStart)) { spec ->
+        header(spec, Messfahrt.HEADER, Messfahrt.doorsLabel(doors))
+        note(spec, Messfahrt.question(doors), colors.onSurface, type.bodyMedium)
+        action(spec, Messfahrt.CANCEL, onClick = onCancel)
+    }
+}
+
+@Composable
 internal fun AlertsScreen(alerts: List<Alert>, ask: WindowAsk?, onAsk: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val type = MaterialTheme.typography
@@ -251,10 +262,12 @@ internal fun AlertsScreen(alerts: List<Alert>, ask: WindowAsk?, onAsk: () -> Uni
     }
 }
 
-class TechState(val learnChip: String, val learning: Boolean, val holdChip: String, val holdOn: Boolean, val footer: String)
+class MessfahrtUi(val status: String = Messfahrt.status(Messfahrt.IDLE), val doors: String? = null, val active: Boolean = false, val busy: Boolean = false, val line: BoostResult? = null)
+
+class TechState(val learnChip: String, val learning: Boolean, val holdChip: String, val holdOn: Boolean, val footer: String, val mess: MessfahrtUi = MessfahrtUi())
 
 @Composable
-internal fun TechScreen(s: TechState, onData: () -> Unit, onLearn: () -> Unit, onHold: () -> Unit) {
+internal fun TechScreen(s: TechState, onData: () -> Unit, onLearn: () -> Unit, onHold: () -> Unit, onMess: (String) -> Unit = {}, onMessCancel: () -> Unit = {}) {
     val colors = MaterialTheme.colorScheme
     val type = MaterialTheme.typography
     ListScreen { spec ->
@@ -266,6 +279,12 @@ internal fun TechScreen(s: TechState, onData: () -> Unit, onLearn: () -> Unit, o
         item {
             SwitchButton(s.holdOn, { onHold() }, Modifier.fillMaxWidth().defaultMinSize(minHeight = TARGET).transformedHeight(this, spec), transformation = SurfaceTransformation(spec), secondaryLabel = { Text(s.holdChip, maxLines = LINES) }, label = { Text("WLAN halten: " + onOff(s.holdOn), maxLines = LINES) })
         }
+        header(spec, Messfahrt.HEADER, s.mess.doors?.takeIf { s.mess.active }?.let { Messfahrt.doorsLabel(it) })
+        note(spec, s.mess.status, colors.onSurface, type.bodySmall)
+        s.mess.line?.let { note(spec, it.line, if (it.ok) colors.primary else colors.error, type.bodySmall) }
+        action(spec, Messfahrt.CLOSED, tonal = false, enabled = !s.mess.busy) { onMess("closed") }
+        action(spec, Messfahrt.OPEN, tonal = false, enabled = !s.mess.busy) { onMess("open") }
+        if (s.mess.active) action(spec, Messfahrt.CANCEL, enabled = !s.mess.busy, onClick = onMessCancel)
         note(spec, s.footer, colors.onSurfaceVariant, type.bodyExtraSmall)
     }
 }

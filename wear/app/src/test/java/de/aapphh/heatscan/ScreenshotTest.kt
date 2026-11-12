@@ -143,6 +143,26 @@ class ScreenshotTest {
 
     @Test fun tech_small() = shot("tech_small") { TechScreen(tech, {}, {}, {}) }
 
+    private fun mess(state: MessfahrtState, busy: Boolean = false, line: BoostResult? = null) = TechState("Lernen", false, "WLAN 10 min", false, footer(), MessfahrtUi(Messfahrt.status(state), state.doors, state.active, busy, line))
+
+    private val messArmed = MessfahrtState("armed", "closed", null, null, null)
+
+    private val messRunning = MessfahrtState("running", "open", "Takte", until, null)
+
+    @Test fun tech_messfahrt_edge() = shot("tech_messfahrt_edge", swipe = 2) { TechScreen(mess(Messfahrt.IDLE), {}, {}, {}) }
+
+    @Test fun tech_messfahrt_armed() = shot("tech_messfahrt_armed", swipe = 2) { TechScreen(mess(messArmed), {}, {}, {}) }
+
+    @Test fun tech_messfahrt_running_font_1_3() = shot("tech_messfahrt_running_font_1_3", 1.3f, 3) { TechScreen(mess(messRunning), {}, {}, {}) }
+
+    @Test fun tech_messfahrt_done_result() = shot("tech_messfahrt_done_result", swipe = 2) { TechScreen(mess(MessfahrtState("done", "open", null, null, "completed"), false, BoostResult(true, Messfahrt.status(messArmed))), {}, {}, {}) }
+
+    @Test fun messfahrt_confirm_closed() = shot("messfahrt_confirm_closed") { MessfahrtConfirmScreen("closed", {}, {}) }
+
+    @Test fun messfahrt_confirm_open_font_1_3() = shot("messfahrt_confirm_open_font_1_3", 1.3f) { MessfahrtConfirmScreen("open", {}, {}) }
+
+    @Test @Config(qualifiers = "w204dp-h204dp-round-xhdpi") fun messfahrt_confirm_41mm() = shot("messfahrt_confirm_41mm") { MessfahrtConfirmScreen("closed", {}, {}) }
+
     @Test fun data_demo() = shot("data_demo") { demo() }
 
     @Test fun data_no_model() = shot("data_no_model") {

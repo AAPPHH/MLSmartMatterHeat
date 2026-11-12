@@ -1329,6 +1329,9 @@ class Store(private val ctx: Context) {
     var glance: Glance
         get() = Glance.fromJson(sp.getString("glance", null))
         set(v) = sp.edit().putString("glance", v.json()).apply()
+    var messfahrt: MessfahrtState
+        get() = Messfahrt.fromJson(sp.getString("messfahrt", null))
+        set(v) = sp.edit().putString("messfahrt", v.json()).apply()
     var lastPromptAlertAt: Long
         get() = sp.getLong("lastPromptAlertAt", 0L)
         set(v) = sp.edit().putLong("lastPromptAlertAt", v).apply()
