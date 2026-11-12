@@ -495,7 +495,7 @@ fn shadow_lake(root: &Path) {
     for minute in [100, 200, 300] {
         let actual = 20.0 + (minute + 20) as f64 / 1000.0;
         let base = 20.0 + minute as f64 / 1000.0;
-        sink.append(ShadowDecision { forecast_c: Some(actual + 0.2), sensor_c: base, resid_live_k: Some(if minute == 200 { -0.3 } else { 0.3 }), ..shadow_row(minute, "a", 0.0, 0.99) }).unwrap();
+        sink.append(ShadowDecision { forecast_c: Some(actual + 0.2), sensor_c: base, resid_live_k: Some(if minute == 200 { -0.3 } else { 0.3 }), forecast_phys_c: Some(actual + 0.2), forecast_pcnn_c: Some(actual - 0.1), pcnn_active: Some(minute != 200), ..shadow_row(minute, "a", 0.0, 0.99) }).unwrap();
     }
     sink.append(ShadowDecision { raise: true, coast_min: Some(100.0), stored_min: Some(10.0), storage: Some("a: Wände 21 °C, Luft 20 °C".into()), ..shadow_row(400, "a", 0.1, 0.99) }).unwrap();
     sink.append(ShadowDecision { kind: "probe".into(), probe_min: Some(20.0), coast_min: Some(50.0), stored_min: Some(-4.0), storage: Some("a: letzter Stand".into()), ..shadow_row(420, "a", 0.5, 0.99) }).unwrap();
@@ -527,6 +527,8 @@ fn shadow_section_reports_forecast_detection_supply_raises_and_resets() {
     let md = shadow_section(dir.path(), day()).unwrap();
     assert!(md.contains("## Raummodell Schatten"), "{md}");
     assert!(md.contains("| a | 3 | 0.20 (N < 10, unsicher) | 0.02 (N < 10, unsicher) | 0.30 (N < 10, unsicher) (3) |"), "forecast
+{md}");
+    assert!(md.contains("Neuronales Restglied") && md.contains("| a | 3 | 0.20 (N < 10, unsicher) | 0.10 (N < 10, unsicher) | 2 von 3 (N < 10, keine Prozentangabe) |"), "net comparison
 {md}");
     assert!(md.contains("erkannt 1 von 1 (N < 10, keine Prozentangabe), mittlere Latenz 5 min"), "ground truth
 {md}");

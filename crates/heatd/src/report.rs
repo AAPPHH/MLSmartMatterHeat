@@ -799,6 +799,29 @@ pub fn shadow_section(root: &Path, date: NaiveDate) -> Result<String> {
         let resid: Vec<f64> = live.iter().filter(|l| l.0 == *room).map(|l| l.1).collect();
         let _ = writeln!(md, "| {room} | {} | {} | {} | {} ({}) |", model.len(), rmse_cell(&model), rmse_cell(&persist), rmse_cell(&resid), resid.len());
     }
+    let pcnn = rows(
+        c,
+        &format!(
+            "SELECT s.room, s.forecast_phys_c - m.actual, s.forecast_pcnn_c - m.actual, coalesce(s.pcnn_active, false) FROM shadow_decisions s JOIN room_minute m ON m.room = s.room AND epoch_us(m.t) = (epoch_us(s.ts) // 60000000 + 20) * 60000000
+             WHERE s.forecast_phys_c IS NOT NULL AND s.forecast_pcnn_c IS NOT NULL AND m.actual IS NOT NULL AND m.gap_mask & 1 = 0 AND epoch_us(s.ts) >= {lo} AND epoch_us(s.ts) < {hi} ORDER BY s.room, s.ts"
+        ),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, bool>(3)?)),
+    )
+    .unwrap_or_default();
+    if !pcnn.is_empty() {
+        let _ = writeln!(md, "
+Neuronales Restglied (Schatten, siehe docs/room-model.md): gleiche Ursprungszeilen, reale 20-min-Fehler der Prognose nur aus der Physik gegen Physik plus Netz; aktiv = der Schatten rechnet mit dem Netz, sonst laeuft es nur mit; bei N < {SHADOW_MIN_N} sind die RMSE unsicher.
+
+| Raum | N | Physik RMSE K | Physik+Netz RMSE K | Netz aktiv (Zeilen) |
+|---|---|---|---|---|");
+        for room in &rooms {
+            let mine: Vec<&(String, f64, f64, bool)> = pcnn.iter().filter(|f| f.0 == *room).collect();
+            if !mine.is_empty() {
+                let (phys, net): (Vec<f64>, Vec<f64>) = mine.iter().map(|f| (f.1, f.2)).unzip();
+                let _ = writeln!(md, "| {room} | {} | {} | {} | {} |", mine.len(), rmse_cell(&phys), rmse_cell(&net), share(mine.iter().filter(|f| f.3).count(), mine.len()));
+            }
+        }
+    }
     let flagged = |room: &str, from: i64, to: i64| shadow.iter().filter(|s| s.room == room && s.p_window > 0.5 && (from..=to).contains(&s.us)).map(|s| s.us).min();
     let hit_us = SHADOW_HIT_MIN * 60_000_000;
     let gt = ground_truth(root, lo, hi);
