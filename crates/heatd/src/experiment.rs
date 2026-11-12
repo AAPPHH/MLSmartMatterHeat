@@ -19,11 +19,13 @@ pub const EXPIRY_MS: i64 = 24 * 3_600_000;
 pub const CAP_MARGIN_K: f64 = 2.0;
 pub const HOMECOMING_MARGIN_MIN: i64 = 30;
 pub const ACTIVITY_MS: i64 = 30 * 60_000;
-pub const AWAY_FRESH_MS: i64 = 3 * 3_600_000;
 const HOMECOMING_DAYS: i64 = 42;
 const HOMECOMING_MIN_DAYS: usize = 3;
+const MAIN_RETURN_FROM_MIN: u32 = 12 * 60;
+const DEPARTURE_FRESH_MS: i64 = 60 * 60_000;
 const HOMECOMING_REFRESH_MS: i64 = 6 * 3_600_000;
 const MIN_MS: i64 = 60_000;
+const REBUILD_EXTRA_MS: i64 = 20 * MIN_MS;
 const LOOKBACK_MS: i64 = 48 * 3_600_000;
 const STEP_MINUTES: u32 = 4;
 const LIFECYCLE: [&str; 4] = [kind::EXPERIMENT_ARMED, kind::EXPERIMENT_STARTED, kind::EXPERIMENT_STEP, kind::EXPERIMENT_ENDED];
@@ -296,7 +298,8 @@ pub struct Tick<'a> {
     pub cap_c: f64,
     pub rooms: &'a [RoomIn<'a>],
     pub activity: Option<&'static str>,
-    pub away_fresh: bool,
+    pub away_confirmed: bool,
+    pub history_ready: bool,
     pub homecoming_ms: Option<i64>,
 }
 
@@ -314,28 +317,35 @@ pub struct Call {
 
 #[derive(Debug, Default)]
 pub struct Homecoming {
-    days: Vec<(bool, Vec<u32>)>,
+    days: Vec<(bool, u32)>,
     loaded_ms: Option<i64>,
+}
+
+fn median(mut v: Vec<u32>) -> u32 {
+    v.sort_unstable();
+    let mid = v.len() / 2;
+    if v.len() % 2 == 1 { v[mid] } else { (v[mid - 1] + v[mid]) / 2 }
 }
 
 impl Homecoming {
     pub fn from_arrivals(local: &[NaiveDateTime]) -> Self {
-        let mut days: BTreeMap<NaiveDate, Vec<u32>> = BTreeMap::new();
+        let mut first: BTreeMap<NaiveDate, u32> = BTreeMap::new();
         for at in local {
-            days.entry(at.date()).or_default().push(at.hour() * 60 + at.minute());
+            let minute = at.hour() * 60 + at.minute();
+            if minute >= MAIN_RETURN_FROM_MIN {
+                let slot = first.entry(at.date()).or_insert(minute);
+                *slot = (*slot).min(minute);
+            }
         }
-        let days = days.into_iter().map(|(d, mut v)| (d.weekday().number_from_monday() > 5, { v.sort_unstable(); v })).collect();
-        Self { days, loaded_ms: None }
+        Self { days: first.into_iter().map(|(d, m)| (d.weekday().number_from_monday() > 5, m)).collect(), loaded_ms: None }
     }
 
-    pub fn next_after(&self, weekend: bool, minute: u32) -> Option<u32> {
-        let mut next: Vec<u32> = self.days.iter().filter(|(w, _)| *w == weekend).filter_map(|(_, v)| v.iter().copied().find(|m| *m > minute)).collect();
-        if next.len() < HOMECOMING_MIN_DAYS {
+    pub fn typical(&self, weekend: bool) -> Option<u32> {
+        if self.days.len() < HOMECOMING_MIN_DAYS {
             return None;
         }
-        next.sort_unstable();
-        let mid = next.len() / 2;
-        Some(if next.len() % 2 == 1 { next[mid] } else { (next[mid - 1] + next[mid]) / 2 })
+        let same: Vec<u32> = self.days.iter().filter(|(w, _)| *w == weekend).map(|(_, m)| *m).collect();
+        Some(median(if same.len() >= HOMECOMING_MIN_DAYS { same } else { self.days.iter().map(|(_, m)| *m).collect() }))
     }
 }
 
@@ -378,6 +388,10 @@ impl Messfahrt {
         self.run.as_ref().is_some_and(|r| matches!(r.status, Status::Armed | Status::Running))
     }
 
+    pub fn history_ready(&self) -> bool {
+        self.learned.loaded_ms.is_some()
+    }
+
     pub fn learn_due(&self, now_ms: i64) -> bool {
         self.active() && self.learned.loaded_ms.is_none_or(|t| now_ms - t >= HOMECOMING_REFRESH_MS)
     }
@@ -391,8 +405,8 @@ impl Messfahrt {
         let reference = self.started_ms().unwrap_or(now_ms);
         let local = now - chrono::Duration::milliseconds(now_ms - reference);
         let minute = local.hour() * 60 + local.minute();
-        let next = self.learned.next_after(local.weekday().number_from_monday() > 5, minute)?;
-        Some(reference + (i64::from(next) - i64::from(minute)) * MIN_MS)
+        let typical = self.learned.typical(local.weekday().number_from_monday() > 5)?;
+        Some(reference + (i64::from(typical) - i64::from(minute)) * MIN_MS)
     }
 
     pub fn view(&self, now_ms: i64) -> Value {
@@ -410,9 +424,9 @@ impl Messfahrt {
                 out.events.push(run.finish(Status::Aborted, "expired", t.now_ms));
                 return out;
             }
-            let departed = self.departed_ms.is_some_and(|d| d >= run.armed_ms);
-            let too_late = run.cutoff_ms().is_some_and(|c| t.now_ms + TOTAL_MIN * MIN_MS > c);
-            if t.here != Here::Away || t.night || t.activity.is_some() || !(t.away_fresh || departed) || too_late {
+            let departed = self.departed_ms.is_some_and(|d| d >= run.armed_ms || t.now_ms - d <= DEPARTURE_FRESH_MS);
+            let too_late = !t.history_ready || run.cutoff_ms().is_some_and(|c| t.now_ms + TOTAL_MIN * MIN_MS > c);
+            if t.here != Here::Away || t.night || t.activity.is_some() || !(t.away_confirmed && departed) || too_late {
                 return out;
             }
             let rooms: Vec<&str> = t.rooms.iter().map(|r| r.room).collect();
@@ -423,6 +437,10 @@ impl Messfahrt {
         }
         if t.here == Here::Home {
             out.events.push(run.finish(Status::Aborted, "homecoming", t.now_ms));
+            return out;
+        }
+        if !t.away_confirmed {
+            out.events.push(run.finish(Status::Aborted, "away_lost", t.now_ms));
             return out;
         }
         if let Some(source) = t.activity {
@@ -557,7 +575,27 @@ pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
     let summary = restored.view(now_ms)["state"].as_str().unwrap_or("idle").to_string();
     ended.into_iter().for_each(|e| log(state, e));
     state.commanded.lock().unwrap().messfahrt = restored;
+    rebuild_home_memory(state, now_ms)?;
     Ok(summary)
+}
+
+fn rebuild_home_memory(state: &AppState, now_ms: i64) -> Result<()> {
+    let from = now_ms - ACTIVITY_MS - REBUILD_EXTRA_MS;
+    let root = state.sink.root();
+    let readings: Vec<crate::lake::DeviceReading> = crate::restore::records(root, Table::DeviceReadings, from, now_ms, &["kind"], &["node", "endpoint", "cluster", "attribute", "value"], &[])?
+        .into_iter()
+        .filter_map(|r| {
+            let [Some(node), Some(endpoint), Some(cluster), Some(attribute)] = r.num[..4] else { return None };
+            Some(crate::lake::DeviceReading { ts: r.ts * 1000, node: node as u64, endpoint: endpoint as u16, cluster: cluster as u32, attribute: attribute as u32, kind: r.text[0].clone()?, value: r.num[4], ..Default::default() })
+        })
+        .collect();
+    let edges: Vec<(String, i64)> = crate::restore::records(root, Table::Labels, now_ms - ACTIVITY_MS, now_ms, &["source", "via"], &[], &[])?.into_iter().filter(|r| r.text[1].as_deref() == Some("plug")).filter_map(|r| Some((r.text[0].clone()?, r.ts))).collect();
+    state.devices.rebuild_home(&readings, &edges);
+    let manual = crate::restore::records(root, Table::Events, now_ms - ACTIVITY_MS, now_ms, &["kind"], &[], &[])?.into_iter().filter(|r| r.text[0].as_deref() == Some(kind::MANUAL_SETPOINT)).map(|r| r.ts);
+    let dialed = crate::restore::records(root, Table::Decisions, now_ms - ACTIVITY_MS, now_ms, &["rule"], &[], &[])?.into_iter().filter(|r| r.text[0].as_deref() == Some("manual")).map(|r| r.ts);
+    let mut commands = state.commanded.lock().unwrap();
+    manual.chain(dialed).for_each(|ts| commands.note_manual(ts));
+    Ok(())
 }
 
 fn log(state: &AppState, event: Event) {
@@ -571,10 +609,13 @@ fn rooms_with_nodes(state: &AppState) -> Vec<&Room> {
 }
 
 fn learn_homecoming(state: &AppState, now_ms: i64) {
-    let rows = crate::restore::records(state.sink.root(), Table::Events, now_ms - HOMECOMING_DAYS * 86_400_000, now_ms, &["kind"], &[], &[]).unwrap_or_else(|e| {
-        eprintln!("homecoming history: {e:#}");
-        Vec::new()
-    });
+    let rows = match crate::restore::records(state.sink.root(), Table::Events, now_ms - HOMECOMING_DAYS * 86_400_000, now_ms, &["kind"], &[], &[]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("homecoming history: {e:#}");
+            return;
+        }
+    };
     let arrivals: Vec<NaiveDateTime> = rows.iter().filter(|r| r.text[0].as_deref() == Some(kind::PRESENCE_ARRIVE)).filter_map(|r| Some(chrono::DateTime::from_timestamp_millis(r.ts)?.with_timezone(&chrono::Local).naive_local())).collect();
     state.commanded.lock().unwrap().messfahrt.learned(Homecoming::from_arrivals(&arrivals), now_ms);
 }
@@ -593,9 +634,9 @@ fn home_activity(state: &AppState, now_ms: i64) -> Option<&'static str> {
     }
 }
 
-fn away_fresh(state: &AppState, now_ms: i64) -> bool {
+fn away_confirmed(state: &AppState) -> bool {
     let tracker = state.tracker.lock().unwrap();
-    state.storage.device_statuses().unwrap_or_default().iter().any(|s| s.away && tracker.confirmed(&s.device) && now_ms - s.state_ts <= AWAY_FRESH_MS)
+    state.storage.device_statuses().unwrap_or_default().iter().any(|s| s.away && tracker.confirmed(&s.device))
 }
 
 pub(crate) fn tick(state: &AppState, now: NaiveDateTime, now_ms: i64, windows: &HashSet<String>, presence: Option<&Presence>) -> Out {
@@ -612,12 +653,12 @@ pub(crate) fn tick(state: &AppState, now: NaiveDateTime, now_ms: i64, windows: &
     };
     let no_supply = state.windows.lock().unwrap().no_supply_rooms();
     let date = now.format("%Y-%m-%d").to_string();
-    let (activity, away_fresh) = (home_activity(state, now_ms), away_fresh(state, now_ms));
+    let (activity, away_confirmed) = (home_activity(state, now_ms), away_confirmed(state));
     let mut out = {
         let mut commands = state.commanded.lock().unwrap();
         let inputs: Vec<RoomIn> = rooms.iter().zip(&temps).map(|(r, t)| RoomIn { room: &r.name, held: commands.holding(&r.nodes), window: windows.contains(&r.name), no_supply: no_supply.contains(&r.name), temp: *t }).collect();
-        let homecoming_ms = commands.messfahrt.homecoming_ms(now, now_ms);
-        let tick = Tick { now_ms, date: &date, here: Here::of(state, presence), night: in_sleep_hours(&state.config, now), cap_c: state.config.occupied_setpoint + CAP_MARGIN_K, rooms: &inputs, activity, away_fresh, homecoming_ms };
+        let (homecoming_ms, history_ready) = (commands.messfahrt.homecoming_ms(now, now_ms), commands.messfahrt.history_ready());
+        let tick = Tick { now_ms, date: &date, here: Here::of(state, presence), night: in_sleep_hours(&state.config, now), cap_c: state.config.occupied_setpoint + CAP_MARGIN_K, rooms: &inputs, activity, away_confirmed, history_ready, homecoming_ms };
         commands.messfahrt.tick(&tick)
     };
     std::mem::take(&mut out.events).into_iter().for_each(|e| log(state, e));

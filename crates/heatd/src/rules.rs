@@ -299,6 +299,10 @@ impl Commands {
         nodes.iter().any(|n| self.holds.get(n).is_some_and(|h| !h.explicit()))
     }
 
+    pub fn note_manual(&mut self, ts_ms: i64) {
+        self.last_manual_ms = self.last_manual_ms.max(Some(ts_ms));
+    }
+
     pub fn last_manual_ms(&self) -> Option<i64> {
         self.last_manual_ms
     }

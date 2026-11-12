@@ -14,12 +14,13 @@ fn rooms<'a>(names: &[&'a str], held: &[&str], window: &[&str], temp: Option<f64
 }
 
 fn tick(m: &mut Messfahrt, now_ms: i64, here: Here, night: bool, list: &[RoomIn]) -> crate::experiment::Out {
-    m.tick(&Tick { now_ms, date: DATE, here, night, cap_c: 23.0, rooms: list, activity: None, away_fresh: true, homecoming_ms: None })
+    m.tick(&Tick { now_ms, date: DATE, here, night, cap_c: 23.0, rooms: list, activity: None, away_confirmed: true, history_ready: true, homecoming_ms: None })
 }
 
 fn running(names: &[&str]) -> (Messfahrt, i64) {
     let mut m = Messfahrt::default();
     m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(500);
     tick(&mut m, 1_000, Here::Away, false, &rooms(names, &[], &[], Some(19.0)));
     (m, 1_000)
 }
@@ -54,6 +55,7 @@ fn arm_replaces_an_armed_run_refuses_a_running_one_and_cancel_ends_it() {
     assert!(m.cancel(0).is_none());
     m.arm(Doors::Closed, "chat", 5).unwrap();
     m.arm(Doors::Open, "watch", 6).unwrap();
+    m.note_departure(7);
     let view = m.view(6);
     assert_eq!((view["state"].as_str(), view["doors"].as_str(), view["source"].as_str()), (Some("armed"), Some("open"), Some("watch")));
     assert_eq!(view["expires_ms"].as_i64(), Some(6 + 24 * 60 * MIN));
@@ -82,6 +84,7 @@ fn an_armed_run_expires_after_24_hours_without_absence() {
 fn it_starts_only_when_away_and_not_at_night() {
     let mut m = Messfahrt::default();
     m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
     let list = rooms(&["a", "b"], &[], &[], Some(19.0));
     for (here, night) in [(Here::Home, false), (Here::Unknown, false), (Here::Away, true)] {
         let out = tick(&mut m, MIN, here, night, &list);
@@ -155,6 +158,7 @@ fn as_rows(events: &[crate::lake::Event]) -> Vec<(i64, String, Value)> {
 fn events_restore_a_run_and_end_stale_ones() {
     let mut m = Messfahrt::default();
     let mut events = vec![m.arm(Doors::Closed, "chat", 0).unwrap()];
+    m.note_departure(0);
     let list = rooms(&["a", "b"], &["b"], &[], Some(19.0));
     let (t0, at) = (MIN, (COOLDOWN_MIN + 2) * MIN);
     for t in [t0, at, at + 10 * MIN] {
@@ -315,9 +319,10 @@ fn the_report_lists_runs_with_planned_and_executed_steps_per_room() {
     let (b, t0) = (base / 1000, base / 1000 + 500 * MIN);
     let mut m = Messfahrt::default();
     let mut events = vec![m.arm(Doors::Open, "chat", b + 480 * MIN).unwrap()];
+    m.note_departure(b + 490 * MIN);
     for k in 0..40 {
         let list = [RoomIn { room: "wohnzimmer", held: false, window: false, no_supply: false, temp: Some(17.0 + k as f64 * 0.1) }];
-        events.extend(m.tick(&Tick { now_ms: t0 + k * 5 * MIN, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_fresh: true, homecoming_ms: None }).events);
+        events.extend(m.tick(&Tick { now_ms: t0 + k * 5 * MIN, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: true, history_ready: true, homecoming_ms: None }).events);
     }
     events.extend(m.cancel(t0 + 200 * MIN));
     for e in events {
@@ -356,6 +361,23 @@ async fn a_watch_back_in_saver_mode_ends_the_run_as_homecoming() {
 }
 
 #[tokio::test]
+async fn a_silent_watch_while_away_keeps_the_run_going_and_an_arrival_ends_it_as_away_lost_or_homecoming() {
+    let mut e = env();
+    arm(&e, "closed").await;
+    away_scan(&e).await;
+    e.step(1).await;
+    assert_eq!(state_of_view(&e).await, "running");
+    e.step(90).await;
+    assert_eq!(state_of_view(&e).await, "running");
+    assert!(e.state.tracker.lock().unwrap().confirmed("pixel-watch"));
+    call(&e.state, "POST", "/api/scan", Some(json!({"ts": e.t + 90 * MIN, "device": "pixel-watch", "motion": "still", "away": false}))).await;
+    assert!(!e.state.tracker.lock().unwrap().confirmed("pixel-watch"));
+    e.step(92).await;
+    let reason = call(&e.state, "GET", "/api/experiment", None).await.1["reason"].as_str().map(String::from);
+    assert!(matches!(reason.as_deref(), Some("away_lost" | "homecoming")), "{reason:?}");
+}
+
+#[tokio::test]
 async fn an_arming_event_from_the_middle_day_of_the_lookback_is_restored() {
     let e = env();
     let armed_ms = "2026-11-09".parse::<NaiveDate>().unwrap().and_hms_opt(2, 0, 0).unwrap().and_utc().timestamp_millis();
@@ -367,15 +389,16 @@ async fn an_arming_event_from_the_middle_day_of_the_lookback_is_restored() {
     assert_eq!(e.state.commanded.lock().unwrap().messfahrt.view(now)["doors"], "open");
 }
 
-fn tick_with(m: &mut Messfahrt, now_ms: i64, here: Here, activity: Option<&'static str>, away_fresh: bool, homecoming_ms: Option<i64>) -> crate::experiment::Out {
+fn tick_with(m: &mut Messfahrt, now_ms: i64, here: Here, activity: Option<&'static str>, away: bool, homecoming_ms: Option<i64>) -> crate::experiment::Out {
     let list = rooms(&["a"], &[], &[], Some(19.0));
-    m.tick(&Tick { now_ms, date: DATE, here, night: false, cap_c: 23.0, rooms: &list, activity, away_fresh, homecoming_ms })
+    m.tick(&Tick { now_ms, date: DATE, here, night: false, cap_c: 23.0, rooms: &list, activity, away_confirmed: away, history_ready: true, homecoming_ms })
 }
 
 #[test]
 fn recent_home_activity_blocks_the_start_and_ends_a_running_run() {
     let mut m = Messfahrt::default();
     m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
     for source in ["coffee_plug", "toothbrush", "manual_setpoint", "watch_scan"] {
         let out = tick_with(&mut m, MIN, Here::Away, Some(source), true, None);
         assert!(out.events.is_empty() && state_of(&m, MIN) == "armed", "{source}");
@@ -392,19 +415,28 @@ fn recent_home_activity_blocks_the_start_and_ends_a_running_run() {
 }
 
 #[test]
-fn a_start_needs_a_fresh_positive_away_signal_not_just_stale_contact() {
+fn a_start_needs_a_confirmed_absence_and_a_departure_after_arming_or_within_an_hour() {
     let mut m = Messfahrt::default();
-    m.arm(Doors::Closed, "chat", 10 * MIN).unwrap();
-    m.note_departure(5 * MIN);
-    tick_with(&mut m, 11 * MIN, Here::Away, None, false, None);
-    assert_eq!(state_of(&m, 11 * MIN), "armed", "a departure from before the arming does not count");
-    m.note_departure(12 * MIN);
-    tick_with(&mut m, 13 * MIN, Here::Away, None, false, None);
-    assert_eq!(state_of(&m, 13 * MIN), "running");
+    m.arm(Doors::Closed, "chat", 200 * MIN).unwrap();
+    m.note_departure(100 * MIN);
+    tick_with(&mut m, 201 * MIN, Here::Away, None, true, None);
+    assert_eq!(state_of(&m, 201 * MIN), "armed", "a departure from before the arming and older than an hour does not count");
+    m.note_departure(202 * MIN);
+    tick_with(&mut m, 203 * MIN, Here::Away, None, true, None);
+    assert_eq!(state_of(&m, 203 * MIN), "running");
     let mut n = Messfahrt::default();
-    n.arm(Doors::Open, "chat", 0).unwrap();
-    tick_with(&mut n, MIN, Here::Away, None, true, None);
-    assert_eq!(state_of(&n, MIN), "running");
+    n.arm(Doors::Open, "chat", 100 * MIN).unwrap();
+    n.note_departure(50 * MIN);
+    tick_with(&mut n, 105 * MIN, Here::Away, None, true, None);
+    assert_eq!(state_of(&n, 105 * MIN), "running", "a departure within the last 60 minutes counts");
+    let mut o = Messfahrt::default();
+    o.arm(Doors::Open, "chat", 100 * MIN).unwrap();
+    o.note_departure(30 * MIN);
+    tick_with(&mut o, 105 * MIN, Here::Away, None, true, None);
+    assert_eq!(state_of(&o, 105 * MIN), "armed", "a departure older than 60 minutes does not");
+    o.note_departure(106 * MIN);
+    tick_with(&mut o, 107 * MIN, Here::Away, None, false, None);
+    assert_eq!(state_of(&o, 107 * MIN), "armed", "no confirmed absence, no start");
 }
 
 #[test]
@@ -412,6 +444,7 @@ fn a_run_must_finish_thirty_minutes_before_the_usual_homecoming_and_ends_there()
     let total = TOTAL_MIN * MIN;
     let mut m = Messfahrt::default();
     m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
     let late_start = 2 * MIN;
     let too_soon = late_start + total + 29 * MIN;
     let out = tick_with(&mut m, late_start, Here::Away, None, true, Some(too_soon));
@@ -434,7 +467,7 @@ fn a_run_must_finish_thirty_minutes_before_the_usual_homecoming_and_ends_there()
 fn a_run_ends_when_the_sleep_window_begins() {
     let (mut m, _) = running(&["a"]);
     let list = rooms(&["a"], &[], &[], Some(19.0));
-    let out = m.tick(&Tick { now_ms: 20 * MIN, date: DATE, here: Here::Away, night: true, cap_c: 23.0, rooms: &list, activity: None, away_fresh: true, homecoming_ms: None });
+    let out = m.tick(&Tick { now_ms: 20 * MIN, date: DATE, here: Here::Away, night: true, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: true, history_ready: true, homecoming_ms: None });
     assert!(out.calls.is_empty());
     assert_eq!((m.view(0)["state"].as_str(), m.view(0)["reason"].as_str()), (Some("aborted"), Some("night")));
 }
@@ -446,7 +479,7 @@ fn a_known_boiler_no_supply_turns_on_pulses_off_and_logs_it_once_per_step() {
     let at = t0 + on.from_min * MIN;
     let starved = |m: &mut Messfahrt, now: i64, no_supply: bool| {
         let list = [RoomIn { room: "a", held: false, window: false, no_supply, temp: Some(19.0) }];
-        m.tick(&Tick { now_ms: now, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_fresh: true, homecoming_ms: None })
+        m.tick(&Tick { now_ms: now, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: true, history_ready: true, homecoming_ms: None })
     };
     let first = starved(&mut m, at, true);
     assert!(!first.calls["a"].on);
@@ -457,27 +490,97 @@ fn a_known_boiler_no_supply_turns_on_pulses_off_and_logs_it_once_per_step() {
     assert!(starved(&mut m, at + 2 * MIN, false).calls["a"].on);
 }
 
+fn at(day: u32, h: u32, m: u32) -> chrono::NaiveDateTime {
+    NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap()
+}
+
+fn usual(m: &mut Messfahrt, minute: u32) {
+    let evening = |h: u32, mi: u32| [at(2, h, mi), at(3, h, mi), at(4, h, mi)];
+    m.learned(Homecoming::from_arrivals(&evening(minute / 60, minute % 60)), 0);
+}
+
 #[test]
-fn the_usual_homecoming_is_the_median_of_the_next_arrival_per_day_type_with_three_samples() {
-    let at = |day: u32, h: u32, m: u32| NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap();
-    let learned = Homecoming::from_arrivals(&[at(2, 17, 30), at(3, 18, 0), at(4, 18, 30), at(5, 12, 0), at(5, 19, 0), at(7, 15, 0), at(8, 16, 0)]);
-    assert_eq!(learned.next_after(false, 10 * 60), Some(17 * 60 + 45));
-    assert_eq!(learned.next_after(false, 13 * 60), Some(18 * 60 + 15));
-    assert_eq!(learned.next_after(false, 20 * 60), None);
-    assert_eq!(learned.next_after(true, 10 * 60), None, "two weekend days are not enough");
-    let more = Homecoming::from_arrivals(&[at(7, 15, 0), at(8, 16, 0), at(14, 17, 0)]);
-    assert_eq!(more.next_after(true, 10 * 60), Some(16 * 60));
+fn the_usual_homecoming_is_the_median_of_each_days_first_afternoon_arrival_per_day_type() {
+    let learned = Homecoming::from_arrivals(&[at(2, 17, 30), at(2, 19, 0), at(3, 18, 0), at(4, 18, 30), at(4, 8, 0), at(5, 19, 0), at(7, 15, 0), at(8, 16, 0)]);
+    assert_eq!(learned.typical(false), Some(18 * 60 + 15), "the morning arrival and the second arrival of a day do not count");
+    assert_eq!(learned.typical(true), Some(17 * 60 + 45), "two weekend days fall back to all days");
+    let more = Homecoming::from_arrivals(&[at(7, 15, 0), at(8, 16, 0), at(14, 17, 0), at(2, 20, 0), at(3, 20, 0), at(4, 20, 0)]);
+    assert_eq!(more.typical(true), Some(16 * 60));
+    assert_eq!(more.typical(false), Some(20 * 60));
+    assert_eq!(Homecoming::from_arrivals(&[at(2, 17, 0), at(3, 17, 0)]).typical(false), None, "fewer than three days at all: no constraint");
+    assert_eq!(Homecoming::from_arrivals(&[]).typical(true), None);
+}
+
+fn home_tick(m: &mut Messfahrt, local: chrono::NaiveDateTime, now_ms: i64) -> crate::experiment::Out {
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    let homecoming_ms = m.homecoming_ms(local, now_ms);
+    m.tick(&Tick { now_ms, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: true, history_ready: true, homecoming_ms })
+}
+
+#[test]
+fn a_start_after_the_typical_homecoming_has_passed_is_blocked() {
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
+    usual(&mut m, 17 * 60 + 30);
+    let now = 1_000_000;
+    let out = home_tick(&mut m, at(9, 17, 50), now);
+    assert!(out.events.is_empty() && state_of(&m, now) == "armed");
+    assert_eq!(m.view(now)["homecoming_ms"].as_i64(), Some(now - 20 * MIN));
+}
+
+#[test]
+fn a_start_well_before_the_typical_homecoming_runs_until_thirty_minutes_before_it() {
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
+    usual(&mut m, 17 * 60 + 30);
+    let now = 1_000_000;
+    home_tick(&mut m, at(9, 13, 0), now);
+    let view = m.view(now);
+    assert_eq!((view["state"].as_str(), view["planned_end_ms"].as_i64()), (Some("running"), Some(now + TOTAL_MIN * MIN)));
+    assert_eq!(view["homecoming_ms"].as_i64(), Some(now + 270 * MIN));
+    assert_eq!(m.view(now)["homecoming_ms"].as_i64().map(|h| h - 30 * MIN), Some(now + 240 * MIN), "the cutoff 17:00 lies after the nominal end 16:45");
+}
+
+#[test]
+fn too_few_samples_leave_the_start_unconstrained_and_an_unread_history_blocks_it() {
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
+    m.learned(Homecoming::from_arrivals(&[at(2, 17, 0), at(3, 17, 0)]), 0);
+    home_tick(&mut m, at(9, 17, 50), 1_000_000);
+    assert_eq!(state_of(&m, 1_000_000), "running");
+    let mut n = Messfahrt::default();
+    n.arm(Doors::Closed, "chat", 0).unwrap();
+    n.note_departure(0);
+    assert!(!n.history_ready());
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    n.tick(&Tick { now_ms: MIN, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: true, history_ready: false, homecoming_ms: None });
+    assert_eq!(state_of(&n, MIN), "armed");
+}
+
+#[test]
+fn losing_the_confirmed_absence_ends_a_running_run_but_a_stale_contact_does_not() {
+    let (mut m, t0) = running(&["a"]);
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    let step = |m: &mut Messfahrt, now: i64, confirmed: bool| m.tick(&Tick { now_ms: now, date: DATE, here: Here::Away, night: false, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: confirmed, history_ready: true, homecoming_ms: None });
+    assert!(step(&mut m, t0 + 90 * MIN, true).calls.contains_key("a"));
+    assert_eq!(state_of(&m, 0), "running", "silence from the watch while away keeps the confirmed absence");
+    let out = step(&mut m, t0 + 91 * MIN, false);
+    assert!(out.calls.is_empty());
+    assert_eq!((m.view(0)["state"].as_str(), m.view(0)["reason"].as_str()), (Some("aborted"), Some("away_lost")));
 }
 
 #[test]
 fn the_planned_homecoming_is_anchored_at_the_run_start_not_at_the_clock() {
-    let at = |day: u32, h: u32, m: u32| NaiveDate::from_ymd_opt(2026, 11, day).unwrap().and_hms_opt(h, m, 0).unwrap();
     let mut m = Messfahrt::default();
     assert!(!m.learn_due(0));
     m.arm(Doors::Closed, "chat", 0).unwrap();
+    m.note_departure(0);
     assert!(m.learn_due(0));
     m.learned(Homecoming::from_arrivals(&[at(2, 17, 0), at(3, 17, 0), at(4, 17, 0)]), 0);
-    assert!(!m.learn_due(MIN));
+    assert!(!m.learn_due(MIN) && m.history_ready());
     let t0 = 1_000_000;
     assert_eq!(m.homecoming_ms(at(9, 12, 0), t0), Some(t0 + 300 * MIN));
     tick(&mut m, t0, Here::Away, false, &rooms(&["a"], &[], &[], Some(19.0)));
@@ -552,4 +655,20 @@ fn the_on_setpoint_is_the_boost_bundle_setpoint_when_it_lies_below_the_cap() {
         wants[0].setpoint
     };
     assert_eq!((want(true), want(false)), (bundle, 8.0));
+}
+
+#[tokio::test]
+async fn a_restart_rebuilds_the_thirty_minute_home_activity_from_the_lake() {
+    let e = env();
+    let ago = |min: i64| (e.t - min * MIN) * 1000;
+    let label = |min: i64| crate::lake::Label { ts: ago(min), room: "bad".into(), source: "toothbrush".into(), via: Some("plug".into()), ..Default::default() };
+    e.state.sink.append_on(crate::lake::date_of_us(ago(10)), label(10)).unwrap();
+    let manual = crate::lake::Event { ts: ago(5), ..crate::lake::Event::now(kind::MANUAL_SETPOINT, "heatd").with_detail(json!({"room": "bad", "cleared": true})) };
+    e.state.sink.append_on(crate::lake::date_of_us(ago(5)), manual).unwrap();
+    e.state.sink.flush().unwrap();
+    crate::experiment::restore(&e.state, e.t).unwrap();
+    assert_eq!(e.state.devices.home_activity(e.t, 30 * MIN), Some("toothbrush"));
+    assert_eq!(e.state.commanded.lock().unwrap().last_manual_ms(), Some(e.t - 5 * MIN));
+    let later = e.t + 31 * MIN;
+    assert_eq!(e.state.devices.home_activity(later, 30 * MIN), None);
 }

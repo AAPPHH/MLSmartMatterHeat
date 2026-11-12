@@ -553,7 +553,8 @@ impl Inner {
     }
 
     fn note_home(&mut self, source: &'static str, now_ms: i64) {
-        self.home.insert(source, now_ms);
+        let at = self.home.entry(source).or_insert(now_ms);
+        *at = (*at).max(now_ms);
     }
 
     fn is_coffee(&self, node: u64) -> bool {
@@ -788,6 +789,28 @@ impl Devices {
                 if was_lost {
                     self.link_event(sink, node, "resubscribed", json!({}));
                 }
+            }
+        }
+    }
+
+    pub fn rebuild_home(&self, rows: &[DeviceReading], edges: &[(String, i64)]) {
+        let mut inner = self.inner.lock().unwrap();
+        let saved = (inner.fallback, inner.last_activity_ms);
+        for row in rows {
+            let ms = row.ts / 1000;
+            if row.cluster == ON_OFF_CLUSTER && row.attribute == 0 && row.kind == "attribute" {
+                let on = row.value == Some(1.0);
+                if inner.on.insert(row.node, on).is_some_and(|before| before != on) && inner.is_coffee(row.node) {
+                    inner.note_home("coffee_plug", ms);
+                }
+            }
+            inner.note_power(row.node, row, ms);
+            inner.note_ambient(row.node, row, ms);
+        }
+        (inner.fallback, inner.last_activity_ms) = saved;
+        for (source, ms) in edges {
+            if let Some(rule) = PRESENCE_RULES.iter().find(|r| r.source == source) {
+                inner.note_home(rule.source, *ms);
             }
         }
     }
