@@ -190,6 +190,11 @@ def ffill_at(t, v, grid):
     return v[np.clip(idx, 0, None)]
 
 
+def ffill_finite(t, v, grid):
+    ok = np.isfinite(v)
+    return ffill_at(t[ok], v[ok], grid) if ok.any() else np.full(len(grid), np.nan)
+
+
 def weather_grid(weather, grid):
     best = {}
     for ts, kind, iss, *vals in weather:
@@ -200,7 +205,7 @@ def weather_grid(weather, grid):
         raise ValueError("no weather data")
     t = np.array(sorted(best))
     cols = np.array([best[x][1] for x in t], dtype=float)
-    return [interp(t, cols[:, i], grid) for i in range(3)]
+    return [ffill_finite(t, cols[:, i], grid) for i in range(3)]
 
 
 @dataclass
@@ -343,7 +348,7 @@ def build_rooms(reports, weather, meta, cfg, events=(), devices=()):
                     if (nn, TEMP) not in series or nn == node:
                         continue
                     nt, nv = series[(nn, TEMP)]
-                    ni = interp(nt, nv / 100.0, grid)
+                    ni = ffill_finite(nt, nv / 100.0, grid)
                     nbn.setdefault(l.get("kind", "wall"), []).append(nn)
                     cnt, tot = nb.setdefault(l.get("kind", "wall"), (np.zeros(len(grid)), np.zeros(len(grid))))
                     cnt += 1

@@ -447,8 +447,8 @@ def fit_bundle(config, rooms, src, version=None):
     house_out = dict(house, night_hours=cfg["night_hours"], timezone=cfg["timezone"])
     bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out,
               "pcnn": {"active": active, "coffee_on_mw": rc["pcnn"]["coffee_on_mw"], "features": list(FEATURES)}}
-    pooled = {k: v for k, v in hold["trv"]["skill"]["pooled"].items()}
-    holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
+    shipped = hold[ship_key(chosen, hold)]
+    holdout = {"variant": ship_key(chosen, hold), "pooled": shipped["skill"]["pooled"], "rooms": shipped["skill"]["rooms"], "folds": shipped["folds"], "window": shipped["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
     sk = ship["skill"]
