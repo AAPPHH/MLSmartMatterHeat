@@ -349,7 +349,9 @@ fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
         let e = Env { ncnt: vec![1.0; kinds], nsum: vec![20.0; kinds], ..env(false, 22.0) };
         let p = plan(&f.par, &bundle.shock, &f.comps, 1.0, &e);
         assert!(p.total.is_finite() && p.cold.is_finite() && p.setpoint.is_finite(), "{room} {p:?}");
-        assert_eq!(p.unusable, room == "bad", "{room} {p:?}");
+        assert_eq!(p.unusable, room != "kueche", "{room} {p:?}");
+        let low = plan(&f.par, &bundle.shock, &f.comps, 1.0, &Env { ncnt: vec![1.0; kinds], nsum: vec![17.0; kinds], ..env(false, 19.0) });
+        assert_eq!(low.unusable, room == "schlafzimmer", "{room} {low:?}");
     }
     let f = &house.rooms["schlafzimmer"];
     let night = plan(&f.par, &bundle.shock, &f.comps, 1.0, &Env { ncnt: vec![1.0], nsum: vec![20.0], ..env(true, 18.0) });

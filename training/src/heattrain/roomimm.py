@@ -485,7 +485,7 @@ def plan(par, shock, comps, p_supply, env):
     sigma_obs = math.sqrt(env["r_grid"] + par.noise_r ** 2)
     back = target if best["kind"] == "boost" else best["first"]
     full = lambda c: c["total"] - c["raise"]
-    unusable = par.unusable or min(par.ts_night if env["night"] else par.ts, reach(par, lam_c, env)) < target + PEAK_MARGIN
+    unusable = par.unusable or (par.ts_night if env["night"] else par.ts) < target + PEAK_MARGIN or reach(par, lam_c, env) < target
     uncertainty = min(pw, 1.0 - pw)
     running = memo is not None and not memo["ended"] and now < memo["start"] + memo["d"]
     event, probed, new_memo = None, 0, memo

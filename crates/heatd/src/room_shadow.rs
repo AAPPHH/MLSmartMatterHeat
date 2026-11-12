@@ -313,7 +313,7 @@ impl RoomModel {
         if inner.panic_next {
             panic!("room model test panic");
         }
-        let mut out = StepOut { events: std::mem::take(&mut inner.pending), rows: std::mem::take(&mut inner.pending_rows), ..Default::default() };
+        let mut out = StepOut { events: std::mem::take(&mut inner.pending), rows: std::mem::take(&mut inner.pending_rows) };
         for (slot, v) in inner.weather.iter_mut().zip(weather) {
             if v.is_finite() {
                 *slot = Some((now_ms, v));

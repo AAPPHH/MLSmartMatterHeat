@@ -427,7 +427,7 @@ def test_terminal_cost_never_falls_when_the_room_is_colder_even_if_full_valve_ca
 def test_fit_is_unusable_when_full_valve_cannot_reach_the_target_even_with_a_hot_supply():
     from heattrain.roomimm import reach
     par = RoomPar(room_doc(False, 0.3, w=0.3, b1=2.0, a1=0.3, ts=23.0, ts_night=23.0, tau_v=3.0, b2=0.6))
-    assert reach(par, 1.0, dict(plan_env(now_min=0, tout=-5.0), cn=0.0, cs=0.0)) < 21.5
+    assert reach(par, 1.0, dict(plan_env(now_min=0, tout=-5.0), cn=0.0, cs=0.0)) < 21.0
     p = plan(par, SHOCK, comps_at(20.4, 20.3, 1.0), 1.0, plan_env(now_min=0, tout=-5.0))
     assert p["kind"] == "fit_unusable" and not p["raise"] and p["probe_min"] is None
 

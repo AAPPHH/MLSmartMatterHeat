@@ -224,7 +224,7 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let q_net = env.q_net.filter(|q| q.is_finite());
     let net_on = env.pcnn_active && q_net.is_some();
     let q_use = if net_on { q_net.unwrap_or(0.0) } else { 0.0 };
-    let unusable = par.unusable || (if env.night { par.p.ts_night } else { par.p.ts }).min(reach(par, lam_c, env, cn, cs)) < target + PEAK_MARGIN;
+    let unusable = par.unusable || (if env.night { par.p.ts_night } else { par.p.ts }) < target + PEAK_MARGIN || reach(par, lam_c, env, cn, cs) < target;
     let evaluate = |name: &str, kind: &'static str, sp: Vec<f64>, first: f64, boost_min: Option<usize>, probe_min: Option<usize>| -> Cand {
         let run = |mi: usize, si: usize| rollout(par, m, a, modes[mi].1, supplies[si].0, &sp, env, cn, cs, q_use);
         let runs = [[run(0, 0), run(0, 1)], [run(1, 0), run(1, 1)]];
