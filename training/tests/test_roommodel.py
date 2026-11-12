@@ -349,13 +349,14 @@ def test_causal_roll_equals_the_planner_rollout_from_the_origin():
     lag = valve_lag_states(u, rf_alpha(tau))
     for i in (0, len(js) // 2, len(js) - 1):
         j = js[i]
-        env = {"tout": c["tout"][j], "wind": 3.0, "rad": 40.0, "night": False, "cn": 0.0, "cs": 0.0, "target": 21.0, "present": 1.0, "lag": [lag[0][j], lag[1][j]]}
+        env = {"tout": c["tout"][j], "wind": 3.0, "rad": 40.0, "night": False, "cn": 0.0, "cs": 0.0, "target": 21.0, "present": 1.0, "lag": [lag[0][j], lag[1][j]], "u_now": u[j], "sp_cur": c["sp"][j], "sp_live": c["sp"][j]}
         _, _, sens, _ = rollout(par, 21.0, 19.5, 1.0, 1, [c["sp"][j]] * 60, env)
         assert abs(out[20][i, 0] - sens[19]) < 1e-9 and abs(out[60][i, 0] - sens[59]) < 1e-9
     res = rf.residuals(np.vstack([th, th + 0.01]), sel, dict(doc, q_um=0.0, q_ua=0.0, valve_obs=False))
     assert np.isfinite(res).all() and res.shape[1] == 2
     held = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
-    c["sp"][:] = 17.0
+    c["u"][:] = np.clip(c["u"] + 0.4, 0.0, 1.0)
+    rf.lags.clear()
     changed = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
     assert not np.allclose(held[20], changed[20])
 

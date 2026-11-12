@@ -63,7 +63,7 @@ def plan_env(i, k):
     sp = i.sp
     v = (k // 10) % 3
     return {"tout": i.tout, "wind": i.wind, "rad": i.rad, "night": i.night, "ncnt": i.ncnt, "nsum": i.nsum, "target": 40.0 if k % 70 == 0 else 21.0 if sp > 20 else 19.0, "present": 0.0 if k % 90 == 0 else 1.0, "sp_cur": sp - (0.0, 1.0, 0.0)[v],
-            "sp_live": sp if k % 20 else sp + 0.5, "frost": 7.0, "boost_c": 24.0, "boost_ok": k % 3 == 0, "raise_cost": 15.0, "cold_cost": (1.0, 0.1, 0.3)[v], "r_grid": HOUSE["r_grid"], "now_min": k}
+            "sp_live": sp if k % 20 else sp + 0.5, "frost": 7.0, "boost_c": 24.0, "boost_ok": k % 3 == 0, "raise_cost": 15.0, "cold_cost": (1.0, 0.1, 0.3)[v], "r_grid": HOUSE["r_grid"], "now_min": k, "u_now": i.u if k % 3 else math.nan}
 
 
 def last_report(inputs, n, k):
@@ -72,7 +72,7 @@ def last_report(inputs, n, k):
 
 def case_env(**over):
     env = {"tout": -5.0, "wind": 3.0, "rad": 0.0, "night": False, "ncnt": (1.0,), "nsum": (20.0,), "target": 21.0, "present": 1.0, "sp_cur": 21.0, "sp_live": 21.0, "frost": 7.0, "boost_c": 24.0, "boost_ok": False, "raise_cost": 15.0, "cold_cost": 1.0,
-           "r_grid": HOUSE["r_grid"], "lag": None, "y_last": None}
+           "r_grid": HOUSE["r_grid"], "lag": None, "y_last": None, "u_now": 0.2}
     return {**env, **over}
 
 

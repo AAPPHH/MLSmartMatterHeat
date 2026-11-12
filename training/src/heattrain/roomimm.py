@@ -360,12 +360,21 @@ def terminal_cold(par, m, a, lam, env):
     return 0.5 * deficit * min(deficit / rate if rate > 1e-12 else COAST_CAP, COAST_CAP) * env["present"]
 
 
+def valve_demand(par, env, sens0, setpoint, sens):
+    u0 = env.get("u_now")
+    if u0 is None or not math.isfinite(u0):
+        return min(max(par.g * (setpoint - sens), 0.0), 1.0)
+    anchor = env["sp_cur"] if env["sp_cur"] is not None else env["sp_live"]
+    return min(max(u0 + par.g * ((setpoint - sens) - (anchor - sens0)), 0.0), 1.0)
+
+
 def rollout(par, m, a, lam, s, sp, env):
     h = 1.0 / 60.0
     en, co, sens = [], [], []
     lag = env["lag"]
+    sens0 = par.sensor(m, a)
     for k in range(HORIZON):
-        u = min(max(par.g * (sp[k] - par.sensor(m, a)), 0.0), 1.0)
+        u = valve_demand(par, env, sens0, sp[k], par.sensor(m, a))
         lag = par.lag(lag, u)
         f11, f12, f21, f22, g1, g2, _ = par.terms(lam, lag[1] * s, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], h)
         m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2

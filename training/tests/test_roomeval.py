@@ -4,7 +4,7 @@ import math
 import numpy as np
 from heattrain.__main__ import CONFIG
 from heattrain.roombatch import Grid
-from heattrain.roomeval import Skill, criteria, interval_logscore, live_episodes, merge_windows, rmse, window_metrics
+from heattrain.roomeval import Skill, criteria, interval_logscore, live_episodes, merge_windows, rmse, skill_unusable, window_metrics
 from heattrain.roomfit import Truth, calibrate_air, episodes, label_loss, load_live_alarms
 
 RC = CONFIG["roommodel"]
@@ -164,3 +164,9 @@ def test_pooled_prior_moves_only_the_pooled_parameters_and_stays_inside_the_boun
     assert abs(out[rf.names.index("ts")] - math.log(40.0)) < 1e-12 and out[rf.names.index("ts_night")] == rf.hi[rf.names.index("ts_night")]
     keep = [i for i, k in enumerate(rf.names) if k not in ("ts", "ts_night")]
     assert np.allclose(out[keep], rf.prior[keep])
+
+
+def test_rooms_with_negative_heldout_skill_at_the_planner_horizon_are_unusable():
+    block = lambda n, skill: {"H60": {"n": n, "skill": skill}}
+    out = skill_unusable({"a": block(500, 0.1), "b": block(500, -0.3), "c": block(50, -0.5), "d": block(500, None)}, RC)
+    assert set(out) == {"b"} and "-0.300" in out["b"][0]

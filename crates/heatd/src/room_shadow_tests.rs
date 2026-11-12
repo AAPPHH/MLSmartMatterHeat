@@ -331,7 +331,7 @@ fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
         let outs = house.step(&bundle.rooms.keys().map(|r| (r.clone(), input(r))).collect());
         assert!(outs.values().all(|o| !o.ok || (o.m.is_finite() && o.a.is_finite() && o.lam.is_finite())));
     }
-    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, now_min: 0, probe: None };
+    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, u_now: None, now_min: 0, probe: None };
     for (room, f) in &house.rooms {
         let kinds = bundle.rooms[room].c.len();
         let e = Env { ncnt: vec![1.0; kinds], nsum: vec![20.0; kinds], ..env(false, 22.0) };

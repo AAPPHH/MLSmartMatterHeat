@@ -197,13 +197,14 @@ class RoomFit:
         alpha = np.where(p["tau_v"] > 0, 1.0 - np.exp(-1.0 / np.maximum(p["tau_v"], 1e-12)), 1.0)
         v0 = np.stack([self.lag_at(t, js) for t in p["tau_v"]], -1)
         w, g = p["w"], doc["valve_gain"]
+        u0, sens0 = at(c["u"]), w * m + (1 - w) * a
         out = {H: 0.0 for H in self.Hs}
         for sup, wt in ((1.0, p_sup), (0.0, 1.0 - p_sup)):
             if np.all(np.asarray(wt) == 0.0):
                 continue
             x, y, v1, v2 = m, a, v0[0], v0[1]
             for s in range(max(self.Hs)):
-                u = np.clip(g * (sp - (w * x + (1 - w) * y)), 0.0, 1.0)
+                u = np.clip(u0 + g * (sens0 - (w * x + (1 - w) * y)), 0.0, 1.0)
                 v1 = np.where(alpha == 1.0, u, v1 + alpha * (u - v1))
                 v2 = np.where(alpha == 1.0, u, v2 + alpha * (v1 - v2))
                 au = p["a1"] * v2 * sup

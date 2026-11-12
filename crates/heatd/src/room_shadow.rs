@@ -381,6 +381,7 @@ impl RoomModel {
                 r_grid: bundle.house.r_grid,
                 lag: filter.lag,
                 y_last: nodes.get(&ctx.room).and_then(|n| inner.feeds.get(n)).and_then(|f| f.temp).filter(|(t, _)| now_ms - t <= stale_ms).map(|(_, v)| v),
+                u_now: Some(input.u).filter(|u| u.is_finite()),
                 now_min: target,
                 probe: inner.probes.get(&ctx.room).cloned(),
             };

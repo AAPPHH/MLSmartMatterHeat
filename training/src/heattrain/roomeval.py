@@ -314,6 +314,15 @@ def ship_key(chosen, hold):
     return key if key in hold else "trv"
 
 
+def skill_unusable(rooms, rc):
+    out = {}
+    for r, blocks in rooms.items():
+        b = blocks[f"H{rc['fit']['guard_horizon']}"]
+        if b["n"] >= rc["fit"]["guard_min_n"] and b["skill"] is not None and b["skill"] < 0.0:
+            out[r] = [f"causal held-out skill at H{rc['fit']['guard_horizon']} is {b['skill']:.3f}, worse than persistence (n {b['n']})"]
+    return out
+
+
 def criteria(rc, hold, key, final_resets, flags, edges):
     c, p = rc["criteria"], hold[key]["skill"]["pooled"]
     w, plain = hold[key]["window"], hold["trv"]["skill"]["pooled"]
@@ -343,6 +352,8 @@ def fit_bundle(config, rooms, src, version=None):
         cal = calibrate_air(full, docs0, rc, variants.sensor_start, full.n, rref[0])
     docs = variants.docs(docs0, chosen["parts"], cal, chosen["effort"])
     bad = unusable_rooms(full, docs, rc)
+    for r, why in skill_unusable(hold[ship_key(chosen, hold)]["skill"]["rooms"], rc).items():
+        bad[r] = bad.get(r, []) + why
     for r in bad:
         docs[r]["unusable"] = True
     run, recs = run_batch(full, docs, [shock], house, record=True)

@@ -56,6 +56,7 @@ fn env(e: &Value) -> Env {
         r_grid: num(&e["r_grid"]),
         lag: e["lag"].as_array().map(|l| [num(&l[0]), num(&l[1])]),
         y_last: e["y_last"].as_f64(),
+        u_now: e["u_now"].as_f64(),
         now_min: e["now_min"].as_i64().unwrap_or(0),
         probe: e["probe"].as_object().map(|m| ProbeMemo { start: m["start"].as_i64().unwrap(), d: m["d"].as_u64().unwrap() as usize, block_until: m["block_until"].as_i64().unwrap(), target: num(&m["target"]), present: num(&m["present"]), ended: m["ended"].as_bool().unwrap() }),
     }
@@ -281,7 +282,7 @@ fn erf_matches_reference_values() {
 }
 
 pub(crate) fn preset_env() -> Env {
-    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None, now_min: 0, probe: None }
+    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None, u_now: None, now_min: 0, probe: None }
 }
 
 pub(crate) fn comps_at(m: f64, a: f64, lam: f64, p: f64) -> Vec<Comp> {

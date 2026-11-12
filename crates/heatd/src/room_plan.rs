@@ -39,6 +39,7 @@ pub struct Env {
     pub r_grid: f64,
     pub lag: Option<[f64; 2]>,
     pub y_last: Option<f64>,
+    pub u_now: Option<f64>,
     pub now_min: i64,
     pub probe: Option<ProbeMemo>,
 }
@@ -122,13 +123,21 @@ fn terminal_cold(par: &RoomPar, m: f64, a: f64, lam: f64, env: &Env, cn: f64, cs
     0.5 * deficit * (if rate > 1e-12 { deficit / rate } else { COAST_CAP as f64 }).min(COAST_CAP as f64) * env.present
 }
 
+fn valve_demand(par: &RoomPar, env: &Env, sens0: f64, setpoint: f64, sens: f64) -> f64 {
+    match env.u_now.filter(|u| u.is_finite()) {
+        None => (par.g * (setpoint - sens)).clamp(0.0, 1.0),
+        Some(u0) => (u0 + par.g * ((setpoint - sens) - (env.sp_cur.unwrap_or(env.sp_live) - sens0))).clamp(0.0, 1.0),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64) -> Run {
     let h = 1.0 / 60.0;
     let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new(), term: 0.0 };
     let mut lag = env.lag;
+    let sens0 = par.sensor(m, a);
     for &set in sp.iter().take(HORIZON) {
-        let u = (par.g * (set - par.sensor(m, a))).clamp(0.0, 1.0);
+        let u = valve_demand(par, env, sens0, set, par.sensor(m, a));
         let l = par.lag(lag, u);
         lag = Some(l);
         let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, l[1] * s, env.tout, env.wind, env.rad, env.night, cn, cs, h);
