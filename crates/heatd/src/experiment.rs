@@ -23,6 +23,7 @@ const HOMECOMING_DAYS: i64 = 42;
 const HOMECOMING_MIN_DAYS: usize = 3;
 const MAIN_RETURN_FROM_MIN: u32 = 12 * 60;
 const DEPARTURE_FRESH_MS: i64 = 60 * 60_000;
+const DEPARTURE_MAX_MS: i64 = 180 * 60_000;
 const HOMECOMING_REFRESH_MS: i64 = 6 * 3_600_000;
 const MIN_MS: i64 = 60_000;
 const REBUILD_EXTRA_MS: i64 = 20 * MIN_MS;
@@ -424,7 +425,7 @@ impl Messfahrt {
                 out.events.push(run.finish(Status::Aborted, "expired", t.now_ms));
                 return out;
             }
-            let departed = self.departed_ms.is_some_and(|d| d >= run.armed_ms || t.now_ms - d <= DEPARTURE_FRESH_MS);
+            let departed = self.departed_ms.is_some_and(|d| t.now_ms - d <= if d >= run.armed_ms { DEPARTURE_MAX_MS } else { DEPARTURE_FRESH_MS });
             let too_late = !t.history_ready || run.cutoff_ms().is_some_and(|c| t.now_ms + TOTAL_MIN * MIN_MS > c);
             if t.here != Here::Away || t.night || t.activity.is_some() || !(t.away_confirmed && departed) || too_late {
                 return out;
