@@ -58,6 +58,8 @@ fn env(e: &Value) -> Env {
         y_last: e["y_last"].as_f64(),
         u_now: e["u_now"].as_f64(),
         now_min: e["now_min"].as_i64().unwrap_or(0),
+        q_net: e["q_net"].as_f64(),
+        pcnn_active: e["pcnn_active"].as_bool().unwrap_or(false),
         probe: e["probe"].as_object().map(|m| ProbeMemo { start: m["start"].as_i64().unwrap(), d: m["d"].as_u64().unwrap() as usize, block_until: m["block_until"].as_i64().unwrap(), target: num(&m["target"]), present: num(&m["present"]), ended: m["ended"].as_bool().unwrap() }),
     }
 }
@@ -82,8 +84,13 @@ fn compare_plan(got: &PlanOut, want: &Value, what: &str) {
         (Some(g), Some(w)) => near(g, w, 5e-6, &format!("{what}.stored_min")),
         (g, w) => assert_eq!(g, w, "{what}.stored_min"),
     }
+    assert_eq!(got.pcnn_active, want["pcnn_active"].as_bool().unwrap(), "{what}.pcnn_active");
+    assert_eq!(got.forecast_pcnn.is_nan(), want["forecast_pcnn"].is_null(), "{what}.forecast_pcnn");
+    if !got.forecast_pcnn.is_nan() {
+        near(got.forecast_pcnn, num(&want["forecast_pcnn"]), 5e-6, &format!("{what}.forecast_pcnn"));
+    }
     for (key, v) in [("setpoint", got.setpoint), ("energy", got.energy), ("cold", got.cold), ("raise_cost", got.raise_cost), ("cost_live", got.cost_live), ("total", got.total), ("p_window", got.p_window), ("lam_closed", got.lam_closed),
-                     ("lam_open", got.lam_open), ("mass", got.mass), ("air", got.air), ("sensor", got.sensor), ("forecast", got.forecast), ("evoi", got.evoi)] {
+                     ("lam_open", got.lam_open), ("mass", got.mass), ("air", got.air), ("sensor", got.sensor), ("forecast", got.forecast), ("forecast_phys", got.forecast_phys), ("evoi", got.evoi)] {
         near(v, num(&want[key]), 5e-6, &format!("{what}.{key}"));
     }
 }
@@ -95,7 +102,7 @@ fn filter_and_planner_match_the_python_fixture() {
     let mut house = House::new(&bundle);
     let steps = fx["steps"].as_u64().unwrap() as usize;
     let plans = fx["plans"].as_array().unwrap();
-    let mut next_plan = 0;
+    let (mut next_plan, mut nets) = (0, 0);
     for k in 0..steps {
         let outs = house.step(&inputs(&fx, k));
         for (name, out) in &outs {
@@ -112,11 +119,19 @@ fn filter_and_planner_match_the_python_fixture() {
             next_plan += 1;
             let name = p["room"].as_str().unwrap();
             let f = &house.rooms[name];
-            let got = plan(&f.par, &bundle.shock, &f.comps, house.w[1], &env(&p["env"]));
+            let feat = &p["feat"];
+            let q = f.pcnn_q(&inputs(&fx, k)[name], num(&feat["hour"]), feat["weekend"].as_bool().unwrap(), num(&feat["present"]), num(&feat["coffee"]));
+            assert_eq!(q.is_some(), p["env"]["q_net"].is_number(), "net presence {name} at {k}");
+            if let Some(q) = q {
+                near(q, num(&p["env"]["q_net"]), 1e-6, &format!("q_net {name} at {k}"));
+                nets += 1;
+            }
+            let got = plan(&f.par, &bundle.shock, &f.comps, house.w[1], &Env { q_net: q, ..env(&p["env"]) });
             compare_plan(&got, &p["out"], &format!("plan {name} at {k}"));
         }
     }
     assert_eq!(next_plan, plans.len());
+    assert!(nets > 100 && plans.iter().any(|p| p["out"]["pcnn_active"] == true) && plans.iter().any(|p| p["out"]["pcnn_active"] == false && p["env"]["q_net"].is_number()));
     let cases = fx["plan_cases"].as_array().unwrap();
     assert!(cases.iter().any(|c| c["out"]["probe_event"] == "start") && cases.iter().any(|c| c["out"]["probe_event"] == "end") && cases.iter().any(|c| c["out"]["probe_event"] == "abort") && cases.iter().any(|c| c["out"]["unusable"] == true));
     for (i, c) in cases.iter().enumerate() {
@@ -129,6 +144,7 @@ fn filter_and_planner_match_the_python_fixture() {
         let got = plan(&house.rooms[name].par, &bundle.shock, &comps, num(&c["p_supply"]), &env(&c["env"]));
         compare_plan(&got, &c["out"], &format!("case {i} {}", c["script"]));
     }
+    assert!(cases.iter().any(|c| c["out"]["pcnn_active"] == true && c["out"]["forecast_pcnn"].is_number()));
     let want: Vec<(String, String, u64)> = fx["resets"].as_array().unwrap().iter().map(|r| (r["room"].as_str().unwrap().to_string(), r["cause"].as_str().unwrap().to_string(), r["step"].as_u64().unwrap())).collect();
     let mut got: Vec<(String, String, u64)> = house.resets.iter().map(|r| (r.room.clone(), r.cause.to_string(), r.step)).collect();
     let mut want_sorted = want;
@@ -282,7 +298,7 @@ fn erf_matches_reference_values() {
 }
 
 pub(crate) fn preset_env() -> Env {
-    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None, u_now: None, now_min: 0, probe: None }
+    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None, u_now: None, now_min: 0, probe: None, q_net: None, pcnn_active: false }
 }
 
 pub(crate) fn comps_at(m: f64, a: f64, lam: f64, p: f64) -> Vec<Comp> {
@@ -404,4 +420,78 @@ fn fit_is_unusable_when_the_supply_cannot_reach_the_target_or_the_bundle_says_so
     let bundle = Bundle::parse(&doc.to_string()).unwrap();
     let flagged = plan(&RoomPar::new(&bundle.rooms["kueche"]), &bundle.shock, &comps_at(17.0, 16.0, 1.0, 1e-4), 1.0, &preset_env());
     assert!(flagged.kind == "fit_unusable", "{flagged:?}");
+}
+
+#[test]
+fn the_net_matches_the_python_reference_and_non_finite_inputs_give_zero() {
+    let fx = fixture();
+    let bundle = Bundle::parse(&fx["bundle"].to_string()).unwrap();
+    let net = bundle.rooms["kueche"].pcnn.clone().unwrap();
+    let mut finite = 0;
+    for (i, c) in fx["net_cases"].as_array().unwrap().iter().enumerate() {
+        let r = &c["raw"];
+        let row = crate::room_obs::feature_row(num(&r["hour"]), r["weekend"].as_bool().unwrap(), num(&r["rad"]), num(&r["tout"]), num(&r["present"]), num(&r["co2_rate"]), num(&r["hum_rate"]), num(&r["coffee"]));
+        for (j, want) in c["row"].as_array().unwrap().iter().enumerate() {
+            if want.is_null() {
+                assert!(row[j].is_nan(), "case {i} feature {j}");
+            } else {
+                near(row[j], num(want), 1e-12, &format!("case {i} feature {j}"));
+            }
+        }
+        let q = net.q(&row);
+        near(q, num(&c["q"]), 1e-12, &format!("case {i} q"));
+        assert!(q.abs() <= net.qmax);
+        finite += usize::from(row.iter().all(|v| v.is_finite()) && q != 0.0);
+        if !row.iter().all(|v| v.is_finite()) {
+            assert_eq!(q, 0.0, "case {i}: a missing required input switches the net off");
+        }
+    }
+    assert!(finite > 20);
+    let mut row = crate::room_obs::feature_row(12.0, false, 100.0, 5.0, 1.0, f64::NAN, f64::NAN, 0.0);
+    assert_eq!((row[6], row[7], row[8], row[9]), (0.0, 0.0, 0.0, 0.0));
+    assert_ne!(net.q(&row), 0.0);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for i in 0..row.len() {
+            let keep = row[i];
+            row[i] = bad;
+            assert_eq!(net.q(&row), 0.0);
+            row[i] = keep;
+        }
+    }
+}
+
+#[test]
+fn the_loader_validates_the_net_block_and_accepts_bundles_without_one() {
+    let mut b = base_bundle();
+    assert!(Bundle::parse(&b.to_string()).is_ok());
+    for (path, bad) in [
+        ("rooms/kueche/pcnn/qmax", Value::from(-1.0)),
+        ("rooms/kueche/pcnn/qmax", Value::Null),
+        ("rooms/kueche/pcnn/sd/0", Value::from(0.0)),
+        ("rooms/kueche/pcnn/w2/1", Value::Null),
+        ("rooms/kueche/pcnn/b2", Value::Null),
+        ("rooms/kueche/pcnn/w1/2", serde_json::json!([1.0, 2.0])),
+        ("rooms/kueche/pcnn/mu", serde_json::json!([0.0])),
+        ("rooms/kueche/pcnn/features", serde_json::json!(["sin_hour"])),
+        ("pcnn/features", serde_json::json!(["x"])),
+        ("pcnn/coffee_on_mw", Value::from(-1.0)),
+    ] {
+        let mut b = base_bundle();
+        *b.pointer_mut(&format!("/{path}")).unwrap() = bad.clone();
+        assert!(Bundle::parse(&b.to_string()).is_err(), "{path}={bad}");
+    }
+    let mut swapped = base_bundle();
+    swapped["rooms"]["kueche"]["pcnn"]["features"].as_array_mut().unwrap().swap(0, 1);
+    assert!(Bundle::parse(&swapped.to_string()).is_err());
+    for room in b["rooms"].as_object_mut().unwrap().values_mut() {
+        room.as_object_mut().unwrap().remove("pcnn");
+    }
+    b.as_object_mut().unwrap().remove("pcnn");
+    let plain = Bundle::parse(&b.to_string()).unwrap();
+    assert!(plain.pcnn.is_none() && plain.rooms.values().all(|r| r.pcnn.is_none()));
+    let (house, mut none) = (House::new(&plain), None);
+    for f in house.rooms.values() {
+        none = f.pcnn_q(&RoomIn::blank(1), 12.0, false, 1.0, 0.0);
+    }
+    assert!(none.is_none());
 }

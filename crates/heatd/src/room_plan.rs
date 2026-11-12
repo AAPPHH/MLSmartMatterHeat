@@ -42,6 +42,8 @@ pub struct Env {
     pub u_now: Option<f64>,
     pub now_min: i64,
     pub probe: Option<ProbeMemo>,
+    pub q_net: Option<f64>,
+    pub pcnn_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +66,9 @@ pub struct PlanOut {
     pub air: f64,
     pub sensor: f64,
     pub forecast: f64,
+    pub forecast_phys: f64,
+    pub forecast_pcnn: f64,
+    pub pcnn_active: bool,
     pub evoi: f64,
     pub best_cost: f64,
     pub perfect_cost: f64,
@@ -131,8 +136,9 @@ fn valve_demand(par: &RoomPar, env: &Env, sens0: f64, setpoint: f64, sens: f64) 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64) -> Run {
+fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64, q: f64) -> Run {
     let h = 1.0 / 60.0;
+    let hq = h * q;
     let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new(), term: 0.0 };
     let mut lag = env.lag;
     let sens0 = par.sensor(m, a);
@@ -141,7 +147,7 @@ fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], 
         let l = par.lag(lag, u);
         lag = Some(l);
         let [f11, f12, f21, f22, g1, g2, _] = par.terms(lam, l[1] * s, env.tout, env.wind, env.rad, env.night, cn, cs, h);
-        (m, a) = (f11 * m + f12 * a + g1, f21 * m + f22 * a + g2);
+        (m, a) = (f11 * m + f12 * a + g1, f21 * m + f22 * a + g2 + hq);
         let sens = par.sensor(m, a);
         run.sens.push(sens);
         run.en.push(u * s);
@@ -202,9 +208,12 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
     let sensor0 = par.sensor(m, a);
     let limit = (target + PEAK_MARGIN).max(sensor0) + EPS;
     let now = env.now_min;
+    let q_net = env.q_net.filter(|q| q.is_finite());
+    let net_on = env.pcnn_active && q_net.is_some();
+    let q_use = if net_on { q_net.unwrap_or(0.0) } else { 0.0 };
     let unusable = par.unusable || (if env.night { par.p.ts_night } else { par.p.ts }) < target + PEAK_MARGIN;
     let evaluate = |name: &str, kind: &'static str, sp: Vec<f64>, first: f64, boost_min: Option<usize>, probe_min: Option<usize>| -> Cand {
-        let run = |mi: usize, si: usize| rollout(par, m, a, modes[mi].1, supplies[si].0, &sp, env, cn, cs);
+        let run = |mi: usize, si: usize| rollout(par, m, a, modes[mi].1, supplies[si].0, &sp, env, cn, cs, q_use);
         let runs = [[run(0, 0), run(0, 1)], [run(1, 0), run(1, 1)]];
         let mut mode_cost = [0.0; 2];
         for (mi, mc) in mode_cost.iter_mut().enumerate() {
@@ -293,8 +302,19 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
         }
     }
     let live = &cands[0];
-    let model_fc = (0..2).fold(0.0, |acc, mi| (0..2).fold(acc, |acc2, si| acc2 + modes[mi].0 * supplies[si].1 * live.runs[mi][si].sens[FORECAST_MIN - 1]));
-    let forecast = env.y_last.filter(|y| y.is_finite()).map_or(model_fc, |y| model_fc + (y - sensor0));
+    let anchor = env.y_last.filter(|y| y.is_finite()).map_or(0.0, |y| y - sensor0);
+    let live_sp = profile(live.first, HORIZON, live.first);
+    let forecast_with = |q: f64| {
+        let mut total = 0.0;
+        for mode in &modes {
+            for supply in &supplies {
+                total += mode.0 * supply.1 * rollout(par, m, a, mode.1, supply.0, &live_sp, env, cn, cs, q).sens[FORECAST_MIN - 1];
+            }
+        }
+        anchor + total
+    };
+    let (forecast_phys, forecast_pcnn) = (forecast_with(0.0), q_net.map_or(f64::NAN, forecast_with));
+    let forecast = if net_on { forecast_pcnn } else { forecast_phys };
     let (cost_live, best_cost, n_allowed, energy_live) = (live.total, cands[best].total, allowed.len(), live.energy);
     let chosen = if unusable { live } else { probe.as_ref().unwrap_or(&cands[best]) };
     let (coast_min, stored_min) = storage(par, m, a, lam_c, env, cn, cs);
@@ -317,6 +337,9 @@ pub fn plan(par: &RoomPar, shock: &Shock, comps: &[Comp], p_supply: f64, env: &E
         air: a,
         sensor: sensor0,
         forecast,
+        forecast_phys,
+        forecast_pcnn,
+        pcnn_active: net_on,
         evoi: evoi_best,
         best_cost,
         perfect_cost: perf,

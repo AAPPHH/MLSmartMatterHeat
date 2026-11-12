@@ -113,7 +113,7 @@ fn device_run(state: &crate::http::AppState, minutes: i64, feed: bool) {
             state.room_model.observe_device(12, 0x0402, 0, 2040.0 - 5.0 * drop, t);
             state.room_model.observe_device(12, 0x0405, 0, 4500.0, t);
         }
-        state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, &[]);
+        state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, false, &[]);
     }
 }
 
@@ -125,7 +125,7 @@ fn device_readings_reach_the_air_and_gas_evidence_of_their_own_room_only() {
     device_run(&fed, 120, true);
     device_run(&plain, 120, false);
     let air = |s: &crate::http::AppState, room: &str| {
-        s.room_model.step(&s.config, aligned() + 120 * MIN, [4.0, 3.0, 0.0], 12.0, &[crate::room_shadow::RoomCtx { room: room.into(), live: 21.0, target: 21.0, present: 1.0, sp_cur: Some(21.0), boost_ok: false, window_live: false, resid_live_k: None }]);
+        s.room_model.step(&s.config, aligned() + 120 * MIN, [4.0, 3.0, 0.0], 12.0, false, &[crate::room_shadow::RoomCtx { room: room.into(), live: 21.0, target: 21.0, present: 1.0, here: false, sp_cur: Some(21.0), boost_ok: false, window_live: false, resid_live_k: None }]);
         s.room_model.view(room)
     };
     let (kitchen, bedroom, kitchen_plain, bedroom_plain) = (air(&fed, "b"), air(&fed, "c"), air(&plain, "b"), air(&plain, "c"));
@@ -154,9 +154,9 @@ fn restart_gap_becomes_filter_reset_events() {
         let t = T0 + minute * MIN;
         state.room_model.observe(5, crate::window::LOCAL_TEMPERATURE, 20.5, t);
         state.room_model.observe(5, crate::window::PI_HEATING_DEMAND, 20.0, t);
-        state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, &[]);
+        state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, false, &[]);
     }
-    let out = state.room_model.step(&state.config, T0 + 200 * MIN, [4.0, 3.0, 0.0], 12.0, &[]);
+    let out = state.room_model.step(&state.config, T0 + 200 * MIN, [4.0, 3.0, 0.0], 12.0, false, &[]);
     assert_eq!(out.events.len(), 3);
     assert!(out.events.iter().all(|e| e.kind == crate::lake::kind::FILTER_RESET && e.detail.as_deref().is_some_and(|d| d.contains("restart_gap"))));
 }
@@ -190,7 +190,7 @@ fn with_storage(mut p: crate::room_plan::PlanOut, mass: f64, air: f64, coast: f6
 }
 
 fn ctx(room: &str) -> crate::room_shadow::RoomCtx {
-    crate::room_shadow::RoomCtx { room: room.into(), live: 21.0, target: 21.0, present: 1.0, sp_cur: Some(21.0), boost_ok: false, window_live: false, resid_live_k: None }
+    crate::room_shadow::RoomCtx { room: room.into(), live: 21.0, target: 21.0, present: 1.0, here: false, sp_cur: Some(21.0), boost_ok: false, window_live: false, resid_live_k: None }
 }
 
 fn feed(state: &crate::http::AppState, minute: i64, valve: bool) {
@@ -211,13 +211,13 @@ fn stale_valve_is_forward_filled_and_the_filter_keeps_predicting_through_a_gap()
     let weather = [4.0, 3.0, 0.0];
     for minute in 0..30 {
         feed(&state, minute, minute < 5);
-        state.room_model.step(&state.config, T0 + minute * MIN, weather, 12.0, &[ctx("b")]);
+        state.room_model.step(&state.config, T0 + minute * MIN, weather, 12.0, false, &[ctx("b")]);
     }
     let before = state.room_model.view("b");
     assert!(before["ts"].as_i64().unwrap() > T0 + 24 * MIN, "{before}");
     let mut seen = Vec::new();
     for minute in 30..150 {
-        let out = state.room_model.step(&state.config, T0 + minute * MIN, weather, 12.0, &[ctx("b")]);
+        let out = state.room_model.step(&state.config, T0 + minute * MIN, weather, 12.0, false, &[ctx("b")]);
         assert!(out.events.iter().all(|e| e.kind != crate::lake::kind::FILTER_RESET), "{minute}");
         seen.push(state.room_model.view("b"));
     }
@@ -231,17 +231,17 @@ fn stale_weather_falls_back_to_the_last_value_and_no_weather_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let (state, _) = rig(dir.path(), true);
     let nan = [f64::NAN; 3];
-    let first = state.room_model.step(&state.config, T0, nan, 12.0, &[]);
+    let first = state.room_model.step(&state.config, T0, nan, 12.0, false, &[]);
     let states = |out: &crate::room_shadow::StepOut| out.events.iter().filter(|e| e.kind == crate::lake::kind::SHADOW_STATE).filter_map(|e| e.detail.clone()).collect::<Vec<_>>();
     assert!(states(&first).iter().any(|d| d.contains("no_weather")), "{:?}", first.events);
     for minute in 1..20 {
         feed(&state, minute, true);
-        state.room_model.step(&state.config, T0 + minute * MIN, if minute < 10 { nan } else { [4.0, 3.0, 0.0] }, 12.0, &[ctx("b")]);
+        state.room_model.step(&state.config, T0 + minute * MIN, if minute < 10 { nan } else { [4.0, 3.0, 0.0] }, 12.0, false, &[ctx("b")]);
     }
     assert!(state.room_model.view("b")["ts"].as_i64().unwrap() > T0 + 14 * MIN);
     for minute in 20..40 {
         feed(&state, minute, true);
-        let out = state.room_model.step(&state.config, T0 + minute * MIN, nan, 12.0, &[ctx("b")]);
+        let out = state.room_model.step(&state.config, T0 + minute * MIN, nan, 12.0, false, &[ctx("b")]);
         assert!(states(&out).is_empty(), "{minute}");
     }
     assert!(state.room_model.view("b")["ts"].as_i64().unwrap() > T0 + 34 * MIN);
@@ -253,13 +253,13 @@ fn reload_resets_every_room_with_cause_reload() {
     let (state, _) = rig(dir.path(), true);
     for minute in 0..20 {
         feed(&state, minute, true);
-        state.room_model.step(&state.config, T0 + minute * MIN, [4.0, 3.0, 0.0], 12.0, &[]);
+        state.room_model.step(&state.config, T0 + minute * MIN, [4.0, 3.0, 0.0], 12.0, false, &[]);
     }
     state.room_model.set_bundle(Bundle::parse(&bundle_text()).unwrap());
-    let out = state.room_model.step(&state.config, T0 + 20 * MIN, [4.0, 3.0, 0.0], 12.0, &[]);
+    let out = state.room_model.step(&state.config, T0 + 20 * MIN, [4.0, 3.0, 0.0], 12.0, false, &[]);
     let reload: Vec<_> = out.events.iter().filter(|e| e.kind == crate::lake::kind::FILTER_RESET && e.detail.as_deref().is_some_and(|d| d.contains("\"reload\""))).collect();
     assert_eq!(reload.len(), 3);
-    assert!(state.room_model.step(&state.config, T0 + 21 * MIN, [4.0, 3.0, 0.0], 12.0, &[]).events.iter().all(|e| !e.detail.as_deref().is_some_and(|d| d.contains("reload"))));
+    assert!(state.room_model.step(&state.config, T0 + 21 * MIN, [4.0, 3.0, 0.0], 12.0, false, &[]).events.iter().all(|e| !e.detail.as_deref().is_some_and(|d| d.contains("reload"))));
 }
 
 #[test]
@@ -278,11 +278,11 @@ fn weather_older_than_the_cap_reports_no_weather() {
     let nan = [f64::NAN; 3];
     for minute in 0..10 {
         feed(&state, minute, true);
-        state.room_model.step(&state.config, T0 + minute * MIN, [4.0, 3.0, 0.0], 12.0, &[]);
+        state.room_model.step(&state.config, T0 + minute * MIN, [4.0, 3.0, 0.0], 12.0, false, &[]);
     }
-    let inside = state.room_model.step(&state.config, T0 + 170 * MIN, nan, 12.0, &[]);
+    let inside = state.room_model.step(&state.config, T0 + 170 * MIN, nan, 12.0, false, &[]);
     assert!(states(&inside).is_empty(), "{:?}", inside.events);
-    let beyond = state.room_model.step(&state.config, T0 + 200 * MIN, nan, 12.0, &[]);
+    let beyond = state.room_model.step(&state.config, T0 + 200 * MIN, nan, 12.0, false, &[]);
     assert!(states(&beyond).iter().any(|d| d.contains("no_weather")), "{:?}", beyond.events);
 }
 
@@ -299,7 +299,7 @@ async fn a_panic_in_the_shadow_disables_it_and_never_touches_live_control() {
     hit.sink.flush().unwrap();
     assert_eq!(mock_hit.setpoint_writes(), mock_off.setpoint_writes());
     assert!(hit.room_model.view("a").is_null());
-    let first = hit.room_model.step(&hit.config, T0 + 500 * MIN, [4.0, 3.0, 0.0], 12.0, &[ctx("a")]);
+    let first = hit.room_model.step(&hit.config, T0 + 500 * MIN, [4.0, 3.0, 0.0], 12.0, false, &[ctx("a")]);
     assert!(first.rows.is_empty() && first.events.is_empty());
     hit.room_model.observe(5, crate::window::LOCAL_TEMPERATURE, 20.0, T0);
     assert!(hit.room_model.version().is_some());
@@ -331,7 +331,7 @@ fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
         let outs = house.step(&bundle.rooms.keys().map(|r| (r.clone(), input(r))).collect());
         assert!(outs.values().all(|o| !o.ok || (o.m.is_finite() && o.a.is_finite() && o.lam.is_finite())));
     }
-    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, u_now: None, now_min: 0, probe: None };
+    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, u_now: None, now_min: 0, probe: None, q_net: None, pcnn_active: false };
     for (room, f) in &house.rooms {
         let kinds = bundle.rooms[room].c.len();
         let e = Env { ncnt: vec![1.0; kinds], nsum: vec![20.0; kinds], ..env(false, 22.0) };
@@ -342,4 +342,53 @@ fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
     let f = &house.rooms["schlafzimmer"];
     let night = plan(&f.par, &bundle.shock, &f.comps, 1.0, &Env { ncnt: vec![1.0], nsum: vec![20.0], ..env(true, 18.0) });
     assert!(night.unusable && night.kind == "fit_unusable", "{night:?}");
+}
+
+const PLUG: &str = "[[devices]]
+node = 14
+kind = 'plug'
+role = 'coffee'
+room = 'b'
+";
+
+fn net_rows(active: bool, here: bool, coffee_mw: f64, weekend: bool) -> Vec<crate::lake::ShadowDecision> {
+    let mut text: Value = serde_json::from_str(&bundle_text()).unwrap();
+    text["pcnn"]["active"] = active.into();
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockController::new(1));
+    [5, 6, 7].iter().for_each(|n| mock.add_node(*n, 19.0, 19.0));
+    let state = state_with(dir.path(), mock, &format!("{ROOMS}{PLUG}[room_model]\nenabled = true\n"));
+    state.status.outdoor_obs(crate::lake::now_us(), 4.0, Some(3.0));
+    state.room_model.set_bundle(Bundle::parse(&text.to_string()).unwrap());
+    device_run(&state, 120, false);
+    let t = aligned() + 120 * MIN;
+    state.room_model.observe_device(14, 0x0090, 8, coffee_mw, t);
+    let ctxs: Vec<_> = ["b", "c"].iter().map(|r| crate::room_shadow::RoomCtx { here: here && *r == "b", ..ctx(r) }).collect();
+    state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, weekend, &ctxs).rows
+}
+
+#[test]
+fn shadow_rows_carry_both_forecasts_and_the_net_follows_presence_coffee_and_weekday() {
+    let find = |rows: &[crate::lake::ShadowDecision], room: &str| rows.iter().find(|r| r.room == room).cloned().unwrap();
+    let base = net_rows(true, false, 0.0, false);
+    let (b, c) = (find(&base, "b"), find(&base, "c"));
+    assert_eq!(b.pcnn_active, Some(true));
+    assert!(b.forecast_phys_c.is_some() && b.forecast_pcnn_c.is_some() && b.forecast_c == b.forecast_pcnn_c);
+    assert!((b.forecast_pcnn_c.unwrap() - b.forecast_phys_c.unwrap()).abs() > 1e-4, "{b:?}");
+    assert_eq!((c.pcnn_active, c.forecast_pcnn_c), (Some(false), None), "a room without a net block has no net forecast and the net cannot be active there");
+    assert_eq!(c.forecast_c, c.forecast_phys_c);
+    for (what, rows) in [("present", net_rows(true, true, 0.0, false)), ("coffee", net_rows(true, false, 1_500_000.0, false)), ("weekend", net_rows(true, false, 0.0, true)), ("idle plug", net_rows(true, false, 5_000.0, false))] {
+        let r = find(&rows, "b");
+        assert_eq!(r.forecast_phys_c, b.forecast_phys_c, "{what}: the physics forecast never depends on the net inputs");
+        if what == "idle plug" {
+            assert_eq!(r.forecast_pcnn_c, b.forecast_pcnn_c, "a plug below the on threshold counts as off");
+        } else {
+            assert_ne!(r.forecast_pcnn_c, b.forecast_pcnn_c, "{what} must reach the net");
+        }
+    }
+    let off = net_rows(false, false, 0.0, false);
+    let r = find(&off, "b");
+    assert_eq!((r.pcnn_active, r.forecast_pcnn_c, r.forecast_phys_c, r.forecast_c), (Some(false), b.forecast_pcnn_c, b.forecast_phys_c, b.forecast_phys_c));
+    let stale_plug = find(&net_rows(true, false, f64::NAN, false), "b");
+    assert_eq!(stale_plug.forecast_pcnn_c, b.forecast_pcnn_c);
 }

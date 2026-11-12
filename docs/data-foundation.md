@@ -382,12 +382,16 @@ kind: dict<utf8>
 coast_min: f64?
 stored_min: f64?
 storage: utf8?
+forecast_phys_c: f64?
+forecast_pcnn_c: f64?
+pcnn_active: bool?
 ```
 
 - `setpoint_live`: Sollwert, den die Live-Regeln gerade wollen; `setpoint_shadow`: Wahl der Kostenminimierung; `raise`: Schatten-Sollwert liegt ueber dem Geraete-Sollwert. Kosten in Heizminuten (Ventilminuten): `cost_energy` Energie, `cost_cold` = cold_cost_min x Kaelte (K min), `cost_raise` = raise_cost_min bei Erhoehung, `cost_live` Gesamtkosten des Live-Sollwerts im Modell.
 - `lambda`/`lambda_std`: Verlustverhaeltnis (1 = normal), `mass_c`/`air_c`: Heizkoerper-/Luftzustand, `p_supply`: Kessel liefert, `p_window`: P(Verlust > lambda_w), `p_window_live`: alter Detektor meldet offen. `sensor_c`: gefilterte Sensortemperatur, `forecast_c`: Modellprognose der Sensortemperatur in 20 min bei Live-Sollwert, `resid_live_k`: Residuum des Live-Fensterdetektors in K (Prognose minus Messung, positiv = kaelter als erwartet).
 - `why`: ein deutscher Satz. `kind`: gewaehlter Kandidat (`live`, `current`, `target`, `frost`, `minus`, `plus`, `boost`, `probe`; `probe` = Ventil zu, `setpoint_shadow` = Frost, `probe_min` = Dauer).
 - Waermespeicher (additiv, in v8 ergaenzt, aeltere Zeilen null): `coast_min` Nachlaufzeit in Minuten bis die Luft ohne Heizen unter Ziel - 0,5 K faellt (0 = schon darunter, 1440 = Deckel 24 h), `stored_min` gespeicherte Waerme in Heizminuten gegenueber dem Zielgleichgewicht (negativ = Defizit; null wenn die Rechnung nicht definiert ist), `storage` ein deutscher Satz dazu (`mass_c`/`air_c` sind Waende/Luft).
+- Neuronales Restglied (additiv, in v8 ergaenzt, aeltere Zeilen null): `forecast_phys_c` 20-min-Prognose nur aus der Physik (immer gerechnet), `forecast_pcnn_c` dieselbe Prognose mit dem Restglied (gerechnet, sobald der Raum einen Netzblock im Bundle hat, auch wenn es nicht aktiv ist; sonst null), `pcnn_active` ob das Netz im Schatten mitrechnet (dann ist `forecast_c` = `forecast_pcnn_c` und die Kandidatenkosten enthalten das Restglied, sonst ist `forecast_c` = `forecast_phys_c`). Der Tagesbericht vergleicht die realen 20-min-Fehler beider Prognosen je Raum.
 
 ## Abweichungen
 

@@ -862,7 +862,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
 
 const WEATHER_MAX_AGE_US: i64 = crate::room_shadow::WEATHER_MAX_AGE_MIN * 60_000_000;
 
-fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_ms: i64, away: bool, sleep: bool, window_busy: &HashSet<String>) {
+fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_ms: i64, (away, sleep, here): (bool, bool, Option<&str>), window_busy: &HashSet<String>) {
     if !state.config.room_model.enabled {
         return;
     }
@@ -885,6 +885,7 @@ fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_
                     live: want.setpoint,
                     target: want.base,
                     present: if want.occupancy == "away" { 0.0 } else { 1.0 },
+                    here: here == Some(room.name.as_str()),
                     sp_cur: commands.device.get(&want.node).copied().or(commands.target(want.node)),
                     boost_ok: gate && after_window && want.occupancy != "away" && !window_busy.contains(&room.name),
                     window_live: window_busy.contains(&room.name),
@@ -894,7 +895,7 @@ fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_
             .collect();
         (ctxs, state.status.weather_within(lake::now_us(), WEATHER_MAX_AGE_US))
     };
-    let out = state.room_model.step(&state.config, now_ms, weather, hour, &ctxs);
+    let out = state.room_model.step(&state.config, now_ms, weather, hour, now.weekday().number_from_monday() >= 6, &ctxs);
     out.rows.into_iter().for_each(|row| log("shadow decision", state.sink.append(row)));
     out.events.into_iter().for_each(|event| log("filter reset", state.sink.append(event)));
 }
@@ -957,7 +958,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
             want.setpoint = clamp_boost(&readings, want.node, want.setpoint, state.failsafe.boost_max_c());
         }
     }
-    room_model_step(state, &wants, now, now_ms, away, presence.as_ref().is_some_and(|p| p.sleep), window_busy);
+    room_model_step(state, &wants, now, now_ms, (away, presence.as_ref().is_some_and(|p| p.sleep), detected.as_deref()), window_busy);
     state.boost.settle(&wants.iter().map(|w| (w.room.as_str(), w.reason)).collect::<Vec<_>>(), now_ms);
     let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().dialed(&r.nodes), away })).collect();
     state.windows.lock().unwrap().set_context(contexts);

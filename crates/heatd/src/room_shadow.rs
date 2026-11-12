@@ -1,7 +1,7 @@
 use crate::room_model::{bundle_candidates, Bundle, House, Out, ResetRec, RoomIn};
 use crate::room_plan::{plan, Env, PlanOut, ProbeMemo, COAST_CAP, PEAK_MARGIN};
 use anyhow::{bail, Result};
-use matter_controller::{CO2_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
+use matter_controller::{CO2_CLUSTER, ELECTRICAL_POWER_MEASUREMENT_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -33,6 +33,7 @@ const MAX_CATCHUP_MIN: i64 = 30;
 pub const WEATHER_MAX_AGE_MIN: i64 = 180;
 const TEMP_RANGE: [f64; 2] = [0.0, 45.0];
 const VALVE_RANGE: [f64; 2] = [0.0, 100.0];
+const PLUG_POWER_ATTRIBUTE: u32 = 8;
 
 #[derive(Debug, Default)]
 struct Feed {
@@ -48,6 +49,7 @@ struct DevFeed {
     temp: Option<(i64, f64)>,
     rh: Option<(i64, f64)>,
     co2: Option<(i64, f64)>,
+    power: Option<(i64, f64)>,
     fresh_temp: Option<f64>,
 }
 
@@ -57,6 +59,7 @@ pub struct RoomCtx {
     pub live: f64,
     pub target: f64,
     pub present: f64,
+    pub here: bool,
     pub sp_cur: Option<f64>,
     pub boost_ok: bool,
     pub window_live: bool,
@@ -243,7 +246,16 @@ impl RoomModel {
     }
 
     pub fn observe_device(&self, node: u64, cluster: u32, attribute: u32, value: f64, ts_ms: i64) {
-        if attribute != 0 || !value.is_finite() {
+        if !value.is_finite() {
+            return;
+        }
+        if cluster == ELECTRICAL_POWER_MEASUREMENT_CLUSTER {
+            if attribute == PLUG_POWER_ATTRIBUTE {
+                self.lock().devs.entry(node).or_default().power = Some((ts_ms, value));
+            }
+            return;
+        }
+        if attribute != 0 {
             return;
         }
         let mut inner = self.lock();
@@ -262,11 +274,11 @@ impl RoomModel {
         self.lock().views.get(room).cloned().unwrap_or(serde_json::Value::Null)
     }
 
-    pub fn step(&self, config: &crate::config::Config, now_ms: i64, weather: [f64; 3], local_hour: f64, ctxs: &[RoomCtx]) -> StepOut {
+    pub fn step(&self, config: &crate::config::Config, now_ms: i64, weather: [f64; 3], local_hour: f64, weekend: bool, ctxs: &[RoomCtx]) -> StepOut {
         if self.lock().state == Some("error") {
             return StepOut::default();
         }
-        catch_unwind(AssertUnwindSafe(|| self.step_inner(config, now_ms, weather, local_hour, ctxs))).unwrap_or_else(|_| {
+        catch_unwind(AssertUnwindSafe(|| self.step_inner(config, now_ms, weather, local_hour, weekend, ctxs))).unwrap_or_else(|_| {
             eprintln!("room model: panic in the shadow step, shadow disabled until restart");
             let mut out = StepOut::default();
             let mut inner = self.lock();
@@ -276,7 +288,7 @@ impl RoomModel {
         })
     }
 
-    fn step_inner(&self, config: &crate::config::Config, now_ms: i64, weather: [f64; 3], local_hour: f64, ctxs: &[RoomCtx]) -> StepOut {
+    fn step_inner(&self, config: &crate::config::Config, now_ms: i64, weather: [f64; 3], local_hour: f64, weekend: bool, ctxs: &[RoomCtx]) -> StepOut {
         let cfg = &config.room_model;
         let mut guard = self.lock();
         let inner = &mut *guard;
@@ -362,6 +374,13 @@ impl RoomModel {
                 continue;
             }
             inner.decided.insert(ctx.room.clone(), target);
+            let coffee_mw = bundle.pcnn.as_ref().map_or(f64::INFINITY, |t| t.coffee_on_mw);
+            let coffee = config
+                .devices
+                .iter()
+                .filter(|d| d.role == crate::devices::ROLE_COFFEE && d.room.as_deref() == Some(ctx.room.as_str()))
+                .any(|d| inner.devs.get(&d.node).and_then(|f| f.power).filter(|(t, _)| now_ms - t <= stale_ms).is_some_and(|(_, v)| v >= coffee_mw));
+            let q_net = filter.pcnn_q(input, local_hour, weekend, if ctx.here { 1.0 } else { 0.0 }, if coffee { 1.0 } else { 0.0 });
             let env = Env {
                 tout: input.tout,
                 wind: input.wind,
@@ -384,6 +403,8 @@ impl RoomModel {
                 u_now: Some(input.u).filter(|u| u.is_finite()),
                 now_min: target,
                 probe: inner.probes.get(&ctx.room).cloned(),
+                q_net,
+                pcnn_active: bundle.pcnn.as_ref().is_some_and(|t| t.active),
             };
             let p = plan(&filter.par, &bundle.shock, &filter.comps, filt.p_supply, &env);
             if let Some(memo) = &p.probe_memo {
@@ -430,6 +451,9 @@ impl RoomModel {
                     why,
                     sensor_c: p.sensor,
                     forecast_c: Some(p.forecast).filter(|v| v.is_finite()),
+                    forecast_phys_c: Some(p.forecast_phys).filter(|v| v.is_finite()),
+                    forecast_pcnn_c: Some(p.forecast_pcnn).filter(|v| v.is_finite()),
+                    pcnn_active: Some(p.pcnn_active),
                     resid_live_k: ctx.resid_live_k.filter(|v| v.is_finite()),
                     kind: if ending { "probe_end".to_string() } else { p.kind.to_string() },
                     coast_min: Some(p.coast_min),

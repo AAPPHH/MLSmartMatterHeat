@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use crate::room_obs::{abs_hum, check_air, check_effort, check_gas, check_house, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update, AirDoc, EffortDoc, GasDoc, Mat};
+use crate::room_obs::{abs_hum, check_air, check_effort, check_gas, check_house, check_pcnn, check_pcnn_top, feature_row, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update, AirDoc, EffortDoc, GasDoc, Mat, PcnnDoc, PcnnTop};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
@@ -47,6 +47,8 @@ pub struct RoomDoc {
     pub hum: Option<GasDoc>,
     #[serde(default)]
     pub unusable: bool,
+    #[serde(default)]
+    pub pcnn: Option<PcnnDoc>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +88,8 @@ pub struct Bundle {
     pub rooms: BTreeMap<String, RoomDoc>,
     pub shock: Shock,
     pub house: HouseCfg,
+    #[serde(default)]
+    pub pcnn: Option<PcnnTop>,
 }
 
 impl Bundle {
@@ -122,6 +126,7 @@ impl Bundle {
             || !h.balance_seed.is_finite()
             || h.night_hours.iter().any(|v| !v.is_finite())
             || check_house(h.trv_grid, h.trv_floor).is_err()
+            || self.pcnn.as_ref().is_some_and(|t| !check_pcnn_top(t))
         {
             bail!("room model bundle {}: invalid parameters", self.version);
         }
@@ -133,6 +138,9 @@ impl Bundle {
             }
             if !r.air.iter().all(check_air) || !r.effort.as_ref().is_none_or(check_effort) || !r.co2.as_ref().is_none_or(|g| check_gas(g, false)) || !r.hum.as_ref().is_none_or(|g| check_gas(g, true)) {
                 bail!("room model bundle {}: invalid observation parameters for {name}", self.version);
+            }
+            if r.pcnn.as_ref().is_some_and(|d| !check_pcnn(d)) {
+                bail!("room model bundle {}: invalid pcnn block for {name}", self.version);
             }
             if r.neighbours.keys().any(|k| !r.c.contains_key(k)) {
                 bail!("room model bundle {}: neighbours of {name} without coupling", self.version);
@@ -209,6 +217,7 @@ pub struct RoomPar {
     pub co2: Option<GasDoc>,
     pub hum: Option<GasDoc>,
     pub unusable: bool,
+    pub pcnn: Option<PcnnDoc>,
 }
 
 impl RoomPar {
@@ -228,6 +237,7 @@ impl RoomPar {
             co2: doc.co2.clone(),
             hum: doc.hum.clone(),
             unusable: doc.unusable,
+            pcnn: doc.pcnn.clone(),
         }
     }
 
@@ -388,6 +398,16 @@ impl RoomFilter {
             (Some(a), Some(b)) if h.len() == win + 1 && a.is_finite() && b.is_finite() => (b - a) / win as f64,
             _ => f64::NAN,
         }
+    }
+
+    pub fn pcnn_q(&self, inp: &RoomIn, hour: f64, weekend: bool, present: f64, coffee: f64) -> Option<f64> {
+        let (co2, hum) = self.gas_rates();
+        self.par.pcnn.as_ref().map(|net| net.q(&feature_row(hour, weekend, inp.rad, inp.tout, present, co2, hum, coffee)))
+    }
+
+    pub fn gas_rates(&self) -> (f64, f64) {
+        let rate = |i: usize, g: &Option<GasDoc>| g.as_ref().map_or(f64::NAN, |g| self.rate(i, g.window()));
+        (rate(0, &self.par.co2), rate(1, &self.par.hum))
     }
 
     fn gas_evidence(&self, inp: &RoomIn) -> Vec<(f64, f64, GasDoc)> {

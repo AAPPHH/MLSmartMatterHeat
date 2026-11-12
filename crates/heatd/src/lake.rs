@@ -186,6 +186,8 @@ impl Table {
                 fields.push(fld("kind", dict(), false));
                 fields.extend(["coast_min", "stored_min"].map(|n| fld(n, DataType::Float64, true)));
                 fields.push(fld("storage", DataType::Utf8, true));
+                fields.extend(["forecast_phys_c", "forecast_pcnn_c"].map(|n| fld(n, DataType::Float64, true)));
+                fields.push(fld("pcnn_active", DataType::Boolean, true));
                 fields
             }
         };
@@ -580,6 +582,9 @@ pub struct ShadowDecision {
     pub coast_min: Option<f64>,
     pub stored_min: Option<f64>,
     pub storage: Option<String>,
+    pub forecast_phys_c: Option<f64>,
+    pub forecast_pcnn_c: Option<f64>,
+    pub pcnn_active: Option<bool>,
 }
 
 impl Row for ShadowDecision {
@@ -592,6 +597,7 @@ impl Row for ShadowDecision {
             f(|r| r.lambda), f(|r| r.lambda_std), f(|r| r.mass_c), f(|r| r.air_c), f(|r| r.p_supply), f(|r| r.p_window), bool_col(rows, |r| Some(r.p_window_live)),
             dict_col(rows, |r| Some(&r.model_version)), str_col(rows, |r| Some(&r.why)), f(|r| r.sensor_c), prim::<Float64Type, _>(rows, |r| r.forecast_c), prim::<Float64Type, _>(rows, |r| r.resid_live_k),
             dict_col(rows, |r| Some(&r.kind)), prim::<Float64Type, _>(rows, |r| r.coast_min), prim::<Float64Type, _>(rows, |r| r.stored_min), str_col(rows, |r| r.storage.as_deref()),
+            prim::<Float64Type, _>(rows, |r| r.forecast_phys_c), prim::<Float64Type, _>(rows, |r| r.forecast_pcnn_c), bool_col(rows, |r| r.pcnn_active),
         ];
         Ok(RecordBatch::try_new(Self::TABLE.schema(), cols)?)
     }

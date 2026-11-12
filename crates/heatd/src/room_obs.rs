@@ -198,3 +198,79 @@ pub fn gas_update(x: &mut [f64; 3], p: &mut Mat, c0: f64, c1: f64, obs: f64, sig
     obs_update(x, p, [0.0, 0.0, c1], v, side * side);
     0.5 * (2.0 / std::f64::consts::PI).ln() - (s_lo.sqrt() + s_hi.sqrt()).ln() - 0.5 * v * v / if low { s_lo } else { s_hi }
 }
+
+pub const FEATURES: [&str; 11] = ["sin_hour", "cos_hour", "weekend", "radiation", "outdoor", "present", "co2_rate", "co2_avail", "hum_rate", "hum_avail", "coffee"];
+const HIDDEN_MAX: usize = 64;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PcnnDoc {
+    pub qmax: f64,
+    pub features: Vec<String>,
+    pub mu: Vec<f64>,
+    pub sd: Vec<f64>,
+    pub w1: Vec<Vec<f64>>,
+    pub b1: Vec<f64>,
+    pub w2: Vec<f64>,
+    pub b2: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PcnnTop {
+    pub active: bool,
+    pub coffee_on_mw: f64,
+    pub features: Vec<String>,
+}
+
+fn same_features(names: &[String]) -> bool {
+    names.len() == FEATURES.len() && names.iter().zip(FEATURES).all(|(a, b)| a == b)
+}
+
+pub fn check_pcnn(d: &PcnnDoc) -> bool {
+    let (n, hidden) = (FEATURES.len(), d.w2.len());
+    let finite = |xs: &[f64]| xs.iter().all(|v| v.is_finite());
+    same_features(&d.features)
+        && d.qmax.is_finite()
+        && d.qmax > 0.0
+        && (1..=HIDDEN_MAX).contains(&hidden)
+        && d.b1.len() == hidden
+        && d.w1.len() == hidden
+        && d.w1.iter().all(|r| r.len() == n && finite(r))
+        && d.mu.len() == n
+        && d.sd.len() == n
+        && finite(&d.mu)
+        && positive(&d.sd)
+        && finite(&d.b1)
+        && finite(&d.w2)
+        && d.b2.is_finite()
+}
+
+pub fn check_pcnn_top(t: &PcnnTop) -> bool {
+    same_features(&t.features) && nonneg(&[t.coffee_on_mw])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn feature_row(hour: f64, weekend: bool, rad: f64, tout: f64, present: f64, co2_rate: f64, hum_rate: f64, coffee: f64) -> [f64; 11] {
+    let ang = 2.0 * std::f64::consts::PI * hour / 24.0;
+    let opt = |v: f64| if v.is_finite() { (v, 1.0) } else { (0.0, 0.0) };
+    let flag = |v: f64| if v > 0.5 { 1.0 } else { 0.0 };
+    let ((co2, co2_ok), (hum, hum_ok)) = (opt(co2_rate), opt(hum_rate));
+    [ang.sin(), ang.cos(), if weekend { 1.0 } else { 0.0 }, rad / 100.0, tout, flag(present), co2, co2_ok, hum, hum_ok, flag(coffee)]
+}
+
+impl PcnnDoc {
+    pub fn q(&self, x: &[f64; 11]) -> f64 {
+        if !x.iter().all(|v| v.is_finite()) {
+            return 0.0;
+        }
+        let z: Vec<f64> = x.iter().zip(&self.mu).zip(&self.sd).map(|((v, m), s)| (v - m) / s).collect();
+        let mut out = self.b2;
+        for ((row, b), w) in self.w1.iter().zip(&self.b1).zip(&self.w2) {
+            let mut acc = *b;
+            for (wi, zi) in row.iter().zip(&z) {
+                acc += wi * zi;
+            }
+            out += w * acc.tanh();
+        }
+        self.qmax * out.tanh()
+    }
+}
