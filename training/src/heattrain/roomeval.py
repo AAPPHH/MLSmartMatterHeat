@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 from heattrain.roombatch import Grid, norm_cdf_np, run_batch
-from heattrain.roomfit import FoldFit, Truth, base_doc, calibrate_air, episodes, fit_shock, shock_defaults, tune_windows, unusable_rooms
+from heattrain.roomfit import Exog, FoldFit, PcnnFit, Truth, base_doc, calibrate_air, coffee_plugs, episodes, fit_shock, shock_defaults, tune_windows, unusable_rooms
 from heattrain.roomobs import evidence_blocks
+from heattrain.roompcnn import FEATURES, pcnn_gate
 from heattrain.thermal import build_rooms, load_devices, load_events, load_lake
 
-KINDS = ("persistence", "imm_anchored", "imm_oracle", "imm_raw", "kf_anchored")
+KINDS = ("persistence", "imm_anchored", "imm_oracle", "imm_raw", "kf_anchored", "imm_pcnn")
 STRATA = ("steady", "heating_start", "heating", "setpoint_change", "cooling", "airing")
 
 
@@ -25,6 +26,9 @@ def build_data(config, src):
     rooms, skipped = build_rooms(reports, weather, meta, cfg, load_events(src), load_devices(src))
     if not rooms:
         raise SystemExit(f"no usable rooms: {skipped}")
+    plugs = coffee_plugs(meta)
+    for d in rooms:
+        d.info["plugs"] = plugs.get(d.info["base_room"], [])
     return rooms, skipped
 
 
@@ -80,7 +84,7 @@ class Skill:
         m = {k: rmse(np.concatenate(self.e[key + (k,)])) if key + (k,) in self.e else None for k in KINDS}
         n = int(sum(len(x) for x in self.e.get(key + ("persistence",), [])))
         skill = lambda k: 1.0 - m[k] / m["persistence"] if n and m["persistence"] and m[k] is not None else None
-        return {"n": n, **m, "skill": skill("imm_anchored"), "oracle_skill": skill("imm_oracle")}
+        return {"n": n, **m, "skill": skill("imm_anchored"), "oracle_skill": skill("imm_oracle"), "pcnn_skill": skill("imm_pcnn")}
 
     def report(self, rooms):
         out = {"pooled": {}, "rooms": {r: {} for r in rooms}}
@@ -104,7 +108,19 @@ def interval_logscore(y, mu, sd, grid):
     return np.log(np.maximum(p, 1e-12))
 
 
-def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q):
+def fold_nets(fold, full, ff, docs, house, pcnn, rc):
+    phi = math.exp(-1.0 / fold["shock"]["tau_l"]) if rc["eval"]["decay_lam"] else 1.0
+    _, recs, _ = run_range(full, docs, [fold["shock"]], house, 0, fold["cut"])
+    X = {r: pcnn["exog"].matrix(r, docs[r]) for r in full.names}
+    nets, info = {}, {}
+    for r, rf in ff.rfs.items():
+        p = rf.params(np.asarray(fold["th"][r])[None])
+        rec = recs[0][r]
+        nets[r], info[r] = pcnn["fit"].fit(rf, p, docs[r], (rec["m"], rec["a"], rec["lam"], rec["p_supply"]), X[r], fold["cut"], phi)
+    return nets, X, info
+
+
+def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q, nets=None, X=None):
     phi = math.exp(-1.0 / fold["shock"]["tau_l"]) if rc["eval"]["decay_lam"] else 1.0
     for r, rf in rfs.items():
         p = rf.params(np.asarray(fold["th"][r])[None])
@@ -115,15 +131,18 @@ def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q):
         e_or, _ = rf.errors(p, test, docs[r], start, phi)
         kf, _ = rf.errors(p, test, docs[r], causal=True)
         e_tr, _ = rf.errors(p, train, docs[r], start, phi, True)
+        e_pc = rf.errors(p, test, docs[r], start, phi, True, q=nets[r].q_batch(X[r][rf.js[test]]))[0] if nets and nets.get(r) else e_te
         st = strata(rf, rf.js[test], spans[r])
         y, js_te, Pc = rf.c["y"], rf.js[test], rf.Pc[test]
         for H in rf.Hs:
             tr_ok = rf.valid[H][train] & rf.sp_ok[train] & np.isfinite(e_tr[H][:, 0])
             sd_i = rmse(e_tr[H][tr_ok, 0]) or 1.0
             sd_p = rmse((y[rf.js[train] + H] - rf.Pc[train])[tr_ok]) or 1.0
-            ok = rf.valid[H][test] & rf.sp_ok[test] & np.isfinite(e_te[H][:, 0]) & np.isfinite(e_or[H][:, 0]) & np.isfinite(kf[H][:, 0])
+            ok = rf.valid[H][test] & rf.sp_ok[test] & np.isfinite(e_te[H][:, 0]) & np.isfinite(e_or[H][:, 0]) & np.isfinite(kf[H][:, 0]) & np.isfinite(e_pc[H][:, 0])
             yh = y[js_te + H][ok]
             errs = {"persistence": (y[js_te + H] - Pc)[ok], "imm_anchored": e_te[H][ok, 0], "imm_oracle": e_or[H][ok, 0], "imm_raw": raw_te[H][ok, 0], "kf_anchored": kf[H][ok, 0]}
+            if nets is not None:
+                errs["imm_pcnn"] = e_pc[H][ok, 0]
             lp = {"persistence": interval_logscore(yh, Pc[ok], sd_p, grid_q), "imm_anchored": interval_logscore(yh, yh - errs["imm_anchored"], sd_i, grid_q)}
             skill.add(r, H, errs, st[ok], lp)
 
@@ -253,7 +272,7 @@ def tuned_trials(fold, full, docs, truth, rc, house):
     return recs[0], recs[gi], lw, lj, resets[gi], tuning
 
 
-def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=None, shock=None):
+def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=None, shock=None, pcnn=None):
     skill = Skill(list(ff.rfs[next(iter(ff.rfs))].Hs), rc["eval"]["floor"])
     wparts, resets, per_fold = [], 0, []
     for f in folds:
@@ -267,11 +286,12 @@ def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=
         rec_a, rec_w, lw, lj, rs, tuning = tuned_trials(f, full, docs, truth, rc, house)
         spans = truth.spans(full.names)
         spans_mask = {r: full.span_mask(spans[r]) for r in full.names}
-        fold_skill(f, ff.rfs, docs, rec_a, spans_mask, skill, rc, house["trv_grid"] or 0.5)
+        nets, X, ninfo = fold_nets(f, full, ff, docs, house, pcnn, rc) if pcnn else (None, None, None)
+        fold_skill(f, ff.rfs, docs, rec_a, spans_mask, skill, rc, house["trv_grid"] or 0.5, nets, X)
         wparts.append(window_metrics(full, rec_w, truth, f["cut"], f["hi"], rc))
         n_r = sum(1 for e in rs if f["cut"] <= e["step"] < f["hi"])
         resets += n_r
-        per_fold.append({"cut": f["cut"], "hi": f["hi"], "lambda_w": lw, "resets": n_r, "shock": {k: f["shock"][k] for k in ("q_calm", "q_jump", "p_jump", "tau_l")}, "tuning_refused": bool(tuning and tuning.get("refused"))})
+        per_fold.append({"cut": f["cut"], "hi": f["hi"], "lambda_w": lw, "resets": n_r, "shock": {k: f["shock"][k] for k in ("q_calm", "q_jump", "p_jump", "tau_l")}, "tuning_refused": bool(tuning and tuning.get("refused")), "pcnn": ninfo})
     rep = skill.report(list(full.names))
     return {"skill": rep, "window": merge_windows(wparts), "resets": resets, "folds": per_fold}
 
@@ -341,6 +361,9 @@ def fit_bundle(config, rooms, src, version=None):
     truth = Truth(src, rc)
     ff, variants = FoldFit(rooms, full, cfg, rc), Variants(rooms, full, rc)
     folds, hold, chosen = rolling_origin(full, ff, variants, truth, rc, house)
+    pcnn = {"exog": Exog.from_lake(full, src, cfg, rc, rooms), "fit": PcnnFit(rc["pcnn"])}
+    ship = evaluate_variant(folds, full, ff, variants, truth, rc, house, tuple(chosen["parts"]), chosen["effort"], pcnn=pcnn)
+    gate = pcnn_gate(ship["skill"], rc["pcnn"]["gate"])
     t_fold = time.time() - t0
     docs0, th, info = ff.run(full.n, folds[-1]["th"], ext=False)
     lo = max(0, full.n - int(rc["shock"]["days"] * 1440))
@@ -362,17 +385,31 @@ def fit_bundle(config, rooms, src, version=None):
     run, recs = run_batch(full, docs, [shock], house, record=True)
     rec, resets = recs[0], run.resets(0)
     by_room = {r: sum(1 for x in resets if x["room"] == r) for r in full.names}
+    nets_info, phi = {}, math.exp(-1.0 / shock["tau_l"]) if rc["eval"]["decay_lam"] else 1.0
+    for r, rf in ff.rfs.items():
+        its = [fi["pcnn"][r]["best_iter"] for fi in ship["folds"] if "reason" not in fi["pcnn"][r]]
+        if not its:
+            nets_info[r] = {"reason": "no fold produced a net"}
+            continue
+        net, nets_info[r] = pcnn["fit"].fit(rf, rf.params(np.asarray(th[r])[None]), docs[r], (rec[r]["m"], rec[r]["a"], rec[r]["lam"], rec[r]["p_supply"]), pcnn["exog"].matrix(r, docs[r]), full.n, phi, iters=int(np.median(its)))
+        if net:
+            docs[r]["pcnn"] = net.doc
+    active = bool(gate["active"] and any("pcnn" in d for d in docs.values()))
     flags = [f"{r}: at bound {','.join(i['at_bound'])}" for r, i in info.items() if i["at_bound"]]
     unconverged = [f"{r}: fit not converged" for r, i in info.items() if not i["converged"]]
     flags_all = flags + unconverged + [f"{r}: fit unusable, {'; '.join(w)}" for r, w in bad.items()] + ([tuning["warning"]] if tuning and tuning.get("refused") else [])
     version = version or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     house_out = dict(house, night_hours=cfg["night_hours"], timezone=cfg["timezone"])
-    bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out}
+    bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out,
+              "pcnn": {"active": active, "coffee_on_mw": rc["pcnn"]["coffee_on_mw"], "features": list(FEATURES)}}
     pooled = {k: v for k, v in hold["trv"]["skill"]["pooled"].items()}
     holdout = {"pooled": pooled, "rooms": hold["trv"]["skill"]["rooms"], "folds": hold["trv"]["folds"], "window": hold["trv"]["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
-    report = {"version": version, "flags": flags_all, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
+    sk = ship["skill"]
+    pick = lambda b: {k: b[k] for k in ("n", "skill", "pcnn_skill")}
+    pcnn_report = {"active": active, "gate": gate, "rooms": nets_info, "folds": [fi["pcnn"] for fi in ship["folds"]], "skill": {"pooled": {h: pick(sk["pooled"][h]) for h in ("H20", "H60")}, "rooms": {r: {h: pick(b[h]) for h in ("H20", "H60")} for r, b in sk["rooms"].items()}}}
+    report = {"version": version, "flags": flags_all, "pcnn": pcnn_report, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
               "resets": len(resets), "reset_list": reset_list(full, resets, truth, rec), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
               "loglik": float(run.loglik[0]), "minutes": full.n, "sensor_start": variants.sensor_start, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"folds": t_fold, "total": time.time() - t0},
               "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"]} for n, d in docs.items()}}

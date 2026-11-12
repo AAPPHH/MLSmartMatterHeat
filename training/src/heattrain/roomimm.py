@@ -1,6 +1,7 @@
 import math
 from collections import deque
 from dataclasses import dataclass
+from heattrain.roompcnn import Pcnn, feature_row
 from heattrain.roomobs import abs_hum, check_house, check_room_doc, effort_coeffs, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update
 
 SQRT2 = math.sqrt(2.0)
@@ -57,6 +58,7 @@ class RoomPar:
         check_room_doc("room", doc)
         self.air = [(a["noise"] ** 2, a.get("offset", 0.0)) for a in doc.get("air") or []]
         self.effort, self.co2, self.hum = doc.get("effort"), doc.get("co2"), doc.get("hum")
+        self.pcnn = Pcnn(doc["pcnn"], "room") if doc.get("pcnn") else None
 
     def lag(self, state, u):
         if state is None or self.alpha == 1.0:
@@ -301,6 +303,11 @@ class RoomFilter:
         self.x, self.p, self.nu = new_x, new_p, new_nu
 
 
+def pcnn_q(filt, inp, hour, weekend, present, coffee):
+    net = filt.par.pcnn
+    return None if net is None else net.q(feature_row(hour, weekend, inp.rad, inp.tout, present, filt.rate("co2"), filt.rate("ah"), coffee))
+
+
 class House:
     def __init__(self, rooms, shock, house):
         check_house(house)
@@ -373,11 +380,12 @@ def rollout(par, m, a, lam, s, sp, env):
     en, co, sens = [], [], []
     lag = env["lag"]
     sens0 = par.sensor(m, a)
+    hq = h * env.get("q", 0.0)
     for k in range(HORIZON):
         u = valve_demand(par, env, sens0, sp[k], par.sensor(m, a))
         lag = par.lag(lag, u)
         f11, f12, f21, f22, g1, g2, _ = par.terms(lam, lag[1] * s, env["tout"], env["wind"], env["rad"], env["night"], env["cn"], env["cs"], h)
-        m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2
+        m, a = f11 * m + f12 * a + g1, f21 * m + f22 * a + g2 + hq
         sens.append(par.sensor(m, a))
         en.append(u * s)
         co.append(max(0.0, env["target"] - sens[-1]) * env["present"])
@@ -428,6 +436,9 @@ def plan(par, shock, comps, p_supply, env):
     lam_c = sum(wt[j] * min(comps[j][1][2], lam_w) for j in range(len(comps))) / sum(wt) if sum(wt) > 0 else 1.0
     lam_o = max(shock["lambda_jump"], sum(mu[j] * q[j] * comps[j][1][2] for j in range(len(comps))) / pw) if pw > 0 else shock["lambda_jump"]
     env = dict(env)
+    q_net = env.get("q_net")
+    net_on = bool(env.get("pcnn_active")) and q_net is not None
+    env["q"] = q_net if net_on else 0.0
     env["cn"], env["cs"] = par.coupling(env["ncnt"], env["nsum"])
     env["lag"] = list(env["lag"]) if env.get("lag") is not None else None
     modes = ((1.0 - pw, lam_c), (pw, lam_o))
@@ -494,14 +505,21 @@ def plan(par, shock, comps, p_supply, env):
                 chosen, evoi_best = pr, evoi
                 new_memo = {"start": now, "d": d, "block_until": now + 2 * d + separation_minutes(pr, sigma_obs), "target": target, "present": env["present"], "ended": False}
                 event = "start"
-    fc = sum(modes[mi][0] * supplies[si][1] * live["runs"][mi][si][2][FORECAST_MIN - 1] for mi in range(2) for si in range(2))
     y_last = env.get("y_last")
-    if y_last is not None and math.isfinite(y_last):
-        fc += y_last - sensor0
+    anchor = y_last - sensor0 if y_last is not None and math.isfinite(y_last) else 0.0
+    live_sp = profile(live["first"], HORIZON, live["first"])
+
+    def forecast_with(q):
+        e = dict(env, q=q)
+        return anchor + sum(modes[mi][0] * supplies[si][1] * rollout(par, m, a, lam, s, live_sp, e)[2][FORECAST_MIN - 1] for mi, (_, lam) in enumerate(modes) for si, (s, _) in enumerate(supplies))
+
+    fc_phys = forecast_with(0.0)
+    fc_pcnn = forecast_with(q_net) if q_net is not None else math.nan
+    fc = fc_pcnn if net_on else fc_phys
     coast, stored = storage(par, m, a, lam_c, env)
     if unusable:
         chosen = live
     return {"coast_min": coast, "stored_min": stored, "kind": "fit_unusable" if unusable else chosen["kind"], "name": "fit_unusable" if unusable else chosen["name"], "setpoint": chosen["first"], "raise": False if unusable else chosen["raise_flag"],
             "probe_min": chosen["probe_min"], "boost_min": chosen["boost_min"], "energy": chosen["energy"], "cold": chosen["cold"], "raise_cost": 0.0 if unusable else chosen["raise"], "cost_live": live["total"], "total": chosen["total"],
-            "p_window": pw, "lam_closed": lam_c, "lam_open": lam_o, "mass": m, "air": a, "sensor": sensor0, "forecast": fc, "evoi": evoi_best, "best_cost": best["total"], "perfect_cost": perf, "n_allowed": len(allowed),
+            "p_window": pw, "lam_closed": lam_c, "lam_open": lam_o, "mass": m, "air": a, "sensor": sensor0, "forecast": fc, "forecast_phys": fc_phys, "forecast_pcnn": fc_pcnn, "pcnn_active": net_on, "evoi": evoi_best, "best_cost": best["total"], "perfect_cost": perf, "n_allowed": len(allowed),
             "probe_event": event, "probed_min": probed, "probe_memo": new_memo, "unusable": unusable}

@@ -4,13 +4,15 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import duckdb
 import numpy as np
 from scipy.optimize import least_squares
-from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, norm_cdf_np, run_batch, valve_lag, valve_lag_states
+from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, abs_hum_np, norm_cdf_np, rate_np, run_batch, valve_lag, valve_lag_states
 from heattrain.roomimm import PEAK_MARGIN, RoomPar, norm_cdf
 from heattrain.roomobs import evidence_blocks
-from heattrain.thermal import build_rooms, epoch, fit, load_devices, load_events, load_lake, raw_batches
+from heattrain.roompcnn import FEATURES, Pcnn, feature_matrix
+from heattrain.thermal import build_rooms, epoch, fit, latest_meta, load_devices, load_events, load_lake, raw_batches, read_arrows
 
 ROOM_KEYS = ("a1", "a2", "b1", "b2", "b3", "b4", "w", "ts", "ts_night", "tau_v")
 
@@ -184,7 +186,7 @@ class RoomFit:
             self.lags[key] = valve_lag_states(self.c["u"], lag_alpha(key))
         return self.lags[key][:, js]
 
-    def roll_causal(self, p, doc, m, a, lam, sel, phi, p_sup):
+    def roll_causal(self, p, doc, m, a, lam, sel, phi, p_sup, q=None, tangent=False):
         c, h, js = self.c, 1.0 / 60.0, self.js[sel]
         at = lambda x: np.asarray(x, float)[js][:, None]
         tout, wind, rad, sp = at(c["tout"]), at(c["wind"]), at(c["rad"]), at(c["sp"])
@@ -194,27 +196,41 @@ class RoomFit:
         amb = p["b2"] + p["b3"] * wind
         ts = np.where(at(c["night"]) > 0.5, p["ts_night"], p["ts"])
         g2 = h * (amb * tout + p["b4"] * rad / 100.0 + cs)
+        hq = 0.0 if q is None else h * np.asarray(q, float).reshape(-1, 1)
         alpha = np.where(p["tau_v"] > 0, 1.0 - np.exp(-1.0 / np.maximum(p["tau_v"], 1e-12)), 1.0)
         v0 = np.stack([self.lag_at(t, js) for t in p["tau_v"]], -1)
         w, g = p["w"], doc["valve_gain"]
         u0, sens0 = at(c["u"]), w * m + (1 - w) * a
         out = {H: 0.0 for H in self.Hs}
+        dout = {H: 0.0 for H in self.Hs}
         for sup, wt in ((1.0, p_sup), (0.0, 1.0 - p_sup)):
             if np.all(np.asarray(wt) == 0.0):
                 continue
             x, y, v1, v2 = m, a, v0[0], v0[1]
+            dx = dy = dv1 = dv2 = 0.0
             for s in range(max(self.Hs)):
-                u = np.clip(u0 + g * (sens0 - (w * x + (1 - w) * y)), 0.0, 1.0)
+                raw = u0 + g * (sens0 - (w * x + (1 - w) * y))
+                u = np.clip(raw, 0.0, 1.0)
+                if tangent:
+                    du = np.where((raw > 0.0) & (raw < 1.0), -g * (w * dx + (1 - w) * dy), 0.0)
+                    dv1 = np.where(alpha == 1.0, du, dv1 + alpha * (du - dv1))
                 v1 = np.where(alpha == 1.0, u, v1 + alpha * (u - v1))
+                if tangent:
+                    dv2 = np.where(alpha == 1.0, du, dv2 + alpha * (dv1 - dv2))
                 v2 = np.where(alpha == 1.0, u, v2 + alpha * (v1 - v2))
                 au = p["a1"] * v2 * sup
                 dl = h * (lam - 1.0) * phi ** s * amb
-                x, y = (1.0 - h * (au + p["a2"])) * x + h * p["a2"] * y + h * au * ts, h * p["b1"] * x + (1.0 - h * (p["b1"] + amb + cn) - dl) * y + g2 + dl * tout
+                if tangent:
+                    dau = p["a1"] * dv2 * sup
+                    dx, dy = (1.0 - h * (au + p["a2"])) * dx - h * dau * x + h * p["a2"] * dy + h * dau * ts, h * p["b1"] * dx + (1.0 - h * (p["b1"] + amb + cn) - dl) * dy + h
+                x, y = (1.0 - h * (au + p["a2"])) * x + h * p["a2"] * y + h * au * ts, h * p["b1"] * x + (1.0 - h * (p["b1"] + amb + cn) - dl) * y + g2 + dl * tout + hq
                 if s + 1 in self.Hs:
                     out[s + 1] = out[s + 1] + wt * (w * x + (1 - w) * y)
-        return out
+                    if tangent:
+                        dout[s + 1] = dout[s + 1] + wt * (w * dx + (1 - w) * dy)
+        return (out, dout) if tangent else out
 
-    def errors(self, p, sel, doc, start=None, phi=1.0, causal=False):
+    def errors(self, p, sel, doc, start=None, phi=1.0, causal=False, q=None, tangent=False):
         coef = self.coef(p)
         P = len(p["w"])
         if start is None:
@@ -223,10 +239,15 @@ class RoomFit:
         else:
             m, a, lam = (np.repeat(np.asarray(x, float)[self.js[sel]][:, None], P, 1) for x in start[:3])
             p_sup = np.repeat(np.asarray(start[3], float)[self.js[sel]][:, None], P, 1) if len(start) > 3 else 1.0
-        pred = self.roll_causal(p, doc, m, a, lam, sel, phi, p_sup) if causal else self.roll(p, coef, m, a, lam, sel, phi)
+        dpred = None
+        if causal and tangent:
+            pred, dpred = self.roll_causal(p, doc, m, a, lam, sel, phi, p_sup, q, True)
+        else:
+            pred = self.roll_causal(p, doc, m, a, lam, sel, phi, p_sup, q) if causal else self.roll(p, coef, m, a, lam, sel, phi)
         shat = p["w"] * m + (1 - p["w"]) * a
         y, js, Pc = self.c["y"], self.js[sel], self.Pc[sel][:, None]
-        return {H: (y[js + H][:, None] - Pc) - (pred[H] - shat) for H in self.Hs}, {H: y[js + H][:, None] - pred[H] for H in self.Hs}
+        errs = {H: (y[js + H][:, None] - Pc) - (pred[H] - shat) for H in self.Hs}, {H: y[js + H][:, None] - pred[H] for H in self.Hs}
+        return errs + (dpred,) if tangent else errs
 
     def residuals(self, th, sel, doc):
         e, _ = self.errors(self.params(th), sel, doc)
@@ -550,3 +571,173 @@ def calibrate_air(grid, docs, rc, lo, hi, rec):
         else:
             out[r] = blocks
     return out
+
+
+PLUG_CLUSTER, PLUG_POWER = 0x0090, 8
+
+
+def load_presence(path):
+    p = Path(path)
+    out = []
+    for b in raw_batches(p, "watch_inference"):
+        if {"ts", "result_room", "abstained"} <= set(b.schema.names):
+            out += list(zip(epoch(b.column("ts").to_pylist()), b.column("result_room").to_pylist(), b.column("abstained").to_pylist()))
+    base = p / "parquet" / "watch_inference"
+    if base.is_dir() and any(base.rglob("part.parquet")):
+        sql = f"SELECT epoch(ts), result_room::VARCHAR, abstained FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true)"
+        out += [(float(a), b, bool(c)) for a, b, c in duckdb.connect().execute(sql).fetchall()]
+    return sorted(set((round(a, 3), None if c or b is None else b) for a, b, c in out if a == a), key=lambda r: (r[0], r[1] or ""))
+
+
+def load_plug_power(path):
+    p = Path(path)
+    rows = []
+    t = read_arrows(p, "device_readings")
+    if t is not None:
+        c = {n: t.column(n).to_pylist() for n in ("node", "cluster", "attribute", "value")}
+        ts = epoch(t.column("ts").to_pylist())
+        rows += [(ts[i], c["node"][i], float(c["value"][i])) for i in range(t.num_rows) if c["cluster"][i] == PLUG_CLUSTER and c["attribute"][i] == PLUG_POWER and c["value"][i] is not None]
+    base = p / "parquet" / "device_readings"
+    if base.is_dir() and any(base.rglob("part.parquet")):
+        sql = f"SELECT epoch(ts), node, value FROM read_parquet('{base.as_posix()}/**/part.parquet', hive_partitioning=false, union_by_name=true) WHERE cluster = {PLUG_CLUSTER} AND attribute = {PLUG_POWER} AND value IS NOT NULL"
+        rows += [(float(a), int(b), float(c)) for a, b, c in duckdb.connect().execute(sql).fetchall()]
+    out = {}
+    for ts, node, v in sorted(set(rows)):
+        out.setdefault(node, ([], []))
+        out[node][0].append(ts)
+        out[node][1].append(v)
+    return {n: (np.array(t), np.array(v)) for n, (t, v) in out.items()}
+
+
+def local_clock(times, tz):
+    times = np.asarray(times, float)
+    keys = (times // 900).astype(np.int64)
+    zone = ZoneInfo(tz)
+    off = {k: datetime.fromtimestamp(int(k) * 900, zone).utcoffset().total_seconds() for k in np.unique(keys)}
+    local = times + np.array([off[k] for k in keys])
+    return (local % 86400.0) / 3600.0, (((local // 86400.0).astype(np.int64) + 3) % 7 >= 5).astype(float)
+
+
+def coffee_plugs(meta):
+    out = {}
+    for d in latest_meta(meta).get("devices", []):
+        if d.get("role") == "coffee" and d.get("room"):
+            out.setdefault(d["room"], []).append(d["node"])
+    return out
+
+
+def held_at(times, t, v, stale_s):
+    idx = np.searchsorted(t, times, side="right") - 1
+    ok = (idx >= 0) & (times - t[np.clip(idx, 0, None)] <= stale_s)
+    return np.where(ok, v[np.clip(idx, 0, None)], np.nan)
+
+
+class Exog:
+    def __init__(self, grid, tz, presence, power, plugs, pc, stale_s):
+        self.grid = grid
+        self.hour, self.weekend = local_clock(grid.times, tz)
+        ts = np.array([r[0] for r in presence], float)
+        last = np.array([r[1] for r in presence] + [None], object)
+        fresh = np.isfinite(held_at(grid.times, ts, np.zeros(len(ts)), pc["presence_min"] * 60.0)) if len(ts) else np.zeros(grid.n, bool)
+        who = last[np.where(fresh, np.searchsorted(ts, grid.times, side="right") - 1, -1)] if len(ts) else np.full(grid.n, None, object)
+        self.present = {r: ((who == r) & fresh).astype(float) for r in grid.names}
+        self.coffee = {}
+        for r in grid.names:
+            on = np.zeros(grid.n)
+            for node in plugs.get(r, []):
+                if node in power:
+                    on = np.maximum(on, (np.nan_to_num(held_at(grid.times, *power[node], stale_s)) >= pc["coffee_on_mw"]).astype(float))
+            self.coffee[r] = on
+
+    @classmethod
+    def from_lake(cls, grid, src, cfg, rc, rooms):
+        return cls(grid, cfg["timezone"], load_presence(src), load_plug_power(src), {d.room: d.info.get("plugs", []) for d in rooms}, rc["pcnn"], cfg["device_stale_s"])
+
+    def matrix(self, room, doc):
+        c = self.grid.cols[room]
+        nan = np.full(self.grid.n, np.nan)
+        co2 = rate_np(c["co2"], int(doc["co2"]["win_min"])) if doc.get("co2") else nan
+        hum = rate_np(abs_hum_np(c["th"], c["rh"]), int(doc["hum"]["win_min"])) if doc.get("hum") else nan
+        return feature_matrix(self.hour, self.weekend, c["rad"], c["tout"], self.present[room], co2, hum, self.coffee[room])
+
+
+class PcnnFit:
+    def __init__(self, pc):
+        self.pc = pc
+        self.F, self.H = len(FEATURES), pc["hidden"]
+
+    def unpack(self, th):
+        H, F = self.H, self.F
+        return th[:H * F].reshape(H, F), th[H * F:H * F + H], th[H * F + H:H * F + 2 * H], th[H * F + 2 * H], th[H * F + 2 * H + 1]
+
+    def initial(self):
+        rng = np.random.default_rng(self.pc["seed"])
+        return np.concatenate([rng.normal(0.0, 0.3 / math.sqrt(self.F), self.H * self.F), np.zeros(self.H), rng.normal(0.0, 0.1, self.H), [0.0, math.log(self.pc["q0"])]])
+
+    def net_doc(self, th, mu, sd):
+        w1, b1, w2, b2, lq = self.unpack(th)
+        return {"qmax": float(math.exp(lq)), "features": list(FEATURES), "mu": mu.tolist(), "sd": sd.tolist(), "w1": w1.tolist(), "b1": b1.tolist(), "w2": w2.tolist(), "b2": float(b2)}
+
+    def forward(self, th, z):
+        w1, b1, w2, b2, lq = self.unpack(th)
+        hid = np.tanh(z @ w1.T + b1)
+        t = np.tanh(hid @ w2 + b2)
+        return hid, t, math.exp(lq) * t
+
+    def fit(self, rf, p, doc, start, X, cut, phi, iters=None):
+        from scipy.optimize import minimize
+        pc, Hs = self.pc, self.pc["horizons"]
+        js = rf.js
+        s0 = lambda k: np.asarray(start[k], float)[js]
+        base = (js + max(rf.Hs) < cut) & np.isfinite(s0(0)) & np.isfinite(s0(1)) & np.isfinite(s0(2)) & np.isfinite(s0(3)) & np.isfinite(X[js]).all(-1)
+        if base.sum() < pc["min_n"]:
+            return None, {"reason": f"only {int(base.sum())} origins", "n_train": int(base.sum())}
+        if iters is None:
+            split = js[base][int(base.sum() * (1.0 - pc["val_frac"]))]
+            train, val = base & (js + max(rf.Hs) < split), base & (js >= split)
+        else:
+            train, val = base, None
+        rows = X[js[train]]
+        mu, sd = rows.mean(0), rows.std(0)
+        sd = np.where(sd < 1e-6, 1.0, sd)
+        pers = {H: float(np.sqrt(np.mean((rf.c["y"][js[train & rf.valid[H]] + H] - rf.Pc[train & rf.valid[H]]) ** 2))) or 1.0 for H in Hs}
+        wd, lq0 = pc["wd"], math.log(pc["q0"])
+
+        def parts(th, sel, grad):
+            z = (X[js[sel]] - mu) / sd
+            hid, t, q = self.forward(th, z)
+            e, _, dpred = rf.errors(p, sel, doc, start, phi, True, q=q, tangent=True)
+            loss, dq, n = 0.0, np.zeros(len(q)), max(int(sel.sum()), 1)
+            for H, wt in zip(Hs, pc["weights"]):
+                ok = rf.valid[H][sel] & np.isfinite(e[H][:, 0])
+                r = np.where(ok, e[H][:, 0], 0.0)
+                loss += wt / pers[H] ** 2 * float(np.sum(r * r)) / n
+                dq += wt / pers[H] ** 2 * 2.0 * r * -np.where(ok, dpred[H][:, 0], 0.0) / n
+            if not grad:
+                return loss
+            w1, b1, w2, b2, lq = self.unpack(th)
+            do = dq * math.exp(lq) * (1.0 - t * t)
+            dh = np.outer(do, w2) * (1.0 - hid * hid)
+            g = np.concatenate([(dh.T @ z).ravel() + 2.0 * wd * w1.ravel(), dh.sum(0), hid.T @ do + 2.0 * wd * w2, [do.sum()], [float(np.sum(dq * t)) * math.exp(lq) + pc["prior_w"] * (lq - lq0) / pc["q_sigma"] ** 2]])
+            return loss + wd * float(np.sum(w1 * w1) + np.sum(w2 * w2)) + 0.5 * pc["prior_w"] * ((lq - lq0) / pc["q_sigma"]) ** 2, g
+
+        th0 = self.initial()
+        base_loss = parts(th0, val, False) if val is not None else math.inf
+        best = {"loss": base_loss, "th": th0, "it": 0, "n": 0}
+
+        def track(xk):
+            best["n"] += 1
+            if val is None:
+                best["th"], best["it"] = np.array(xk), best["n"]
+                return
+            v = parts(np.asarray(xk), val, False)
+            if v < best["loss"] - 1e-12:
+                best.update(loss=v, th=np.array(xk), it=best["n"])
+            if best["n"] - best["it"] >= pc["patience"]:
+                raise StopIteration
+
+        minimize(lambda th: parts(th, train, True), th0, jac=True, method="L-BFGS-B", callback=track, options={"maxiter": iters or pc["max_iter"]})
+        info = {"n_train": int(train.sum()), "n_val": int(val.sum()) if val is not None else 0, "best_iter": int(best["it"]), "val_loss": None if val is None else float(best["loss"]), "val_loss_physics": None if val is None else float(base_loss)}
+        if best["it"] == 0 or (val is not None and not best["loss"] < base_loss - 1e-9):
+            return None, dict(info, reason="no validation gain" if val is not None else "no iteration")
+        return Pcnn(self.net_doc(best["th"], mu, sd)), info
