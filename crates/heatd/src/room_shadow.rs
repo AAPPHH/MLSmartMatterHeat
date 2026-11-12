@@ -84,6 +84,7 @@ struct Inner {
     last_row: HashMap<String, (f64, i64, bool, &'static str)>,
     views: BTreeMap<String, serde_json::Value>,
     pending: Vec<crate::lake::Event>,
+    pending_rows: Vec<crate::lake::ShadowDecision>,
     away_since: Option<i64>,
     returned: Option<i64>,
     weather: [Option<(i64, f64)>; 3],
@@ -177,6 +178,20 @@ fn house_resets(house: &House, cause: &'static str, now_ms: i64) -> Vec<crate::l
         .collect()
 }
 
+pub(crate) fn close_probes(probes: &mut HashMap<String, ProbeMemo>, version: &str, now_ms: i64) -> Vec<crate::lake::ShadowDecision> {
+    let now_min = now_ms.div_euclid(MIN_MS);
+    let mut rows: Vec<_> = probes
+        .drain()
+        .filter(|(_, mm)| !mm.ended)
+        .map(|(room, mm)| {
+            let spent = (now_min - mm.start).clamp(0, mm.d as i64) as usize;
+            crate::lake::ShadowDecision { ts: now_ms * 1000, why: probe_end_sentence(&room, "end", spent), room, kind: "probe_end".to_string(), probe_min: Some(spent as f64), model_version: version.to_string(), ..Default::default() }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.room.cmp(&b.room));
+    rows
+}
+
 impl Inner {
     fn set_state(&mut self, state: &'static str, out: &mut StepOut) {
         if self.state != Some(state) {
@@ -207,7 +222,9 @@ impl RoomModel {
         inner.cursor = None;
         inner.inputs.clear();
         inner.decided.clear();
-        inner.probes.clear();
+        let version = inner.bundle.as_ref().map(|b| b.version.clone()).unwrap_or_default();
+        let rows = close_probes(&mut inner.probes, &version, crate::lake::now_us() / 1000);
+        inner.pending_rows.extend(rows);
     }
 
     pub fn homecoming_open(&self, away: bool, now_ms: i64, min_away_min: f64) -> bool {
@@ -296,7 +313,7 @@ impl RoomModel {
         if inner.panic_next {
             panic!("room model test panic");
         }
-        let mut out = StepOut { events: std::mem::take(&mut inner.pending), ..Default::default() };
+        let mut out = StepOut { events: std::mem::take(&mut inner.pending), rows: std::mem::take(&mut inner.pending_rows), ..Default::default() };
         for (slot, v) in inner.weather.iter_mut().zip(weather) {
             if v.is_finite() {
                 *slot = Some((now_ms, v));
@@ -323,7 +340,7 @@ impl RoomModel {
         if target - cursor > MAX_CATCHUP_MIN {
             out.events.extend(house_resets(house, "restart_gap", now_ms));
             *house = House::new(&bundle);
-            inner.probes.clear();
+            out.rows.extend(close_probes(&mut inner.probes, &bundle.version, now_ms));
             cursor = target - 1;
         }
         let [night_from, night_to] = bundle.house.night_hours;

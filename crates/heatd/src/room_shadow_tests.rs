@@ -320,6 +320,18 @@ fn probe_sentence_names_the_closed_valve_and_the_cooling_that_shows_it() {
 }
 
 #[test]
+fn a_reload_or_gap_turns_a_running_probe_into_a_probe_end_row_with_the_minutes_spent() {
+    use crate::room_plan::ProbeMemo;
+    let memo = |start: i64, ended: bool| ProbeMemo { start, d: 20, base: 40, block_until: start + 40, target: 21.0, present: 1.0, ended, unc: 0.4, strikes: 0 };
+    let mut probes = std::collections::HashMap::from([("a".to_string(), memo(100, false)), ("b".to_string(), memo(50, true)), ("c".to_string(), memo(10, false))]);
+    let rows = crate::room_shadow::close_probes(&mut probes, "v1", 107 * MIN);
+    assert!(probes.is_empty());
+    let got: Vec<_> = rows.iter().map(|r| (r.room.as_str(), r.kind.as_str(), r.probe_min)).collect();
+    assert_eq!(got, [("a", "probe_end", Some(7.0)), ("c", "probe_end", Some(20.0))]);
+    assert_eq!(rows[0].why, "a: Probe nach 7 min zu Ende");
+}
+
+#[test]
 fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
     use crate::room_model::{House, RoomIn};
     use crate::room_plan::{plan, Env};
