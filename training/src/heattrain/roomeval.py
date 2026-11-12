@@ -358,11 +358,11 @@ class ProbeReplay:
     def __init__(self, full, docs, shock, rec, present, rc):
         self.full, self.docs, self.shock, self.rec, self.present, self.rc, self.cfg = full, docs, shock, rec, present, rc, rc["replay"]
 
-    def env(self, r, par, k, lag):
+    def env(self, r, par, k, lag, present):
         c, cfg = self.full.cols[r], self.cfg
         sp = float(c["sp"][k])
         return {"tout": float(c["tout"][k]), "wind": float(c["wind"][k]), "rad": float(c["rad"][k]), "night": bool(c["night"][k] > 0.5), "ncnt": tuple(float(a[k]) for a in c["ncnt"]), "nsum": tuple(float(b[k]) for b in c["nsum"]),
-                "target": sp, "present": float(self.present[r][k]), "sp_cur": sp, "sp_live": sp, "frost": cfg["frost"], "boost_c": self.rc["house"]["boost_c"], "boost_ok": False, "raise_cost": cfg["raise_cost"], "cold_cost": cfg["cold_cost"],
+                "target": sp, "present": float(present[k]), "sp_cur": sp, "sp_live": sp, "frost": cfg["frost"], "boost_c": self.rc["house"]["boost_c"], "boost_ok": False, "raise_cost": cfg["raise_cost"], "cold_cost": cfg["cold_cost"],
                 "r_grid": self.rc["house"]["r_grid"], "u_now": float(c["u"][k]), "lag": [float(lag[0, k]), float(lag[1, k])], "y_last": float(c["y"][k]), "now_min": k}
 
     def comps(self, rec, k):
@@ -371,16 +371,17 @@ class ProbeReplay:
         state = lambda lm: [float(rec["m"][k]), float(rec["a"][k]), lm]
         return [(1.0 - pw, state(min(lam, lw - 1e-3)), flat), (pw, state(max(lam, lj)), flat)]
 
-    def room(self, r):
+    def room(self, r, always=False):
         par, rec, cfg = RoomPar(self.docs[r]), self.rec[r], self.cfg
+        present = np.ones(self.full.n) if always else self.present[r]
         lag = valve_lag_states(self.full.cols[r]["u"], par.alpha)
         n, memo, out = self.full.n, None, {"plans": 0, "probes": 0, "probe_min": 0, "aborts": 0, "kinds": {}}
         for k in range(max(n - int(cfg["days"] * 1440), 0), n, cfg["every_min"]):
             c = self.full.cols[r]
-            needed = [rec["m"][k], rec["lam"][k], rec["p_supply"][k], rec["p_window"][k], c["sp"][k], c["u"][k], c["tout"][k], c["wind"][k], c["rad"][k], lag[1, k], self.present[r][k]]
+            needed = [rec["m"][k], rec["lam"][k], rec["p_supply"][k], rec["p_window"][k], c["sp"][k], c["u"][k], c["tout"][k], c["wind"][k], c["rad"][k], lag[1, k], present[k]]
             if not np.isfinite(needed).all() or c["sp"][k] <= cfg["frost"] + 1.0:
                 continue
-            res = plan(par, self.shock, self.comps(rec, k), float(rec["p_supply"][k]), dict(self.env(r, par, k, lag), probe=memo))
+            res = plan(par, self.shock, self.comps(rec, k), float(rec["p_supply"][k]), dict(self.env(r, par, k, lag, present), probe=memo))
             memo = res["probe_memo"]
             out["plans"] += 1
             out["kinds"][res["kind"]] = out["kinds"].get(res["kind"], 0) + 1
@@ -388,12 +389,13 @@ class ProbeReplay:
             out["aborts"] += int(res["probe_event"] == "abort")
             out["probe_min"] += res["probed_min"] if res["probe_event"] in ("end", "abort") else 0
             out["unusable"] = bool(res["unusable"])
+        out["present_share"] = float(np.nanmean(present[max(n - int(cfg["days"] * 1440), 0):]))
         out["probes_per_day"] = out["probes"] / cfg["days"]
         out["probe_min_per_day"] = out["probe_min"] / cfg["days"]
         return out
 
     def run(self):
-        return {r: self.room(r) for r in self.full.names}
+        return {"observed_presence": {r: self.room(r) for r in self.full.names}, "always_present": {r: self.room(r, True) for r in self.full.names}}
 
 
 def fit_bundle(config, rooms, src, version=None):

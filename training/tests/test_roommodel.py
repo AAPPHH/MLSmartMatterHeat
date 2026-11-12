@@ -434,6 +434,6 @@ def replay_inputs(pw, n=600):
 
 def test_probe_replay_probes_only_when_the_window_state_is_uncertain():
     sure = replay_inputs(0.0).room("r")
-    unsure = replay_inputs(0.5).room("r")
+    unsure = replay_inputs(0.5).room("r", True)
     assert sure["plans"] > 0 and sure["probes"] == 0
     assert unsure["probes"] >= 1 and unsure["probes_per_day"] > 0 and unsure["probe_min"] > 0
