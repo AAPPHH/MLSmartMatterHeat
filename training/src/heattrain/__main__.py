@@ -53,7 +53,7 @@ CONFIG = {
                 "bounds": {"a1": [0.01, 300.0], "a2": [0.01, 300.0], "b1": [0.01, 300.0], "b2": [1e-3, 10.0], "b3": [1e-5, 3.0], "b4": [1e-5, 5.0], "w": [1e-3, 0.999], "ts": [20.0, 95.0], "ts_night": [15.0, 95.0],
                            "tau_v": [0.1, 120.0], "c": [1e-4, 20.0]}},
         "shock": {"tau_l": 90.0, "hold_min": 20.0, "p_l0": 0.01, "lambda_jump": 3.0, "lambda_w": 2.0, "start": {"q_calm": 0.01, "p_jump": 1e-4, "q_jump": 0.3, "tau_l": 90.0}, "passes": 2, "batch_max": 64, "days": 14, "reset_cost": 3.0,
-                  "grid": {"q_calm": [0.001, 0.003, 0.01, 0.03], "q_jump": [0.1, 0.2, 0.3, 0.5, 0.8, 1.2], "p_jump": [1e-5, 3e-5, 1e-4, 3e-4, 1e-3], "tau_l": [30.0, 60.0, 90.0, 180.0]},
+                  "grid": {"q_calm": [0.003, 0.01, 0.03], "q_jump": [0.3, 0.5, 0.8, 1.2], "p_jump": [3e-5, 1e-4, 3e-4, 1e-3], "tau_l": [30.0, 60.0, 90.0, 180.0]},
                   "label": {"fa_cost": 20.0, "event_weight": 15.0, "pw_floor": 0.02},
                   "lambda_w_grid": [1.5, 2.0, 2.5, 3.0], "hit_min": 20, "pad_min": 30, "fa_weight": 1.0},
         "eval": {"folds": [0.45, 0.6, 0.75], "sensor_split": 0.5, "min_sensor_min": 600, "warm_days": 3, "floor": 0.5 / 12 ** 0.5, "decay_lam": True, "pw_flag": 0.5, "min_episode_min": 5,
