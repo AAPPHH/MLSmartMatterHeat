@@ -5,9 +5,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
-from heattrain.roombatch import Grid, norm_cdf_np, run_batch
+from heattrain.roombatch import Grid, norm_cdf_np, run_batch, valve_lag_states
 from heattrain.roomfit import Exog, FoldFit, PcnnFit, Truth, base_doc, calibrate_air, coffee_plugs, episodes, fit_shock, shock_defaults, tune_windows, unusable_rooms
 from heattrain.roomobs import evidence_blocks
+from heattrain.roomimm import RoomPar, plan
 from heattrain.roompcnn import FEATURES, pcnn_gate
 from heattrain.thermal import build_rooms, load_devices, load_events, load_lake
 
@@ -353,6 +354,48 @@ def criteria(rc, hold, key, final_resets, flags, edges):
             "S4": {"pass": bool(not flags and not edges and max(final_resets.values()) < c["s4_resets"]), "resets_per_room": final_resets, "at_bound": flags, "shock_at_grid_edge": edges}}
 
 
+class ProbeReplay:
+    def __init__(self, full, docs, shock, rec, present, rc):
+        self.full, self.docs, self.shock, self.rec, self.present, self.rc, self.cfg = full, docs, shock, rec, present, rc, rc["replay"]
+
+    def env(self, r, par, k, lag):
+        c, cfg = self.full.cols[r], self.cfg
+        sp = float(c["sp"][k])
+        return {"tout": float(c["tout"][k]), "wind": float(c["wind"][k]), "rad": float(c["rad"][k]), "night": bool(c["night"][k] > 0.5), "ncnt": tuple(float(a[k]) for a in c["ncnt"]), "nsum": tuple(float(b[k]) for b in c["nsum"]),
+                "target": sp, "present": float(self.present[r][k]), "sp_cur": sp, "sp_live": sp, "frost": cfg["frost"], "boost_c": self.rc["house"]["boost_c"], "boost_ok": False, "raise_cost": cfg["raise_cost"], "cold_cost": cfg["cold_cost"],
+                "r_grid": self.rc["house"]["r_grid"], "u_now": float(c["u"][k]), "lag": [float(lag[0, k]), float(lag[1, k])], "y_last": float(c["y"][k]), "now_min": k}
+
+    def comps(self, rec, k):
+        pw, lam, lw, lj = float(rec["p_window"][k]), float(rec["lam"][k]), self.shock["lambda_w"], self.shock["lambda_jump"]
+        flat = [1e-4, 0, 0, 0, 1e-4, 0, 0, 0, 1e-6]
+        state = lambda lm: [float(rec["m"][k]), float(rec["a"][k]), lm]
+        return [(1.0 - pw, state(min(lam, lw - 1e-3)), flat), (pw, state(max(lam, lj)), flat)]
+
+    def room(self, r):
+        par, rec, cfg = RoomPar(self.docs[r]), self.rec[r], self.cfg
+        lag = valve_lag_states(self.full.cols[r]["u"], par.alpha)
+        n, memo, out = self.full.n, None, {"plans": 0, "probes": 0, "probe_min": 0, "aborts": 0, "kinds": {}}
+        for k in range(max(n - int(cfg["days"] * 1440), 0), n, cfg["every_min"]):
+            c = self.full.cols[r]
+            needed = [rec["m"][k], rec["lam"][k], rec["p_supply"][k], rec["p_window"][k], c["sp"][k], c["u"][k], c["tout"][k], c["wind"][k], c["rad"][k], lag[1, k], self.present[r][k]]
+            if not np.isfinite(needed).all() or c["sp"][k] <= cfg["frost"] + 1.0:
+                continue
+            res = plan(par, self.shock, self.comps(rec, k), float(rec["p_supply"][k]), dict(self.env(r, par, k, lag), probe=memo))
+            memo = res["probe_memo"]
+            out["plans"] += 1
+            out["kinds"][res["kind"]] = out["kinds"].get(res["kind"], 0) + 1
+            out["probes"] += int(res["probe_event"] == "start")
+            out["aborts"] += int(res["probe_event"] == "abort")
+            out["probe_min"] += res["probed_min"] if res["probe_event"] in ("end", "abort") else 0
+            out["unusable"] = bool(res["unusable"])
+        out["probes_per_day"] = out["probes"] / cfg["days"]
+        out["probe_min_per_day"] = out["probe_min"] / cfg["days"]
+        return out
+
+    def run(self):
+        return {r: self.room(r) for r in self.full.names}
+
+
 def fit_bundle(config, rooms, src, version=None):
     t0 = time.time()
     cfg, rc = config["thermal"], config["roommodel"]
@@ -408,8 +451,9 @@ def fit_bundle(config, rooms, src, version=None):
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
     sk = ship["skill"]
     pick = lambda b: {k: b[k] for k in ("n", "skill", "pcnn_skill")}
+    probe_replay = ProbeReplay(full, docs, shock, rec, pcnn["exog"].present, rc).run()
     pcnn_report = {"active": active, "gate": gate, "rooms": nets_info, "folds": [fi["pcnn"] for fi in ship["folds"]], "skill": {"pooled": {h: pick(sk["pooled"][h]) for h in ("H20", "H60")}, "rooms": {r: {h: pick(b[h]) for h in ("H20", "H60")} for r, b in sk["rooms"].items()}}}
-    report = {"version": version, "flags": flags_all, "pcnn": pcnn_report, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
+    report = {"version": version, "flags": flags_all, "pcnn": pcnn_report, "probe_replay": probe_replay, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
               "resets": len(resets), "reset_list": reset_list(full, resets, truth, rec), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
               "loglik": float(run.loglik[0]), "minutes": full.n, "sensor_start": variants.sensor_start, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"folds": t_fold, "total": time.time() - t0},
               "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"]} for n, d in docs.items()}}

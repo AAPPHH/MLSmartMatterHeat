@@ -117,10 +117,14 @@ def plan_env(**over):
     return env
 
 
-def light_par():
+def light_doc():
     doc = room_doc(False, 0.3)
     doc["params"].update(w=0.3, b1=2.0, a1=3.0, ts=35.0, ts_night=35.0)
-    return RoomPar(doc)
+    return doc
+
+
+def light_par():
+    return RoomPar(light_doc())
 
 
 def comps_at(m, a, lam, p=1e-4):
@@ -416,3 +420,20 @@ def test_fit_is_unusable_when_the_supply_temperature_cannot_reach_the_target():
     doc = room_doc(False, 0.3, w=0.3, b1=2.0, a1=3.0)
     doc["unusable"] = True
     assert plan(RoomPar(doc), SHOCK, comps_at(17.0, 16.0, 1.0), 1.0, plan_env(now_min=0))["kind"] == "fit_unusable"
+
+
+def replay_inputs(pw, n=600):
+    from heattrain.roomeval import ProbeReplay
+    cols = {"y": np.full(n, 20.0), "sp": np.full(n, 21.0), "u": np.full(n, 0.3), "tout": np.full(n, -5.0), "wind": np.full(n, 3.0), "rad": np.zeros(n), "night": np.zeros(n), "ncnt": [], "nsum": []}
+    full = type("G", (), {"names": ["r"], "n": n, "cols": {"r": cols}})()
+    rec = {"r": {"m": np.full(n, 20.0), "a": np.full(n, 19.5), "lam": np.full(n, 2.0), "p_supply": np.ones(n), "p_window": np.full(n, pw)}}
+    rc = copy.deepcopy(CONFIG["roommodel"])
+    rc["replay"].update(days=n / 1440.0, every_min=10)
+    return ProbeReplay(full, {"r": light_doc()}, dict(SHOCK, lambda_jump=6.0), rec, {"r": np.ones(n)}, rc)
+
+
+def test_probe_replay_probes_only_when_the_window_state_is_uncertain():
+    sure = replay_inputs(0.0).room("r")
+    unsure = replay_inputs(0.5).room("r")
+    assert sure["plans"] > 0 and sure["probes"] == 0
+    assert unsure["probes"] >= 1 and unsure["probes_per_day"] > 0 and unsure["probe_min"] > 0
