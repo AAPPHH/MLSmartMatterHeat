@@ -2188,4 +2188,33 @@ class CoreTest {
         assertEquals(g, Glance.fromJson(g.json()))
         assertEquals("Von dir vorgegeben", RoomView.why(RoomView.glance(g, "bad")))
     }
+
+    @Test
+    fun messfahrtBodiesStatusLinesAndReplies() {
+        assertEquals("closed", JSONObject(Messfahrt.body("closed")).getString("doors"))
+        assertEquals("watch", JSONObject(Messfahrt.body("open")).getString("source"))
+        assertTrue(JSONObject(Messfahrt.cancelBody()).getBoolean("cancel"))
+        assertEquals("Türen zu", Messfahrt.doorsLabel("closed"))
+        assertEquals("Türen offen", Messfahrt.doorsLabel("open"))
+        assertTrue(Messfahrt.question("open").contains("Türen offen") && Messfahrt.question("open").contains("wenn du weg bist"))
+        val armed = Messfahrt.parse("""{"experiment": {"state": "armed", "doors": "closed", "phase_label": null, "planned_end_ms": null, "reason": null}}""")!!
+        assertTrue(armed.active)
+        assertEquals("bereit – startet, wenn du weg bist", Messfahrt.status(armed))
+        val running = Messfahrt.parse("""{"experiment": {"state": "running", "doors": "open", "phase_label": "Takte", "planned_end_ms": 5000, "reason": null}}""")!!
+        assertEquals("läuft: Takte, bis " + RoomView.clock(5_000L), Messfahrt.status(running))
+        assertEquals(running, Messfahrt.fromJson(running.json()))
+        assertEquals("fertig", Messfahrt.status(MessfahrtState("done", "open", null, null, "completed")))
+        assertFalse(MessfahrtState("done", "open", null, null, "completed").active)
+        assertEquals("abgebrochen", Messfahrt.status(MessfahrtState("aborted", "open", null, null, "cancel")))
+        assertEquals("beendet: du bist zurück", Messfahrt.status(MessfahrtState("aborted", "open", null, null, "homecoming")))
+        assertEquals("keine Messfahrt geplant", Messfahrt.status(Messfahrt.IDLE))
+        assertEquals(Messfahrt.IDLE, Messfahrt.fromJson("kaputt"))
+        assertNull(Messfahrt.parse("""{"rooms": []}"""))
+        val ok = Messfahrt.result(200, """{"ok": true, "experiment": {"state": "armed", "doors": "closed"}}""")
+        assertTrue(ok.ok)
+        assertEquals("bereit – startet, wenn du weg bist", ok.line)
+        assertFalse(Messfahrt.result(409, """{"ok": false, "error": "x"}""").ok)
+        assertEquals("Läuft schon – erst abbrechen", Messfahrt.result(409, """{"ok": false}""").line)
+        assertEquals("Server nicht erreichbar", Messfahrt.result(0, "").line)
+    }
 }

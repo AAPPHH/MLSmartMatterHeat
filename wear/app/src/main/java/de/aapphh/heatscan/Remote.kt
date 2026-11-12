@@ -132,6 +132,7 @@ object Remote {
                 if (r.code in 200..299) {
                     Glance.parse(r.text, System.currentTimeMillis())?.let { store.glance = it }
                     Glance.alerts(r.text)?.let { store.alerts = it }
+                    Messfahrt.parse(r.text)?.let { store.messfahrt = it }
                     TileService.getUpdater(app).requestUpdate(HeatTileService::class.java)
                 }
             } catch (e: Exception) {
@@ -142,12 +143,12 @@ object Remote {
         }
     }
 
-    private fun setpoint(c: Context, body: String, parse: (Int, String) -> BoostResult, done: (BoostResult) -> Unit) {
+    private fun send(c: Context, path: String, body: String, parse: (Int, String) -> BoostResult, done: (BoostResult) -> Unit) {
         val store = Store(c.applicationContext)
         val net = wifi() ?: return done(Boost.failed(Boost.NO_WIFI))
         run {
             done(try {
-                Poster.send(store.server, SetpointControl.PATH, body, net).let { parse(it.code, it.text) }
+                Poster.send(store.server, path, body, net).let { parse(it.code, it.text) }
             } catch (e: Exception) {
                 Trace.w("setpoint_failed", e)
                 Boost.failed()
@@ -155,9 +156,11 @@ object Remote {
         }
     }
 
-    fun setpoint(c: Context, room: String, celsius: Double, minutes: Int, done: (BoostResult) -> Unit) = setpoint(c, SetpointControl.body(room, celsius, minutes), SetpointControl::result, done)
+    fun setpoint(c: Context, room: String, celsius: Double, minutes: Int, done: (BoostResult) -> Unit) = send(c, SetpointControl.PATH, SetpointControl.body(room, celsius, minutes), SetpointControl::result, done)
 
-    fun clearSetpoint(c: Context, room: String, done: (BoostResult) -> Unit) = setpoint(c, SetpointControl.clearBody(room), SetpointControl::cleared, done)
+    fun clearSetpoint(c: Context, room: String, done: (BoostResult) -> Unit) = send(c, SetpointControl.PATH, SetpointControl.clearBody(room), SetpointControl::cleared, done)
+
+    fun experiment(c: Context, body: String, done: (BoostResult) -> Unit) = send(c, Messfahrt.PATH, body, Messfahrt::result, done)
 
     fun boost(c: Context, room: String, done: (BoostResult) -> Unit) {
         val store = Store(c.applicationContext)

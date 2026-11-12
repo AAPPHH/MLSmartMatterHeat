@@ -64,10 +64,15 @@ pub mod kind {
     pub const MANUAL_SETPOINT: &str = "manual_setpoint";
     pub const FILTER_RESET: &str = "filter_reset";
     pub const SHADOW_STATE: &str = "shadow_state";
-    pub const ALL: [&str; 34] = [
+    pub const EXPERIMENT_ARMED: &str = "experiment_armed";
+    pub const EXPERIMENT_STARTED: &str = "experiment_started";
+    pub const EXPERIMENT_STEP: &str = "experiment_step";
+    pub const EXPERIMENT_ENDED: &str = "experiment_ended";
+    pub const ALL: [&str; 38] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
         ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
         WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED, BOOST_CYCLE, FAILSAFE, BR_WATCHDOG, SUPPLY, PI_RESET, WINDOW_EPISODE, NODE_HEALTH, COFFEE_ON, DEVICE_LINK, MANUAL_SETPOINT, FILTER_RESET, SHADOW_STATE,
+        EXPERIMENT_ARMED, EXPERIMENT_STARTED, EXPERIMENT_STEP, EXPERIMENT_ENDED,
     ];
 }
 

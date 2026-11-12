@@ -224,6 +224,8 @@ pub struct Commands {
     resets: HashMap<u64, i64>,
     last_reset: HashMap<u64, i64>,
     occ: Occ,
+    last_manual_ms: Option<i64>,
+    pub messfahrt: crate::experiment::Messfahrt,
 }
 
 impl Commands {
@@ -297,7 +299,16 @@ impl Commands {
         nodes.iter().any(|n| self.holds.get(n).is_some_and(|h| !h.explicit()))
     }
 
+    pub fn note_manual(&mut self, ts_ms: i64) {
+        self.last_manual_ms = self.last_manual_ms.max(Some(ts_ms));
+    }
+
+    pub fn last_manual_ms(&self) -> Option<i64> {
+        self.last_manual_ms
+    }
+
     pub fn set_manual(&mut self, nodes: &[u64], value: f64, since_ms: i64, until_ms: i64, source: HoldSource) {
+        self.last_manual_ms = self.last_manual_ms.max(Some(since_ms));
         for &node in nodes {
             self.holds.insert(node, Hold { value, since_ms, until_ms, source });
         }
@@ -427,7 +438,7 @@ pub fn base_setpoint(room: &Room, config: &Config, now: NaiveDateTime) -> f64 {
     scheduled(room, now).unwrap_or(config.default_setpoint)
 }
 
-fn in_sleep_hours(config: &Config, now: NaiveDateTime) -> bool {
+pub(crate) fn in_sleep_hours(config: &Config, now: NaiveDateTime) -> bool {
     let Ok((from, to)) = config.watchmatch.state.sleep_minutes() else { return false };
     let minute = now.hour() * 60 + now.minute();
     if from <= to { (from..to).contains(&minute) } else { minute >= from || minute < to }
@@ -695,10 +706,13 @@ fn raise_verdict(state: &AppState, commands: &Commands, want: &Desired, old: Opt
     if matches!(want.reason, "manual_api" | "manual_watch") {
         return Verdict::Exempt("manual");
     }
+    if want.reason == "experiment" {
+        return Verdict::Exempt("experiment");
+    }
     if want.reason == "no_supply" {
         return Verdict::Exempt("supply_cap");
     }
-    if last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset")) && !matches!(want.reason, "boost" | "exploration") && want.setpoint <= state.config.occupied_setpoint.max(state.config.default_setpoint) {
+    if last_write.is_some_and(|(_, r)| matches!(r, "window_open" | "pi_reset" | "experiment")) && !matches!(want.reason, "boost" | "exploration") && want.setpoint <= state.config.occupied_setpoint.max(state.config.default_setpoint) {
         return Verdict::Exempt("window_close");
     }
     if commands.budget.allows(&want.room, now_ms, limit) {
@@ -760,7 +774,7 @@ fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], no
         log("pi reset event", state.sink.append(event));
     };
     for want in wants.iter_mut() {
-        let blocked = window_busy.contains(&want.room) || exploring.contains_key(&want.room) || matches!(want.reason, "window_open" | "away" | "boost" | "boost_off" | "exploration") || state.commanded.lock().unwrap().holding(&[want.node]);
+        let blocked = window_busy.contains(&want.room) || exploring.contains_key(&want.room) || matches!(want.reason, "window_open" | "away" | "boost" | "boost_off" | "exploration" | "experiment") || state.commanded.lock().unwrap().holding(&[want.node]);
         let running = state.commanded.lock().unwrap().resets.get(&want.node).copied();
         if let Some(until) = running {
             if !blocked && now_ms < until {
@@ -834,6 +848,8 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
                 Some("manual_hold")
             } else if exploring.contains_key(&room.name) {
                 Some("exploration")
+            } else if state.commanded.lock().unwrap().messfahrt.running_in(&room.name) {
+                Some("experiment")
             } else {
                 None
             };
@@ -917,6 +933,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         return Ok(Vec::new());
     }
     for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes) {
+        if matches!(transition, Transition::Left { .. }) {
+            state.commanded.lock().unwrap().messfahrt.note_departure(now_ms);
+        }
         log("presence event", state.sink.append(presence_event(&device, transition)));
     }
     let presence = current_presence(state, now_ms).unwrap_or_else(|e| {
@@ -929,9 +948,10 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let window_busy = &windows;
     let away = presence.as_ref().is_some_and(|p| p.occupancy(&state.config) == Occupancy::Away);
     state.devices.on_control(state, now, now_ms, presence.is_some(), away);
+    let experiment = crate::experiment::tick(state, now, now_ms, window_busy, presence.as_ref());
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
-        let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else { None };
+        let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else if state.commanded.lock().unwrap().messfahrt.running_in(room) { Some("experiment") } else { None };
         let base = |room: &Room| base_setpoint(room, &state.config, now);
         let mut explorer = state.explorer.lock().unwrap();
         let no_raise = |room: &str| !state.commanded.lock().unwrap().budget.allows(room, now_ms, state.config.raise_budget_per_hour);
@@ -952,6 +972,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let readings = state.latest.all();
     let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (presence.is_some(), away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
+    crate::experiment::apply_calls(state, &experiment, &mut wants, &readings);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
     for want in wants.iter_mut() {
         if state.commanded.lock().unwrap().apply_manual(want, now_ms) {
@@ -994,7 +1015,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
                 continue;
             }
             let last_write = commands.last_write.get(&want.node).copied();
-            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off" | "no_supply" | "pi_reset" | "manual_api" | "manual_watch");
+            let urgent = |r: &str| matches!(r, "away" | "window_open" | "exploration" | "boost" | "boost_off" | "no_supply" | "pi_reset" | "manual_api" | "manual_watch" | "experiment");
             let bypass = hold_ended || drifted || urgent(want.reason) || last_write.is_some_and(|(_, r)| urgent(r)) || (want.reason == "occupied" && want.source == "stay_label");
             if !bypass && last_write.is_some_and(|(t, _)| now_ms - t < interval_ms) {
                 if commands.deferred.get(&want.node).is_none_or(|d| (d - want.setpoint).abs() >= DESIRED_EPS_C) {
@@ -1089,6 +1110,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     }
     let previous = sent.acked.unwrap_or(sent.target);
     commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
+    commands.last_manual_ms = commands.last_manual_ms.max(Some(now_ms));
     let replaced = commands.holds.insert(report.node, Hold { value: report.value, since_ms: now_ms, until_ms: now_ms + (state.config.manual_hold_minutes * 60_000.0) as i64, source: HoldSource::Dial });
     Some((previous, replaced.filter(Hold::explicit)))
 }

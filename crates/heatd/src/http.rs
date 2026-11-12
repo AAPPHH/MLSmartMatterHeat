@@ -199,6 +199,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/snapshot", post(snapshot))
         .route("/api/window", post(window))
         .route("/api/boost", get(boost_state).post(boost))
+        .route("/api/experiment", get(experiment_state).post(experiment))
         .route("/api/setpoint", get(setpoint_state).post(setpoint).delete(setpoint_clear))
         .route("/api/label", post(label))
         .route("/api/label/void", post(label_void))
@@ -721,7 +722,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "room_model": state.room_model.view(&room.name), "manual": room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| h.view()), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "experiment": commands.messfahrt.view(now_ms()), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 fn devices_view(state: &AppState) -> anyhow::Result<Vec<Value>> {
@@ -795,6 +796,24 @@ async fn setpoint(State(state): State<AppState>, body: Result<Json<SetpointBody>
 
 async fn setpoint_clear(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<ClearQuery>) -> Response {
     manual_reply(state, crate::intent::Intent::SetpointClear { room: q.room, source: q.source }).await
+}
+
+async fn experiment_state(State(state): State<AppState>) -> Json<Value> {
+    Json(state.commanded.lock().unwrap().messfahrt.view(now_ms()))
+}
+
+async fn experiment(State(state): State<AppState>, body: Result<Json<crate::experiment::Body>, axum::extract::rejection::JsonRejection>) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": "Ungueltige Anfrage: JSON mit doors und source oder cancel erwartet"}))).into_response(),
+    };
+    let reply = crate::experiment::apply(&state, body, now_ms());
+    let sink = state.sink.clone();
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || sink.flush().map(|_| ())).await {
+        eprintln!("experiment flush: {e:#}");
+    }
+    state.boost.waker().notify_one();
+    (reply.status, Json(reply.body)).into_response()
 }
 
 async fn setpoint_state(State(state): State<AppState>) -> Json<Value> {

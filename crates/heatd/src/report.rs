@@ -460,6 +460,16 @@ Nicht verfuegbar: {e:#}");
         }
     }
 
+    match crate::experiment::report_section(root, date) {
+        Ok(section) => md.push_str(&section),
+        Err(e) => {
+            let _ = writeln!(md, "
+## Messfahrten
+
+Nicht verfuegbar: {e:#}");
+        }
+    }
+
     md.push_str(&crate::failsafe::report_section(&root.join("failsafe")));
     md.push_str("\n## Router-Watchdog\n\n");
     let br = rows(c, &format!("SELECT epoch_us(ts), detail FROM events WHERE kind = 'br_watchdog' AND {day} ORDER BY ts"), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?;

@@ -208,6 +208,10 @@ impl Boost {
         Err(anyhow!("no valid boost bundle in {dir}"))
     }
 
+    pub fn boost_setpoint(&self) -> Option<f64> {
+        self.inner.lock().unwrap().model.as_ref().map(|m| m.boost_setpoint())
+    }
+
     #[cfg(test)]
     pub fn set_model(&self, model: BoostModel) {
         self.inner.lock().unwrap().model = Some(Arc::new(model));

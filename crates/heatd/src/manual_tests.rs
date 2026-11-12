@@ -14,17 +14,21 @@ use tower::ServiceExt;
 
 const MIN: i64 = 60_000;
 
-struct Env {
-    state: AppState,
-    mock: Arc<MockController>,
-    dir: tempfile::TempDir,
-    t: i64,
+pub(crate) struct Env {
+    pub(crate) state: AppState,
+    pub(crate) mock: Arc<MockController>,
+    pub(crate) dir: tempfile::TempDir,
+    pub(crate) t: i64,
 }
 
-fn env() -> Env {
+pub(crate) fn env() -> Env {
+    env_with("")
+}
+
+pub(crate) fn env_with(head: &str) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().replace('\\', "/");
-    let config = Config::parse(&format!("db_path = '{root}/live.duckdb'\ndefault_setpoint = 20.0\nfrost_setpoint = 8.0\naway_guard_minutes = 0\n[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms]]\nname = 'bad'\nnodes = [6]\n[[rooms]]\nname = 'flur'\nnodes = []\n")).unwrap();
+    let config = Config::parse(&format!("db_path = '{root}/live.duckdb'\ndefault_setpoint = 20.0\nfrost_setpoint = 8.0\naway_guard_minutes = 0\n{head}[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms]]\nname = 'bad'\nnodes = [6]\n[[rooms]]\nname = 'flur'\nnodes = []\n")).unwrap();
     let sink = crate::lake::Sink::open(crate::lake::LakeConfig::new(dir.path().join("lake"))).unwrap();
     let status = crate::status::Status::new(crate::lake::now_us());
     let mock = Arc::new(MockController::new(1));
@@ -52,7 +56,7 @@ fn env() -> Env {
     Env { state, mock, dir, t: now_ms() }
 }
 
-async fn call(state: &AppState, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+pub(crate) async fn call(state: &AppState, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
     let request = Request::builder().method(method).uri(uri).header("content-type", "application/json").body(body.map_or_else(Body::empty, |b| Body::from(b.to_string()))).unwrap();
     let response = crate::http::router(state.clone()).oneshot(request).await.unwrap();
     let status = response.status();
@@ -61,13 +65,13 @@ async fn call(state: &AppState, method: &str, uri: &str, body: Option<Value>) ->
 }
 
 impl Env {
-    async fn step(&mut self, minutes: i64) -> Vec<crate::rules::Desired> {
+    pub(crate) async fn step(&mut self, minutes: i64) -> Vec<crate::rules::Desired> {
         self.t += minutes * MIN;
         let noon = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap().and_hms_opt(12, 0, 0).unwrap();
         crate::rules::control_step(&self.state, noon, self.t).await.unwrap()
     }
 
-    async fn device(&self, node: u64) -> f64 {
+    pub(crate) async fn device(&self, node: u64) -> f64 {
         self.mock.read_thermostat(node).await.unwrap().occupied_heating_setpoint_c.unwrap()
     }
 
@@ -75,7 +79,7 @@ impl Env {
         call(&self.state, "POST", "/api/setpoint", Some(body)).await
     }
 
-    fn reasons(&self) -> Vec<String> {
+    pub(crate) fn reasons(&self) -> Vec<String> {
         self.state.sink.flush().unwrap();
         let mut files: Vec<_> = std::fs::read_dir(self.dir.path().join("lake/raw/decisions")).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
         files.sort();
