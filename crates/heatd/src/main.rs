@@ -9,6 +9,9 @@ mod br_watchdog_tests;
 mod capture;
 mod config;
 mod devices;
+mod experiment;
+#[cfg(test)]
+mod experiment_tests;
 mod explore;
 mod failsafe;
 mod context;
@@ -272,6 +275,10 @@ async fn serve(config: Config) -> Result<()> {
     match restore::restore_holds(&state, lake::now_us() / 1000) {
         Ok(n) => println!("manual hold restore: {n} holds"),
         Err(e) => eprintln!("manual hold restore: {e:#}"),
+    }
+    match experiment::restore(&state, lake::now_us() / 1000) {
+        Ok(s) => println!("messfahrt restore: {s}"),
+        Err(e) => eprintln!("messfahrt restore: {e:#}"),
     }
     rules::spawn_background(state.clone());
     if state.config.br_watchdog.enabled {

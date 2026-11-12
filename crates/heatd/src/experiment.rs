@@ -1,0 +1,564 @@
+use crate::config::Room;
+use crate::explore::Rng;
+use crate::http::AppState;
+use crate::intent::Reply;
+use crate::lake::{kind, Event, Table};
+use crate::report::{hhmm, midnight_us, open_lake, rows};
+use crate::rules::{clamp_boost, clamp_setpoint, in_sleep_hours, Desired, Occupancy, Presence};
+use anyhow::Result;
+use axum::http::StatusCode;
+use chrono::{NaiveDate, NaiveDateTime};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write;
+use std::path::Path;
+
+pub const COOLDOWN_MIN: i64 = 75;
+pub const TOTAL_MIN: i64 = 225;
+pub const EXPIRY_MS: i64 = 24 * 3_600_000;
+pub const CAP_MARGIN_K: f64 = 2.0;
+const MIN_MS: i64 = 60_000;
+const LOOKBACK_MS: i64 = 48 * 3_600_000;
+const STEP_MINUTES: u32 = 4;
+const LIFECYCLE: [&str; 4] = [kind::EXPERIMENT_ARMED, kind::EXPERIMENT_STARTED, kind::EXPERIMENT_STEP, kind::EXPERIMENT_ENDED];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Doors {
+    Closed,
+    Open,
+}
+
+impl Doors {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "closed" => Some(Doors::Closed),
+            "open" => Some(Doors::Open),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Doors::Closed => "closed",
+            Doors::Open => "open",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Doors::Closed => "Türen zu",
+            Doors::Open => "Türen offen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Cooldown,
+    Pulses,
+}
+
+impl Phase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Cooldown => "cooldown",
+            Phase::Pulses => "pulses",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Phase::Cooldown => "Abkühlen",
+            Phase::Pulses => "Takte",
+        }
+    }
+
+    pub fn rule(self) -> &'static str {
+        match self {
+            Phase::Cooldown => "experiment_abkuehlen",
+            Phase::Pulses => "experiment_takt",
+        }
+    }
+
+    fn of(elapsed_min: i64) -> Self {
+        if elapsed_min < COOLDOWN_MIN { Phase::Cooldown } else { Phase::Pulses }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Armed,
+    Running,
+    Done,
+    Aborted,
+}
+
+impl Status {
+    pub fn name(self) -> &'static str {
+        match self {
+            Status::Armed => "armed",
+            Status::Running => "running",
+            Status::Done => "done",
+            Status::Aborted => "aborted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Here {
+    Away,
+    Home,
+    Unknown,
+}
+
+impl Here {
+    pub fn of(state: &AppState, presence: Option<&Presence>) -> Self {
+        let Some(p) = presence else { return Here::Unknown };
+        match p.occupancy(&state.config) {
+            Occupancy::Away => Here::Away,
+            Occupancy::Room(_) => Here::Home,
+            Occupancy::Unknown if !p.away && p.contact_age_minutes.is_some_and(|a| a <= state.config.still_contact_timeout_minutes) => Here::Home,
+            Occupancy::Unknown => Here::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seg {
+    pub from_min: i64,
+    pub to_min: i64,
+    pub on: bool,
+    pub phase: Phase,
+}
+
+fn fnv(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+pub fn schedule(room: &str, doors: Doors, date: &str) -> Vec<Seg> {
+    let mut rng = Rng::new(fnv(&format!("{room}|{}|{date}", doors.name())));
+    let mut segs = vec![Seg { from_min: 0, to_min: COOLDOWN_MIN, on: false, phase: Phase::Cooldown }];
+    let (mut at, mut on) = (COOLDOWN_MIN, rng.unit() < 0.5);
+    while at < TOTAL_MIN {
+        let length = (10 * i64::from(rng.range(1, STEP_MINUTES))).min(TOTAL_MIN - at);
+        segs.push(Seg { from_min: at, to_min: at + length, on, phase: Phase::Pulses });
+        at += length;
+        on = !on;
+    }
+    segs
+}
+
+#[derive(Debug, Clone)]
+struct RoomRun {
+    room: String,
+    segs: Vec<Seg>,
+    end: Option<String>,
+    entered: Option<usize>,
+    executed: u32,
+    capped: Option<usize>,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+impl RoomRun {
+    fn new(room: &str, doors: Doors, date: &str) -> Self {
+        Self { room: room.into(), segs: schedule(room, doors, date), end: None, entered: None, executed: 0, capped: None, min: None, max: None }
+    }
+
+    fn seen(&mut self, temp: Option<f64>) {
+        if let Some(t) = temp {
+            self.min = Some(self.min.map_or(t, |m| m.min(t)));
+            self.max = Some(self.max.map_or(t, |m| m.max(t)));
+        }
+    }
+
+    fn index(&self, elapsed_min: i64) -> usize {
+        self.segs.iter().position(|s| elapsed_min < s.to_min).unwrap_or(self.segs.len() - 1)
+    }
+
+    fn summary(&self) -> Value {
+        json!({"planned": self.segs.len(), "executed": self.executed, "min": self.min, "max": self.max, "ended": self.end})
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Run {
+    id: String,
+    doors: Doors,
+    source: String,
+    status: Status,
+    armed_ms: i64,
+    started_ms: Option<i64>,
+    ended_ms: Option<i64>,
+    reason: Option<String>,
+    date: String,
+    rooms: Vec<RoomRun>,
+}
+
+impl Run {
+    fn expires_ms(&self) -> i64 {
+        self.armed_ms + EXPIRY_MS
+    }
+
+    fn planned_end_ms(&self) -> Option<i64> {
+        self.started_ms.map(|s| s + TOTAL_MIN * MIN_MS)
+    }
+
+    fn event(&self, name: &str, now_ms: i64, detail: Value) -> Event {
+        let mut detail = detail;
+        detail["id"] = json!(self.id);
+        detail["doors"] = json!(self.doors.name());
+        Event { ts: now_ms * 1000, ..Event::now(name, "heatd").with_experiment(&self.id).with_detail(detail) }
+    }
+
+    fn schedule_json(&self) -> Value {
+        let map: Map<String, Value> = self.rooms.iter().map(|r| (r.room.clone(), json!(r.segs.iter().map(|s| json!({"from_min": s.from_min, "to_min": s.to_min, "on": s.on, "phase": s.phase.name()})).collect::<Vec<_>>()))).collect();
+        Value::Object(map)
+    }
+
+    fn finish(&mut self, status: Status, reason: &str, now_ms: i64) -> Event {
+        self.status = status;
+        self.reason = Some(reason.into());
+        self.ended_ms = Some(now_ms);
+        let rooms: Map<String, Value> = self.rooms.iter().map(|r| (r.room.clone(), r.summary())).collect();
+        self.event(kind::EXPERIMENT_ENDED, now_ms, json!({"reason": reason, "status": status.name(), "source": self.source, "armed_ms": self.armed_ms, "started_ms": self.started_ms, "ended_ms": now_ms, "rooms": rooms}))
+    }
+
+    fn start(&mut self, rooms: &[&str], now_ms: i64, date: &str) -> Event {
+        self.status = Status::Running;
+        self.started_ms = Some(now_ms);
+        self.date = date.into();
+        self.rooms = rooms.iter().map(|r| RoomRun::new(r, self.doors, date)).collect();
+        let end = self.planned_end_ms();
+        self.event(kind::EXPERIMENT_STARTED, now_ms, json!({"source": self.source, "date": date, "started_ms": now_ms, "planned_end_ms": end, "cooldown_min": COOLDOWN_MIN, "total_min": TOTAL_MIN, "schedule": self.schedule_json()}))
+    }
+
+    fn step_event(&self, now_ms: i64, room: &RoomRun, idx: usize, temp: Option<f64>, capped: bool) -> Event {
+        let seg = room.segs[idx];
+        let until = self.started_ms.unwrap_or(now_ms) + seg.to_min * MIN_MS;
+        self.event(kind::EXPERIMENT_STEP, now_ms, json!({"room": room.room, "phase": seg.phase.name(), "step": idx, "steps": room.segs.len(), "on": seg.on && !capped, "capped": capped, "until_ms": until, "temp": temp}))
+    }
+
+    fn view(&self, now_ms: i64) -> Value {
+        let elapsed = self.started_ms.map(|s| ((now_ms - s) / MIN_MS).max(0));
+        let running = self.status == Status::Running;
+        let rooms: Vec<Value> = self
+            .rooms
+            .iter()
+            .map(|r| {
+                let idx = elapsed.filter(|_| running && r.end.is_none()).map(|e| r.index(e));
+                json!({"room": r.room, "step": idx, "steps": r.segs.len(), "on": idx.map(|i| r.segs[i].on && r.capped != Some(i)), "ended": r.end, "executed": r.executed, "min": r.min, "max": r.max, "schedule": r.segs.iter().map(|s| json!({"from_min": s.from_min, "to_min": s.to_min, "on": s.on, "phase": s.phase.name()})).collect::<Vec<_>>()})
+            })
+            .collect();
+        let phase = elapsed.filter(|_| running).map(Phase::of);
+        json!({"id": self.id, "state": self.status.name(), "doors": self.doors.name(), "doors_label": self.doors.label(), "source": self.source, "phase": phase.map(Phase::name), "phase_label": phase.map(Phase::label), "step_min": elapsed.filter(|_| running), "armed_ms": self.armed_ms, "expires_ms": (self.status == Status::Armed).then(|| self.expires_ms()), "started_ms": self.started_ms, "planned_end_ms": self.planned_end_ms(), "ended_ms": self.ended_ms, "reason": self.reason, "rooms": rooms})
+    }
+}
+
+pub struct RoomIn<'a> {
+    pub room: &'a str,
+    pub held: bool,
+    pub window: bool,
+    pub temp: Option<f64>,
+}
+
+pub struct Tick<'a> {
+    pub now_ms: i64,
+    pub date: &'a str,
+    pub here: Here,
+    pub night: bool,
+    pub cap_c: f64,
+    pub rooms: &'a [RoomIn<'a>],
+}
+
+#[derive(Debug, Default)]
+pub struct Out {
+    pub events: Vec<Event>,
+    pub calls: HashMap<String, Call>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Call {
+    pub on: bool,
+    pub rule: &'static str,
+}
+
+#[derive(Debug, Default)]
+pub struct Messfahrt {
+    run: Option<Run>,
+}
+
+impl Messfahrt {
+    pub fn arm(&mut self, doors: Doors, source: &str, now_ms: i64) -> Result<Event, &'static str> {
+        if self.run.as_ref().is_some_and(|r| r.status == Status::Running) {
+            return Err("Eine Messfahrt läuft schon – erst abbrechen");
+        }
+        let run = Run { id: format!("mf-{now_ms}"), doors, source: source.into(), status: Status::Armed, armed_ms: now_ms, started_ms: None, ended_ms: None, reason: None, date: String::new(), rooms: Vec::new() };
+        let event = run.event(kind::EXPERIMENT_ARMED, now_ms, json!({"source": source, "armed_ms": now_ms, "expires_ms": run.expires_ms()}));
+        self.run = Some(run);
+        Ok(event)
+    }
+
+    pub fn cancel(&mut self, now_ms: i64) -> Option<Event> {
+        let run = self.run.as_mut().filter(|r| matches!(r.status, Status::Armed | Status::Running))?;
+        Some(run.finish(Status::Aborted, "cancel", now_ms))
+    }
+
+    pub fn running_in(&self, room: &str) -> bool {
+        self.run.as_ref().is_some_and(|r| r.status == Status::Running && r.rooms.iter().any(|x| x.room == room && x.end.is_none()))
+    }
+
+    pub fn view(&self, now_ms: i64) -> Value {
+        self.run.as_ref().map_or_else(|| json!({"state": "idle"}), |r| r.view(now_ms))
+    }
+
+    pub fn tick(&mut self, t: &Tick) -> Out {
+        let mut out = Out::default();
+        let Some(run) = self.run.as_mut() else { return out };
+        if run.status == Status::Armed {
+            if t.now_ms >= run.expires_ms() {
+                out.events.push(run.finish(Status::Aborted, "expired", t.now_ms));
+                return out;
+            }
+            if t.here != Here::Away || t.night {
+                return out;
+            }
+            let rooms: Vec<&str> = t.rooms.iter().map(|r| r.room).collect();
+            out.events.push(run.start(&rooms, t.now_ms, t.date));
+        }
+        if run.status != Status::Running {
+            return out;
+        }
+        if t.here == Here::Home {
+            out.events.push(run.finish(Status::Aborted, "homecoming", t.now_ms));
+            return out;
+        }
+        if run.planned_end_ms().is_some_and(|e| t.now_ms >= e) {
+            out.events.push(run.finish(Status::Done, "completed", t.now_ms));
+            return out;
+        }
+        let elapsed = (t.now_ms - run.started_ms.unwrap_or(t.now_ms)) / MIN_MS;
+        for i in 0..run.rooms.len() {
+            let input = t.rooms.iter().find(|r| r.room == run.rooms[i].room);
+            let why = match input {
+                None => Some("room_gone"),
+                Some(r) if r.held => Some("manual_hold"),
+                Some(r) if r.window => Some("window"),
+                _ => None,
+            };
+            let temp = input.and_then(|r| r.temp);
+            if let (Some(why), None) = (why, &run.rooms[i].end) {
+                run.rooms[i].end = Some(why.into());
+                out.events.push(run.event(kind::EXPERIMENT_STEP, t.now_ms, json!({"room": run.rooms[i].room, "ended": why, "temp": temp})));
+            }
+            if run.rooms[i].end.is_some() {
+                continue;
+            }
+            run.rooms[i].seen(temp);
+            let idx = run.rooms[i].index(elapsed);
+            let seg = run.rooms[i].segs[idx];
+            let over = seg.on && temp.is_some_and(|c| c > t.cap_c);
+            let new_cap = over && run.rooms[i].capped != Some(idx);
+            if new_cap {
+                run.rooms[i].capped = Some(idx);
+            }
+            if run.rooms[i].entered != Some(idx) || new_cap {
+                if run.rooms[i].entered != Some(idx) {
+                    run.rooms[i].executed += 1;
+                }
+                run.rooms[i].entered = Some(idx);
+                let capped = run.rooms[i].capped == Some(idx);
+                out.events.push(run.step_event(t.now_ms, &run.rooms[i], idx, temp, capped));
+            }
+            let on = seg.on && run.rooms[i].capped != Some(idx) && temp.is_some();
+            out.calls.insert(run.rooms[i].room.clone(), Call { on, rule: seg.phase.rule() });
+        }
+        out
+    }
+
+    pub fn from_events(events: &[(i64, String, Value)], now_ms: i64, here: Here) -> (Self, Vec<Event>) {
+        let mut run: Option<Run> = None;
+        for (ts, k, d) in events {
+            let id = d["id"].as_str().unwrap_or_default().to_string();
+            let doors = d["doors"].as_str().and_then(Doors::parse);
+            match (k.as_str(), doors) {
+                (kind::EXPERIMENT_ARMED, Some(doors)) => run = Some(Run { id, doors, source: d["source"].as_str().unwrap_or("chat").into(), status: Status::Armed, armed_ms: d["armed_ms"].as_i64().unwrap_or(*ts), started_ms: None, ended_ms: None, reason: None, date: String::new(), rooms: Vec::new() }),
+                (kind::EXPERIMENT_STARTED, _) => {
+                    let Some(r) = run.as_mut().filter(|r| r.id == id) else { continue };
+                    let names: Vec<String> = d["schedule"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                    r.start(&names, d["started_ms"].as_i64().unwrap_or(*ts), d["date"].as_str().unwrap_or_default());
+                }
+                (kind::EXPERIMENT_STEP, _) => {
+                    let Some(r) = run.as_mut().filter(|r| r.id == id && r.status == Status::Running) else { continue };
+                    let Some(room) = r.rooms.iter_mut().find(|x| Some(x.room.as_str()) == d["room"].as_str()) else { continue };
+                    room.seen(d["temp"].as_f64());
+                    match d["ended"].as_str() {
+                        Some(why) => room.end = Some(why.into()),
+                        None => {
+                            let step = d["step"].as_u64().unwrap_or(0) as usize;
+                            if room.entered != Some(step) {
+                                room.executed += 1;
+                            }
+                            room.entered = Some(step);
+                            if d["capped"].as_bool() == Some(true) {
+                                room.capped = Some(step);
+                            }
+                        }
+                    }
+                }
+                (kind::EXPERIMENT_ENDED, _) => {
+                    let Some(r) = run.as_mut().filter(|r| r.id == id) else { continue };
+                    r.status = if d["status"].as_str() == Some("done") { Status::Done } else { Status::Aborted };
+                    r.reason = d["reason"].as_str().map(String::from);
+                    r.ended_ms = d["ended_ms"].as_i64().or(Some(*ts));
+                }
+                _ => {}
+            }
+        }
+        let mut events = Vec::new();
+        if let Some(r) = run.as_mut() {
+            let reason = match r.status {
+                Status::Armed if now_ms >= r.expires_ms() => Some("expired"),
+                Status::Running if here != Here::Away || r.planned_end_ms().is_none_or(|e| now_ms >= e) => Some("restart"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                events.push(r.finish(Status::Aborted, reason, now_ms));
+            }
+        }
+        (Self { run }, events)
+    }
+}
+
+pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
+    let rows = crate::restore::records(state.sink.root(), Table::Events, now_ms - LOOKBACK_MS, now_ms, &["kind", "detail"], &[], &[])?;
+    let events: Vec<(i64, String, Value)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let [Some(k), Some(detail)] = &r.text[..] else { return None };
+            Some((r.ts, k.clone(), serde_json::from_str::<Value>(detail).ok()?)).filter(|(_, k, _)| LIFECYCLE.contains(&k.as_str()))
+        })
+        .collect();
+    let presence = crate::rules::current_presence(state, now_ms)?;
+    let here = Here::of(state, presence.as_ref());
+    let (restored, ended) = Messfahrt::from_events(&events, now_ms, here);
+    let summary = restored.view(now_ms)["state"].as_str().unwrap_or("idle").to_string();
+    ended.into_iter().for_each(|e| log(state, e));
+    state.commanded.lock().unwrap().messfahrt = restored;
+    Ok(summary)
+}
+
+fn log(state: &AppState, event: Event) {
+    if let Err(e) = state.sink.append(event) {
+        eprintln!("experiment event: {e:#}");
+    }
+}
+
+fn rooms_with_nodes(state: &AppState) -> Vec<&Room> {
+    state.config.rooms.iter().filter(|r| !r.nodes.is_empty()).collect()
+}
+
+pub(crate) fn tick(state: &AppState, now: NaiveDateTime, now_ms: i64, windows: &HashSet<String>, presence: Option<&Presence>) -> Out {
+    let rooms = rooms_with_nodes(state);
+    let temps: Vec<Option<f64>> = {
+        let w = state.windows.lock().unwrap();
+        rooms.iter().map(|r| r.nodes.iter().find_map(|&n| w.local_temp(n, now_ms, state.config.stale.after_ms()))).collect()
+    };
+    let date = now.format("%Y-%m-%d").to_string();
+    let mut out = {
+        let mut commands = state.commanded.lock().unwrap();
+        let inputs: Vec<RoomIn> = rooms.iter().zip(&temps).map(|(r, t)| RoomIn { room: &r.name, held: commands.holding(&r.nodes), window: windows.contains(&r.name), temp: *t }).collect();
+        let tick = Tick { now_ms, date: &date, here: Here::of(state, presence), night: in_sleep_hours(&state.config, now), cap_c: state.config.occupied_setpoint + CAP_MARGIN_K, rooms: &inputs };
+        commands.messfahrt.tick(&tick)
+    };
+    std::mem::take(&mut out.events).into_iter().for_each(|e| log(state, e));
+    out
+}
+
+pub(crate) fn apply_calls(state: &AppState, out: &Out, wants: &mut [Desired], readings: &[crate::storage::Reading]) {
+    let (frost, cap) = (state.config.frost_setpoint, state.failsafe.boost_max_c());
+    let high = state.boost.boost_setpoint().map_or(cap, |b| b.min(cap));
+    for want in wants.iter_mut().filter(|w| w.reason != "window_open") {
+        let Some(call) = out.calls.get(&want.room) else { continue };
+        want.setpoint = if call.on { clamp_boost(readings, want.node, high, cap) } else { clamp_setpoint(readings, want.node, frost, state.failsafe.max_c()) };
+        (want.reason, want.rule, want.experiment_id) = ("experiment", call.rule, None);
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct Body {
+    #[serde(default)]
+    pub doors: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub cancel: bool,
+}
+
+fn reply(status: StatusCode, body: Value) -> Reply {
+    Reply { status, body }
+}
+
+fn fail(status: StatusCode, error: &str) -> Reply {
+    reply(status, json!({"ok": false, "error": error}))
+}
+
+pub fn apply(state: &AppState, body: Body, now_ms: i64) -> Reply {
+    if body.cancel {
+        let event = state.commanded.lock().unwrap().messfahrt.cancel(now_ms);
+        let cancelled = event.is_some();
+        event.into_iter().for_each(|e| log(state, e));
+        return reply(StatusCode::OK, json!({"ok": true, "cancelled": cancelled, "experiment": state.commanded.lock().unwrap().messfahrt.view(now_ms)}));
+    }
+    let Some(doors) = body.doors.as_deref().and_then(Doors::parse) else { return fail(StatusCode::BAD_REQUEST, "doors muss closed oder open sein") };
+    let source = body.source.as_deref().unwrap_or("chat");
+    if !matches!(source, "chat" | "watch") {
+        return fail(StatusCode::BAD_REQUEST, "source muss chat oder watch sein");
+    }
+    let armed = state.commanded.lock().unwrap().messfahrt.arm(doors, source, now_ms);
+    match armed {
+        Ok(event) => {
+            log(state, event);
+            reply(StatusCode::OK, json!({"ok": true, "experiment": state.commanded.lock().unwrap().messfahrt.view(now_ms)}))
+        }
+        Err(why) => fail(StatusCode::CONFLICT, why),
+    }
+}
+
+pub fn report_section(root: &Path, date: NaiveDate) -> Result<String> {
+    let db = open_lake(root, date - chrono::Duration::days(1), date + chrono::Duration::days(1))?;
+    let (lo, hi) = (midnight_us(date), midnight_us(date) + 86_400_000_000);
+    let list = LIFECYCLE.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", ");
+    let events = rows(&db.conn, &format!("SELECT epoch_us(ts), kind, detail FROM events WHERE kind IN ({list}) AND epoch_us(ts) >= {lo} AND epoch_us(ts) < {hi} ORDER BY ts"), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?;
+    let mut runs: BTreeMap<String, Vec<(i64, String, Value)>> = BTreeMap::new();
+    for (us, k, detail) in events {
+        let d: Value = detail.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+        runs.entry(d["id"].as_str().unwrap_or("-").to_string()).or_default().push((us, k, d));
+    }
+    let mut md = String::from("\n## Messfahrten\n\n");
+    if runs.is_empty() {
+        md.push_str("Keine Messfahrt.\n");
+    }
+    for (id, list) in runs {
+        let find = |name: &str| list.iter().find(|(_, k, _)| k == name);
+        let doors = list.iter().find_map(|(_, _, d)| d["doors"].as_str()).and_then(Doors::parse).map_or("-", Doors::label);
+        let started = find(kind::EXPERIMENT_STARTED).map(|(us, _, _)| hhmm(*us));
+        let ended = find(kind::EXPERIMENT_ENDED);
+        let reason = ended.and_then(|(_, _, d)| d["reason"].as_str()).unwrap_or("offen");
+        let _ = writeln!(md, "- {id}: {doors}, scharf {}, Start {}, Ende {}, Grund {reason}", find(kind::EXPERIMENT_ARMED).map_or("-".into(), |(us, _, _)| hhmm(*us)), started.unwrap_or_else(|| "-".into()), ended.map_or("-".into(), |(us, _, _)| hhmm(*us)));
+        let plan = find(kind::EXPERIMENT_STARTED).and_then(|(_, _, d)| d["schedule"].as_object());
+        for (room, segs) in plan.into_iter().flatten() {
+            let planned = segs.as_array().map_or(0, Vec::len);
+            let steps = list.iter().filter(|(_, k, d)| k == kind::EXPERIMENT_STEP && d["room"] == json!(room) && d["ended"].is_null()).map(|(_, _, d)| d["step"].as_u64()).collect::<HashSet<_>>().len();
+            let summary = ended.map(|(_, _, d)| &d["rooms"][room]);
+            let range = match summary.map(|s| (s["min"].as_f64(), s["max"].as_f64())) {
+                Some((Some(lo), Some(hi))) => format!("{} bis {} °C", crate::manual::celsius_text(lo), crate::manual::celsius_text(hi)),
+                _ => "keine Messwerte".into(),
+            };
+            let stop = summary.and_then(|s| s["ended"].as_str()).map_or(String::new(), |why| format!(", Raum vorzeitig beendet ({why})"));
+            let _ = writeln!(md, "  - {room}: {steps} von {planned} Schritten ausgeführt, Sensor {range}{stop}");
+        }
+    }
+    Ok(md)
+}

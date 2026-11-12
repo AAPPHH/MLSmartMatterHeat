@@ -15,17 +15,17 @@ const MIN_MS: i64 = 60_000;
 const LABEL_LOOKBACK_MS: i64 = 24 * 3_600_000;
 const EVENT_LOOKBACK_MAX_MS: i64 = 24 * 3_600_000;
 
-struct Rec {
-    ts: i64,
-    to: Option<i64>,
-    text: Vec<Option<String>>,
-    num: Vec<Option<f64>>,
-    flag: Vec<Option<bool>>,
+pub(crate) struct Rec {
+    pub(crate) ts: i64,
+    pub(crate) to: Option<i64>,
+    pub(crate) text: Vec<Option<String>>,
+    pub(crate) num: Vec<Option<f64>>,
+    pub(crate) flag: Vec<Option<bool>>,
 }
 
-fn records(root: &Path, table: Table, from_ms: i64, now_ms: i64, text: &[&str], num: &[&str], flag: &[&str]) -> Result<Vec<Rec>> {
-    let mut dates = vec![lake::date_of_us(from_ms * 1000), lake::date_of_us(now_ms * 1000)];
-    dates.dedup();
+pub(crate) fn records(root: &Path, table: Table, from_ms: i64, now_ms: i64, text: &[&str], num: &[&str], flag: &[&str]) -> Result<Vec<Rec>> {
+    let last = lake::date_of_us(now_ms * 1000);
+    let dates: Vec<chrono::NaiveDate> = lake::date_of_us(from_ms * 1000).iter_days().take_while(|d| *d <= last).collect();
     let mut out = Vec::new();
     for batch in read_raw(root, table, Some(&dates))? {
         let ts = ts_column(&batch, "ts")?;
