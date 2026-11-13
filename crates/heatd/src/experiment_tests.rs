@@ -672,3 +672,25 @@ async fn a_restart_rebuilds_the_thirty_minute_home_activity_from_the_lake() {
     let later = e.t + 31 * MIN;
     assert_eq!(e.state.devices.home_activity(later, 30 * MIN), None);
 }
+
+#[test]
+fn arming_counts_as_the_departure_so_a_run_starts_without_the_watch_after_the_settle_time() {
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    let step = |m: &mut Messfahrt, now: i64, here: Here| m.tick(&Tick { now_ms: now, date: DATE, here, night: false, cap_c: 23.0, rooms: &list, activity: None, away_confirmed: false, history_ready: true, homecoming_ms: None });
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    step(&mut m, 14 * MIN, Here::Unknown);
+    assert_eq!(state_of(&m, 0), "armed");
+    step(&mut m, 20 * MIN, Here::Home);
+    assert_eq!(state_of(&m, 0), "armed");
+    step(&mut m, 21 * MIN, Here::Unknown);
+    assert_eq!(state_of(&m, 0), "running");
+    step(&mut m, 120 * MIN, Here::Unknown);
+    assert_eq!(state_of(&m, 0), "running", "a silent watch does not end a declared run");
+    step(&mut m, 121 * MIN, Here::Home);
+    assert_eq!((m.view(0)["state"].as_str(), m.view(0)["reason"].as_str()), (Some("aborted"), Some("homecoming")));
+    let mut late = Messfahrt::default();
+    late.arm(Doors::Open, "watch", 0).unwrap();
+    step(&mut late, 181 * MIN, Here::Unknown);
+    assert_eq!(state_of(&late, 0), "armed", "a declaration older than 180 min does not start a run");
+}

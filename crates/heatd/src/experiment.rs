@@ -24,6 +24,7 @@ const HOMECOMING_MIN_DAYS: usize = 3;
 const MAIN_RETURN_FROM_MIN: u32 = 12 * 60;
 const DEPARTURE_FRESH_MS: i64 = 60 * 60_000;
 const DEPARTURE_MAX_MS: i64 = 180 * 60_000;
+const DECLARED_SETTLE_MS: i64 = 15 * 60_000;
 const HOMECOMING_REFRESH_MS: i64 = 6 * 3_600_000;
 const MIN_MS: i64 = 60_000;
 const REBUILD_EXTRA_MS: i64 = 20 * MIN_MS;
@@ -355,6 +356,7 @@ impl Homecoming {
 pub struct Messfahrt {
     run: Option<Run>,
     departed_ms: Option<i64>,
+    away_seen: bool,
     learned: Homecoming,
 }
 
@@ -428,11 +430,14 @@ impl Messfahrt {
             }
             let departed = self.departed_ms.is_some_and(|d| t.now_ms - d <= if d >= run.armed_ms { DEPARTURE_MAX_MS } else { DEPARTURE_FRESH_MS });
             let too_late = !t.history_ready || run.cutoff_ms().is_some_and(|c| t.now_ms + TOTAL_MIN * MIN_MS > c);
-            if t.here != Here::Away || t.night || t.activity.is_some() || !(t.away_confirmed && departed) || too_late {
+            let since_armed = t.now_ms - run.armed_ms;
+            let gone = (t.here != Here::Home && (DECLARED_SETTLE_MS..=DEPARTURE_MAX_MS).contains(&since_armed)) || (t.here == Here::Away && t.away_confirmed && departed);
+            if !gone || t.night || t.activity.is_some() || too_late {
                 return out;
             }
             let rooms: Vec<&str> = t.rooms.iter().map(|r| r.room).collect();
             out.events.push(run.start(&rooms, t.now_ms, t.date));
+            self.away_seen = false;
         }
         if run.status != Status::Running {
             return out;
@@ -441,10 +446,11 @@ impl Messfahrt {
             out.events.push(run.finish(Status::Aborted, "homecoming", t.now_ms));
             return out;
         }
-        if !t.away_confirmed {
+        if self.away_seen && !t.away_confirmed {
             out.events.push(run.finish(Status::Aborted, "away_lost", t.now_ms));
             return out;
         }
+        self.away_seen |= t.away_confirmed;
         if let Some(source) = t.activity {
             out.events.push(run.finish_with(Status::Aborted, "home_activity", t.now_ms, json!({"activity": source})));
             return out;
