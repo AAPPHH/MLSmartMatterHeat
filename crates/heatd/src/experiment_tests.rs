@@ -38,7 +38,7 @@ fn schedule_is_deterministic_bounded_and_decorrelated() {
     assert_ne!(a, schedule("bad", Doors::Closed, DATE));
     assert_eq!((a[0].from_min, a[0].to_min, a[0].on, a[0].phase), (0, COOLDOWN_MIN, false, Phase::Cooldown));
     assert_eq!(a.last().unwrap().to_min, TOTAL_MIN);
-    assert!(a[1..].iter().all(|s| s.phase == Phase::Pulses && [10, 20, 30, 40].contains(&(s.to_min - s.from_min))));
+    assert!(a[1..].iter().all(|s| s.phase == Phase::Pulses && [5, 10, 15, 20].contains(&(s.to_min - s.from_min))));
     assert!(a.windows(2).all(|w| w[0].to_min == w[1].from_min && (w[1].phase == Phase::Cooldown || w[0].on != w[1].on || w[0].phase == Phase::Cooldown)));
     let names = ["a", "b", "c", "d", "e", "f"];
     let all: Vec<_> = names.iter().map(|n| schedule(n, Doors::Open, DATE)).collect();

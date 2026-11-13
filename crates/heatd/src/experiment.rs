@@ -28,7 +28,8 @@ const HOMECOMING_REFRESH_MS: i64 = 6 * 3_600_000;
 const MIN_MS: i64 = 60_000;
 const REBUILD_EXTRA_MS: i64 = 20 * MIN_MS;
 const LOOKBACK_MS: i64 = 48 * 3_600_000;
-const STEP_MINUTES: u32 = 4;
+const PULSE_STEPS: u32 = 4;
+const PULSE_GRID_MIN: i64 = 5;
 const LIFECYCLE: [&str; 4] = [kind::EXPERIMENT_ARMED, kind::EXPERIMENT_STARTED, kind::EXPERIMENT_STEP, kind::EXPERIMENT_ENDED];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +150,7 @@ pub fn schedule(room: &str, doors: Doors, date: &str) -> Vec<Seg> {
     let mut segs = vec![Seg { from_min: 0, to_min: COOLDOWN_MIN, on: false, phase: Phase::Cooldown }];
     let (mut at, mut on) = (COOLDOWN_MIN, rng.unit() < 0.5);
     while at < TOTAL_MIN {
-        let length = (10 * i64::from(rng.range(1, STEP_MINUTES))).min(TOTAL_MIN - at);
+        let length = (PULSE_GRID_MIN * i64::from(rng.range(1, PULSE_STEPS))).min(TOTAL_MIN - at);
         segs.push(Seg { from_min: at, to_min: at + length, on, phase: Phase::Pulses });
         at += length;
         on = !on;
