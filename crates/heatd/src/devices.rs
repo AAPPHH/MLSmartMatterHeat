@@ -70,7 +70,6 @@ const CO2_FALL_SPAN_MS: i64 = 15 * 60 * 1000;
 const CO2_NIGHT_RISE_PPM: f64 = 200.0;
 const CO2_KEEP_MS: i64 = 8 * 3600 * 1000;
 const WATCH_MOTION_FRESH_MS: i64 = 10 * 60 * 1000;
-const COFFEE_ACTIVE_MW: i64 = 20_000;
 const CO2_HOME_RISE_PPM: f64 = 50.0;
 const CO2_HOME_SPAN_MS: i64 = 15 * 60 * 1000;
 const READ_ALL_EVERY: Duration = Duration::from_secs(6 * 3600);
@@ -497,7 +496,6 @@ struct Inner {
     day_file: Option<PathBuf>,
     detectors: BTreeMap<u64, EdgeDetector>,
     home: BTreeMap<&'static str, i64>,
-    coffee_power: BTreeMap<u64, i64>,
 }
 
 impl Inner {
@@ -559,16 +557,6 @@ impl Inner {
 
     fn is_coffee(&self, node: u64) -> bool {
         self.configs.iter().any(|c| c.node == node && c.role == ROLE_COFFEE)
-    }
-
-    fn note_power(&mut self, node: u64, row: &DeviceReading, now_ms: i64) {
-        if row.cluster != ELECTRICAL_POWER_MEASUREMENT_CLUSTER || row.attribute != POWER_ATTRIBUTE || row.kind != "attribute" || !self.is_coffee(node) {
-            return;
-        }
-        let Some(milliwatts) = row.value.map(|v| v.round() as i64) else { return };
-        if self.coffee_power.insert(node, milliwatts).is_some_and(|before| (before >= COFFEE_ACTIVE_MW) != (milliwatts >= COFFEE_ACTIVE_MW)) {
-            self.note_home("coffee_power", now_ms);
-        }
     }
 
     fn note_onoff(&mut self, node: u64, on: bool, local: NaiveDateTime, now_ms: i64) {
@@ -754,7 +742,6 @@ impl Devices {
                         inner.note_onoff(node, row.value == Some(1.0), chrono::Local::now().naive_local(), now_ms);
                     }
                     inner.note_ambient(node, &row, now_ms);
-                    inner.note_power(node, &row, now_ms);
                     let label = inner.edge_label(node, &row);
                     if label.is_some() {
                         inner.note_activity("toothbrush", now_ms);
@@ -804,7 +791,6 @@ impl Devices {
                     inner.note_home("coffee_plug", ms);
                 }
             }
-            inner.note_power(row.node, row, ms);
             inner.note_ambient(row.node, row, ms);
         }
         (inner.fallback, inner.last_activity_ms) = saved;

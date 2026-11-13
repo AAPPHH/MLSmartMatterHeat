@@ -900,7 +900,6 @@ room = 'a'
     let d = Devices::new(&config, mock.clone(), mock);
     let (min, window) = (60_000, 30 * 60_000);
     let row = |node: u64, cluster: u32, value: f64| DeviceReading { ts: 0, node, endpoint: 1, cluster, attribute: 0, kind: "attribute".into(), name: String::new(), value: Some(value), raw: String::new(), source: String::new() };
-    let power = |node: u64, mw: f64| DeviceReading { attribute: 8, ..row(node, 0x90, mw) };
     let at = local("2026-11-10 10:00");
     assert_eq!(d.home_activity(NOW_MS, window), None);
     d.inner.lock().unwrap().note_onoff(9, false, at, NOW_MS - 100 * min);
@@ -909,19 +908,7 @@ room = 'a'
     d.inner.lock().unwrap().note_onoff(9, true, at, NOW_MS - 20 * min);
     assert_eq!(d.home_activity(NOW_MS, window), Some("coffee_plug"));
     assert_eq!(d.home_activity(NOW_MS + 11 * min, window), None);
-    let mut inner = d.inner.lock().unwrap();
-    inner.note_power(9, &power(9, 1000.0), NOW_MS - 60 * min);
-    inner.note_power(9, &power(9, 1200.0), NOW_MS - 50 * min);
-    inner.note_power(12, &power(12, 5000.0), NOW_MS - 45 * min);
-    inner.note_power(12, &power(12, 90000.0), NOW_MS - 44 * min);
-    drop(inner);
-    assert_eq!(d.home_activity(NOW_MS, window), Some("coffee_plug"));
-    d.inner.lock().unwrap().note_power(9, &power(9, 1_243_100.0), NOW_MS - 5 * min);
-    assert_eq!(d.home_activity(NOW_MS, window), Some("coffee_power"));
     d.inner.lock().unwrap().home.clear();
-    d.inner.lock().unwrap().note_power(9, &power(9, 1_241_900.0), NOW_MS - 4 * min);
-    d.inner.lock().unwrap().note_power(9, &power(9, 1_243_100.0), NOW_MS - 3 * min);
-    assert_eq!(d.home_activity(NOW_MS, window), None, "a wobble while the machine runs is no edge");
     let mut inner = d.inner.lock().unwrap();
     inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5000.0), NOW_MS - 3 * min);
     inner.note_ambient(11, &row(11, HUMIDITY_MEASUREMENT_CLUSTER, 5500.0), NOW_MS - 2 * min);
