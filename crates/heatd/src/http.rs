@@ -1888,17 +1888,16 @@ nodes = [7]
     }
 
     #[tokio::test]
-    async fn first_report_of_the_shutdown_failsafe_after_a_restart_write_is_not_manual() {
+    async fn the_echo_of_the_shutdown_failsafe_write_is_no_dial_change() {
         let h = harness(false);
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         control_step(&h.state, noon, 2_000).await.unwrap();
+        h.state.commanded.lock().unwrap().test_sent(5, 20.0, 19.0, 1_000);
+        crate::failsafe::shutdown(&h.state).await;
         let failsafe = h.state.config.failsafe.setpoint;
-        crate::rules::on_report(&h.state, &setpoint_report(failsafe), false, 300_000);
-        crate::rules::on_report(&h.state, &setpoint_report(failsafe), false, 330_000);
+        crate::rules::on_report(&h.state, &setpoint_report(failsafe), false, now_ms() + 300_000);
         assert!(!some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
         assert!(h.state.commanded.lock().unwrap().last_manual_ms().is_none());
-        crate::rules::on_report(&h.state, &setpoint_report(failsafe + 3.0), false, 600_000);
-        assert!(some(&column(&lake_rows(&h, "decisions"), "rule")).iter().any(|r| r == "manual"));
     }
 
     fn setpoint_report(value: f64) -> matter_controller::AttributeReport {

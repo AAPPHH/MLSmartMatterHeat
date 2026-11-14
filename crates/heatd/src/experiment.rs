@@ -480,7 +480,8 @@ impl Messfahrt {
         let gone = (t.here != Here::Home && (DECLARED_SETTLE_MS..=DEPARTURE_MAX_MS).contains(&since_armed)) || (t.here == Here::Away && t.away_confirmed && departed);
         if !gone {
             return Some(match (t.here, since_armed < DECLARED_SETTLE_MS) {
-                (Here::Home, _) => Wait::Home,
+                (Here::Home, _) if since_armed <= DEPARTURE_MAX_MS => Wait::Home,
+                (Here::Home, _) => Wait::Stale,
                 (_, true) => Wait::Settle(run.armed_ms + DECLARED_SETTLE_MS),
                 _ => Wait::Stale,
             });
