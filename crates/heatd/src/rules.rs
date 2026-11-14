@@ -1127,6 +1127,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
 }
 
 fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64, reconnected: bool) -> Option<(f64, Option<Hold>)> {
+    if state.failsafe.stopping() {
+        return None;
+    }
     let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
     let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
     let mut commands = state.commanded.lock().unwrap();

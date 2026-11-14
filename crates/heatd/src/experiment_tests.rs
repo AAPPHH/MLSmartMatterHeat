@@ -17,6 +17,10 @@ fn tick(m: &mut Messfahrt, now_ms: i64, here: Here, night: bool, list: &[RoomIn]
     m.tick(&Tick { now_ms, date: DATE, here, night, cap_c: 23.0, rooms: list, activity: None, away_confirmed: true, history_ready: true, homecoming_ms: None })
 }
 
+fn lifecycle_quiet(out: &crate::experiment::Out) -> bool {
+    out.events.iter().all(|e| e.kind == kind::EXPERIMENT_WAITING)
+}
+
 fn running(names: &[&str]) -> (Messfahrt, i64) {
     let mut m = Messfahrt::default();
     m.arm(Doors::Closed, "chat", 0).unwrap();
@@ -73,7 +77,7 @@ fn an_armed_run_expires_after_24_hours_without_absence() {
     let mut m = Messfahrt::default();
     m.arm(Doors::Closed, "chat", 0).unwrap();
     let list = rooms(&["a"], &[], &[], None);
-    assert!(tick(&mut m, 24 * 60 * MIN - 1, Here::Home, false, &list).events.is_empty());
+    assert!(lifecycle_quiet(&tick(&mut m, 24 * 60 * MIN - 1, Here::Home, false, &list)));
     assert_eq!(state_of(&m, 0), "armed");
     let out = tick(&mut m, 24 * 60 * MIN, Here::Home, false, &list);
     assert_eq!(out.events.len(), 1);
@@ -88,7 +92,7 @@ fn it_starts_only_when_away_and_not_at_night() {
     let list = rooms(&["a", "b"], &[], &[], Some(19.0));
     for (here, night) in [(Here::Home, false), (Here::Unknown, false), (Here::Away, true)] {
         let out = tick(&mut m, MIN, here, night, &list);
-        assert!(out.events.is_empty() && out.calls.is_empty() && state_of(&m, MIN) == "armed");
+        assert!(lifecycle_quiet(&out) && out.calls.is_empty() && state_of(&m, MIN) == "armed");
     }
     let out = tick(&mut m, 2 * MIN, Here::Away, false, &list);
     assert_eq!(state_of(&m, 2 * MIN), "running");
@@ -391,7 +395,7 @@ async fn an_arming_event_from_the_middle_day_of_the_lookback_is_restored() {
 
 fn tick_with(m: &mut Messfahrt, now_ms: i64, here: Here, activity: Option<&'static str>, away: bool, homecoming_ms: Option<i64>) -> crate::experiment::Out {
     let list = rooms(&["a"], &[], &[], Some(19.0));
-    m.tick(&Tick { now_ms, date: DATE, here, night: false, cap_c: 23.0, rooms: &list, activity, away_confirmed: away, history_ready: true, homecoming_ms })
+    m.tick(&Tick { now_ms, date: DATE, here, night: false, cap_c: 23.0, rooms: &list, activity: activity.map(|a| (a, 0)), away_confirmed: away, history_ready: true, homecoming_ms })
 }
 
 #[test]
@@ -401,7 +405,7 @@ fn recent_home_activity_blocks_the_start_and_ends_a_running_run() {
     m.note_departure(0);
     for source in ["coffee_plug", "toothbrush", "manual_setpoint", "watch_scan"] {
         let out = tick_with(&mut m, MIN, Here::Away, Some(source), true, None);
-        assert!(out.events.is_empty() && state_of(&m, MIN) == "armed", "{source}");
+        assert!(lifecycle_quiet(&out) && state_of(&m, MIN) == "armed", "{source}");
     }
     tick_with(&mut m, 2 * MIN, Here::Away, None, true, None);
     assert_eq!(state_of(&m, 2 * MIN), "running");
@@ -448,7 +452,7 @@ fn a_run_must_finish_thirty_minutes_before_the_usual_homecoming_and_ends_there()
     let late_start = 2 * MIN;
     let too_soon = late_start + total + 29 * MIN;
     let out = tick_with(&mut m, late_start, Here::Away, None, true, Some(too_soon));
-    assert!(out.events.is_empty() && state_of(&m, late_start) == "armed");
+    assert!(lifecycle_quiet(&out) && state_of(&m, late_start) == "armed");
     assert_eq!(m.view(late_start)["homecoming_ms"].as_i64(), Some(too_soon));
     let fine = late_start + total + 31 * MIN;
     tick_with(&mut m, late_start, Here::Away, None, true, Some(fine));
@@ -525,7 +529,7 @@ fn a_start_after_the_typical_homecoming_has_passed_is_blocked() {
     usual(&mut m, 17 * 60 + 30);
     let now = 1_000_000;
     let out = home_tick(&mut m, at(9, 17, 50), now);
-    assert!(out.events.is_empty() && state_of(&m, now) == "armed");
+    assert!(lifecycle_quiet(&out) && state_of(&m, now) == "armed");
     assert_eq!(m.view(now)["homecoming_ms"].as_i64(), Some(now - 20 * MIN));
 }
 
@@ -693,4 +697,35 @@ fn arming_counts_as_the_departure_so_a_run_starts_without_the_watch_after_the_se
     late.arm(Doors::Open, "watch", 0).unwrap();
     step(&mut late, 181 * MIN, Here::Unknown);
     assert_eq!(state_of(&late, 0), "armed", "a declaration older than 180 min does not start a run");
+}
+
+type Wait = (usize, Option<String>);
+
+fn wait_step(m: &mut Messfahrt, now: i64, here: Here, night: bool, activity: Option<(&'static str, i64)>, ready: bool, homecoming_ms: Option<i64>) -> Wait {
+    let list = rooms(&["a"], &[], &[], Some(19.0));
+    let out = m.tick(&Tick { now_ms: now, date: DATE, here, night, cap_c: 23.0, rooms: &list, activity, away_confirmed: false, history_ready: ready, homecoming_ms });
+    let waits: Vec<Value> = out.events.iter().filter(|e| e.kind == kind::EXPERIMENT_WAITING).map(|e| serde_json::from_str(e.detail.as_deref().unwrap()).unwrap()).collect();
+    (waits.len(), waits.first().and_then(|w| w["waiting"].as_str().map(String::from)))
+}
+
+#[test]
+fn an_armed_run_names_why_it_has_not_started_and_logs_each_change_once() {
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    let coffee = Some(("coffee_plug", 18 * MIN));
+    assert_eq!(wait_step(&mut m, MIN, Here::Home, false, None, true, None), (1, Some("Uhr sieht dich noch zu Hause".into())));
+    assert_eq!(wait_step(&mut m, 2 * MIN, Here::Home, false, None, true, None).0, 0);
+    assert!(wait_step(&mut m, 3 * MIN, Here::Unknown, false, None, true, None).1.unwrap().starts_with("noch in der Wartezeit bis "));
+    assert_eq!(wait_step(&mut m, 20 * MIN, Here::Unknown, true, None, true, None).1.as_deref(), Some("Nacht"));
+    assert_eq!(wait_step(&mut m, 21 * MIN, Here::Unknown, false, coffee, true, None).1.as_deref(), Some("Aktivität im Haus: coffee_plug vor 3 min"));
+    assert_eq!(wait_step(&mut m, 22 * MIN, Here::Unknown, false, coffee, true, None).0, 0);
+    assert_eq!(wait_step(&mut m, 23 * MIN, Here::Unknown, false, None, false, None).1.as_deref(), Some("Heimkehr-Historie fehlt"));
+    let late = wait_step(&mut m, 24 * MIN, Here::Unknown, false, None, true, Some(100 * MIN)).1.unwrap();
+    assert!(late.starts_with("zu nah an deiner üblichen Heimkehr ("), "{late}");
+    assert_eq!(m.view(24 * MIN)["waiting"].as_str(), Some(late.as_str()));
+    assert_eq!(wait_step(&mut m, 200 * MIN, Here::Unknown, false, None, true, None).1.as_deref(), Some("Abmeldung älter als 3 h"));
+    let mut m = Messfahrt::default();
+    m.arm(Doors::Closed, "chat", 0).unwrap();
+    wait_step(&mut m, 20 * MIN, Here::Unknown, false, None, true, None);
+    assert_eq!((state_of(&m, 20 * MIN), m.view(20 * MIN)["waiting"].clone()), ("running".into(), Value::Null));
 }

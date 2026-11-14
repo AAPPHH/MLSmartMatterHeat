@@ -801,8 +801,13 @@ impl Devices {
         }
     }
 
+    #[cfg(test)]
     pub fn home_activity(&self, now_ms: i64, within_ms: i64) -> Option<&'static str> {
-        self.inner.lock().unwrap().home.iter().filter(|(_, at)| now_ms - **at <= within_ms).max_by_key(|(_, at)| **at).map(|(source, _)| *source)
+        self.home_activity_at(now_ms, within_ms).map(|(source, _)| source)
+    }
+
+    pub fn home_activity_at(&self, now_ms: i64, within_ms: i64) -> Option<(&'static str, i64)> {
+        self.inner.lock().unwrap().home.iter().filter(|(_, at)| now_ms - **at <= within_ms).max_by_key(|(_, at)| **at).map(|(source, at)| (*source, *at))
     }
 
     fn break_edge_link(&self, node: u64) {
