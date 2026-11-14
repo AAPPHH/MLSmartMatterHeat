@@ -917,10 +917,10 @@ room = 'a'
     let other = self::mock();
     let d = Devices::new(&config, other.clone(), other);
     let mut inner = d.inner.lock().unwrap();
-    for (back, ppm) in [(14, 500.0), (10, 530.0), (5, 545.0)] {
+    for (back, ppm) in [(14, 500.0), (10, 580.0), (5, 640.0)] {
         inner.note_ambient(14, &row(14, CO2_CLUSTER, ppm), NOW_MS - back * min);
     }
-    assert!(inner.home.is_empty(), "45 ppm in 14 minutes is not enough");
-    inner.note_ambient(14, &row(14, CO2_CLUSTER, 552.0), NOW_MS);
+    assert!(inner.home.is_empty(), "140 ppm in 14 minutes is sensor drift in an empty room (seen up to 80 ppm)");
+    inner.note_ambient(14, &row(14, CO2_CLUSTER, 660.0), NOW_MS);
     assert!(inner.home.contains_key("bedroom_co2"));
 }

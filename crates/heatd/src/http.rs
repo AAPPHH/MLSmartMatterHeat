@@ -358,16 +358,21 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     }
     let pairs: Vec<(String, i32)> = body.aps.iter().map(|a| (a.bssid.clone(), a.rssi)).collect();
     let matched = state.watchmatch.scan_match(&body.device, body.ts, received, &pairs);
-    let transition = {
+    let transitions = {
         let mut tracker = state.tracker.lock().unwrap();
-        let transition = tracker.observe(&body.device, body.ts, body.away, body.motion, body.power);
+        let mut out: Vec<(String, crate::rules::Transition)> = if body.away { Vec::new() } else { tracker.poll(body.ts, state.config.away_guard_minutes, None) };
+        out.extend(tracker.observe(&body.device, body.ts, body.away, body.motion, body.power).map(|t| (body.device.clone(), t)));
         if let Some(info) = body.info.as_ref().filter(|i| i.hb) {
             tracker.note_heartbeat(&body.device, body.ts, received, info.leaving);
         }
-        transition
+        out
     };
-    if let Some(t) = transition {
-        if let Err(e) = state.sink.append(presence_event(&body.device, t)) {
+    for (device, t) in transitions {
+        let mut event = presence_event(&device, t);
+        if t == crate::rules::Transition::Arrived {
+            event.ts = body.ts * 1000;
+        }
+        if let Err(e) = state.sink.append(event) {
             eprintln!("presence event: {e}");
         }
     }
@@ -2029,6 +2034,22 @@ nodes = [6]
         assert!(column(&events, "detail").iter().flatten().any(|d| d.contains("watch_wifi")));
         call(&h.state, "POST", "/api/scan", Some(body(now + 1, false, "moving"))).await;
         assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "presence_arrive"));
+    }
+
+    #[tokio::test]
+    async fn a_backlog_delivered_at_home_still_logs_the_absence_with_its_true_times() {
+        let h = harness_with(false, "", "[[rooms]]\nname = 'a'\nnodes = [5]\n");
+        let now = now_ms();
+        let body = |ts: i64, away: bool, motion: &str| json!({"ts": ts, "device": "pixel-watch", "motion": motion, "away": away}).to_string();
+        for (ago, away, motion) in [(300, false, "still"), (290, true, "moving"), (200, true, "still"), (120, false, "moving")] {
+            call(&h.state, "POST", "/api/scan", Some(body(now - ago * 60_000, away, motion))).await;
+        }
+        let events = lake_rows(&h, "events");
+        let rows: Vec<(String, i64)> = some(&column(&events, "kind")).into_iter().zip(some(&column(&events, "ts")).into_iter().map(|t| t.parse::<i64>().unwrap())).filter(|(k, _)| k.starts_with("presence_")).collect();
+        assert_eq!(rows, vec![("presence_leave".to_string(), (now - 290 * 60_000) * 1000), ("presence_arrive".to_string(), (now - 120 * 60_000) * 1000)]);
+        call(&h.state, "POST", "/api/scan", Some(body(now - 100 * 60_000, true, "moving"))).await;
+        call(&h.state, "POST", "/api/scan", Some(body(now - 95 * 60_000, false, "still"))).await;
+        assert_eq!(some(&column(&lake_rows(&h, "events"), "kind")).iter().filter(|k| k.starts_with("presence_")).count(), 2, "a short trip under the guard is no absence");
     }
 
     fn extras(h: &Harness, why: &str) -> usize {

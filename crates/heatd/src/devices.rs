@@ -70,7 +70,7 @@ const CO2_FALL_SPAN_MS: i64 = 15 * 60 * 1000;
 const CO2_NIGHT_RISE_PPM: f64 = 200.0;
 const CO2_KEEP_MS: i64 = 8 * 3600 * 1000;
 const WATCH_MOTION_FRESH_MS: i64 = 10 * 60 * 1000;
-const CO2_HOME_RISE_PPM: f64 = 50.0;
+const CO2_HOME_RISE_PPM: f64 = 150.0;
 const CO2_HOME_SPAN_MS: i64 = 15 * 60 * 1000;
 const READ_ALL_EVERY: Duration = Duration::from_secs(6 * 3600);
 
