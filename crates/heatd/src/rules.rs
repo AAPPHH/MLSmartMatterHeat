@@ -386,7 +386,7 @@ impl Presence {
     }
 
     pub fn occupancy(&self, config: &Config) -> Occupancy<'_> {
-        if self.contact_age_minutes.is_some_and(|a| a > config.still_contact_timeout_minutes) || matches!(self.power, Some(Power::Saver | Power::Offbody)) {
+        if (!self.away && self.contact_age_minutes.is_some_and(|a| a > config.still_contact_timeout_minutes)) || matches!(self.power, Some(Power::Saver | Power::Offbody)) {
             return Occupancy::Unknown;
         }
         if self.away {
@@ -1319,6 +1319,23 @@ nodes = [8]
     }
 
     #[test]
+    fn a_confirmed_away_outlives_the_contact_timeout_and_never_reads_as_homecoming() {
+        let config = Config::parse("default_setpoint = 18.0
+occupied_setpoint = 20.0
+home_setpoint = 20.0
+").unwrap();
+        let mut boost_away = Vec::new();
+        for contact in [75.0, 180.0, 181.0, 240.0, 900.0] {
+            let p = device("flur", 500.0, Some(Motion::Still), None, true, contact).unwrap();
+            assert_eq!(p.occupancy(&config), Occupancy::Away, "contact {contact}");
+            boost_away.push(p.occupancy(&config) == Occupancy::Away);
+        }
+        assert!(boost_away.iter().all(|a| *a));
+        let silent = device("flur", 500.0, Some(Motion::Still), None, false, 240.0).unwrap();
+        assert_eq!(silent.occupancy(&config), Occupancy::Unknown);
+    }
+
+    #[test]
     fn sleep_hours_fallback_keeps_the_bedroom_at_default_without_a_sleep_report() {
         let config = Config::parse("default_setpoint = 18.0
 occupied_setpoint = 20.0
@@ -1373,7 +1390,7 @@ home_setpoint = 20.0
             ("offbody is unknown", at(27, 7, 0), device("wohnzimmer", 1.0, Some(Motion::Still), Some(Power::Offbody), false, 1.0), vec![], 5, (21.0, "schedule")),
             ("away goes eco", at(27, 12, 0), device("wohnzimmer", 1.0, Some(Motion::Moving), None, true, 1.0), vec![], 5, (18.0, "away")),
             ("away with saver is unknown", at(27, 12, 0), device("wohnzimmer", 1.0, None, Some(Power::Saver), true, 1.0), vec![], 5, (18.0, "default")),
-            ("away but contact stale is unknown", at(27, 12, 0), device("wohnzimmer", 1.0, None, None, true, 181.0), vec![], 5, (18.0, "default")),
+            ("a confirmed away outlives the stale contact", at(27, 12, 0), device("wohnzimmer", 1.0, None, None, true, 181.0), vec![], 5, (18.0, "away")),
             ("away without prediction", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: None, power: None, away: true, contact_age_minutes: Some(1.0), source: "matcher", sleep: false, bedtime: false }), vec![], 5, (18.0, "away")),
             ("heartbeat without prediction is unknown", at(27, 12, 0), Some(Presence { room: None, prediction_age_minutes: None, motion: Some(Motion::Still), power: None, away: false, contact_age_minutes: Some(1.0), source: "matcher", sleep: false, bedtime: false }), vec![], 5, (18.0, "default")),
             ("window open frost", at(27, 7, 0), presence("wohnzimmer", 1.0), vec!["wohnzimmer"], 5, (7.0, "window_open")),
