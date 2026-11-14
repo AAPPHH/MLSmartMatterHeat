@@ -330,7 +330,7 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     if heat && (!body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty())) {
         state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref(), body.label_id.as_deref());
     }
-    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "heat": heat, "away": body.away, "bedtime": body.bedtime, "id": body.id, "net": body.info.as_ref().and_then(|i| i.diag.clone())});
+    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "heat": heat, "away": body.away, "bedtime": body.bedtime, "id": body.id, "app": body.app_version, "net": body.info.as_ref().and_then(|i| i.diag.clone())});
     let mut state_event = Event::now(kind::WATCH_STATE, "watch").with_detail(detail);
     state_event.ts = body.ts * 1000;
     if let Err(e) = state.sink.append(state_event) {
@@ -406,6 +406,8 @@ struct LongBody {
     label_id: Option<String>,
     #[serde(default)]
     queued: Option<bool>,
+    #[serde(default)]
+    app_version: Option<String>,
 }
 
 impl LongBody {
@@ -427,6 +429,7 @@ impl LongBody {
             heat: self.heat,
             label_id: self.label_id.clone(),
             info: None,
+            app_version: self.app_version.clone(),
         })
     }
 }
@@ -1092,6 +1095,10 @@ async fn update_apk(State(state): State<AppState>) -> Response {
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return e.into_response(),
     };
+    let served = Event::now(kind::WATCH_UPDATE_SERVED, "watch").with_detail(json!({"version_code": manifest.version_code, "version_name": manifest.version_name, "size": manifest.size}));
+    if let Err(e) = state.sink.append(served) {
+        eprintln!("watch_update_served: {e}");
+    }
     let file = tokio::fs::File::from_std(file);
     let stream = futures_util::stream::unfold(file, |mut file| async move {
         use tokio::io::AsyncReadExt;
@@ -1243,6 +1250,32 @@ mod tests {
         assert_eq!(headers["content-type"], "application/vnd.android.package-archive");
         assert_eq!(headers["content-length"], apk.len().to_string());
         assert_eq!(body, apk);
+    }
+
+    #[tokio::test]
+    async fn watch_update_apk_download_is_logged_but_manifest_is_not() {
+        let apk: Vec<u8> = vec![7u8; 1000];
+        let manifest = manifest_json(&apk, apk.len());
+        let (h, _dir) = update_harness(&[("update.json", manifest.as_bytes()), ("update.apk", &apk)]);
+        get_bytes(&h.state, "/watch/update").await;
+        assert!(!some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "watch_update_served"));
+        get_bytes(&h.state, "/watch/update.apk").await;
+        let events = lake_rows(&h, "events");
+        let kinds = some(&column(&events, "kind"));
+        let at = kinds.iter().position(|k| k == "watch_update_served").unwrap();
+        let detail: Value = serde_json::from_str(&some(&column(&events, "detail"))[at]).unwrap();
+        assert_eq!((detail["version_code"].as_i64(), detail["version_name"].as_str(), detail["size"].as_u64()), (Some(30), Some("4.0.1"), Some(1000)));
+    }
+
+    #[tokio::test]
+    async fn scan_app_version_lands_in_watch_state_detail() {
+        let h = harness(false);
+        let body = json!({"ts": now_ms(), "device": "pixel-watch", "label": "kueche", "app_version": "4.4.2", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]}).to_string();
+        assert_eq!(call(&h.state, "POST", "/api/scan", Some(body)).await.0, StatusCode::OK);
+        let events = lake_rows(&h, "events");
+        let at = some(&column(&events, "kind")).iter().position(|k| k == "watch_state").unwrap();
+        let detail: Value = serde_json::from_str(&some(&column(&events, "detail"))[at]).unwrap();
+        assert_eq!(detail["app"].as_str(), Some("4.4.2"));
     }
 
     #[tokio::test]

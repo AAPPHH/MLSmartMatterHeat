@@ -446,7 +446,7 @@ async fn the_control_step_wake_signal_switches_the_coffee_plug_once() {
     let dir = tempfile::tempdir().unwrap();
     let (state, mock) = setup(dir.path(), DEVICES);
     let now = crate::storage::now_ms();
-    let scan = |ts: i64, bedtime: bool| ScanBody { ts, device: "pixel-watch".into(), id: None, label: None, aps: Vec::new(), motion: None, queued: false, power: None, away: false, bedtime: Some(bedtime), heat: None, label_id: None, info: None };
+    let scan = |ts: i64, bedtime: bool| ScanBody { ts, device: "pixel-watch".into(), id: None, label: None, aps: Vec::new(), motion: None, queued: false, power: None, away: false, bedtime: Some(bedtime), heat: None, label_id: None, info: None, app_version: None };
     state.storage.ingest(&scan(now - 180_000, true), now - 180_000, None).unwrap();
     crate::rules::control_step(&state, local("2026-11-10 05:30"), now - 170_000).await.unwrap();
     assert_eq!(on_offs(&mock), 0);
@@ -469,7 +469,7 @@ async fn an_evening_off_before_the_window_does_not_hide_the_morning_wake() {
     let dir = tempfile::tempdir().unwrap();
     let (state, mock) = setup(dir.path(), DEVICES);
     let now = crate::storage::now_ms();
-    let scan = |ts: i64, bedtime: bool| ScanBody { ts, device: "pixel-watch".into(), id: None, label: None, aps: Vec::new(), motion: None, queued: false, power: None, away: false, bedtime: Some(bedtime), heat: None, label_id: None, info: None };
+    let scan = |ts: i64, bedtime: bool| ScanBody { ts, device: "pixel-watch".into(), id: None, label: None, aps: Vec::new(), motion: None, queued: false, power: None, away: false, bedtime: Some(bedtime), heat: None, label_id: None, info: None, app_version: None };
     let hour = 3_600_000;
     for (ago, bed) in [(9 * hour, true), (8 * hour + hour / 2, false), (8 * hour, true), (hour / 6, false)] {
         state.storage.ingest(&scan(now - ago, bed), now - ago, None).unwrap();

@@ -392,6 +392,7 @@ fn migrates_legacy_duckdb() {
             heat: None,
             label_id: None,
             info: None,
+            app_version: None,
         };
         storage.ingest(&scan, 1_761_580_801_000, Some(("bad", 0.8))).unwrap();
         storage.insert_reading(1_761_580_802_000, 5, 1, "local_temperature", 21.5).unwrap();
