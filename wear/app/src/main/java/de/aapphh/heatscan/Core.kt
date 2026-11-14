@@ -926,6 +926,11 @@ object Home {
 
     private fun norm(s: String) = s.trim().trim('"').lowercase()
 
+    fun strongest(seen: Collection<Pair<String, Int>>, home: Collection<String>): Int? {
+        val wanted = home.map(::norm).filter { it.isNotEmpty() }.toSet()
+        return seen.filter { norm(it.first) in wanted }.maxOfOrNull { it.second }
+    }
+
     fun isHome(seen: Collection<String>, home: Collection<String>): Boolean {
         val wanted = home.map(::norm).filter { it.isNotEmpty() }.toSet()
         return wanted.isEmpty() || seen.any { norm(it) in wanted }
@@ -958,7 +963,7 @@ object Summary {
 object Payload {
     fun build(
         ts: Long, device: String, label: String?, aps: List<Ap>,
-        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null, heat: Boolean? = null, labelId: String? = null
+        motion: String? = null, power: String? = null, away: Boolean = false, id: String? = null, elapsedNs: Long? = null, bedtime: Boolean? = null, heat: Boolean? = null, labelId: String? = null, hb: Boolean = false, leaving: Boolean = false
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
@@ -971,6 +976,7 @@ object Payload {
         .also { if (bedtime != null) it.put("bedtime", bedtime) }
         .also { if (heat != null) it.put("heat", heat) }
         .also { if (labelId != null) it.put("label_id", labelId) }
+        .also { if (hb) it.put("info", JSONObject().put("hb", true).also { i -> if (leaving) i.put("leaving", true) }) }
         .put("aps", JSONArray().also { arr ->
             aps.forEach { arr.put(JSONObject().put("bssid", it.bssid.lowercase()).put("rssi", it.rssi).put("freq", it.freq)) }
         })
@@ -1513,6 +1519,91 @@ object Poster {
     }
 
     fun room(text: String): String = try { JSONObject(text).optString("room", "").takeIf { it != "null" } ?: "" } catch (e: Exception) { "" }
+}
+
+object BurstConfig {
+    const val INTERVAL_MS = 30 * 60_000L
+    const val TIMEOUT_MS = 60_000L
+    const val MIN_GAP_MS = 2 * 60_000L
+    const val LINGER_MS = 3 * 60_000L
+    const val LEAVE_RSSI = -75
+    const val NEAR_RSSI = -70
+}
+
+enum class Trigger { CADENCE, ARRIVED, LEAVING, OPEN }
+
+enum class Burst { NONE, SEND, BEAT }
+
+class HomeWatch {
+    private var home: Boolean? = null
+    private var near = false
+
+    fun onScan(isHome: Boolean, strongest: Int?): Trigger? {
+        val arrived = isHome && home == false
+        val leaving = near && (!isHome || (strongest ?: Int.MIN_VALUE) < BurstConfig.LEAVE_RSSI)
+        home = isHome
+        near = if (isHome && strongest != null && strongest >= BurstConfig.NEAR_RSSI) true else if (leaving || !isHome) false else near
+        return if (leaving) Trigger.LEAVING else if (arrived) Trigger.ARRIVED else null
+    }
+}
+
+class BurstPolicy(private val intervalMs: Long = BurstConfig.INTERVAL_MS, private val minGapMs: Long = BurstConfig.MIN_GAP_MS) {
+    private var lastAt = Long.MIN_VALUE / 4
+
+    fun decide(now: Long, queued: Int, home: Boolean, bound: Boolean, trigger: Trigger): Burst {
+        if (bound || now - lastAt < minGapMs) return Burst.NONE
+        val burst = when (trigger) {
+            Trigger.LEAVING -> if (queued > 0) Burst.SEND else Burst.NONE
+            Trigger.ARRIVED -> if (home && queued > 0) Burst.SEND else Burst.NONE
+            Trigger.OPEN -> if (home) Burst.SEND else Burst.NONE
+            Trigger.CADENCE -> if (!home || now - lastAt < intervalMs) Burst.NONE else if (queued > 0) Burst.SEND else Burst.BEAT
+        }
+        if (burst != Burst.NONE) lastAt = now
+        return burst
+    }
+}
+
+class BurstStats {
+    private var requests = 0
+    private var grants = 0
+    private var failures = 0
+    private var firstBattery: Int? = null
+    private var lastBattery: Int? = null
+    private var deliveredAt: Long? = null
+
+    fun requested(battery: Int) {
+        requests++
+        if (firstBattery == null) firstBattery = battery
+        lastBattery = battery
+    }
+
+    fun granted() { grants++ }
+
+    fun failed() { failures++ }
+
+    fun delivered(now: Long) {
+        requests = 0
+        grants = 0
+        failures = 0
+        firstBattery = null
+        lastBattery = null
+        deliveredAt = now
+    }
+
+    fun json(now: Long): JSONObject = JSONObject()
+        .put("requests", requests)
+        .put("grants", grants)
+        .put("failures", failures)
+        .put("since_delivery_min", deliveredAt?.let { ((now - it) / 60_000L).toInt() } ?: JSONObject.NULL)
+        .put("batt_first", firstBattery ?: JSONObject.NULL)
+        .put("batt_last", lastBattery ?: JSONObject.NULL)
+
+    fun attach(row: JSONObject, now: Long): JSONObject {
+        val copy = JSONObject(row.toString())
+        val info = copy.optJSONObject("info") ?: JSONObject().also { copy.put("info", it) }
+        info.put("diag", json(now))
+        return copy
+    }
 }
 
 object ScanConfig {
