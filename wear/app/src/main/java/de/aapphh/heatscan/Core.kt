@@ -967,6 +967,7 @@ object Payload {
     ): JSONObject = JSONObject()
         .put("ts", ts)
         .put("device", device)
+        .put("app_version", BuildConfig.VERSION_NAME)
         .also { if (id != null) it.put("id", id) }
         .also { if (elapsedNs != null) it.put("elapsed_ns", elapsedNs) }
         .put("label", label ?: JSONObject.NULL)

@@ -27,7 +27,7 @@ class CoreTest {
         val built = Payload.build(example.getLong("ts"), "pixel-watch", "wohnzimmer", aps)
         assertTrue(built.keys().asSequence().toSet().containsAll(example.keys().asSequence().toSet()))
         assertEquals(shape(example), shape(built).filterKeys { it in example.keys().asSequence().toSet() })
-        assertEquals(setOf("motion", "power", "away"), built.keys().asSequence().toSet() - example.keys().asSequence().toSet())
+        assertEquals(setOf("motion", "power", "away", "app_version"), built.keys().asSequence().toSet() - example.keys().asSequence().toSet())
         assertEquals(example.getLong("ts"), built.getLong("ts"))
         assertEquals("wohnzimmer", built.getString("label"))
         val exAps = example.getJSONArray("aps")
