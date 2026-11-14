@@ -1085,7 +1085,7 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     let near = |a: f64, b: f64| (a - b).abs() < MANUAL_TOLERANCE_C;
     let grace_ms = GRACE_FACTOR * state.config.chip_tool.timeout_s as i64 * 1000;
     let mut commands = state.commanded.lock().unwrap();
-    commands.device.insert(report.node, report.value);
+    let first = commands.device.insert(report.node, report.value).is_none();
     commands.device_ms.insert(report.node, now_ms);
     let Some(sent) = commands.sent.get_mut(&report.node) else {
         commands.sent.insert(report.node, Sent { target: report.value, previous: None, written_ms: 0, acked: None, stale: None });
@@ -1093,6 +1093,10 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     };
     if near(report.value, sent.target) {
         (sent.acked, sent.stale) = (None, None);
+        return None;
+    }
+    if first && near(report.value, state.config.failsafe.setpoint) {
+        sent.stale = Some(report.value);
         return None;
     }
     let in_grace = now_ms - sent.written_ms < grace_ms;
