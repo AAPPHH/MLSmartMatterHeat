@@ -207,6 +207,8 @@ pub struct Run {
     date: String,
     homecoming_ms: Option<i64>,
     rooms: Vec<RoomRun>,
+    waiting: Option<String>,
+    wait_key: Option<String>,
 }
 
 impl Run {
@@ -244,6 +246,7 @@ impl Run {
 
     fn finish_with(&mut self, status: Status, reason: &str, now_ms: i64, extra: Value) -> Event {
         self.status = status;
+        (self.waiting, self.wait_key) = (None, None);
         self.reason = Some(reason.into());
         self.ended_ms = Some(now_ms);
         let rooms: Map<String, Value> = self.rooms.iter().map(|r| (r.room.clone(), r.summary())).collect();
@@ -256,6 +259,7 @@ impl Run {
 
     fn start(&mut self, rooms: &[&str], now_ms: i64, date: &str) -> Event {
         self.status = Status::Running;
+        (self.waiting, self.wait_key) = (None, None);
         self.started_ms = Some(now_ms);
         self.date = date.into();
         self.rooms = rooms.iter().map(|r| RoomRun::new(r, self.doors, date)).collect();
@@ -267,6 +271,18 @@ impl Run {
         let seg = room.segs[idx];
         let until = self.started_ms.unwrap_or(now_ms) + seg.to_min * MIN_MS;
         self.event(kind::EXPERIMENT_STEP, now_ms, json!({"room": room.room, "phase": seg.phase.name(), "step": idx, "steps": room.segs.len(), "on": seg.on && !capped && !starved, "capped": capped, "no_supply": starved, "until_ms": until, "temp": temp}))
+    }
+
+    fn note_wait(&mut self, wait: Option<&Wait>, now_ms: i64) -> Option<Event> {
+        self.waiting = wait.map(Wait::text);
+        let key = wait.map(Wait::key);
+        if key == self.wait_key || key.is_none() {
+            self.wait_key = key;
+            return None;
+        }
+        self.wait_key = key;
+        let detail = json!({"waiting": self.waiting, "key": self.wait_key, "armed_ms": self.armed_ms});
+        Some(self.event(kind::EXPERIMENT_WAITING, now_ms, detail))
     }
 
     fn view(&self, now_ms: i64) -> Value {
@@ -281,7 +297,7 @@ impl Run {
             })
             .collect();
         let phase = elapsed.filter(|_| running).map(Phase::of);
-        json!({"id": self.id, "state": self.status.name(), "doors": self.doors.name(), "doors_label": self.doors.label(), "source": self.source, "phase": phase.map(Phase::name), "phase_label": phase.map(Phase::label), "step_min": elapsed.filter(|_| running), "armed_ms": self.armed_ms, "expires_ms": (self.status == Status::Armed).then(|| self.expires_ms()), "started_ms": self.started_ms, "planned_end_ms": self.planned_end_ms(), "homecoming_ms": self.homecoming_ms, "ended_ms": self.ended_ms, "reason": self.reason, "rooms": rooms})
+        json!({"id": self.id, "state": self.status.name(), "doors": self.doors.name(), "doors_label": self.doors.label(), "source": self.source, "phase": phase.map(Phase::name), "phase_label": phase.map(Phase::label), "step_min": elapsed.filter(|_| running), "armed_ms": self.armed_ms, "expires_ms": (self.status == Status::Armed).then(|| self.expires_ms()), "started_ms": self.started_ms, "planned_end_ms": self.planned_end_ms(), "homecoming_ms": self.homecoming_ms, "ended_ms": self.ended_ms, "reason": self.reason, "waiting": self.waiting, "rooms": rooms})
     }
 }
 
@@ -300,10 +316,51 @@ pub struct Tick<'a> {
     pub night: bool,
     pub cap_c: f64,
     pub rooms: &'a [RoomIn<'a>],
-    pub activity: Option<&'static str>,
+    pub activity: Option<(&'static str, i64)>,
     pub away_confirmed: bool,
     pub history_ready: bool,
     pub homecoming_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Wait {
+    Home,
+    Settle(i64),
+    Stale,
+    Night,
+    Activity(&'static str, i64),
+    NoHistory,
+    TooLate(i64),
+}
+
+fn local_hhmm(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map_or("?".into(), |t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+}
+
+impl Wait {
+    fn key(&self) -> String {
+        match self {
+            Wait::Home => "home".into(),
+            Wait::Settle(_) => "settle".into(),
+            Wait::Stale => "stale".into(),
+            Wait::Night => "night".into(),
+            Wait::Activity(source, _) => format!("activity:{source}"),
+            Wait::NoHistory => "no_history".into(),
+            Wait::TooLate(_) => "too_late".into(),
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Wait::Home => "Uhr sieht dich noch zu Hause".into(),
+            Wait::Settle(until) => format!("noch in der Wartezeit bis {}", local_hhmm(*until)),
+            Wait::Stale => "Abmeldung älter als 3 h".into(),
+            Wait::Night => "Nacht".into(),
+            Wait::Activity(source, ago_min) => format!("Aktivität im Haus: {source} vor {ago_min} min"),
+            Wait::NoHistory => "Heimkehr-Historie fehlt".into(),
+            Wait::TooLate(at) => format!("zu nah an deiner üblichen Heimkehr ({})", local_hhmm(*at)),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -365,7 +422,7 @@ impl Messfahrt {
         if self.run.as_ref().is_some_and(|r| r.status == Status::Running) {
             return Err("Eine Messfahrt läuft schon – erst abbrechen");
         }
-        let run = Run { id: format!("mf-{now_ms}"), doors, source: source.into(), status: Status::Armed, armed_ms: now_ms, started_ms: None, ended_ms: None, reason: None, date: String::new(), homecoming_ms: None, rooms: Vec::new() };
+        let run = Run { id: format!("mf-{now_ms}"), doors, source: source.into(), status: Status::Armed, armed_ms: now_ms, started_ms: None, ended_ms: None, reason: None, date: String::new(), homecoming_ms: None, rooms: Vec::new(), waiting: None, wait_key: None };
         let event = run.event(kind::EXPERIMENT_ARMED, now_ms, json!({"source": source, "armed_ms": now_ms, "expires_ms": run.expires_ms()}));
         self.run = Some(run);
         Ok(event)
@@ -417,6 +474,29 @@ impl Messfahrt {
         self.run.as_ref().map_or_else(|| json!({"state": "idle"}), |r| r.view(now_ms))
     }
 
+    fn blocker(run: &Run, departed_ms: Option<i64>, t: &Tick) -> Option<Wait> {
+        let departed = departed_ms.is_some_and(|d| t.now_ms - d <= if d >= run.armed_ms { DEPARTURE_MAX_MS } else { DEPARTURE_FRESH_MS });
+        let since_armed = t.now_ms - run.armed_ms;
+        let gone = (t.here != Here::Home && (DECLARED_SETTLE_MS..=DEPARTURE_MAX_MS).contains(&since_armed)) || (t.here == Here::Away && t.away_confirmed && departed);
+        if !gone {
+            return Some(match (t.here, since_armed < DECLARED_SETTLE_MS) {
+                (Here::Home, _) => Wait::Home,
+                (_, true) => Wait::Settle(run.armed_ms + DECLARED_SETTLE_MS),
+                _ => Wait::Stale,
+            });
+        }
+        if t.night {
+            return Some(Wait::Night);
+        }
+        if let Some((source, at)) = t.activity {
+            return Some(Wait::Activity(source, (t.now_ms - at).max(0) / MIN_MS));
+        }
+        if !t.history_ready {
+            return Some(Wait::NoHistory);
+        }
+        run.cutoff_ms().filter(|c| t.now_ms + TOTAL_MIN * MIN_MS > *c).map(|c| Wait::TooLate(c + HOMECOMING_MARGIN_MIN * MIN_MS))
+    }
+
     pub fn tick(&mut self, t: &Tick) -> Out {
         let mut out = Out::default();
         let Some(run) = self.run.as_mut() else { return out };
@@ -428,11 +508,9 @@ impl Messfahrt {
                 out.events.push(run.finish(Status::Aborted, "expired", t.now_ms));
                 return out;
             }
-            let departed = self.departed_ms.is_some_and(|d| t.now_ms - d <= if d >= run.armed_ms { DEPARTURE_MAX_MS } else { DEPARTURE_FRESH_MS });
-            let too_late = !t.history_ready || run.cutoff_ms().is_some_and(|c| t.now_ms + TOTAL_MIN * MIN_MS > c);
-            let since_armed = t.now_ms - run.armed_ms;
-            let gone = (t.here != Here::Home && (DECLARED_SETTLE_MS..=DEPARTURE_MAX_MS).contains(&since_armed)) || (t.here == Here::Away && t.away_confirmed && departed);
-            if !gone || t.night || t.activity.is_some() || too_late {
+            let wait = Self::blocker(run, self.departed_ms, t);
+            out.events.extend(run.note_wait(wait.as_ref(), t.now_ms));
+            if wait.is_some() {
                 return out;
             }
             let rooms: Vec<&str> = t.rooms.iter().map(|r| r.room).collect();
@@ -451,7 +529,7 @@ impl Messfahrt {
             return out;
         }
         self.away_seen |= t.away_confirmed;
-        if let Some(source) = t.activity {
+        if let Some((source, _)) = t.activity {
             out.events.push(run.finish_with(Status::Aborted, "home_activity", t.now_ms, json!({"activity": source})));
             return out;
         }
@@ -518,7 +596,7 @@ impl Messfahrt {
             let id = d["id"].as_str().unwrap_or_default().to_string();
             let doors = d["doors"].as_str().and_then(Doors::parse);
             match (k.as_str(), doors) {
-                (kind::EXPERIMENT_ARMED, Some(doors)) => run = Some(Run { id, doors, source: d["source"].as_str().unwrap_or("chat").into(), status: Status::Armed, armed_ms: d["armed_ms"].as_i64().unwrap_or(*ts), started_ms: None, ended_ms: None, reason: None, date: String::new(), homecoming_ms: None, rooms: Vec::new() }),
+                (kind::EXPERIMENT_ARMED, Some(doors)) => run = Some(Run { id, doors, source: d["source"].as_str().unwrap_or("chat").into(), status: Status::Armed, armed_ms: d["armed_ms"].as_i64().unwrap_or(*ts), started_ms: None, ended_ms: None, reason: None, date: String::new(), homecoming_ms: None, rooms: Vec::new(), waiting: None, wait_key: None }),
                 (kind::EXPERIMENT_STARTED, _) => {
                     let Some(r) = run.as_mut().filter(|r| r.id == id) else { continue };
                     let names: Vec<String> = d["schedule"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
@@ -628,17 +706,17 @@ fn learn_homecoming(state: &AppState, now_ms: i64) {
     state.commanded.lock().unwrap().messfahrt.learned(Homecoming::from_arrivals(&arrivals), now_ms);
 }
 
-fn home_activity(state: &AppState, now_ms: i64) -> Option<&'static str> {
+fn home_activity(state: &AppState, now_ms: i64) -> Option<(&'static str, i64)> {
     let recent = |ms: i64| now_ms - ms <= ACTIVITY_MS;
-    if let Some(source) = state.devices.home_activity(now_ms, ACTIVITY_MS) {
-        return Some(source);
+    if let Some(found) = state.devices.home_activity_at(now_ms, ACTIVITY_MS) {
+        return Some(found);
     }
-    if state.commanded.lock().unwrap().last_manual_ms().is_some_and(recent) {
-        return Some("manual_setpoint");
+    if let Some(at) = state.commanded.lock().unwrap().last_manual_ms().filter(|ms| recent(*ms)) {
+        return Some(("manual_setpoint", at));
     }
     match state.storage.device_statuses() {
-        Ok(statuses) => statuses.iter().any(|s| !s.away && recent(s.state_ts)).then_some("watch_scan"),
-        Err(_) => Some("status_unreadable"),
+        Ok(statuses) => statuses.iter().filter(|s| !s.away && recent(s.state_ts)).map(|s| s.state_ts).max().map(|at| ("watch_scan", at)),
+        Err(_) => Some(("status_unreadable", now_ms)),
     }
 }
 
