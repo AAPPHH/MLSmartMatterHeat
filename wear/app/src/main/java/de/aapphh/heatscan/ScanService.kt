@@ -148,7 +148,8 @@ class ScanService : Service() {
         val decision = burstPolicy.decide(SystemClock.elapsedRealtime(), queued, store.atHome == true && !policy.away, bound, trigger)
         if (decision == Burst.NONE) return
         if (decision == Burst.BEAT) enqueue(System.currentTimeMillis(), emptyList(), false, "beat")
-        val cb = WifiCallback(::onBurstUp, ::onBurstDown)
+        lateinit var cb: WifiCallback
+        cb = WifiCallback({ n -> if (burstCallback === cb) onBurstUp(n) }, { why, n -> if (burstCallback === cb) onBurstDown(why, n) })
         try {
             cm.requestNetwork(wifiRequest, cb, handler, BurstConfig.TIMEOUT_MS.toInt())
             burstCallback = cb
@@ -161,7 +162,6 @@ class ScanService : Service() {
     }
 
     private fun onBurstUp(n: Network) {
-        if (burstCallback == null) return
         network = n
         burstStats.granted()
         Trace.i("net_available", "source" to "burst", "queue" to queue.size)
@@ -176,19 +176,18 @@ class ScanService : Service() {
     }
 
     private fun onBurstDown(why: String, n: Network?) {
-        if (burstCallback == null) return
         if (n != null && network != n) return
         Trace.i("burst_down", "why" to why)
         if (why == "unavailable") burstStats.failed()
-        endBurst(why)
+        endBurst(why, why != "unavailable")
     }
 
-    private fun endBurst(why: String) {
+    private fun endBurst(why: String, unregister: Boolean = true) {
         handler.removeCallbacks(burstEnd)
         val cb = burstCallback ?: return
         burstCallback = null
         if (!holding) network = null
-        try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) { Log.w(TAG, "unregister burst", e) }
+        if (unregister) try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) { Log.w(TAG, "unregister burst", e) }
         Trace.i("burst_end", "why" to why)
     }
 
@@ -218,6 +217,7 @@ class ScanService : Service() {
             if (until != 0L) store.wifiHoldUntil = 0L
             if (holding) {
                 holding = false
+                network = HoldRelease.keep(network, burstCallback != null)
                 try { cm.unregisterNetworkCallback(holdCallback) } catch (e: Exception) { Log.w(TAG, "unregister hold", e) }
                 Trace.i("wifi_hold", "on" to false)
             }
@@ -361,6 +361,7 @@ class ScanService : Service() {
         store.wifiHoldUntil = 0L
         handler.removeCallbacks(tick)
         handler.removeCallbacks(beatTimeout)
+        endBurst("destroy")
         if (active) {
             alarms.cancel(alarmIntent)
             releaseSensors()
@@ -368,7 +369,6 @@ class ScanService : Service() {
             sampler?.stop()
             sampler = null
             try { unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregister", e) }
-            endBurst("destroy")
             wake?.let { if (it.isHeld) it.release() }
             flushWake?.let { if (it.isHeld) it.release() }
         }

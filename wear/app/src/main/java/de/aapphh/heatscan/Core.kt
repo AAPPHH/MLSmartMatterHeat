@@ -1528,6 +1528,11 @@ object BurstConfig {
     const val LINGER_MS = 3 * 60_000L
     const val LEAVE_RSSI = -75
     const val NEAR_RSSI = -70
+    const val LEAVE_SCANS = 2
+}
+
+object HoldRelease {
+    fun <T> keep(network: T?, burstActive: Boolean): T? = if (burstActive) network else null
 }
 
 enum class Trigger { CADENCE, ARRIVED, LEAVING, OPEN }
@@ -1537,12 +1542,16 @@ enum class Burst { NONE, SEND, BEAT }
 class HomeWatch {
     private var home: Boolean? = null
     private var near = false
+    private var weak = 0
 
     fun onScan(isHome: Boolean, strongest: Int?): Trigger? {
         val arrived = isHome && home == false
-        val leaving = near && (!isHome || (strongest ?: Int.MIN_VALUE) < BurstConfig.LEAVE_RSSI)
+        val faded = !isHome || (strongest ?: Int.MIN_VALUE) < BurstConfig.LEAVE_RSSI
+        weak = if (near && faded) weak + 1 else 0
+        val leaving = weak >= BurstConfig.LEAVE_SCANS
         home = isHome
-        near = if (isHome && strongest != null && strongest >= BurstConfig.NEAR_RSSI) true else if (leaving || !isHome) false else near
+        near = if (isHome && strongest != null && strongest >= BurstConfig.NEAR_RSSI) true else if (leaving) false else near
+        if (leaving) weak = 0
         return if (leaving) Trigger.LEAVING else if (arrived) Trigger.ARRIVED else null
     }
 }

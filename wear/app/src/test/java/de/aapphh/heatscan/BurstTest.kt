@@ -56,12 +56,36 @@ class BurstTest {
         val w = HomeWatch()
         assertNull(w.onScan(true, -50))
         assertNull(w.onScan(true, -72))
+        assertNull(w.onScan(true, -80))
         assertEquals(Trigger.LEAVING, w.onScan(true, -80))
         assertNull(w.onScan(false, null))
         assertEquals(Trigger.ARRIVED, w.onScan(true, -85))
         assertNull(w.onScan(true, -60))
+        assertNull(w.onScan(false, null))
         assertEquals(Trigger.LEAVING, w.onScan(false, null))
         assertNull(w.onScan(false, null))
+    }
+
+    @Test
+    fun releasingTheManualHoldClearsTheNetworkSoBurstsAreNotBlockedForever() {
+        assertNull(HoldRelease.keep("wifi", false))
+        assertEquals("wifi", HoldRelease.keep("wifi", true))
+        val p = BurstPolicy()
+        val bound = HoldRelease.keep("wifi", false) != null
+        assertEquals(Burst.SEND, p.decide(0, 3, true, bound, Trigger.CADENCE))
+    }
+
+    @Test
+    fun aSingleWeakOrMissingScanNeverFiresLeaving() {
+        val w = HomeWatch()
+        assertNull(w.onScan(true, -50))
+        assertNull(w.onScan(true, -80))
+        assertNull(w.onScan(true, -60))
+        assertNull(w.onScan(false, null))
+        assertEquals(Trigger.ARRIVED, w.onScan(true, -60))
+        assertNull(w.onScan(true, -78))
+        assertNull(w.onScan(true, -65))
+        assertNull(w.onScan(true, -78))
     }
 
     @Test
