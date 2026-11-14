@@ -57,6 +57,7 @@ class UpdateTest {
     fun networkAloneStartsACheckWithoutCharger() {
         val c = ApplicationProvider.getApplicationContext<Context>()
         val store = Store(c)
+        store.server = "http://127.0.0.1:1"
         val done = java.util.concurrent.CountDownLatch(1)
         assertTrue(Updater.start(c, 1_000_000L, ShadowNetwork.newInstance(1)) { done.countDown() })
         assertEquals(1_000_000L, store.updateAt)

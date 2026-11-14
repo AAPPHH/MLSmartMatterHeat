@@ -85,14 +85,13 @@ object Updater {
     private val handler = Handler(Looper.getMainLooper())
 
     fun onCharger(c: Context) {
-        val store = Store(c.applicationContext)
-        if (UpdateRules.windowOver(System.currentTimeMillis(), store.updateAt)) store.updateRetried = false
         start(c)
     }
 
     fun start(c: Context, now: Long = System.currentTimeMillis(), net: Network? = Remote.wifi(), onDone: (() -> Unit)? = null): Boolean {
         val app = c.applicationContext
         val store = Store(app)
+        if (UpdateRules.windowOver(now, store.updateAt)) store.updateRetried = false
         if (net == null || !UpdateRules.due(now, store.updateAt, store.updateFailed, store.updateRetried)) return false
         if (store.updateFailed && Span.ms(now, store.updateAt) in 0 until UpdateRules.GAP_MS) store.updateRetried = true
         store.updateAt = now

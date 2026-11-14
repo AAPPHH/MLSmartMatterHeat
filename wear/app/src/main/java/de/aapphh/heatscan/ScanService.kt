@@ -168,10 +168,11 @@ class ScanService : Service() {
         network = n
         burstStats.granted()
         Trace.i("net_available", "source" to "burst", "queue" to queue.size)
+        val cb = burstCallback
         try {
             io.execute {
                 runFlush("burst")
-                handler.post { if (burstCallback != null) updateOrFinish(n) }
+                handler.post { if (burstCallback != null && burstCallback === cb) updateOrFinish(n) }
             }
         } catch (e: RejectedExecutionException) {
             endBurst("rejected")
@@ -210,7 +211,7 @@ class ScanService : Service() {
     }
 
     fun onBackground() {
-        handler.post { if (burstCallback != null && network != null) endBurst("background") }
+        handler.post { if (burstCallback != null && network != null && !UpdateRules.keepNetwork(updateSince != null, SystemClock.elapsedRealtime() - (updateSince ?: 0L))) endBurst("background") }
     }
     private var holding = false
     private val holdRelease = Runnable { syncHold() }
