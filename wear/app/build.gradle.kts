@@ -23,8 +23,8 @@ android {
         applicationId = "de.aapphh.heatscan"
         minSdk = 30
         targetSdk = 37
-        versionCode = 41
-        versionName = "4.4.1"
+        versionCode = 42
+        versionName = "4.4.2"
         val home = localProps.getProperty("heatscan.home", "HomeWiFi").replace("\\", "\\\\").replace("\"", "\\\"")
         buildConfigField("String", "HOME", "\"$home\"")
     }

@@ -92,6 +92,8 @@ pub struct ScanBody {
     pub label_id: Option<String>,
     #[serde(default)]
     pub info: Option<RowInfo>,
+    #[serde(default)]
+    pub app_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -361,6 +363,7 @@ mod tests {
             heat: None,
             label_id: None,
             info: None,
+            app_version: None,
             aps: vec![
                 AccessPoint { bssid: "AA:BB:CC:00:00:01".into(), rssi: -45, freq: 2412 },
                 AccessPoint { bssid: "aa:bb:cc:00:00:02".into(), rssi: -67, freq: 5180 },

@@ -7,10 +7,8 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageInstaller
 import android.net.Network
-import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -24,7 +22,8 @@ import java.util.concurrent.RejectedExecutionException
 data class UpdateInfo(val versionCode: Long, val versionName: String, val sha256: String, val size: Long)
 
 object UpdateRules {
-    const val GAP_MS = 6 * 3_600_000L
+    const val GAP_MS = 60 * 60_000L
+    const val HOLD_CAP_MS = 5 * 60_000L
     const val RETRY_DELAY_MS = 600_000L
     const val INFO_PATH = "/watch/update"
     const val APK_PATH = "/watch/update.apk"
@@ -69,6 +68,8 @@ object UpdateRules {
 
     fun due(now: Long, at: Long, failed: Boolean, retried: Boolean) = windowOver(now, at) || (failed && !retried)
 
+    fun keepNetwork(updating: Boolean, heldMs: Long) = updating && heldMs in 0 until HOLD_CAP_MS
+
     fun verdict(status: Int, pending: Int) = when (status) {
         PackageInstaller.STATUS_SUCCESS -> false
         PackageInstaller.STATUS_PENDING_USER_ACTION -> pending >= 2
@@ -83,28 +84,26 @@ object Updater {
     private val io = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
 
-    fun charging(c: Context): Boolean = (c.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
-
     fun onCharger(c: Context) {
-        val store = Store(c.applicationContext)
-        if (UpdateRules.windowOver(System.currentTimeMillis(), store.updateAt)) store.updateRetried = false
         start(c)
     }
 
-    fun start(c: Context, now: Long = System.currentTimeMillis(), net: Network? = Remote.wifi(), plugged: Boolean = charging(c)): Boolean {
+    fun start(c: Context, now: Long = System.currentTimeMillis(), net: Network? = Remote.wifi(), onDone: (() -> Unit)? = null): Boolean {
         val app = c.applicationContext
         val store = Store(app)
-        if (net == null || !plugged || !UpdateRules.due(now, store.updateAt, store.updateFailed, store.updateRetried)) return false
+        if (UpdateRules.windowOver(now, store.updateAt)) store.updateRetried = false
+        if (net == null || !UpdateRules.due(now, store.updateAt, store.updateFailed, store.updateRetried)) return false
         if (store.updateFailed && Span.ms(now, store.updateAt) in 0 until UpdateRules.GAP_MS) store.updateRetried = true
         store.updateAt = now
-        try { io.execute { attempt(app, store, net) } } catch (e: RejectedExecutionException) { Trace.i("update_rejected") }
+        try { io.execute { attempt(app, store, net, onDone) } } catch (e: RejectedExecutionException) { Trace.i("update_rejected") }
         return true
     }
 
-    private fun attempt(app: Context, store: Store, net: Network) {
+    private fun attempt(app: Context, store: Store, net: Network, onDone: (() -> Unit)?) {
         val ok = try { check(app, store, net); true } catch (e: Exception) { Trace.w("update_failed", e); false }
         store.updateFailed = !ok
         if (!ok && !store.updateRetried) handler.postDelayed({ start(app) }, UpdateRules.RETRY_DELAY_MS)
+        onDone?.invoke()
     }
 
     private fun check(app: Context, store: Store, net: Network) {
@@ -122,7 +121,6 @@ object Updater {
         } finally { conn.disconnect() }
         val installed = app.packageManager.getPackageInfo(app.packageName, 0).longVersionCode
         if (!UpdateRules.newer(info, installed, store.updateBad)) return Trace.i("update_current", "installed" to installed, "offered" to info.versionCode, "bad" to store.updateBad)
-        if (!charging(app)) return Trace.i("update_unplugged")
         try {
             download(store.server, net, file, info.size)
             if (!UpdateRules.intact(file, info)) throw IOException("apk_mismatch")

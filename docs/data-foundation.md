@@ -160,7 +160,8 @@ Explicit list of `kind` values (dictionary column; adding a kind is not a schema
 | node_health | Thermostat-Gesundheit (`docs/node-health.md`): aspect link = Zustandswechsel ok / degraded / silent / unreachable; aspect setpoint = Neuschreiben eines nicht uebernommenen Sollwerts (action rewrite) oder Alarm an/aus | heatd | no | link: from, to, silent_s, episode_s, attempts, subscription, last_action, last_error; setpoint: target, device, rewrites, error bzw. alert, consecutive_failures, last_error |
 | supply | Kessel liefert nicht (`no_supply`): Ventil >= 90 % seit >= 45 min ohne Temperaturanstieg am Heizkoerper; Start/Ende je Raum | heatd | no | room, state (start / end), since_ms; bei end: duration_min |
 | pi_reset | Ueberschwing-Reset: Raumtemperatur >= Sollwert + 1 K bei Ventil >= 50 % seit >= 15 min, Sollwert kurz auf Frost gesetzt und danach wiederhergestellt | heatd | no | room, state (start / end), temp, setpoint, valve |
-| watch_state | watch heartbeat state (migrated legacy device_state; new code may keep emitting it) | watch / legacy | no | device, motion, power, queued, n_aps, away, id |
+| watch_state | watch heartbeat state (migrated legacy device_state; new code may keep emitting it) | watch / legacy | no | device, motion, power, queued, n_aps, away, id, app (app version) |
+| watch_update_served | the watch downloaded the published APK (`GET /watch/update.apk`) | watch | no | version_code, version_name, size |
 
 `experiment_id` links experiment_* events to `decisions.experiment_id`. `source` values: `subscription`, `poll`, `read`, `heatd`, `watch`, `legacy`.
 

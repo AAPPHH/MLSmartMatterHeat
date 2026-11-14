@@ -129,12 +129,15 @@ class ScanService : Service() {
     private val burstStats = BurstStats()
     private var burstCallback: WifiCallback? = null
     private val burstEnd = Runnable { endBurst("linger") }
+    private var updateSince: Long? = null
+    private val updateCap = Runnable { if (updateSince != null) endBurst("update_cap") }
 
     private val holdCallback = WifiCallback(
         { n ->
             network = n
             Trace.i("net_available", "source" to "hold", "queue" to queue.size)
             flush("hold")
+            Updater.start(this, net = n)
         },
         { _, n -> if (n == null || network == n) network = null }
     )
@@ -165,14 +168,28 @@ class ScanService : Service() {
         network = n
         burstStats.granted()
         Trace.i("net_available", "source" to "burst", "queue" to queue.size)
+        val cb = burstCallback
         try {
             io.execute {
                 runFlush("burst")
-                handler.post { if (foregroundSince == Reuse.NONE) endBurst("done") else handler.postDelayed(burstEnd, BurstConfig.LINGER_MS) }
+                handler.post { if (burstCallback != null && burstCallback === cb) updateOrFinish(n) }
             }
         } catch (e: RejectedExecutionException) {
             endBurst("rejected")
         }
+    }
+
+    private fun updateOrFinish(n: Network) {
+        val cb = burstCallback
+        val started = Updater.start(this, net = n, onDone = { handler.post { if (burstCallback === cb && updateSince != null) { updateSince = null; handler.removeCallbacks(updateCap); finishBurst() } } })
+        if (!started) return finishBurst()
+        updateSince = SystemClock.elapsedRealtime()
+        handler.postDelayed(updateCap, UpdateRules.HOLD_CAP_MS)
+        Trace.i("burst_update_hold")
+    }
+
+    private fun finishBurst() {
+        if (foregroundSince == Reuse.NONE) endBurst("done") else handler.postDelayed(burstEnd, BurstConfig.LINGER_MS)
     }
 
     private fun onBurstDown(why: String, n: Network?) {
@@ -184,6 +201,8 @@ class ScanService : Service() {
 
     private fun endBurst(why: String, unregister: Boolean = true) {
         handler.removeCallbacks(burstEnd)
+        handler.removeCallbacks(updateCap)
+        updateSince = null
         val cb = burstCallback ?: return
         burstCallback = null
         if (!holding) network = null
@@ -192,7 +211,7 @@ class ScanService : Service() {
     }
 
     fun onBackground() {
-        handler.post { if (burstCallback != null && network != null) endBurst("background") }
+        handler.post { if (burstCallback != null && network != null && !UpdateRules.keepNetwork(updateSince != null, SystemClock.elapsedRealtime() - (updateSince ?: 0L))) endBurst("background") }
     }
     private var holding = false
     private val holdRelease = Runnable { syncHold() }
@@ -536,6 +555,7 @@ class ScanService : Service() {
             val open = Reuse.openScan(usableScan(now), store.learnAt != 0L)
             Trace.i("foreground", "openScan" to open)
             burstCheck(Trigger.OPEN)
+            if (holding) network?.let { Updater.start(this, net = it) }
             if (open && policy.claimWake(now)) scan(open = true)
         }
     }

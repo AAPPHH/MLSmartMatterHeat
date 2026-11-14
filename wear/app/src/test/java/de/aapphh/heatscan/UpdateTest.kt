@@ -45,13 +45,40 @@ class UpdateTest {
     }
 
     @Test
-    fun noNetworkOrNotChargingDoesNothing() {
+    fun noNetworkDoesNothing() {
         val c = ApplicationProvider.getApplicationContext<Context>()
         val store = Store(c)
-        assertFalse(Updater.start(c, 1_000_000L, null, true))
-        assertFalse(Updater.start(c, 1_000_000L, ShadowNetwork.newInstance(1), false))
+        assertFalse(Updater.start(c, 1_000_000L, null))
         assertEquals(0L, store.updateAt)
         assertFalse(store.updateFailed)
+    }
+
+    @Test
+    fun networkAloneStartsACheckWithoutCharger() {
+        val c = ApplicationProvider.getApplicationContext<Context>()
+        val store = Store(c)
+        store.server = "http://127.0.0.1:1"
+        val done = java.util.concurrent.CountDownLatch(1)
+        assertTrue(Updater.start(c, 1_000_000L, ShadowNetwork.newInstance(1)) { done.countDown() })
+        assertEquals(1_000_000L, store.updateAt)
+        assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun gapIsSixtyMinutes() {
+        assertEquals(3_600_000L, UpdateRules.GAP_MS)
+        val now = 100 * UpdateRules.GAP_MS
+        assertFalse(UpdateRules.due(now, now - 59 * 60_000L, false, false))
+        assertTrue(UpdateRules.due(now, now - 60 * 60_000L, false, false))
+    }
+
+    @Test
+    fun networkIsKeptWhileUpdatingUntilTheCap() {
+        assertTrue(UpdateRules.keepNetwork(true, 0))
+        assertTrue(UpdateRules.keepNetwork(true, UpdateRules.HOLD_CAP_MS - 1))
+        assertFalse(UpdateRules.keepNetwork(true, UpdateRules.HOLD_CAP_MS))
+        assertFalse(UpdateRules.keepNetwork(false, 1_000L))
+        assertFalse(UpdateRules.keepNetwork(true, -1L))
     }
 
     @Test

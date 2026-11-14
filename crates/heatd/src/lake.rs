@@ -45,6 +45,7 @@ pub mod kind {
     pub const ROLL_OK: &str = "roll_ok";
     pub const ROLL_FAILED: &str = "roll_failed";
     pub const WATCH_STATE: &str = "watch_state";
+    pub const WATCH_UPDATE_SERVED: &str = "watch_update_served";
     pub const POLL_FAILED: &str = "poll_failed";
     pub const MATCHER_DRIFT: &str = "matcher_drift";
     pub const OCCUPANCY_END: &str = "occupancy_end";
@@ -69,9 +70,9 @@ pub mod kind {
     pub const EXPERIMENT_STEP: &str = "experiment_step";
     pub const EXPERIMENT_ENDED: &str = "experiment_ended";
     pub const EXPERIMENT_WAITING: &str = "experiment_waiting";
-    pub const ALL: [&str; 39] = [
+    pub const ALL: [&str; 40] = [
         MATTER_EVENT, SUBSCRIPTION_LOST, RESUBSCRIBED, STARTUP, SHUTDOWN, FW_CHANGE, EXPERIMENT_START, EXPERIMENT_END, EXPERIMENT_ABORT, NTP_DRIFT, PRESENCE_ARRIVE, PRESENCE_LEAVE,
-        ROLL_OK, ROLL_FAILED, WATCH_STATE, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
+        ROLL_OK, ROLL_FAILED, WATCH_STATE, WATCH_UPDATE_SERVED, POLL_FAILED, MATCHER_DRIFT, OCCUPANCY_END,
         WINDOW_OPEN, WINDOW_CLOSE, WINDOW_REOPEN, WINDOW_SUPPRESSED, BOOST_CYCLE, FAILSAFE, BR_WATCHDOG, SUPPLY, PI_RESET, WINDOW_EPISODE, NODE_HEALTH, COFFEE_ON, DEVICE_LINK, MANUAL_SETPOINT, FILTER_RESET, SHADOW_STATE,
         EXPERIMENT_ARMED, EXPERIMENT_STARTED, EXPERIMENT_STEP, EXPERIMENT_ENDED, EXPERIMENT_WAITING,
     ];
