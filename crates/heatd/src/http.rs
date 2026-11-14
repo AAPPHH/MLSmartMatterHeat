@@ -330,7 +330,7 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     if heat && (!body.aps.is_empty() || body.label.as_deref().is_some_and(|l| !l.is_empty())) {
         state.watchmatch.note_stay(&body.device, body.ts, body.label.as_deref(), body.label_id.as_deref());
     }
-    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "heat": heat, "away": body.away, "bedtime": body.bedtime, "id": body.id});
+    let detail = json!({"device": body.device, "received_ts": received * 1000, "motion": body.motion, "power": body.power, "queued": body.queued, "n_aps": body.aps.len(), "heat": heat, "away": body.away, "bedtime": body.bedtime, "id": body.id, "net": body.info.as_ref().and_then(|i| i.diag.clone())});
     let mut state_event = Event::now(kind::WATCH_STATE, "watch").with_detail(detail);
     state_event.ts = body.ts * 1000;
     if let Err(e) = state.sink.append(state_event) {
@@ -358,7 +358,14 @@ fn record_scan(state: &AppState, body: &ScanBody, received: i64, room: Option<&(
     }
     let pairs: Vec<(String, i32)> = body.aps.iter().map(|a| (a.bssid.clone(), a.rssi)).collect();
     let matched = state.watchmatch.scan_match(&body.device, body.ts, received, &pairs);
-    let transition = state.tracker.lock().unwrap().observe(&body.device, body.ts, body.away, body.motion, body.power);
+    let transition = {
+        let mut tracker = state.tracker.lock().unwrap();
+        let transition = tracker.observe(&body.device, body.ts, body.away, body.motion, body.power);
+        if let Some(info) = body.info.as_ref().filter(|i| i.hb) {
+            tracker.note_heartbeat(&body.device, body.ts, received, info.leaving);
+        }
+        transition
+    };
     if let Some(t) = transition {
         if let Err(e) = state.sink.append(presence_event(&body.device, t)) {
             eprintln!("presence event: {e}");
@@ -414,6 +421,7 @@ impl LongBody {
             bedtime: self.bedtime,
             heat: self.heat,
             label_id: self.label_id.clone(),
+            info: None,
         })
     }
 }

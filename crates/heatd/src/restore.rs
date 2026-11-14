@@ -151,7 +151,7 @@ pub fn restore(state: &AppState, now_ms: i64) -> Result<String> {
         for h in &history {
             let _ = tracker.observe(&h.device, h.ts, h.away, h.motion, h.power);
         }
-        drop(tracker.poll(now_ms, cfg.away_guard_minutes));
+        drop(tracker.poll(now_ms, cfg.away_guard_minutes, None));
         if let Some(since) = tracker.confirmed_since() {
             state.boost.seed_away(since);
         }

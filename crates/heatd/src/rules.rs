@@ -490,12 +490,22 @@ pub enum Transition {
     Arrived,
 }
 
+const HEARTBEAT_REGULAR_GAP_MS: i64 = 60 * 60_000;
+const HEARTBEAT_NEW_DELIVERY_MS: i64 = 10 * 60_000;
+const HEARTBEAT_MIN_STREAK: u32 = 3;
+
 #[derive(Debug, Default)]
 struct Track {
     last_ts: i64,
     away_since: Option<i64>,
     moved: bool,
     confirmed: bool,
+    silent: bool,
+    last_home: bool,
+    leaving: bool,
+    contact_ms: i64,
+    streak: u32,
+    info_ts: i64,
 }
 
 #[derive(Debug, Default)]
@@ -510,9 +520,12 @@ impl Tracker {
             return None;
         }
         t.last_ts = ts;
+        t.last_home = !away;
+        t.leaving = false;
         if !away {
             t.away_since = None;
             t.moved = false;
+            t.silent = false;
             return std::mem::take(&mut t.confirmed).then_some(Transition::Arrived);
         }
         t.away_since.get_or_insert(ts);
@@ -520,8 +533,34 @@ impl Tracker {
         None
     }
 
-    pub fn poll(&mut self, now_ms: i64, guard_minutes: f64) -> Vec<(String, Transition)> {
+    pub fn note_heartbeat(&mut self, device: &str, ts: i64, received_ms: i64, leaving: bool) {
+        let t = self.devices.entry(device.to_string()).or_default();
+        if ts < t.info_ts {
+            return;
+        }
+        t.info_ts = ts;
+        let gap = received_ms - t.contact_ms;
+        if t.contact_ms == 0 || gap > HEARTBEAT_REGULAR_GAP_MS {
+            t.streak = 1;
+        } else if gap >= HEARTBEAT_NEW_DELIVERY_MS {
+            t.streak += 1;
+        }
+        t.contact_ms = t.contact_ms.max(received_ms);
+        t.leaving = leaving;
+    }
+
+    pub fn poll(&mut self, now_ms: i64, guard_minutes: f64, silence_minutes: Option<f64>) -> Vec<(String, Transition)> {
         let mut out = Vec::new();
+        if let Some(silence) = silence_minutes {
+            for (device, t) in self.devices.iter_mut().filter(|(_, t)| !t.confirmed && t.streak >= HEARTBEAT_MIN_STREAK && (t.last_home || t.leaving)) {
+                if (now_ms - t.contact_ms) as f64 >= silence * 60_000.0 {
+                    let since = *t.away_since.get_or_insert(t.last_ts);
+                    t.confirmed = true;
+                    t.silent = true;
+                    out.push((device.clone(), Transition::Left { since }));
+                }
+            }
+        }
         for (device, t) in self.devices.iter_mut().filter(|(_, t)| !t.confirmed && t.moved) {
             if let Some(since) = t.away_since.filter(|s| (now_ms - s) as f64 >= guard_minutes * 60_000.0) {
                 t.confirmed = true;
@@ -535,8 +574,13 @@ impl Tracker {
         self.devices.values().filter(|t| t.confirmed).filter_map(|t| t.away_since).min()
     }
 
+    #[cfg(test)]
     pub fn confirmed(&self, device: &str) -> bool {
         self.devices.get(device).is_some_and(|t| t.confirmed)
+    }
+
+    pub fn away(&self, device: &str, status_away: bool) -> bool {
+        self.devices.get(device).is_some_and(|t| t.confirmed && (status_away || t.silent))
     }
 }
 
@@ -570,7 +614,7 @@ pub(crate) fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<P
     if prediction.is_none() && status.is_none() && stay.is_none() && !matched.as_ref().is_some_and(Option::is_some) {
         return Ok(None);
     }
-    let away = status.as_ref().is_some_and(|s| s.away && state.tracker.lock().unwrap().confirmed(&s.device));
+    let away = status.as_ref().is_some_and(|s| state.tracker.lock().unwrap().away(&s.device, s.away));
     let (model_room, model_age) = match matched {
         Some(held) => (held.as_ref().map(|h| h.0.clone()), held.as_ref().map(|h| minutes(h.1))),
         None => (prediction.as_ref().map(|p| p.room.clone()), prediction.as_ref().map(|p| minutes(p.ts))),
@@ -932,7 +976,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     if state.failsafe.stopping() {
         return Ok(Vec::new());
     }
-    for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes) {
+    let silence = (!in_sleep_hours(&state.config, now)).then_some(state.config.presence.heartbeat_silence_minutes);
+    for (device, transition) in state.tracker.lock().unwrap().poll(now_ms, state.config.away_guard_minutes, silence) {
         if matches!(transition, Transition::Left { .. }) {
             state.commanded.lock().unwrap().messfahrt.note_departure(now_ms);
         }
@@ -1435,16 +1480,76 @@ setpoint=21.0").unwrap();
         let mut t = Tracker::default();
         let min = 60_000;
         assert_eq!(t.observe("w", 0, true, Some(Motion::Still), Some(Power::Doze)), None);
-        assert!(t.poll(60 * min, 20.0).is_empty());
+        assert!(t.poll(60 * min, 20.0, None).is_empty());
         assert!(!t.confirmed("w"));
         t.observe("w", 61 * min, true, Some(Motion::Moving), None);
-        assert!(t.poll(10 * min + 61 * min, 20.0).len() == 1 && t.confirmed("w"));
+        assert!(t.poll(10 * min + 61 * min, 20.0, None).len() == 1 && t.confirmed("w"));
         assert_eq!(t.observe("w", 100 * min, false, None, None), Some(Transition::Arrived));
         assert!(!t.confirmed("w") && t.observe("w", 101 * min, false, None, None).is_none());
         t.observe("w", 200 * min, true, Some(Motion::Moving), None);
-        assert!(t.poll(210 * min, 20.0).is_empty());
-        assert_eq!(t.poll(220 * min, 20.0), vec![("w".to_string(), Transition::Left { since: 200 * min })]);
+        assert!(t.poll(210 * min, 20.0, None).is_empty());
+        assert_eq!(t.poll(220 * min, 20.0, None), vec![("w".to_string(), Transition::Left { since: 200 * min })]);
         assert_eq!(t.observe("w", 150 * min, false, None, None), None);
         assert!(t.confirmed("w"));
+    }
+
+    fn beats(t: &mut Tracker, from_min: i64, n: i64, leaving_last: bool) -> i64 {
+        let min = 60_000;
+        for k in 0..n {
+            let at = (from_min + k * 30) * min;
+            let leaving = leaving_last && k == n - 1;
+            t.observe("w", at, leaving, Some(Motion::Still), None);
+            t.note_heartbeat("w", at, at, leaving);
+        }
+        (from_min + (n - 1) * 30) * min
+    }
+
+    #[test]
+    fn silence_after_regular_heartbeats_is_away_after_75_min() {
+        let mut t = Tracker::default();
+        let min = 60_000;
+        let last = beats(&mut t, 0, 4, false);
+        assert!(t.poll(last + 74 * min, 20.0, Some(75.0)).is_empty());
+        assert_eq!(t.poll(last + 75 * min, 20.0, Some(75.0)), vec![("w".to_string(), Transition::Left { since: last })]);
+        assert!(t.confirmed("w") && t.away("w", false));
+        assert_eq!(t.confirmed_since(), Some(last));
+        assert!(t.poll(last + 90 * min, 20.0, Some(75.0)).is_empty());
+    }
+
+    #[test]
+    fn silence_without_regular_heartbeats_keeps_old_behaviour() {
+        let mut t = Tracker::default();
+        let min = 60_000;
+        for k in 0..4 {
+            t.observe("w", k * 30 * min, false, Some(Motion::Still), None);
+        }
+        assert!(t.poll(1000 * min, 20.0, Some(75.0)).is_empty() && !t.confirmed("w"));
+        let mut sparse = Tracker::default();
+        for k in 0..4 {
+            let at = k * 180 * min;
+            sparse.observe("w", at, false, None, None);
+            sparse.note_heartbeat("w", at, at, false);
+        }
+        assert!(sparse.poll(540 * min + 200 * min, 20.0, Some(75.0)).is_empty());
+    }
+
+    #[test]
+    fn silence_is_not_inferred_in_sleep_hours() {
+        let mut t = Tracker::default();
+        let last = beats(&mut t, 0, 4, false);
+        assert!(t.poll(last + 600 * 60_000, 20.0, None).is_empty() && !t.confirmed("w"));
+        assert_eq!(t.poll(last + 601 * 60_000, 20.0, Some(75.0)).len(), 1);
+    }
+
+    #[test]
+    fn leaving_row_sets_away_since_to_its_ts_and_a_home_row_ends_the_silence_away() {
+        let mut t = Tracker::default();
+        let min = 60_000;
+        let last = beats(&mut t, 0, 4, true);
+        assert!(t.poll(last + 74 * min, 20.0, Some(75.0)).is_empty());
+        assert_eq!(t.poll(last + 75 * min, 20.0, Some(75.0)), vec![("w".to_string(), Transition::Left { since: last })]);
+        assert!(t.away("w", true));
+        assert_eq!(t.observe("w", last + 100 * min, false, None, None), Some(Transition::Arrived));
+        assert!(!t.confirmed("w") && !t.away("w", false));
     }
 }
