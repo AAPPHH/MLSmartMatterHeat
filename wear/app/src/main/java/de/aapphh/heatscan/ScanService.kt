@@ -26,6 +26,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -111,20 +112,88 @@ class ScanService : Service() {
         }
     }
 
-    private val netCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(n: Network) {
-            network = n
-            Trace.i("net_available", "queue" to queue.size)
-            flush("net")
-        }
+    private inner class WifiCallback(val onUp: (Network) -> Unit, val onDown: (String, Network?) -> Unit) : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(n: Network) { handler.post { onUp(n) } }
+        override fun onLost(n: Network) { handler.post { onDown("lost", n) } }
+        override fun onUnavailable() { handler.post { onDown("unavailable", null) } }
+    }
 
-        override fun onLost(n: Network) {
-            if (network == n) network = null
-            Trace.i("net_lost")
+    private val wifiRequest get() = NetworkRequest.Builder()
+        .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        .build()
+
+    private val burstPolicy = BurstPolicy()
+    private val homeWatch = HomeWatch()
+    private val burstStats = BurstStats()
+    private var burstCallback: WifiCallback? = null
+    private val burstEnd = Runnable { endBurst("linger") }
+
+    private val holdCallback = WifiCallback(
+        { n ->
+            network = n
+            Trace.i("net_available", "source" to "hold", "queue" to queue.size)
+            flush("hold")
+        },
+        { _, n -> if (n == null || network == n) network = null }
+    )
+
+    private fun battery() = getSystemService(BatteryManager::class.java).getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+
+    private fun burstCheck(trigger: Trigger) {
+        if (!active) return
+        val queued = queue.size
+        val bound = network != null || burstCallback != null || holding
+        val decision = burstPolicy.decide(SystemClock.elapsedRealtime(), queued, store.atHome == true && !policy.away, bound, trigger)
+        if (decision == Burst.NONE) return
+        if (decision == Burst.BEAT) enqueue(System.currentTimeMillis(), emptyList(), false, "beat")
+        lateinit var cb: WifiCallback
+        cb = WifiCallback({ n -> if (burstCallback === cb) onBurstUp(n) }, { why, n -> if (burstCallback === cb) onBurstDown(why, n) })
+        try {
+            cm.requestNetwork(wifiRequest, cb, handler, BurstConfig.TIMEOUT_MS.toInt())
+            burstCallback = cb
+            burstStats.requested(battery())
+            Trace.i("burst_request", "trigger" to trigger.name, "decision" to decision.name, "queue" to queued)
+        } catch (e: Exception) {
+            Trace.w("burst_request", e, "trigger" to trigger.name)
+            burstStats.failed()
         }
     }
 
-    private val holdCallback = object : ConnectivityManager.NetworkCallback() {}
+    private fun onBurstUp(n: Network) {
+        network = n
+        burstStats.granted()
+        Trace.i("net_available", "source" to "burst", "queue" to queue.size)
+        try {
+            io.execute {
+                runFlush("burst")
+                handler.post { if (foregroundSince == Reuse.NONE) endBurst("done") else handler.postDelayed(burstEnd, BurstConfig.LINGER_MS) }
+            }
+        } catch (e: RejectedExecutionException) {
+            endBurst("rejected")
+        }
+    }
+
+    private fun onBurstDown(why: String, n: Network?) {
+        if (n != null && network != n) return
+        Trace.i("burst_down", "why" to why)
+        if (why == "unavailable") burstStats.failed()
+        endBurst(why, why != "unavailable")
+    }
+
+    private fun endBurst(why: String, unregister: Boolean = true) {
+        handler.removeCallbacks(burstEnd)
+        val cb = burstCallback ?: return
+        burstCallback = null
+        if (!holding) network = null
+        if (unregister) try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) { Log.w(TAG, "unregister burst", e) }
+        Trace.i("burst_end", "why" to why)
+    }
+
+    fun onBackground() {
+        handler.post { if (burstCallback != null && network != null) endBurst("background") }
+    }
     private var holding = false
     private val holdRelease = Runnable { syncHold() }
 
@@ -135,7 +204,7 @@ class ScanService : Service() {
         if (active && WifiHold.active(until, now)) {
             if (!holding) {
                 try {
-                    cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), holdCallback)
+                    cm.requestNetwork(wifiRequest, holdCallback, handler)
                     holding = true
                     Trace.i("wifi_hold", "on" to true, "until" to until)
                 } catch (e: Exception) {
@@ -148,6 +217,7 @@ class ScanService : Service() {
             if (until != 0L) store.wifiHoldUntil = 0L
             if (holding) {
                 holding = false
+                network = HoldRelease.keep(network, burstCallback != null)
                 try { cm.unregisterNetworkCallback(holdCallback) } catch (e: Exception) { Log.w(TAG, "unregister hold", e) }
                 Trace.i("wifi_hold", "on" to false)
             }
@@ -243,12 +313,6 @@ class ScanService : Service() {
             wake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:scan").also { it.setReferenceCounted(false) }
             flushWake = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "heatscan:flush").also { it.setReferenceCounted(false) }
             hold(false)
-            try {
-                cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), netCallback)
-                Trace.i("net_request", "ok" to true)
-            } catch (e: Exception) {
-                Trace.w("net_request", e, "ok" to false)
-            }
             wakeStep = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR, true)
             step = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR) ?: wakeStep
             triggers = listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_MOTION_DETECT, true), sensors.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION))
@@ -297,6 +361,7 @@ class ScanService : Service() {
         store.wifiHoldUntil = 0L
         handler.removeCallbacks(tick)
         handler.removeCallbacks(beatTimeout)
+        endBurst("destroy")
         if (active) {
             alarms.cancel(alarmIntent)
             releaseSensors()
@@ -304,7 +369,6 @@ class ScanService : Service() {
             sampler?.stop()
             sampler = null
             try { unregisterReceiver(receiver) } catch (e: Exception) { Log.w(TAG, "unregister", e) }
-            try { cm.unregisterNetworkCallback(netCallback) } catch (e: Exception) { Log.w(TAG, "unregister net", e) }
             wake?.let { if (it.isHeld) it.release() }
             flushWake?.let { if (it.isHeld) it.release() }
         }
@@ -376,6 +440,7 @@ class ScanService : Service() {
     private fun tick() {
         val now = SystemClock.elapsedRealtime()
         if (holding) syncHold()
+        burstCheck(Trigger.CADENCE)
         sampler?.closeIfDue()
         val before = policy.mode
         if (policy.onTick(now)) scan(policy.mode.sleeps || now - lastEnqueueAt >= ScanConfig.HEARTBEAT_MS)
@@ -470,6 +535,7 @@ class ScanService : Service() {
             val now = SystemClock.elapsedRealtime()
             val open = Reuse.openScan(usableScan(now), store.learnAt != 0L)
             Trace.i("foreground", "openScan" to open)
+            burstCheck(Trigger.OPEN)
             if (open && policy.claimWake(now)) scan(open = true)
         }
     }
@@ -728,6 +794,7 @@ class ScanService : Service() {
             Trace.i("scan_result", "count" to results.size, "home" to home)
             if (store.atHome != home) Trace.i("home_change", "home" to home)
             store.atHome = home
+            val trigger = homeWatch.onScan(home, Home.strongest(results.map { it.SSID to it.level }, store.homeList))
             if (home) store.homeAt = System.currentTimeMillis() else Prompter.cancel(applicationContext)
             val before = policy.mode
             val now = SystemClock.elapsedRealtime()
@@ -740,7 +807,7 @@ class ScanService : Service() {
                 lastScanMs = if (home) newest / 1000 else 0L
                 lastScanTs = ts
             }
-            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away, if (home || manual) "scan" else "away", manual, newest * 1000, learn)
+            enqueue(ts, if (home) results.map { Ap(it.BSSID, it.level, it.frequency) } else emptyList(), policy.away || trigger == Trigger.LEAVING, if (home || manual) "scan" else "away", manual, newest * 1000, learn, trigger)
             if (learn) {
                 learnPending = false
                 if (home && store.learnAt != 0L) {
@@ -755,7 +822,7 @@ class ScanService : Service() {
         }
     }
 
-    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false, elapsedNs: Long? = null, learn: Boolean = false) {
+    private fun enqueue(ts: Long, aps: List<Ap>, away: Boolean, kind: String, manual: Boolean = false, elapsedNs: Long? = null, learn: Boolean = false, trigger: Trigger? = null) {
         lastEnqueueAt = SystemClock.elapsedRealtime()
         val state = powerState()
         val motion = policy.mode.motion
@@ -768,12 +835,13 @@ class ScanService : Service() {
                 val wall = System.currentTimeMillis()
                 val labelId = if (manual) LabelRecorder.point(applicationContext, manualRoom, ts, manualHeat, false) else null
                 val d = if (learn || (manual && !manualHeat)) Decision() else if (kind == "away") store.stay { it.reset() }.let { Decision() } else if (manual) store.stay { it.onManual(ts, wall, aps, moving, moved, store.guess) } else store.stay { it.onScan(ts, wall, aps, moving, moved, store.guess) }
-                val body = Payload.build(ts, store.device, if (manual) (if (manualHeat) manualRoom else null) else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime(), if (manual && !manualHeat || learn) false else null, labelId)
+                val body = Payload.build(ts, store.device, if (manual) (if (manualHeat) manualRoom else null) else d.label, aps, motion, state, away, store.nextId(), elapsedNs, bedtime(), if (manual && !manualHeat || learn) false else null, labelId, true, trigger == Trigger.LEAVING)
                 val dropped = queue.add(body, wall)
                 Trace.i("enqueue", "kind" to kind, "aps" to aps.size, "queue" to queue.size, "dropped" to dropped, "motion" to motion, "power" to state, "away" to away, "label" to (d.label ?: "-"), "ask" to d.ask)
                 store.status = stamp() + " " + kind + " q" + queue.size
                 if (d.ask) Prompter.ask(this, store, away, off, d)
                 flush(kind)
+                if (trigger != null) handler.post { burstCheck(trigger) }
             }
         } catch (e: RejectedExecutionException) {
             Log.w(TAG, "enqueue rejected", e)
@@ -852,17 +920,25 @@ class ScanService : Service() {
 
     private fun sendScans(server: String, a: JSONArray, net: Network?): Int = send(server, "/api/scans", JSONObject().put("scans", a).toString(), net)
 
+    private fun diagnosed(a: JSONArray): JSONArray {
+        val first = a.optJSONObject(0)
+        if (first?.optJSONObject("info") == null) return a
+        return JSONArray().also { out -> out.put(burstStats.attach(first, System.currentTimeMillis())); for (i in 1 until a.length()) out.put(a.get(i)) }
+    }
+
+    private fun diagnosed(e: JSONObject): JSONObject = if (e.optJSONObject("info") == null) e else burstStats.attach(e, System.currentTimeMillis())
+
     private fun runFlush(reason: String) {
         val server = store.server
-        val net = network
+        val net = network ?: return Trace.i("flush_skipped", "reason" to reason, "queue" to queue.size)
         val before = queue.size
         if (before == 0) return
         val lock = flushWake?.also { it.acquire(ScanConfig.FLUSH_HOLD_MS) }
         val r = try {
             flusher.run(
                 queue, System.currentTimeMillis(),
-                { a -> sendScans(server, a, net) },
-                { e -> sendScan(server, e, net) },
+                { a -> sendScans(server, diagnosed(a), net) },
+                { e -> sendScan(server, diagnosed(e), net) },
                 { e -> sendLabel(server, e, net) },
                 { e -> sendMeta(server, e, net) }
             )
@@ -876,6 +952,7 @@ class ScanService : Service() {
             else -> "${r.code} rejected"
         }
         store.postsOk += r.sent
+        if (ok && r.sent > 0) burstStats.delivered(System.currentTimeMillis())
         if (r.deferred > 0) {
             store.labels404 += r.deferred
             Trace.i("label_404", "deferred" to r.deferred, "total" to store.labels404, "queue" to queue.size)
@@ -914,7 +991,7 @@ class ScanService : Service() {
 
         fun setForeground(on: Boolean) {
             foregroundSince = if (on) SystemClock.elapsedRealtime() else Reuse.NONE
-            if (on) instance?.onForeground()
+            if (on) instance?.onForeground() else instance?.onBackground()
         }
 
         fun alarmIntent(c: Context): PendingIntent = PendingIntent.getBroadcast(

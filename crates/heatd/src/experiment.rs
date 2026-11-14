@@ -644,7 +644,7 @@ fn home_activity(state: &AppState, now_ms: i64) -> Option<&'static str> {
 
 fn away_confirmed(state: &AppState) -> bool {
     let tracker = state.tracker.lock().unwrap();
-    state.storage.device_statuses().unwrap_or_default().iter().any(|s| s.away && tracker.confirmed(&s.device))
+    state.storage.device_statuses().unwrap_or_default().iter().any(|s| tracker.away(&s.device, s.away))
 }
 
 pub(crate) fn tick(state: &AppState, now: NaiveDateTime, now_ms: i64, windows: &HashSet<String>, presence: Option<&Presence>) -> Out {

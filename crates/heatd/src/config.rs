@@ -274,11 +274,12 @@ impl Default for FailsafeSection {
 pub struct PresenceSection {
     pub restore: bool,
     pub tracker_lookback_h: f64,
+    pub heartbeat_silence_minutes: f64,
 }
 
 impl Default for PresenceSection {
     fn default() -> Self {
-        Self { restore: true, tracker_lookback_h: 72.0 }
+        Self { restore: true, tracker_lookback_h: 72.0, heartbeat_silence_minutes: 75.0 }
     }
 }
 
