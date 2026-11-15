@@ -27,6 +27,8 @@ android {
         versionName = "4.4.2"
         val home = localProps.getProperty("heatscan.home", "HomeWiFi").replace("\\", "\\\\").replace("\"", "\\\"")
         buildConfigField("String", "HOME", "\"$home\"")
+        val server = localProps.getProperty("heatscan.server", "http://192.0.2.1:8090").replace("\\", "\\\\").replace("\"", "\\\"")
+        buildConfigField("String", "SERVER", "\"$server\"")
     }
     signingConfigs {
         if (!keystoreProps.isEmpty) {

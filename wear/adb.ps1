@@ -1,4 +1,5 @@
-param([string]$Ip = "192.168.178.21")
+param([string]$Ip = $env:WATCH_IP)
+if (-not $Ip) { throw "set WATCH_IP or pass -Ip <watch-ip>" }
 $adb = (Get-Command adb -ErrorAction SilentlyContinue).Source
 if (-not $adb) { $adb = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\Google.PlatformTools*\platform-tools\adb.exe" | Select-Object -First 1 -ExpandProperty FullName }
 $fixed = "${Ip}:5555"
