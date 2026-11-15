@@ -33,7 +33,7 @@ stub systemctl 'echo "systemctl $*" >> $NG_CALLS
 exit 0'
 
 export NG_NET=$N NG_CALLS=$T/calls
-export NETGUARD_ADDR6=fd00:aaaa:aaaa::29/64 NETGUARD_ROUTE6=fd00:bbbb:bbbb:1::/64 NETGUARD_VIA6=fe80::1
+export NETGUARD_GATEWAY=192.0.2.1 NETGUARD_ADDR6=fd00:aaaa:aaaa::29/64 NETGUARD_ROUTE6=fd00:bbbb:bbbb:1::/64 NETGUARD_VIA6=fe80::1
 export NETGUARD_STATE_DIR=$T/state NETGUARD_MAINTENANCE=$T/maint NETGUARD_SETTLE=0
 export PATH="$BIN:$PATH"
 
