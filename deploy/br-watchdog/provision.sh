@@ -5,7 +5,7 @@ STORAGE=${STORAGE:-$ROOT/chip-storage}
 PAA=${PAA:-$ROOT/paa}
 TOKEN_FILE=${TOKEN_FILE:-$ROOT/secrets/br_watchdog_token}
 CREDS_FILE=${CREDS_FILE:-$ROOT/secrets/br_watchdog_creds.json}
-BR_URL=${BR_URL:-http://192.168.178.33}
+BR_URL=${BR_URL:?set BR_URL=http://<br-host>}
 NODES=${NODES:-"5 6 7 8"}
 ENDPOINT=${ENDPOINT:-1}
 CONTROLLER_NODE_ID=${CONTROLLER_NODE_ID:-0x1B2D0001}

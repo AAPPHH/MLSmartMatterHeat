@@ -101,7 +101,7 @@ Die Comet Zero haben weder Zeitplan noch Fallback: sie behalten den zuletzt gesc
 Installation auf dem Minix (Image `heatd:local` und `paa/` muessen vorhanden sein):
 
 ```bash
-sudo cp deploy/failsafe/heatd-failsafe.{service,timer} /etc/systemd/system/
+sudo DEPLOY_USER=<user> HEATD_ROOT=<install-dir> deploy/install-units.sh
 sudo systemctl enable --now heatd-failsafe.timer
 journalctl -t heatd-failsafe -n 20      # zusaetzlich /var/log/heatd-failsafe.log
 ```
@@ -135,7 +135,7 @@ mkdir -p secrets && scp <pc>:.../secrets/thread_dataset.hex secrets/
 Im Betrieb hält `heatd` **einen** dauerhaften `chip-tool interactive`-Prozess. Darüber laufen eine Subscription pro Thermostat (Ist-Temperatur, Sollwert, Modus) und alle Schreibbefehle; stirbt der Prozess, startet er mit Backoff neu.
 
 ```bash
-sudo cp deploy/heatd.service /etc/systemd/system/ && sudo systemctl enable --now heatd
+sudo DEPLOY_USER=<user> HEATD_ROOT=<install-dir> deploy/install-units.sh && sudo systemctl enable --now heatd
 curl http://localhost:8080/health
 ```
 

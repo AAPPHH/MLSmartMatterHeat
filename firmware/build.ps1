@@ -1,5 +1,5 @@
 param([ValidateSet("wifi", "ethernet")][string]$Variant = "wifi", [string]$Port = "", [switch]$NoErase)
-$Idf = if ($env:IDF_PATH) { $env:IDF_PATH } else { "C:\clones\esp\esp-idf" }
+$Idf = if ($env:IDF_PATH) { $env:IDF_PATH } else { throw "set IDF_PATH to the ESP-IDF checkout" }
 . "$Idf\export.ps1"
 function Step($Name) { if ($LASTEXITCODE -ne 0) { Pop-Location; throw "$Name failed" } }
 Push-Location "$Idf\examples\openthread\ot_rcp"

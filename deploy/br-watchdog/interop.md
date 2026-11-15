@@ -28,8 +28,8 @@ On the PC or Minix (not on the BR), in a throwaway directory so the production `
 
 ## 2. Real thermostat, one node, attended
 
-1. `curl -H "X-Heatd-Token: $T" -d '{"timeout_s":60,"setpoint_c":18.0,"nodes":[8],"endpoint":1}' http://192.168.178.33/watchdog/heartbeat` (one node only; the heartbeat call also needs a short timeout, restore afterwards).
-2. `curl -H ... -d '{"mode":"armed"}' http://192.168.178.33/watchdog/mode`; stop sending heartbeats; after 60 s the trigger fires.
+1. `curl -H "X-Heatd-Token: $T" -d '{"timeout_s":60,"setpoint_c":18.0,"nodes":[8],"endpoint":1}' http://<br-host>/watchdog/heartbeat` (one node only; the heartbeat call also needs a short timeout, restore afterwards).
+2. `curl -H ... -d '{"mode":"armed"}' http://<br-host>/watchdog/mode`; stop sending heartbeats; after 60 s the trigger fires.
 3. Watch `GET /watchdog/status` (`results[{node,ok,err}]`) and `GET /watchdog/heap` (`min_free`, `wd_stack_free_min`). Expect `ok:true`; on failure `err` names the stage: `no_address` (not in SRP and not cached), `timeout_sigma1|sigma3|write` (unreachable or asleep), `case_nosharedroot` (IPK/fabric/node), `cert_*`, `sig_sigma2`, `write_status_NN` (IM status, 0x7e UNSUPPORTED_ACCESS means the ACL entry is missing).
 4. Confirm independently: `chip-tool thermostat read occupied-heating-setpoint 8 1` from heatd shows 1800.
 5. Switch back to `dry_run`, restore heartbeat parameters, and let heatd re-write its own setpoints.

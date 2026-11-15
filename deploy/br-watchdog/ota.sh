@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BR_URL=${BR_URL:-http://192.168.178.33}
+BR_URL=${BR_URL:?set BR_URL=http://<br-host>}
 TOKEN_FILE=${TOKEN_FILE:-secrets/br_watchdog_token}
 BIN=${1:-firmware/br/build-wifi/esp_ot_br.bin}
 [ -s "$BIN" ] || { echo "ota: image $BIN not found" >&2; exit 1; }

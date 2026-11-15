@@ -15,8 +15,8 @@ stub() {
 
 stub ip 'N=$NG_NET
 case "$*" in
-  "-4 -o addr show dev wlo1 scope global") [ -e $N/v4 ] && echo "2: wlo1 inet 192.168.178.29/24 scope global" ;;
-  "-4 route show default dev wlo1") [ -e $N/def4 ] && echo "default via 192.168.178.1 proto dhcp src 192.168.178.29" ;;
+  "-4 -o addr show dev wlo1 scope global") [ -e $N/v4 ] && echo "2: wlo1 inet 192.0.2.29/24 scope global" ;;
+  "-4 route show default dev wlo1") [ -e $N/def4 ] && echo "default via 192.0.2.1 proto dhcp src 192.0.2.29" ;;
   "-6 -o addr show dev wlo1") [ -e $N/a6 ] && echo "2: wlo1 inet6 fd00:aaaa:aaaa::29/64 scope global" ;;
   "-6 route show to fd00:bbbb:bbbb:1::/64 dev wlo1") [ -e $N/r6 ] && echo "fd00:bbbb:bbbb:1::/64 via fe80::1 metric 1024" ;;
   "-6 addr add"*) touch $N/a6; echo "ip $*" >> $NG_CALLS ;;

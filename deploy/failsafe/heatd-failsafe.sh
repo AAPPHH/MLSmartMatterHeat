@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -u
-ROOT=${HEATD_ROOT:-/home/aapphh/MLSmartMatterHeat}
+ROOT=${HEATD_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 PORT=${HEATD_PORT:-8090}
 STATE_DIR=${FAILSAFE_STATE_DIR:-/var/lib/heatd-failsafe}
 LOG=${FAILSAFE_LOG:-/var/log/heatd-failsafe.log}

@@ -72,7 +72,7 @@ impl Default for ChipToolConfig {
         Self {
             binary: "chip-tool".into(),
             storage_dir: None,
-            paa_trust_store: Some("/home/aapphh/snap/chip-tool/common/paa-root-certs".into()),
+            paa_trust_store: None,
             bypass_attestation: false,
             endpoint: 1,
             subscribe_min_s: 30,
@@ -1104,10 +1104,7 @@ mod tests {
         assert_eq!(c.interactive_args(), expect(&["interactive", "start"]));
         let plain = ChipToolConfig { paa_trust_store: None, endpoint: 2, ..Default::default() };
         assert_eq!(plain.read_args(&SYSTEM_MODE, 9), ["thermostat", "read", "system-mode", "9", "2"]);
-        assert_eq!(
-            ChipToolConfig::default().paa_trust_store.as_deref(),
-            Some("/home/aapphh/snap/chip-tool/common/paa-root-certs")
-        );
+        assert_eq!(ChipToolConfig::default().paa_trust_store, None);
     }
 
     #[test]

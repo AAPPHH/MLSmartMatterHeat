@@ -501,6 +501,9 @@ impl Config {
                 blackout.minutes()?;
             }
         }
+        if config.br_watchdog.enabled && config.br_watchdog.url.trim().is_empty() {
+            return Err(anyhow!("br_watchdog: enabled but url is empty (set [br_watchdog] url)"));
+        }
         let known = |name: &String| config.rooms.iter().any(|room| &room.name == name);
         for link in &config.neighbours {
             if let Some(unknown) = [&link.a, &link.b].into_iter().find(|r| !known(r)) {
@@ -659,7 +662,7 @@ sleep_hours = '22-6'").unwrap();
 sleep_hours = 'never'").is_err());
         let chip = config.chip_tool.to_controller_config();
         assert_eq!((chip.storage_dir, chip.bypass_attestation, chip.commission_timeout_s), (None, false, 180));
-        assert_eq!(chip.paa_trust_store.as_deref(), Some("/home/aapphh/snap/chip-tool/common/paa-root-certs"));
+        assert_eq!(chip.paa_trust_store.as_deref(), None);
         let custom = Config::parse("[chip_tool]
 storage_dir = ''
 paa_trust_store = ''

@@ -5,6 +5,6 @@ Requires=docker.service
 
 [Service]
 Type=oneshot
-User=aapphh
+User=@DEPLOY_USER@
 Nice=10
-ExecStart=/usr/bin/docker run --rm --cpus 1 --memory 1g -e OMP_NUM_THREADS=1 --entrypoint sh -v /home/aapphh/MLSmartMatterHeat/data:/data:ro -v /home/aapphh/MLSmartMatterHeat/models:/models heattrain:local /usr/local/bin/boost
+ExecStart=/usr/bin/docker run --rm --cpus 1 --memory 1g -e OMP_NUM_THREADS=1 --entrypoint sh -v @HEATD_ROOT@/data:/data:ro -v @HEATD_ROOT@/models:/models heattrain:local /usr/local/bin/boost

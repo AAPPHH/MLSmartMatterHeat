@@ -4,7 +4,7 @@ After=systemd-networkd.service
 
 [Service]
 Type=oneshot
-ExecStart=/home/aapphh/MLSmartMatterHeat/deploy/netguard/heatd-netguard.sh
+ExecStart=@HEATD_ROOT@/deploy/netguard/heatd-netguard.sh
 TimeoutStartSec=120
 Nice=10
 IOSchedulingClass=idle

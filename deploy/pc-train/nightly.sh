@@ -1,6 +1,6 @@
 set -e
-M=aapphh@192.168.178.29
-R=/c/clones/MLSmartMatterHeat
+M=${MINIX:?set MINIX=user@host}
+R=$(cd "$(dirname "$0")/../.." && pwd)
 W="${LOCALAPPDATA:-/c/Users/$USERNAME/AppData/Local}/heatd-train"
 mkdir -p "$W"
 cd "$W"
