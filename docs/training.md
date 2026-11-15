@@ -1,6 +1,6 @@
 # Uhr und Training
 
-HeatScan-App, Etiketten, Raum-Matcher und thermisches Modell. Überblick: [README](../README.md).
+HeatScan-App, Etiketten, Raum-Matcher und thermisches Modell. Überblick: [Überblick](overview.de.md).
 
 ## HeatScan-App
 

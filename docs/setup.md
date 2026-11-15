@@ -1,10 +1,10 @@
 # Einrichtung: Border Router, Minix, Commissioning
 
-Anleitung für den Aufbau von Grund auf. Überblick und Architektur: [README](../README.md).
+Anleitung für den Aufbau von Grund auf. Überblick und Architektur: [Überblick](overview.de.md).
 
 ## 1. Border Router flashen (Windows, einmalig)
 
-Voraussetzung ist ESP-IDF v5.5.4 unter `C:\clones\esp\esp-idf` (`install.ps1 esp32s3,esp32h2`). Das USB-C-Kabel muss am **Main Board (ESP32-S3)** stecken, nicht am H2.
+Voraussetzung ist ESP-IDF v5.5.4 (Pfad in `IDF_PATH`, `install.ps1 esp32s3,esp32h2`). Das USB-C-Kabel muss am **Main Board (ESP32-S3)** stecken, nicht am H2.
 
 ```powershell
 git submodule update --init
