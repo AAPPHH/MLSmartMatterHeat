@@ -41,7 +41,7 @@ neighbours = [
 ]
 
 [br_watchdog]
-enabled = true
+enabled = false
 url = "http://192.0.2.33"
 token_file = "/secrets/br_watchdog_token"
 interval_s = 30

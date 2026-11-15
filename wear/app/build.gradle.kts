@@ -82,3 +82,4 @@ dependencies {
     testImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+gradle.taskGraph.whenReady { if (allTasks.any { it.name.contains("Release") } && localProps.getProperty("heatscan.server") == null) throw GradleException("heatscan.server missing in wear/local.properties") }
