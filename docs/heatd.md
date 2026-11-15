@@ -1,6 +1,6 @@
 # heatd: Daten, Konfiguration, Regeln, Fenster, Boost, Geräte, API
 
-Verhalten und Konfiguration des Rust-Dienstes `crates/heatd`. Überblick: [README](../README.md).
+Verhalten und Konfiguration des Rust-Dienstes `crates/heatd`. Überblick: [Überblick](overview.de.md).
 
 ## Datenlake, Export und Konfiguration
 

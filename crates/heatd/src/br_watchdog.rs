@@ -25,7 +25,7 @@ impl Default for BrWatchdogSection {
     fn default() -> Self {
         Self {
             enabled: false,
-            url: "http://192.168.178.33".into(),
+            url: String::new(),
             token_file: "secrets/br_watchdog_token".into(),
             interval_s: 30,
             timeout_s: 600,

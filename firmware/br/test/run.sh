@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-IDF=${IDF_PATH:-/c/clones/esp/esp-idf}
+IDF=${IDF_PATH:?set IDF_PATH=<path to esp-idf>}
 TMP=${TMPDIR:-/tmp}
 CC=${CC:-gcc}
 MBED=$IDF/components/mbedtls/mbedtls

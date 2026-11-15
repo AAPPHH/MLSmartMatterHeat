@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-M=${MINIX:-aapphh@192.168.178.29}
+M=${MINIX:?set MINIX=user@host}
 PORT=${HEATD_PORT:-8090}
 cd "$(dirname "$0")/../.."
 docker image inspect heatd:local >/dev/null 2>&1 || { echo "image heatd:local fehlt, erst mit docker build bauen (docs/setup.md)" >&2; exit 1; }

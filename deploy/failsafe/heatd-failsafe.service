@@ -5,5 +5,5 @@ Wants=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/home/aapphh/MLSmartMatterHeat/deploy/failsafe/heatd-failsafe.sh
+ExecStart=@HEATD_ROOT@/deploy/failsafe/heatd-failsafe.sh
 TimeoutStartSec=900

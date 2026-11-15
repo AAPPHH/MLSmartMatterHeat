@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-M=${MINIX:-aapphh@192.168.178.29}
-DEST=${WATCH_UPDATE_DIR:-/home/aapphh/MLSmartMatterHeat/data/watch_update}
+M=${MINIX:?set MINIX=user@host}
+DEST=${WATCH_UPDATE_DIR:-MLSmartMatterHeat/data/watch_update}
 APK=${APK:-wear/app/build/outputs/apk/release/app-release.apk}
 [ -f "$APK" ] || { echo "APK fehlt: $APK" >&2; exit 1; }
 IMAGE=${WEAR_IMAGE:-ghcr.io/cirruslabs/android-sdk:36}

@@ -4,7 +4,7 @@ CONFIG = {
     "heatd_url": "http://127.0.0.1:8090/api/ambient",
     "interval_s": 60,
     "sysfs": "/sys",
-    "br_http": {"enabled": False, "url": "http://192.168.178.33/ambient", "json_path": ["die_temperature_c"], "timeout_s": 5},
+    "br_http": {"enabled": False, "url": "", "json_path": ["die_temperature_c"], "timeout_s": 5},
 }
 
 

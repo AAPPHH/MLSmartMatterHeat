@@ -27,6 +27,8 @@ android {
         versionName = "4.4.2"
         val home = localProps.getProperty("heatscan.home", "HomeWiFi").replace("\\", "\\\\").replace("\"", "\\\"")
         buildConfigField("String", "HOME", "\"$home\"")
+        val server = localProps.getProperty("heatscan.server", "http://192.0.2.1:8090").replace("\\", "\\\\").replace("\"", "\\\"")
+        buildConfigField("String", "SERVER", "\"$server\"")
     }
     signingConfigs {
         if (!keystoreProps.isEmpty) {
@@ -80,3 +82,4 @@ dependencies {
     testImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+gradle.taskGraph.whenReady { if (allTasks.any { it.name.contains("Release") } && localProps.getProperty("heatscan.server") == null) throw GradleException("heatscan.server missing in wear/local.properties") }

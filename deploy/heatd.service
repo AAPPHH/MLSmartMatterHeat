@@ -4,10 +4,10 @@ After=network-online.target bluetooth.target
 Wants=network-online.target
 
 [Service]
-User=aapphh
-WorkingDirectory=/home/aapphh/MLSmartMatterHeat
-Environment=HEATD_CONFIG=/home/aapphh/MLSmartMatterHeat/heatd.toml
-ExecStart=/home/aapphh/MLSmartMatterHeat/target/release/heatd serve
+User=@DEPLOY_USER@
+WorkingDirectory=@HEATD_ROOT@
+Environment=HEATD_CONFIG=@HEATD_ROOT@/heatd.toml
+ExecStart=@HEATD_ROOT@/target/release/heatd serve
 Restart=always
 RestartSec=5
 
