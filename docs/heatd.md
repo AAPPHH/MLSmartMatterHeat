@@ -43,9 +43,11 @@ Neue Schlüssel in `heatd.toml` (Vorlagen in `heatd.example.toml`, Docker: `depl
 | 1 | Fenster offen (`POST /api/window`) | `frost_setpoint` |
 | 2 | Uhr abwesend (Schutz: `away_guard_minutes`, Uhr muss getragen worden sein) | `away_setpoint` (18 °C) in allen Räumen, ohne Zeitplan |
 | 3 | Laufendes Explorationsexperiment (`rooms.exploration`) | Experiment-Sollwert |
-| 4 | Raum, in dem du bist, außer `sleep_room`, solange die Uhr auf Schlafen steht | `occupied_setpoint` (21 °C), immer genau dieser Wert |
+| 4 | Raum, in dem du bist, außer `sleep_room` und außer im Nachtfenster oder bei Schlafen der Uhr | `occupied_setpoint` (21 °C), immer genau dieser Wert |
 | 5 | Zeitplan greift (auch über Mitternacht), auch im `sleep_room` bei Schlafen | Zeitplan-Wert |
 | – | sonst | `default_setpoint` |
+
+Im Nachtfenster (`watchmatch.state.sleep_hours`) oder solange die Uhr schläft, fällt jeder Raum ohne Zeitplan auf `default_setpoint` zurück (Grund `night`, im `sleep_room` `sleep`), auch wenn du gerade dort bist; ein Zeitplan und ein manueller Eingriff gehen weiter vor.
 
 Ein manueller Eingriff am Thermostat (`manual_hold_minutes`) hält den Wert des Geräts genau 60 Minuten und geht allem außer offenem Fenster und Abwesenheit vor. Frost (`frost_setpoint`) ist der Wert bei offenem Fenster.
 

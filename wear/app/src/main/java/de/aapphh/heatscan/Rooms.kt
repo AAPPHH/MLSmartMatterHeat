@@ -27,7 +27,7 @@ object RoomView {
 
     val REASONS = mapOf(
         "home" to "Du bist zuhause – normale Temperatur", "occupied" to "Du bist hier – normale Temperatur", "away" to "Du bist weg – Sparmodus",
-        "window_open" to "Fenster offen – Heizung pausiert", "sleep" to "Nachtruhe – Schlaftemperatur", "default" to "Niemand hier – Grundtemperatur",
+        "window_open" to "Fenster offen – Heizung pausiert", "sleep" to "Nachtruhe – Schlaftemperatur", "night" to "Nacht – Grundtemperatur", "default" to "Niemand hier – Grundtemperatur",
         "schedule" to "Nach Zeitplan", "exploration" to "Probiert gerade eine andere Temperatur aus", "boost" to "Schnell aufheizen", "boost_off" to "Aufheizen beendet",
         "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt",
         "manual_api" to "Von dir vorgegeben", "manual_watch" to "Von dir vorgegeben"

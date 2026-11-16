@@ -455,7 +455,8 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
             let sleep_here = (sleeping || night) && config.sleep_room.as_deref() == Some(room.name.as_str());
             let (base, base_reason) = match (scheduled(room, now), room.home_setpoint) {
                 (Some(s), _) => (s, "schedule"),
-                (None, Some(h)) if !sleep_here && occupancy != Occupancy::Away => (h, "home"),
+                (None, Some(_)) if (sleeping || night) && occupancy != Occupancy::Away => (config.default_setpoint, "night"),
+                (None, Some(h)) if occupancy != Occupancy::Away => (h, "home"),
                 _ => (config.default_setpoint, "default"),
             };
             let window = window_open.contains(&room.name);
@@ -469,8 +470,8 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
             } else {
                 match held.contains(&room.name) {
                     _ if sleep_here => (base, "sleep", "presence"),
-                    true => (config.occupied_setpoint, "occupied", "presence"),
-                    false => (base, base_reason, "schedule"),
+                    true if !(sleeping || night) => (config.occupied_setpoint, "occupied", "presence"),
+                    _ => (base, base_reason, "schedule"),
                 }
             };
             let label = match occupancy {
@@ -1318,7 +1319,7 @@ nodes = [8]
         assert_eq!(get(away, 5).0, 18.0);
         let sleeping = Some(Presence { sleep: true, ..home().unwrap() });
         assert_eq!(get(sleeping.clone(), 6), (18.0, "sleep"));
-        assert_eq!(get(sleeping, 5), (20.0, "home"));
+        assert_eq!(get(sleeping, 5), (18.0, "night"));
     }
 
     #[test]
@@ -1358,10 +1359,58 @@ home_setpoint = 20.0
         assert_eq!(get(at(31, 3, 0), None, 6), (18.0, "sleep"));
         assert_eq!(get(at(31, 6, 59), awake(), 6), (18.0, "sleep"));
         assert_eq!(get(at(31, 3, 0), presence("schlafzimmer", 1.0), 6), (18.0, "sleep"));
-        assert_eq!(get(at(31, 3, 0), awake(), 5), (20.0, "home"));
+        assert_eq!(get(at(31, 3, 0), awake(), 5), (18.0, "night"));
         assert_eq!(get(at(31, 7, 0), awake(), 6), (20.0, "home"));
         assert_eq!(get(at(30, 22, 59), awake(), 6), (20.0, "home"));
         assert_eq!(get(at(30, 12, 0), presence("schlafzimmer", 1.0), 6), (20.0, "occupied"));
+    }
+
+    #[test]
+    fn at_night_every_room_falls_back_to_the_base_setpoint() {
+        let config = Config::parse("default_setpoint = 18.0
+occupied_setpoint = 20.0
+sleep_room = \"schlafzimmer\"
+[[rooms]]
+name = \"wohnzimmer\"
+nodes = [5]
+home_setpoint = 20.0
+[[rooms]]
+name = \"bad\"
+nodes = [9]
+home_setpoint = 20.0
+[[rooms]]
+name = \"schlafzimmer\"
+nodes = [6]
+home_setpoint = 20.0
+[[rooms]]
+name = \"buero\"
+nodes = [10]
+home_setpoint = 20.0
+[[rooms.schedules]]
+days = [\"weekdays\"]
+from = \"21:00\"
+to = \"07:00\"
+setpoint = 21.0
+").unwrap();
+        let go = |now: NaiveDateTime, p: Option<Presence>, windows: &[&str], node: u64| {
+            let windows = windows.iter().map(|s| s.to_string()).collect();
+            raw(now, &config, p.as_ref(), &windows, &HashMap::new()).into_iter().find(|d| d.node == node).map(|d| (d.setpoint, d.reason)).unwrap()
+        };
+        let bad = || presence("bad", 1.0);
+        assert_eq!(go(at(27, 23, 30), bad(), &[], 9), (18.0, "night"));
+        assert_eq!(go(at(27, 23, 30), bad(), &[], 6), (18.0, "sleep"));
+        assert_eq!(go(at(27, 23, 30), bad(), &[], 5), (18.0, "night"));
+        assert_eq!(go(at(27, 22, 30), bad(), &[], 9), (20.0, "occupied"));
+        assert_eq!(go(at(27, 22, 30), bad(), &[], 5), (20.0, "home"));
+        let watch_sleep = Some(Presence { sleep: true, ..presence("bad", 1.0).unwrap() });
+        assert_eq!(go(at(27, 21, 0), watch_sleep.clone(), &[], 9), (18.0, "night"));
+        assert_eq!(go(at(27, 21, 0), watch_sleep, &[], 5), (18.0, "night"));
+        assert_eq!(go(at(27, 23, 30), bad(), &[], 10), (21.0, "schedule"));
+        assert_eq!(go(at(27, 23, 30), presence("buero", 1.0), &[], 10), (21.0, "schedule"));
+        assert_eq!(go(at(27, 23, 30), bad(), &["bad"], 9), (config.frost_setpoint, "window_open"));
+        let away = Some(Presence { away: true, ..bad().unwrap() });
+        assert_eq!(go(at(27, 23, 30), away, &[], 9), (config.away_setpoint, "away"));
+        assert_eq!(go(at(28, 7, 0), bad(), &[], 9), (20.0, "occupied"));
     }
 
     #[test]
@@ -1416,7 +1465,7 @@ home_setpoint = 20.0
         assert_eq!(go(presence("wohnzimmer", 1.0), 6), (19.0, "schedule", "schedule", "matcher", false));
         assert_eq!(go(asleep("schlafzimmer"), 6), (19.0, "sleep", "presence", "matcher", true));
         assert_eq!(go(asleep("schlafzimmer"), 5), (18.0, "default", "schedule", "matcher", true));
-        assert_eq!(go(asleep("wohnzimmer"), 5), (21.0, "occupied", "presence", "matcher", true));
+        assert_eq!(go(asleep("wohnzimmer"), 5), (18.0, "default", "schedule", "matcher", true));
         assert_eq!(go(presence("schlafzimmer", 1.0), 6), (21.0, "occupied", "presence", "matcher", false));
         let label = presence("wohnzimmer", 2.0).map(|p| Presence { source: "stay_label", ..p });
         assert_eq!(go(label, 5), (21.0, "occupied", "presence", "stay_label", false));
