@@ -444,10 +444,15 @@ pub(crate) fn in_sleep_hours(config: &Config, now: NaiveDateTime) -> bool {
     if from <= to { (from..to).contains(&minute) } else { minute >= from || minute < to }
 }
 
+pub(crate) fn morning_hour(boost: &crate::config::BoostSection, now: NaiveDateTime) -> bool {
+    let hour = f64::from(now.hour()) + f64::from(now.minute()) / 60.0;
+    (boost.morning_hours[0]..boost.morning_hours[1]).contains(&hour)
+}
+
 pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
     let occupancy = presence.map_or(Occupancy::Unknown, |p| p.occupancy(config));
     let (source, sleeping) = presence.map_or(("", false), |p| (p.source, p.sleep));
-    let night = in_sleep_hours(config, now);
+    let night = in_sleep_hours(config, now) && !(presence.is_some() && !sleeping && morning_hour(&config.boost, now));
     config
         .rooms
         .iter()
@@ -929,7 +934,7 @@ fn room_model_step(state: &AppState, wants: &[Desired], now: NaiveDateTime, now_
     }
     let boost = &state.config.boost;
     let hour = f64::from(now.hour()) + f64::from(now.minute()) / 60.0;
-    let wake = !sleep && (boost.morning_hours[0]..boost.morning_hours[1]).contains(&hour);
+    let wake = !sleep && morning_hour(boost, now);
     let gate = wake || state.room_model.homecoming_open(away, now_ms, boost.homecoming_min_away_min);
     let (ctxs, weather): (Vec<crate::room_shadow::RoomCtx>, [f64; 3]) = {
         let windows = state.windows.lock().unwrap();
@@ -1034,7 +1039,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     };
     let fresh = state.commanded.lock().unwrap().occ.fresh_pending(&step.pending);
     if let Some((room, _)) = step.pending.as_ref().filter(|_| fresh) {
-        for want in wants.iter().filter(|w| &w.room == room && w.reason != "window_open") {
+        for want in wants.iter().filter(|w| &w.room == room && !matches!(w.reason, "window_open" | "night" | "sleep")) {
             let old = current(&state.commanded.lock().unwrap(), want.node);
             let target = clamp_setpoint(&readings, want.node, state.config.occupied_setpoint, state.failsafe.max_c());
             if old.is_some_and(|o| (o - target).abs() < state.config.setpoint_deadband) {
@@ -1357,7 +1362,7 @@ home_setpoint = 20.0
         let awake = || presence("flur", 1.0);
         assert_eq!(get(at(30, 23, 45), awake(), 6), (18.0, "sleep"));
         assert_eq!(get(at(31, 3, 0), None, 6), (18.0, "sleep"));
-        assert_eq!(get(at(31, 6, 59), awake(), 6), (18.0, "sleep"));
+        assert_eq!(get(at(31, 6, 59), None, 6), (18.0, "sleep"));
         assert_eq!(get(at(31, 3, 0), presence("schlafzimmer", 1.0), 6), (18.0, "sleep"));
         assert_eq!(get(at(31, 3, 0), awake(), 5), (18.0, "night"));
         assert_eq!(get(at(31, 7, 0), awake(), 6), (20.0, "home"));
@@ -1411,6 +1416,48 @@ setpoint = 21.0
         let away = Some(Presence { away: true, ..bad().unwrap() });
         assert_eq!(go(at(27, 23, 30), away, &[], 9), (config.away_setpoint, "away"));
         assert_eq!(go(at(28, 7, 0), bad(), &[], 9), (20.0, "occupied"));
+    }
+
+    #[test]
+    fn waking_in_the_morning_hours_ends_the_night_early_but_only_with_a_watch() {
+        let config = Config::parse("default_setpoint = 18.0
+occupied_setpoint = 20.0
+sleep_room = \"schlafzimmer\"
+[[rooms]]
+name = \"bad\"
+nodes = [9]
+home_setpoint = 20.0
+[[rooms]]
+name = \"schlafzimmer\"
+nodes = [6]
+home_setpoint = 20.0
+").unwrap();
+        let go = |now: NaiveDateTime, p: Option<Presence>, node: u64| raw(now, &config, p.as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == node).map(|d| (d.setpoint, d.reason)).unwrap();
+        assert_eq!(go(at(28, 6, 16), presence("bad", 1.0), 9), (20.0, "occupied"));
+        assert_eq!(go(at(28, 6, 16), presence("bad", 1.0), 6), (20.0, "home"));
+        assert_eq!(go(at(28, 6, 16), None, 9), (18.0, "night"));
+        assert_eq!(go(at(28, 6, 16), Some(Presence { sleep: true, ..presence("bad", 1.0).unwrap() }), 9), (18.0, "night"));
+        assert_eq!(go(at(27, 23, 30), presence("bad", 1.0), 9), (18.0, "night"));
+        assert_eq!(go(at(28, 3, 0), presence("bad", 1.0), 9), (18.0, "night"));
+    }
+
+    #[test]
+    fn a_manual_dial_hold_survives_the_night() {
+        let config = Config::parse("default_setpoint = 18.0
+occupied_setpoint = 20.0
+sleep_room = \"schlafzimmer\"
+[[rooms]]
+name = \"schlafzimmer\"
+nodes = [6]
+home_setpoint = 20.0
+").unwrap();
+        let mut commands = Commands::default();
+        commands.set_manual(&[6], 22.0, 0, 3_600_000, HoldSource::Dial);
+        let want = raw(at(27, 23, 30), &config, presence("schlafzimmer", 1.0).as_ref(), &HashSet::new(), &HashMap::new()).into_iter().find(|d| d.node == 6).unwrap();
+        assert_eq!(want.reason, "sleep");
+        assert_eq!(commands.release_due(&want, 1000), None);
+        assert!(commands.holds.contains_key(&6));
+        assert_eq!(commands.release_due(&want, 3_600_001), Some(true));
     }
 
     #[test]
