@@ -2098,7 +2098,7 @@ class CoreTest {
         assertEquals("Aufheizen beendet", RoomView.why(RoomGlance("bad", 20.0, 20.0, false, "boost_off")))
         val said = mapOf("occupied" to "Du bist hier – normale Temperatur", "default" to "Niemand hier – Grundtemperatur", "no_supply" to "Heizung liefert gerade keine Wärme", "pi_reset" to "Thermostat wird neu eingestellt", "sleep" to "Nachtruhe – Schlaftemperatur", "home" to "Du bist zuhause – normale Temperatur")
         said.forEach { (reason, text) -> assertEquals(text, RoomView.why(RoomGlance("bad", 20.0, 20.0, false, reason))) }
-        listOf("home", "occupied", "sleep", "default", "away", "window_open", "boost", "boost_off", "no_supply", "pi_reset", "schedule", "exploration", "manual_api", "manual_watch").forEach { assertNotNull(it, RoomView.REASONS[it]) }
+        listOf("home", "occupied", "sleep", "default", "away", "window_open", "boost", "boost_off", "no_supply", "pi_reset", "schedule", "exploration", "manual_api", "manual_watch", "night").forEach { assertNotNull(it, RoomView.REASONS[it]) }
         assertEquals("19,0° · heizt", RoomView.row(RoomView.glance(g, "wohnzimmer")))
         assertEquals("19,9° · normal", RoomView.row(RoomView.glance(g, "flur")))
         assertEquals("keine Daten", RoomView.row(null))
