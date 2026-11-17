@@ -289,7 +289,7 @@ impl Status {
                 node
             })
             .collect();
-        let degraded = inner.nodes.values().any(|n| matches!(n.state, SubState::Lost | SubState::Resubscribing) || n.health.state != crate::node_health::Health::Ok);
+        let degraded = inner.nodes.values().any(|n| matches!(n.state, SubState::Lost | SubState::Resubscribing) || n.health.state != crate::node_health::Health::Ok || n.health.adapt.since_us.is_some());
         json!({
             "status": if degraded { "degraded" } else { "ok" },
             "uptime_s": age(Some(inner.started_us)),
@@ -344,6 +344,8 @@ impl Status {
             ("heatd_node_setpoint_rewrites_total", "setpoint rewrites by the verification per node since start", "counter", 5),
             ("heatd_node_setpoint_failures_total", "failed setpoint writes per node since start", "counter", 6),
             ("heatd_node_alert", "1 while an alert is active for the node", "gauge", 7),
+            ("heatd_node_not_adapted", "1 while the thermostat reports a demand above 100 (valve not adapted)", "gauge", 8),
+            ("heatd_node_adapt_nudges_total", "setpoint nudges to start the valve adaptation per node since start", "counter", 9),
         ] {
             family(&mut out, name, help, kind);
             for (id, n) in &inner.nodes {
@@ -356,7 +358,9 @@ impl Status {
                     4 => writeln!(out, "{name}{{node=\"{id}\"}} {}", u8::from(r.set.mismatch_since_us.is_some())),
                     5 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.set.rewrites_total),
                     6 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.set.failures_total),
-                    _ => writeln!(out, "{name}{{node=\"{id}\",kind=\"unreachable\"}} {}\n{name}{{node=\"{id}\",kind=\"setpoint\"}} {}", u8::from(r.state == crate::node_health::Health::Unreachable), u8::from(r.setpoint_alert())),
+                    8 => writeln!(out, "{name}{{node=\"{id}\"}} {}", u8::from(r.adapt.since_us.is_some())),
+                    9 => writeln!(out, "{name}{{node=\"{id}\"}} {}", r.adapt.nudges_total),
+                    _ => writeln!(out, "{name}{{node=\"{id}\",kind=\"unreachable\"}} {}\n{name}{{node=\"{id}\",kind=\"setpoint\"}} {}\n{name}{{node=\"{id}\",kind=\"not_adapted\"}} {}", u8::from(r.state == crate::node_health::Health::Unreachable), u8::from(r.setpoint_alert()), u8::from(r.adapt.since_us.is_some())),
                 };
             }
         }

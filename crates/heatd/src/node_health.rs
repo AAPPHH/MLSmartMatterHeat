@@ -31,11 +31,16 @@ pub struct NodeHealthSection {
     pub alert_retries: u32,
     pub max_restarts_per_day: u32,
     pub max_resubscribes_per_day: u32,
+    pub adapt_nudge: bool,
+    pub adapt_nudge_delay_s: f64,
+    pub adapt_restore_delay_s: f64,
+    pub adapt_nudge_c: f64,
+    pub adapt_success_min: f64,
 }
 
 impl Default for NodeHealthSection {
     fn default() -> Self {
-        Self { enabled: true, tick_s: 30.0, silent_min: 10.0, unreachable_min: 30.0, min_gap_s: 60.0, backoff_start_s: 120.0, backoff_max_min: 10.0, reset_gap_min: 30.0, max_restarts: 1, restart_grace_s: 180.0, unreachable_backoff_max_min: 240.0, verify_min: 10.0, tolerance_c: 0.3, alert_retries: 3, max_restarts_per_day: 2, max_resubscribes_per_day: 24 }
+        Self { enabled: true, tick_s: 30.0, silent_min: 10.0, unreachable_min: 30.0, min_gap_s: 60.0, backoff_start_s: 120.0, backoff_max_min: 10.0, reset_gap_min: 30.0, max_restarts: 1, restart_grace_s: 180.0, unreachable_backoff_max_min: 240.0, verify_min: 10.0, tolerance_c: 0.3, alert_retries: 3, max_restarts_per_day: 2, max_resubscribes_per_day: 24, adapt_nudge: true, adapt_nudge_delay_s: 120.0, adapt_restore_delay_s: 120.0, adapt_nudge_c: 0.5, adapt_success_min: 10.0 }
     }
 }
 
@@ -87,6 +92,39 @@ pub struct SetpointCheck {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct Adaptation {
+    pub high_reports: u32,
+    pub since_us: Option<i64>,
+    pub nudged: bool,
+    pub nudged_us: Option<i64>,
+    pub restore_due_us: Option<i64>,
+    pub nudges_total: u64,
+    pub episodes_total: u64,
+}
+
+impl Adaptation {
+    fn observe(&mut self, value: f64, now_us: i64, success_us: i64) -> Option<Value> {
+        if crate::window::valve_valid(value) {
+            self.high_reports = 0;
+            let since = self.since_us.take()?;
+            let after = self.nudged_us.map(|t| (now_us - t) / 1_000_000);
+            return Some(json!({"aspect": "adaptation", "state": "adapted", "value": value, "episode_s": (now_us - since) / 1_000_000, "nudged": self.nudged, "after_nudge_s": after, "recovered_after_nudge": self.nudged_us.is_some_and(|t| now_us - t <= success_us)}));
+        }
+        self.high_reports += 1;
+        if self.high_reports < 2 || self.since_us.is_some() {
+            return None;
+        }
+        (self.since_us, self.nudged, self.nudged_us) = (Some(now_us), false, None);
+        self.episodes_total += 1;
+        Some(json!({"aspect": "adaptation", "state": "not_adapted", "value": value}))
+    }
+
+    fn view(&self, now_us: i64) -> Value {
+        json!({"state": if self.since_us.is_some() { "not_adapted" } else { "adapted" }, "since_ts": self.since_us.map(|t| t / 1000), "since_age_s": age(now_us, self.since_us), "nudged": self.nudged, "nudges_total": self.nudges_total, "episodes_total": self.episodes_total})
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Record {
     pub state: Health,
     pub since_us: i64,
@@ -102,6 +140,7 @@ pub struct Record {
     pub last_action: Option<&'static str>,
     pub last_error: Option<String>,
     pub set: SetpointCheck,
+    pub adapt: Adaptation,
 }
 
 fn age(now_us: i64, t: Option<i64>) -> Option<f64> {
@@ -129,6 +168,7 @@ impl Record {
             "last_action": self.last_action,
             "last_error": self.last_error,
             "transitions": self.transitions,
+            "adaptation": self.adapt.view(now_us),
             "setpoint": {
                 "mismatch": s.mismatch_since_us.is_some(),
                 "mismatch_age_s": age(now_us, s.mismatch_since_us),
@@ -371,6 +411,71 @@ async fn verify(state: &AppState, node: u64, health: Health, now_us: i64) {
     }
 }
 
+pub fn observe_valve(state: &AppState, node: u64, value: f64, now_us: i64) {
+    let success_us = min_us(state.config.node_health.adapt_success_min);
+    if let Some(detail) = state.status.update_health(node, |r| r.adapt.observe(value, now_us, success_us)) {
+        eprintln!("node {node}: valve {}", if detail["state"] == "adapted" { "adapted again" } else { "not adapted (demand outside 0..100)" });
+        emit(state, node, detail);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nudge {
+    Lower,
+    Restore,
+}
+
+impl Nudge {
+    fn name(self) -> &'static str {
+        match self {
+            Nudge::Lower => "lower",
+            Nudge::Restore => "restore",
+        }
+    }
+}
+
+async fn nudge_write(state: &AppState, node: u64, stage: Nudge, now_us: i64) {
+    let cfg = &state.config.node_health;
+    let now_ms = now_us / 1000;
+    let Some(target) = state.commanded.lock().unwrap().target(node) else { return };
+    let low = target - cfg.adapt_nudge_c;
+    let value = if stage == Nudge::Lower { low } else { target };
+    let previous = if stage == Nudge::Lower { target } else { low };
+    let prior = state.commanded.lock().unwrap().begin_nudge(node, target, previous, low, now_ms);
+    let error = crate::rules::send_setpoint(state, node, value).await.err().map(|e| e.to_string());
+    if error.is_some() {
+        state.commanded.lock().unwrap().rollback_sent(node, prior);
+    }
+    state.status.update_health(node, |r| {
+        let a = &mut r.adapt;
+        match (stage, error.is_some()) {
+            (Nudge::Lower, failed) => (a.nudged, a.nudged_us, a.restore_due_us, a.nudges_total) = (true, Some(now_us), (!failed).then_some(now_us + s_us(cfg.adapt_restore_delay_s)), a.nudges_total + 1),
+            (Nudge::Restore, false) => a.restore_due_us = None,
+            (Nudge::Restore, true) => {}
+        }
+    });
+    eprintln!("node {node}: adapt_nudge {} to {value}{}", stage.name(), error.as_ref().map(|e| format!(" failed: {e}")).unwrap_or_default());
+    emit(state, node, json!({"aspect": "adaptation", "action": "adapt_nudge", "stage": stage.name(), "target": target, "written": value, "error": error, "budget": "exempt_maintenance"}));
+}
+
+async fn adapt(state: &AppState, node: u64, health: Health, now_us: i64) {
+    let cfg = &state.config.node_health;
+    if !cfg.adapt_nudge || health > Health::Degraded || state.failsafe.stopping() {
+        return;
+    }
+    let stage = state.status.update_health(node, |r| {
+        let a = &r.adapt;
+        match (a.restore_due_us, a.since_us) {
+            (Some(due), _) if now_us >= due => Some(Nudge::Restore),
+            (None, Some(since)) if !a.nudged && now_us >= since + s_us(cfg.adapt_nudge_delay_s) => Some(Nudge::Lower),
+            _ => None,
+        }
+    });
+    if let Some(stage) = stage {
+        nudge_write(state, node, stage, now_us).await;
+    }
+}
+
 async fn step_node(state: AppState, node: u64, now_us: i64) {
     let Some(snap) = state.status.node_snapshot(node) else { return };
     let started = state.status.started_us();
@@ -379,6 +484,7 @@ async fn step_node(state: AppState, node: u64, now_us: i64) {
     settle_episode(&state, node, now_us);
     recover(&state, node, next, now_us).await;
     verify(&state, node, next, now_us).await;
+    adapt(&state, node, next, now_us).await;
 }
 
 pub async fn step(state: &AppState, now_us: i64) {
@@ -421,6 +527,11 @@ pub fn alerts(state: &AppState) -> Vec<Value> {
             out.push(json!({"id": format!("setpoint_not_applied:{node}@{}", since / 1000), "title": "Heizung: Thermostat", "text": format!("{}: Solltemperatur {target:.1} Grad wird nicht uebernommen{reported}. heatd schreibt sie erneut.", label(state, node))}));
         }
     }
+    for (node, n) in state.status.nodes_snapshot() {
+        if let Some(since) = n.health.adapt.since_us {
+            out.push(json!({"id": format!("valve_not_adapted:{node}@{}", since / 1000), "title": "Heizung: Thermostat", "text": format!("{}: Das Thermostat zeigt „Ad“ und das Ventil steht ganz offen. Bitte + und − gleichzeitig 3 Sekunden drücken.", label(state, node))}));
+        }
+    }
     out.sort_by_key(|a| a["id"].as_str().and_then(|id| id.rsplit_once('@')).and_then(|(_, since)| since.parse::<i64>().ok()).unwrap_or(i64::MAX));
     out
 }
@@ -455,6 +566,9 @@ fn line(v: &Value) -> String {
     match v["aspect"].as_str() {
         Some("setpoint") if v["action"].is_string() => format!("Sollwert {} nicht uebernommen (Thermostat meldet {}), Neuschreiben {}", v["target"], v["device"], v["rewrites"]),
         Some("setpoint") => format!("Sollwert-Alarm {}", if v["alert"] == true { "an" } else { "aus" }),
+        Some("adaptation") if v["action"].is_string() => format!("Adaptions-Anstoss ({}) auf {}", text("stage"), v["written"]),
+        Some("adaptation") if v["state"] == "adapted" => format!("Ventil adaptiert nach {} s (Anstoss {})", v["episode_s"], if v["recovered_after_nudge"] == true { "wirksam" } else { "nicht wirksam" }),
+        Some("adaptation") => "Ventil nicht adaptiert (Anzeige Ad, Ventil ganz offen)".into(),
         _ => format!("{} -> {} (stumm seit {} s, Versuche {}, Stoerzeit {} s)", text("from"), text("to"), v["silent_s"], v["attempts"], v["episode_s"]),
     }
 }

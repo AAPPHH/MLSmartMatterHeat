@@ -592,3 +592,111 @@ async fn a_manual_change_back_to_the_pre_rewrite_value_an_hour_later_is_held_and
     }
     assert_eq!(r.mock.setpoint_writes(), writes);
 }
+
+impl Rig {
+    fn valve(&self, node: u64, value: f64, at_us: i64) {
+        self.report(node, at_us);
+        crate::rules::on_report(&self.state, &AttributeReport { node, endpoint: 1, attribute: "pi_heating_demand".into(), value }, false, at_us / 1000);
+    }
+
+    fn adaptation(&self) -> Vec<Value> {
+        self.events().into_iter().filter(|e| e["aspect"] == "adaptation").collect()
+    }
+}
+
+#[tokio::test]
+async fn a_valve_demand_above_100_on_two_reports_starts_an_alerted_episode_that_ends_with_the_first_valid_report() {
+    let r = rig();
+    let s = 1_000_000;
+    r.valve(5, 134.0, r.t0 + s);
+    assert!(alerts_empty(&r.state) && r.adaptation().is_empty());
+    r.valve(5, 134.0, r.t0 + 2 * s);
+    let found = alerts(&r.state);
+    assert_eq!(found.len(), 1);
+    let text = found[0]["text"].as_str().unwrap();
+    assert!(found[0]["id"].as_str().unwrap().starts_with("valve_not_adapted:5@") && found[0]["title"] == "Heizung: Thermostat", "{found:?}");
+    assert!(text.starts_with("a (Node 5): Das Thermostat zeigt „Ad“") && text.contains("+ und − gleichzeitig 3 Sekunden"), "{text}");
+    r.valve(5, 134.0, r.t0 + 3 * s);
+    assert_eq!(r.adaptation().len(), 1);
+    let view = r.state.status.node_health_view(5, r.t0 + 3 * s).unwrap();
+    assert_eq!((view["adaptation"]["state"].clone(), view["adaptation"]["nudged"].clone()), ("not_adapted".into(), false.into()));
+    assert!(r.state.status.metrics(r.t0 + 3 * s).contains("heatd_node_not_adapted{node=\"5\"} 1"));
+    r.valve(5, 100.0, r.t0 + 4 * s);
+    assert!(alerts_empty(&r.state));
+    let events = r.adaptation();
+    assert_eq!((events[0]["state"].clone(), events[1]["state"].clone(), events.len()), ("not_adapted".into(), "adapted".into(), 2));
+    assert_eq!(events[1]["episode_s"], 2);
+    r.valve(5, 134.0, r.t0 + 5 * s);
+    r.valve(5, 20.0, r.t0 + 6 * s);
+    r.valve(5, 134.0, r.t0 + 7 * s);
+    assert!(alerts_empty(&r.state));
+}
+
+#[tokio::test]
+async fn one_nudge_per_episode_lowers_then_restores_the_setpoint_as_maintenance() {
+    let r = rig();
+    let s = 1_000_000;
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, 1);
+    r.valve(5, 134.0, r.t0);
+    r.valve(5, 134.0, r.t0 + s);
+    let since = r.t0 + s;
+    for (t, writes) in [(60, 0), (119, 0), (121, 1), (150, 1), (239, 1), (241, 2), (400, 2), (900, 2)] {
+        r.report(5, since + t * s);
+        step(&r.state, since + t * s).await;
+        if t == 121 {
+            r.push(5, 20.5, since + t * s + s);
+        }
+        if t == 241 {
+            r.push(5, 21.0, since + t * s + s);
+        }
+        assert_eq!(r.mock.setpoint_writes().len(), writes, "t={t}");
+    }
+    assert_eq!(r.mock.setpoint_writes(), vec![(5, 20.5), (5, 21.0)]);
+    let commands = r.state.commanded.lock().unwrap();
+    assert!(!commands.holding(&[5]) && commands.budget.used("a", since / 1000 + 400_000) == 0 && commands.target(5) == Some(21.0));
+    drop(commands);
+    assert!(alerts(&r.state).iter().all(|a| !a["id"].as_str().unwrap().starts_with("setpoint_not_applied")));
+    r.valve(5, 40.0, since + 300 * s);
+    let nudges: Vec<Value> = r.adaptation().into_iter().filter(|e| e["action"] == "adapt_nudge").collect();
+    assert_eq!(nudges.iter().map(|e| e["stage"].as_str().unwrap()).collect::<Vec<_>>(), ["lower", "restore"]);
+    assert!(nudges.iter().all(|e| e["budget"] == "exempt_maintenance" && e["error"].is_null()));
+    let ended = r.adaptation().into_iter().find(|e| e["state"] == "adapted").unwrap();
+    assert_eq!((ended["nudged"].clone(), ended["recovered_after_nudge"].clone()), (true.into(), true.into()));
+    assert!((178..=179).contains(&ended["after_nudge_s"].as_i64().unwrap()));
+}
+
+#[tokio::test]
+async fn an_episode_that_ends_before_the_delay_is_never_nudged_and_a_disabled_nudge_stays_silent() {
+    let r = rig();
+    let s = 1_000_000;
+    r.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, 1);
+    r.valve(5, 134.0, r.t0);
+    r.valve(5, 134.0, r.t0 + s);
+    r.valve(5, 30.0, r.t0 + 60 * s);
+    r.report(5, r.t0 + 300 * s);
+    step(&r.state, r.t0 + 300 * s).await;
+    assert!(r.mock.setpoint_writes().is_empty());
+    let off = rig_with("adapt_nudge = false\n");
+    off.state.commanded.lock().unwrap().test_sent(5, 21.0, 19.0, 1);
+    off.valve(5, 134.0, off.t0);
+    off.valve(5, 134.0, off.t0 + s);
+    off.report(5, off.t0 + 600 * s);
+    step(&off.state, off.t0 + 600 * s).await;
+    assert!(off.mock.setpoint_writes().is_empty() && alerts(&off.state).iter().filter(|a| a["id"].as_str().unwrap().starts_with("valve_not_adapted")).count() == 1);
+}
+
+#[test]
+fn a_demand_above_100_never_reaches_the_window_model_state() {
+    let r = rig();
+    let ms = 1_700_000_000_000;
+    let min = 60_000;
+    let report = |value: f64, attribute: &str, at: i64| crate::rules::on_report(&r.state, &AttributeReport { node: 5, endpoint: 1, attribute: attribute.into(), value }, false, at);
+    report(22.0, "local_temperature", ms);
+    report(60.0, "pi_heating_demand", ms);
+    let (supply, stale) = (&r.state.config.supply, r.state.config.stale.after_ms());
+    assert!(r.state.windows.lock().unwrap().overshoot_due(supply, 5, 19.0, ms, stale).is_none());
+    report(134.0, "pi_heating_demand", ms + 10 * min);
+    report(22.0, "local_temperature", ms + 10 * min);
+    report(22.0, "local_temperature", ms + 16 * min);
+    assert!(r.state.windows.lock().unwrap().overshoot_due(supply, 5, 19.0, ms + 16 * min, stale).is_some());
+}

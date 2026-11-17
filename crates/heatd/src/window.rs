@@ -17,6 +17,10 @@ pub const DETECTOR: &str = "v3";
 
 pub const LOCAL_TEMPERATURE: &str = "local_temperature";
 pub const PI_HEATING_DEMAND: &str = "pi_heating_demand";
+
+pub fn valve_valid(value: f64) -> bool {
+    (0.0..=100.0).contains(&value)
+}
 pub const OCCUPIED_SETPOINT: &str = matter_controller::OCCUPIED_HEATING_SETPOINT.snake;
 
 #[derive(Debug, Clone, Default)]
