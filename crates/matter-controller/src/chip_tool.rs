@@ -32,6 +32,7 @@ const POLL_GRACE: Duration = Duration::from_secs(2);
 const WRITE_ATTEMPTS: u32 = 3;
 const SWITCH_LIMIT_S: u64 = 15;
 const WRITE_BACKOFF: Duration = Duration::from_secs(5);
+const READ_ALL_SETTLE: Duration = Duration::from_secs(3);
 
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
@@ -719,9 +720,12 @@ impl Session {
     }
 
     async fn read_all(&self, node: NodeId) -> Result<()> {
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
-        Self::send(stdin, &ChipToolConfig::read_all_line(node)).await
+        gated_read_all(&self.write_gate, READ_ALL_SETTLE, || async {
+            let mut guard = self.stdin.lock().await;
+            let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
+            Self::send(stdin, &ChipToolConfig::read_all_line(node)).await
+        })
+        .await
     }
 
     async fn resubscribe(&self, node: NodeId) -> Result<()> {
@@ -826,6 +830,17 @@ impl Session {
             }
         }
     }
+}
+
+async fn gated_read_all<F, Fut>(gate: &tokio::sync::Mutex<()>, settle: Duration, send: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let _gate = gate.lock().await;
+    send().await?;
+    sleep(settle).await;
+    Ok(())
 }
 
 fn retryable(error: &Error) -> bool {
@@ -1325,6 +1340,23 @@ mod tests {
         assert_eq!(calls.swap(0, std::sync::atomic::Ordering::SeqCst), 3);
         assert!(retrying(3, Duration::from_millis(1), flaky(9, "status = 0x87 (CONSTRAINT_ERROR)")).await.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn read_all_holds_the_write_gate_until_its_failure_line_can_no_longer_hit_a_write() {
+        let gate = tokio::sync::Mutex::new(());
+        let settle = Duration::from_millis(150);
+        let started = Instant::now();
+        let read = gated_read_all(&gate, settle, || async { Ok(()) });
+        let write = async {
+            sleep(Duration::from_millis(20)).await;
+            let _g = gate.lock().await;
+            started.elapsed()
+        };
+        let (done, waited) = tokio::join!(read, write);
+        assert!(done.is_ok() && waited >= settle);
+        let failed = gated_read_all(&gate, settle, || async { Err(Error::Command("down".into())) }).await;
+        assert!(failed.is_err() && gate.try_lock().is_ok());
     }
 
     #[test]
