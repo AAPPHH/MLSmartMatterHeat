@@ -264,8 +264,8 @@ impl Commands {
         Some(current)
     }
 
-    pub fn begin_nudge(&mut self, node: u64, target: f64, previous: f64, acked: f64, now_ms: i64) -> Option<Sent> {
-        self.sent.insert(node, Sent { target, previous: Some(previous), written_ms: now_ms, acked: Some(acked), stale: None })
+    pub fn begin_nudge(&mut self, node: u64, target: f64, previous: f64, acked: Option<f64>, stale: Option<f64>, now_ms: i64) -> Option<Sent> {
+        self.sent.insert(node, Sent { target, previous: Some(previous), written_ms: now_ms, acked, stale })
     }
 
     pub fn rollback_sent(&mut self, node: u64, prior: Option<Sent>) {
@@ -1185,6 +1185,7 @@ pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
     if report.attribute == crate::window::PI_HEATING_DEMAND {
         crate::node_health::observe_valve(state, report.node, report.value, now_ms * 1000);
         if !crate::window::valve_valid(report.value) {
+            state.windows.lock().unwrap().invalidate_valve(report.node);
             return;
         }
     }

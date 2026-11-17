@@ -236,11 +236,15 @@ impl RoomWin {
 }
 
 impl NodeWin {
+    fn invalidate_valve(&mut self) {
+        self.valve = None;
+        self.high_since = None;
+        self.over_since = None;
+    }
+
     fn set_valve(&mut self, high_pct: f64, ts_ms: i64, value: f64) {
-        if !(0.0..=100.0).contains(&value) {
-            self.valve = None;
-            self.high_since = None;
-            self.over_since = None;
+        if !valve_valid(value) {
+            self.invalidate_valve();
             return;
         }
         self.high_since = if value >= high_pct { self.high_since.or(Some(ts_ms)) } else { None };
@@ -261,6 +265,12 @@ impl Windows {
         n.high_since = None;
         if let Some(room) = config.rooms.iter().find(|r| r.nodes.contains(&node)) {
             self.rooms.entry(room.name.clone()).or_default().floor_ms = ts_ms - 1;
+        }
+    }
+
+    pub fn invalidate_valve(&mut self, node: u64) {
+        if let Some(n) = self.nodes.get_mut(&node) {
+            n.invalidate_valve();
         }
     }
 

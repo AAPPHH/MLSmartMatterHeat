@@ -120,7 +120,7 @@ impl Adaptation {
     }
 
     fn view(&self, now_us: i64) -> Value {
-        json!({"state": if self.since_us.is_some() { "not_adapted" } else { "adapted" }, "since_ts": self.since_us.map(|t| t / 1000), "since_age_s": age(now_us, self.since_us), "nudged": self.nudged, "nudges_total": self.nudges_total, "episodes_total": self.episodes_total})
+        json!({"state": if self.since_us.is_some() { "not_adapted" } else { "adapted" }, "since_ts": self.since_us.map(|t| t / 1000), "since_age_s": age(now_us, self.since_us), "nudged": self.since_us.is_some() && self.nudged, "nudges_total": self.nudges_total, "episodes_total": self.episodes_total})
     }
 }
 
@@ -438,10 +438,10 @@ async fn nudge_write(state: &AppState, node: u64, stage: Nudge, now_us: i64) {
     let cfg = &state.config.node_health;
     let now_ms = now_us / 1000;
     let Some(target) = state.commanded.lock().unwrap().target(node) else { return };
-    let low = target - cfg.adapt_nudge_c;
+    let low = crate::rules::clamp_setpoint(&state.latest.all(), node, target - cfg.adapt_nudge_c, state.failsafe.max_c()).min(target);
     let value = if stage == Nudge::Lower { low } else { target };
     let previous = if stage == Nudge::Lower { target } else { low };
-    let prior = state.commanded.lock().unwrap().begin_nudge(node, target, previous, low, now_ms);
+    let prior = state.commanded.lock().unwrap().begin_nudge(node, target, previous, (stage == Nudge::Lower).then_some(low), (stage == Nudge::Restore).then_some(low), now_ms);
     let error = crate::rules::send_setpoint(state, node, value).await.err().map(|e| e.to_string());
     if error.is_some() {
         state.commanded.lock().unwrap().rollback_sent(node, prior);
@@ -449,9 +449,10 @@ async fn nudge_write(state: &AppState, node: u64, stage: Nudge, now_us: i64) {
     state.status.update_health(node, |r| {
         let a = &mut r.adapt;
         match (stage, error.is_some()) {
-            (Nudge::Lower, failed) => (a.nudged, a.nudged_us, a.restore_due_us, a.nudges_total) = (true, Some(now_us), (!failed).then_some(now_us + s_us(cfg.adapt_restore_delay_s)), a.nudges_total + 1),
+            (Nudge::Lower, false) => (a.nudged, a.nudged_us, a.restore_due_us, a.nudges_total) = (true, Some(now_us), Some(now_us + s_us(cfg.adapt_restore_delay_s)), a.nudges_total + 1),
+            (Nudge::Lower, true) => a.nudged = true,
             (Nudge::Restore, false) => a.restore_due_us = None,
-            (Nudge::Restore, true) => {}
+            (Nudge::Restore, true) => a.restore_due_us = Some(now_us + s_us(cfg.adapt_restore_delay_s))
         }
     });
     eprintln!("node {node}: adapt_nudge {} to {value}{}", stage.name(), error.as_ref().map(|e| format!(" failed: {e}")).unwrap_or_default());

@@ -698,5 +698,5 @@ fn a_demand_above_100_never_reaches_the_window_model_state() {
     report(134.0, "pi_heating_demand", ms + 10 * min);
     report(22.0, "local_temperature", ms + 10 * min);
     report(22.0, "local_temperature", ms + 16 * min);
-    assert!(r.state.windows.lock().unwrap().overshoot_due(supply, 5, 19.0, ms + 16 * min, stale).is_some());
+    assert!(r.state.windows.lock().unwrap().overshoot_due(supply, 5, 19.0, ms + 16 * min, stale).is_none());
 }
