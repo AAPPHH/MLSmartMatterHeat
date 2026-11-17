@@ -23,3 +23,7 @@ adb shell pm install -r -i de.aapphh.heatscan /data/local/tmp/app-release.apk
 - Heim-WLAN: `heatscan.home=<SSID>` in `wear/local.properties` (gitignored) setzt den Standardwert fuer das Heim-WLAN; ohne Eintrag `HomeWiFi`.
 - Server-URL: `heatscan.server=http://<heatd-host>:8090` in `wear/local.properties` (gitignored) setzt den Standardwert fuer die heatd-Adresse; ohne Eintrag `http://192.0.2.1:8090` (Platzhalter).
 - Die Berechtigungen `REQUEST_INSTALL_PACKAGES` und `UPDATE_PACKAGES_WITHOUT_USER_ACTION` stehen im Manifest; auf der Uhr muss "Unbekannte Apps installieren" fuer HeatScan erlaubt sein.
+
+## Burst-Rhythmus (ab 4.4.3)
+
+Die Uhr sendet im Heim-WLAN alle 30 min einen Burst. Scheitert er (WLAN nicht gewaehrt, Zeitueberschreitung, nichts hochgeladen), folgt nach 5 min ein neuer Versuch, hoechstens 3 pro Intervall; danach gilt wieder der Takt ab Beginn des Intervalls (Slot plus 30 min), damit heatd (75 min Stille bis Away) nie laenger ohne Upload bleibt als vorher. Ein geglueckter Burst haelt den 30-min-Takt. Weg von zuhause gibt es keine Wiederholung. Ein uebersprungener App-Oeffnen-, Ankunfts- oder Abgangs-Burst steht als `burst_skip` im Trace.

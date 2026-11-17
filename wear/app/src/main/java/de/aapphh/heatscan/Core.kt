@@ -1561,12 +1561,13 @@ class HomeWatch {
 
 class BurstPolicy(private val intervalMs: Long = BurstConfig.INTERVAL_MS, private val minGapMs: Long = BurstConfig.MIN_GAP_MS, private val retryMs: Long = BurstConfig.RETRY_MS, private val maxRetries: Int = BurstConfig.MAX_RETRIES) {
     private var lastAt = Long.MIN_VALUE / 4
+    private var slotAt = lastAt
     private var retries = 0
 
     fun delivered() { retries = 0 }
 
     fun failed(now: Long) {
-        if (retries >= maxRetries) { retries = 0; return }
+        if (retries >= maxRetries) { retries = 0; lastAt = slotAt; return }
         retries++
         lastAt = now - intervalMs + retryMs
     }
@@ -1579,7 +1580,10 @@ class BurstPolicy(private val intervalMs: Long = BurstConfig.INTERVAL_MS, privat
             Trigger.OPEN -> if (home) Burst.SEND else Burst.NONE
             Trigger.CADENCE -> if (!home || now - lastAt < intervalMs) Burst.NONE else if (queued > 0) Burst.SEND else Burst.BEAT
         }
-        if (burst != Burst.NONE) lastAt = now
+        if (burst != Burst.NONE) {
+            if (retries == 0) slotAt = now
+            lastAt = now
+        }
         return burst
     }
 }

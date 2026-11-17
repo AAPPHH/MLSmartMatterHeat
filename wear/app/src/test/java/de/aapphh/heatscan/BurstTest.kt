@@ -157,7 +157,8 @@ class BurstTest {
             now += 5 * min
         }
         assertEquals(Burst.NONE, p.decide(now, 5, true, false, Trigger.CADENCE))
-        assertEquals(Burst.SEND, p.decide(now + 25 * min, 5, true, false, Trigger.CADENCE))
+        assertEquals(Burst.NONE, p.decide(29 * min, 5, true, false, Trigger.CADENCE))
+        assertEquals(Burst.SEND, p.decide(30 * min, 5, true, false, Trigger.CADENCE))
     }
 
     @Test

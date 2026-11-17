@@ -150,7 +150,10 @@ class ScanService : Service() {
         val queued = queue.size
         val bound = network != null || burstCallback != null || holding
         val decision = burstPolicy.decide(SystemClock.elapsedRealtime(), queued, store.atHome == true && !policy.away, bound, trigger)
-        if (decision == Burst.NONE) return
+        if (decision == Burst.NONE) {
+            if (trigger != Trigger.CADENCE) Trace.i("burst_skip", "trigger" to trigger.name, "bound" to bound, "queue" to queued, "home" to (store.atHome == true && !policy.away))
+            return
+        }
         burstDelivered = false
         if (decision == Burst.BEAT) enqueue(System.currentTimeMillis(), emptyList(), false, "beat")
         lateinit var cb: WifiCallback
@@ -175,6 +178,7 @@ class ScanService : Service() {
         try {
             io.execute {
                 runFlush("burst")
+                if (queue.size == 0) burstDelivered = true
                 handler.post { if (burstCallback != null && burstCallback === cb) updateOrFinish(n) }
             }
         } catch (e: RejectedExecutionException) {
