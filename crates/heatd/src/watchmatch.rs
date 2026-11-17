@@ -657,7 +657,7 @@ impl WatchMatch {
             return None;
         }
         let inner = self.inner.lock().unwrap();
-        let hold_ms = inner.model.as_ref()?.spec.t_hold_min * 60_000;
+        let hold_ms = inner.model.as_ref()?.spec.t_hold_min.max(self.cfg.hold_floor_min) * 60_000;
         Some(inner.devices.values().filter_map(|d| d.hold.clone()).filter(|(_, t)| now_ms - t <= hold_ms).max_by_key(|(_, t)| *t))
     }
 

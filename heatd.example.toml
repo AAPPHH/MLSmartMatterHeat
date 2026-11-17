@@ -50,7 +50,8 @@ roof_rooms = ["schlafzimmer"]
 enabled = true
 model_dir = "/models/watchroom"
 model_version = "latest"
-scan_fresh_s = 180
+scan_fresh_s = 2100
+hold_floor_min = 45
 
 [watchmatch.state]
 hr_rest_max = 70

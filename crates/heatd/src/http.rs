@@ -672,7 +672,9 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     let (mut stored, mut duplicates) = (0, 0);
     let mut latest: Option<Outcome> = None;
     let mut matched: Option<(i64, Value)> = None;
-    for scan in &body.scans {
+    let mut ordered: Vec<&ScanBody> = body.scans.iter().collect();
+    ordered.sort_by_key(|s| s.ts);
+    for scan in ordered {
         let out = ingest(&state, scan, received, true)?;
         if let Some(m) = out.matched.clone().filter(|_| matched.as_ref().is_none_or(|l| scan.ts >= l.0)) {
             matched = Some((scan.ts, m));
@@ -2557,6 +2559,26 @@ labels_since = '{iso}'
         long["bedtime"] = json!(false);
         assert_eq!(call(&h.state, "POST", "/watch/measurement", Some(long.to_string())).await.0, StatusCode::OK);
         assert_eq!(h.state.storage.device_statuses().unwrap()[0].bedtime, Some(false));
+    }
+
+    #[tokio::test]
+    async fn burst_delivered_scans_are_replayed_in_order_and_set_a_hold() {
+        let head = format!("away_guard_minutes = 0\n[watchmatch]\nenabled = true\nmodel_dir = '{}'\n", fixture_models().replace('\\', "/"));
+        let h = harness_with(false, &head, "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms]]\nname = 'schlafzimmer'\nnodes = [6]\n");
+        let now = now_ms();
+        let ap = |b: &str, r: i32| json!({"bssid": b, "rssi": r, "freq": 2437});
+        let living = [ap("aa:bb:cc:00:00:01", -45), ap("aa:bb:cc:00:00:02", -67), ap("aa:bb:cc:00:00:03", -82)];
+        let scans: Vec<Value> = [4i64, 30, 17, 10].iter().map(|m| json!({"device": "pixel-watch", "ts": now - m * 60_000, "aps": living.clone(), "queued": true})).collect();
+        let (status, body) = call(&h.state, "POST", "/api/scans", Some(json!({"scans": scans}).to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["match"]["room"], json!("wohnzimmer"));
+        let rows = lake_rows(&h, "watch_inference");
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 4);
+        let ts: Vec<i64> = column(&rows, "ts").into_iter().flatten().map(|t| t.parse().unwrap()).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]));
+        assert!(some(&column(&rows, "result_room")).contains(&"wohnzimmer".to_string()));
+        let hold = h.state.watchmatch.effective(now).unwrap().unwrap();
+        assert_eq!((hold.0.as_str(), hold.1), ("wohnzimmer", now - 4 * 60_000));
     }
 
     #[tokio::test]
