@@ -1299,6 +1299,13 @@ sleep_hours = '3-3'
     }
 
     #[test]
+    fn default_presence_timeout_covers_the_burst_cycle() {
+        let config = Config::parse("").unwrap();
+        assert!(matches!(presence("wohnzimmer", 44.0).unwrap().occupancy(&config), Occupancy::Room("wohnzimmer")));
+        assert!(matches!(presence("wohnzimmer", 46.0).unwrap().occupancy(&config), Occupancy::Unknown));
+    }
+
+    #[test]
     fn home_setpoint_applies_while_home_except_away_and_sleeping_bedroom() {
         let config = Config::parse("default_setpoint = 18.0
 away_setpoint = 18.0

@@ -2109,11 +2109,11 @@ nodes = [5]
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0)]);
         control_step(&h.state, noon, at(10)).await.unwrap();
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0)]);
-        for m in 11..75 {
+        for m in 11..90 {
             control_step(&h.state, noon, at(m)).await.unwrap();
         }
         assert_eq!(device_setpoint(&h).await, 21.0);
-        control_step(&h.state, noon, at(75)).await.unwrap();
+        control_step(&h.state, noon, at(90)).await.unwrap();
         assert_eq!(h.mock.setpoint_writes(), vec![(5, 18.0), (5, 21.0), (5, 18.0)]);
         assert_eq!(extras(&h, "debounce"), 1);
         assert!(some(&column(&lake_rows(&h, "events"), "kind")).iter().any(|k| k == "occupancy_end"));
@@ -2502,7 +2502,7 @@ name = 'flur'
         };
         post(json!({"ts": now - 60_000, "label": "wohnzimmer", "motion": "still", "aps": [{"bssid": "aa:bb:cc:dd:ee:ff", "rssi": -50, "freq": 2412}]})).await;
         assert_eq!(wanted(&h, now), vec![("wohnzimmer".to_string(), 21.0, "occupied", "stay_label", false), ("schlafzimmer".to_string(), 18.0, "default", "stay_label", false)]);
-        assert_eq!(wanted(&h, now + 31 * 60_000)[0].1, 18.0);
+        assert_eq!(wanted(&h, now + 46 * 60_000)[0].1, 18.0);
         post(json!({"ts": now - 20_000, "motion": "moving"})).await;
         assert_eq!(wanted(&h, now)[0].1, 18.0);
     }

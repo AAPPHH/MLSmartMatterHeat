@@ -453,7 +453,7 @@ impl Default for Config {
             raise_budget_per_hour: 1,
             setpoint_deadband: 0.3,
             sleep_room: None,
-            presence_timeout_minutes: 30.0,
+            presence_timeout_minutes: 45.0,
             still_contact_timeout_minutes: 180.0,
             frost_setpoint: 7.0,
             rooms: Vec::new(),
