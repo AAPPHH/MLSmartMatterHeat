@@ -264,6 +264,17 @@ impl Commands {
         Some(current)
     }
 
+    pub fn begin_nudge(&mut self, node: u64, target: f64, previous: f64, acked: Option<f64>, stale: Option<f64>, now_ms: i64) -> Option<Sent> {
+        self.sent.insert(node, Sent { target, previous: Some(previous), written_ms: now_ms, acked, stale })
+    }
+
+    pub fn rollback_sent(&mut self, node: u64, prior: Option<Sent>) {
+        match prior {
+            Some(p) => self.sent.insert(node, p),
+            None => self.sent.remove(&node),
+        };
+    }
+
     pub fn release_rewrite(&mut self, node: u64, claimed_ms: i64, prior: Sent) {
         if self.sent.get(&node).is_some_and(|s| s.written_ms == claimed_ms) {
             self.sent.insert(node, prior);
@@ -1171,6 +1182,13 @@ fn manual_change(state: &AppState, report: &AttributeReport, poll: bool, now_ms:
 
 pub fn on_report(state: &AppState, report: &AttributeReport, poll: bool, now_ms: i64) {
     state.windows.lock().unwrap().touch(&state.config, report.node, now_ms);
+    if report.attribute == crate::window::PI_HEATING_DEMAND {
+        crate::node_health::observe_valve(state, report.node, report.value, now_ms * 1000);
+        if !crate::window::valve_valid(report.value) {
+            state.windows.lock().unwrap().invalidate_valve(report.node);
+            return;
+        }
+    }
     if [crate::window::LOCAL_TEMPERATURE, crate::window::PI_HEATING_DEMAND, crate::window::OCCUPIED_SETPOINT].contains(&report.attribute.as_str()) {
         state.windows.lock().unwrap().observe(&state.config, report.node, &report.attribute, report.value, now_ms);
         state.room_model.observe(report.node, &report.attribute, report.value, now_ms);
