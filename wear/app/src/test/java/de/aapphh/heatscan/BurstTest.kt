@@ -134,4 +134,38 @@ class BurstTest {
         val leaving = Payload.build(1L, "w", null, emptyList(), away = true, hb = true, leaving = true)
         assertTrue(leaving.getBoolean("away") && leaving.getJSONObject("info").getBoolean("leaving"))
     }
+
+    @Test
+    fun failedBurstRetriesAfterFiveMinutesAndSuccessKeepsTheCadence() {
+        val p = BurstPolicy()
+        assertEquals(Burst.SEND, p.decide(0, 5, true, false, Trigger.CADENCE))
+        p.failed(0)
+        assertEquals(Burst.NONE, p.decide(4 * min, 5, true, false, Trigger.CADENCE))
+        assertEquals(Burst.SEND, p.decide(5 * min, 5, true, false, Trigger.CADENCE))
+        p.delivered()
+        assertEquals(Burst.NONE, p.decide(34 * min, 5, true, false, Trigger.CADENCE))
+        assertEquals(Burst.SEND, p.decide(35 * min, 5, true, false, Trigger.CADENCE))
+    }
+
+    @Test
+    fun retriesAreCappedPerInterval() {
+        val p = BurstPolicy()
+        var now = 0L
+        repeat(1 + BurstConfig.MAX_RETRIES) {
+            assertEquals(Burst.SEND, p.decide(now, 5, true, false, Trigger.CADENCE))
+            p.failed(now)
+            now += 5 * min
+        }
+        assertEquals(Burst.NONE, p.decide(now, 5, true, false, Trigger.CADENCE))
+        assertEquals(Burst.SEND, p.decide(now + 25 * min, 5, true, false, Trigger.CADENCE))
+    }
+
+    @Test
+    fun awayNeverRetries() {
+        val p = BurstPolicy()
+        assertEquals(Burst.SEND, p.decide(0, 5, true, false, Trigger.CADENCE))
+        p.failed(0)
+        assertEquals(Burst.NONE, p.decide(5 * min, 5, false, false, Trigger.CADENCE))
+        assertEquals(Burst.NONE, p.decide(40 * min, 5, false, false, Trigger.CADENCE))
+    }
 }
