@@ -1526,6 +1526,8 @@ object BurstConfig {
     const val INTERVAL_MS = 30 * 60_000L
     const val TIMEOUT_MS = 60_000L
     const val MIN_GAP_MS = 2 * 60_000L
+    const val RETRY_MS = 5 * 60_000L
+    const val MAX_RETRIES = 3
     const val LINGER_MS = 3 * 60_000L
     const val LEAVE_RSSI = -75
     const val NEAR_RSSI = -70
@@ -1557,8 +1559,18 @@ class HomeWatch {
     }
 }
 
-class BurstPolicy(private val intervalMs: Long = BurstConfig.INTERVAL_MS, private val minGapMs: Long = BurstConfig.MIN_GAP_MS) {
+class BurstPolicy(private val intervalMs: Long = BurstConfig.INTERVAL_MS, private val minGapMs: Long = BurstConfig.MIN_GAP_MS, private val retryMs: Long = BurstConfig.RETRY_MS, private val maxRetries: Int = BurstConfig.MAX_RETRIES) {
     private var lastAt = Long.MIN_VALUE / 4
+    private var slotAt = lastAt
+    private var retries = 0
+
+    fun delivered() { retries = 0 }
+
+    fun failed(now: Long) {
+        if (retries >= maxRetries) { retries = 0; lastAt = slotAt; return }
+        retries++
+        lastAt = now - intervalMs + retryMs
+    }
 
     fun decide(now: Long, queued: Int, home: Boolean, bound: Boolean, trigger: Trigger): Burst {
         if (bound || now - lastAt < minGapMs) return Burst.NONE
@@ -1568,7 +1580,10 @@ class BurstPolicy(private val intervalMs: Long = BurstConfig.INTERVAL_MS, privat
             Trigger.OPEN -> if (home) Burst.SEND else Burst.NONE
             Trigger.CADENCE -> if (!home || now - lastAt < intervalMs) Burst.NONE else if (queued > 0) Burst.SEND else Burst.BEAT
         }
-        if (burst != Burst.NONE) lastAt = now
+        if (burst != Burst.NONE) {
+            if (retries == 0) slotAt = now
+            lastAt = now
+        }
         return burst
     }
 }

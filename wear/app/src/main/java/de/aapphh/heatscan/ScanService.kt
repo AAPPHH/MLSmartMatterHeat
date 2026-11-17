@@ -125,6 +125,7 @@ class ScanService : Service() {
         .build()
 
     private val burstPolicy = BurstPolicy()
+    @Volatile private var burstDelivered = false
     private val homeWatch = HomeWatch()
     private val burstStats = BurstStats()
     private var burstCallback: WifiCallback? = null
@@ -149,7 +150,11 @@ class ScanService : Service() {
         val queued = queue.size
         val bound = network != null || burstCallback != null || holding
         val decision = burstPolicy.decide(SystemClock.elapsedRealtime(), queued, store.atHome == true && !policy.away, bound, trigger)
-        if (decision == Burst.NONE) return
+        if (decision == Burst.NONE) {
+            if (trigger != Trigger.CADENCE) Trace.i("burst_skip", "trigger" to trigger.name, "bound" to bound, "queue" to queued, "home" to (store.atHome == true && !policy.away))
+            return
+        }
+        burstDelivered = false
         if (decision == Burst.BEAT) enqueue(System.currentTimeMillis(), emptyList(), false, "beat")
         lateinit var cb: WifiCallback
         cb = WifiCallback({ n -> if (burstCallback === cb) onBurstUp(n) }, { why, n -> if (burstCallback === cb) onBurstDown(why, n) })
@@ -161,6 +166,7 @@ class ScanService : Service() {
         } catch (e: Exception) {
             Trace.w("burst_request", e, "trigger" to trigger.name)
             burstStats.failed()
+            burstPolicy.failed(SystemClock.elapsedRealtime())
         }
     }
 
@@ -172,6 +178,7 @@ class ScanService : Service() {
         try {
             io.execute {
                 runFlush("burst")
+                if (queue.size == 0) burstDelivered = true
                 handler.post { if (burstCallback != null && burstCallback === cb) updateOrFinish(n) }
             }
         } catch (e: RejectedExecutionException) {
@@ -205,6 +212,7 @@ class ScanService : Service() {
         updateSince = null
         val cb = burstCallback ?: return
         burstCallback = null
+        if (burstDelivered) burstPolicy.delivered() else burstPolicy.failed(SystemClock.elapsedRealtime())
         if (!holding) network = null
         if (unregister) try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) { Log.w(TAG, "unregister burst", e) }
         Trace.i("burst_end", "why" to why)
@@ -547,6 +555,10 @@ class ScanService : Service() {
     private fun suppressed() = Reuse.suppress(foregroundSince != Reuse.NONE, store.learnAt != 0L)
 
     private fun usableScan(now: Long) = Reuse.usable(now, lastScanMs, foregroundSince, screenOnAt, usedScanMs)
+
+    fun onOpen() {
+        handler.post { if (active) burstCheck(Trigger.OPEN) }
+    }
 
     fun onForeground() {
         handler.post {
@@ -972,7 +984,10 @@ class ScanService : Service() {
             else -> "${r.code} rejected"
         }
         store.postsOk += r.sent
-        if (ok && r.sent > 0) burstStats.delivered(System.currentTimeMillis())
+        if (ok && r.sent > 0) {
+            burstDelivered = true
+            burstStats.delivered(System.currentTimeMillis())
+        }
         if (r.deferred > 0) {
             store.labels404 += r.deferred
             Trace.i("label_404", "deferred" to r.deferred, "total" to store.labels404, "queue" to queue.size)

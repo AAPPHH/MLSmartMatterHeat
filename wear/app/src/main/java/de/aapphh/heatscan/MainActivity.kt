@@ -139,6 +139,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         wake()
         newIntents++
+        ScanService.instance?.onOpen()
     }
 
     override fun onResume() {

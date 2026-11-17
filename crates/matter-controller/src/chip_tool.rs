@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,6 +33,8 @@ const POLL_GRACE: Duration = Duration::from_secs(2);
 const WRITE_ATTEMPTS: u32 = 3;
 const SWITCH_LIMIT_S: u64 = 15;
 const WRITE_BACKOFF: Duration = Duration::from_secs(5);
+const READ_ALL_LIMIT: Duration = Duration::from_secs(10);
+const READ_ALL_POLL: Duration = Duration::from_millis(50);
 
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::new();
@@ -436,7 +439,7 @@ impl StreamParser {
         Self { reports: ReportParser::new(0, default_endpoint), peer: None, in_write: false }
     }
 
-    pub fn feed(&mut self, raw: &str, sole_node: Option<NodeId>, writing: bool) -> Vec<StreamEvent> {
+    pub fn feed(&mut self, raw: &str, sole_node: Option<NodeId>, writing: bool, reading_all: bool) -> Vec<StreamEvent> {
         let line = clean(raw);
         if let Some(peer) = rx_peer(&line) {
             self.peer = Some(peer);
@@ -458,7 +461,7 @@ impl StreamParser {
         }
         if is_failure(&line) {
             let message = line.trim().to_string();
-            let ours = self.in_write || command_status || (writing && payload(&line).unwrap_or(&line).trim().starts_with("Run command failure"));
+            let ours = self.in_write || command_status || (writing && !reading_all && payload(&line).unwrap_or(&line).trim().starts_with("Run command failure"));
             self.in_write = false;
             return vec![if ours { StreamEvent::Write(Err(message)) } else { StreamEvent::Failure(message) }];
         }
@@ -509,6 +512,7 @@ struct Hub {
     pending: Mutex<Option<oneshot::Sender<std::result::Result<(), String>>>>,
     logged: Mutex<HashSet<String>>,
     plans: Mutex<HashMap<NodeId, DeviceSubscription>>,
+    reading_all: AtomicBool,
 }
 
 impl Hub {
@@ -635,9 +639,15 @@ impl Session {
                         self.hub.emit(item).await;
                     }
                     let writing = self.hub.pending.lock().unwrap().is_some();
-                    for event in parser.feed(&text, self.hub.sole_node(), writing) {
+                    let reading_all = self.hub.reading_all.load(Ordering::SeqCst);
+                    for event in parser.feed(&text, self.hub.sole_node(), writing, reading_all) {
                         match event {
-                            StreamEvent::Failure(message) => self.hub.log_once(&message),
+                            StreamEvent::Failure(message) => {
+                                if reading_all && message.contains("Run command failure") {
+                                    self.hub.reading_all.store(false, Ordering::SeqCst);
+                                }
+                                self.hub.log_once(&message);
+                            }
                             StreamEvent::Report(report) => self.hub.dispatch(report).await,
                             StreamEvent::Write(result) => {
                                 if let Some(message) = self.hub.finish_write(result) {
@@ -719,9 +729,12 @@ impl Session {
     }
 
     async fn read_all(&self, node: NodeId) -> Result<()> {
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
-        Self::send(stdin, &ChipToolConfig::read_all_line(node)).await
+        gated_read_all(&self.write_gate, &self.hub.reading_all, READ_ALL_LIMIT, || async {
+            let mut guard = self.stdin.lock().await;
+            let stdin = guard.as_mut().ok_or_else(|| Error::Command("chip-tool interactive session not ready".into()))?;
+            Self::send(stdin, &ChipToolConfig::read_all_line(node)).await
+        })
+        .await
     }
 
     async fn resubscribe(&self, node: NodeId) -> Result<()> {
@@ -826,6 +839,25 @@ impl Session {
             }
         }
     }
+}
+
+async fn gated_read_all<F, Fut>(gate: &tokio::sync::Mutex<()>, active: &AtomicBool, limit: Duration, send: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let _gate = gate.lock().await;
+    active.store(true, Ordering::SeqCst);
+    if let Err(e) = send().await {
+        active.store(false, Ordering::SeqCst);
+        return Err(e);
+    }
+    let started = Instant::now();
+    while active.load(Ordering::SeqCst) && started.elapsed() < limit {
+        sleep(READ_ALL_POLL).await;
+    }
+    active.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 fn retryable(error: &Error) -> bool {
@@ -1079,7 +1111,7 @@ mod tests {
 
     fn stream(text: &str, sole: Option<NodeId>) -> Vec<StreamEvent> {
         let mut parser = StreamParser::new(1);
-        text.lines().flat_map(|l| parser.feed(l, sole, false)).collect()
+        text.lines().flat_map(|l| parser.feed(l, sole, false, false)).collect()
     }
 
     #[test]
@@ -1289,7 +1321,7 @@ mod tests {
     fn command_response_status_completes_a_pending_switch() {
         let run = |text: &str, writing: bool| {
             let mut parser = StreamParser::new(1);
-            text.lines().flat_map(|l| parser.feed(l, Some(9), writing)).collect::<Vec<_>>()
+            text.lines().flat_map(|l| parser.feed(l, Some(9), writing, false)).collect::<Vec<_>>()
         };
         assert_eq!(run(include_str!("../tests/fixtures/command_onoff_ok.txt"), true), vec![StreamEvent::Write(Ok(()))]);
         assert!(run(include_str!("../tests/fixtures/command_onoff_ok.txt"), false).is_empty());
@@ -1301,7 +1333,7 @@ mod tests {
     #[test]
     fn address_resolve_timeout_fails_a_pending_write_and_is_retryable() {
         let mut parser = StreamParser::new(1);
-        let events: Vec<StreamEvent> = include_str!("../tests/fixtures/write_resolve_timeout.txt").lines().flat_map(|l| parser.feed(l, Some(5), true)).collect();
+        let events: Vec<StreamEvent> = include_str!("../tests/fixtures/write_resolve_timeout.txt").lines().flat_map(|l| parser.feed(l, Some(5), true, false)).collect();
         let [StreamEvent::Write(Err(message))] = events.as_slice() else { panic!("{events:?}") };
         assert!(message.contains("Timeout") && retryable(&Error::Command(message.clone())));
         let rejected = stream(include_str!("../tests/fixtures/write_fail.txt"), Some(5));
@@ -1327,13 +1359,45 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn read_all_holds_the_write_gate_until_its_failure_line_arrives() {
+        let gate = tokio::sync::Mutex::new(());
+        let active = AtomicBool::new(false);
+        let started = Instant::now();
+        let read = gated_read_all(&gate, &active, Duration::from_secs(5), || async { Ok(()) });
+        let write = async {
+            sleep(Duration::from_millis(20)).await;
+            let _g = gate.lock().await;
+            started.elapsed()
+        };
+        let line = async {
+            sleep(Duration::from_millis(300)).await;
+            active.store(false, Ordering::SeqCst);
+        };
+        let (done, waited, _) = tokio::join!(read, write, line);
+        assert!(done.is_ok() && waited >= Duration::from_millis(300) && waited < Duration::from_secs(2));
+        let failed = gated_read_all(&gate, &active, Duration::from_secs(5), || async { Err(Error::Command("down".into())) }).await;
+        assert!(failed.is_err() && gate.try_lock().is_ok() && !active.load(Ordering::SeqCst));
+        let capped = Instant::now();
+        gated_read_all(&gate, &active, Duration::from_millis(120), || async { Ok(()) }).await.unwrap();
+        assert!(capped.elapsed() >= Duration::from_millis(120) && !active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_read_all_failure_is_never_a_write_failure() {
+        let mut parser = StreamParser::new(1);
+        let line = "[1.0] [1:2] [TOO] Run command failure: IM Error 0x00000501: General error: 0x01 (FAILURE)";
+        assert!(matches!(parser.feed(line, Some(9), true, true).as_slice(), [StreamEvent::Failure(_)]));
+        assert!(matches!(parser.feed(line, Some(9), true, false).as_slice(), [StreamEvent::Write(Err(_))]));
+    }
+
     #[test]
     fn unrelated_failures_do_not_fail_a_pending_write() {
         let mut parser = StreamParser::new(1);
         let line = "[1.0] [1:2] [TOO] Run command failure: IM Error 0x00000581: General error: 0x81 (UNSUPPORTED_CLUSTER)";
-        assert!(matches!(parser.feed(line, Some(5), false).as_slice(), [StreamEvent::Failure(_)]));
-        assert!(matches!(parser.feed("[1.0] [1:2] [TOO] Response Failure: x", Some(5), true).as_slice(), [StreamEvent::Failure(_)]));
-        assert!(matches!(parser.feed(line, Some(5), true).as_slice(), [StreamEvent::Write(Err(_))]));
+        assert!(matches!(parser.feed(line, Some(5), false, false).as_slice(), [StreamEvent::Failure(_)]));
+        assert!(matches!(parser.feed("[1.0] [1:2] [TOO] Response Failure: x", Some(5), true, false).as_slice(), [StreamEvent::Failure(_)]));
+        assert!(matches!(parser.feed(line, Some(5), true, false).as_slice(), [StreamEvent::Write(Err(_))]));
     }
 
     #[test]

@@ -39,7 +39,7 @@ impl Env {
     }
 
     fn matcher(&self, version: &str) -> WatchMatch {
-        let cfg = WatchMatchSection { enabled: true, model_dir: self.models().to_string_lossy().into_owned(), model_version: version.into(), ..Default::default() };
+        let cfg = WatchMatchSection { enabled: true, model_dir: self.models().to_string_lossy().into_owned(), model_version: version.into(), hold_floor_min: 0, ..Default::default() };
         let sink = Sink::open(LakeConfig::new(self.dir.path().join("lake"))).unwrap();
         WatchMatch::new(&cfg, sink, Status::new(lake::now_us()))
     }
@@ -159,7 +159,7 @@ fn ignores_stale_and_out_of_order_scans_and_logs_gaps() {
     let env = Env::new();
     env.install("v1", |_| {});
     let wm = env.matcher("v1");
-    assert!(wm.scan_at("w", T - 10 * MIN, T, NOON, &living()).is_none());
+    assert!(wm.scan_at("w", T - 40 * MIN, T, NOON, &living()).is_none());
     assert!(wm.scan_at("w", T, T, NOON, &[]).is_none());
     scan(&wm, "w", T, NOON, &living());
     assert!(wm.scan_at("w", T - MIN, T, NOON, &living()).is_none());
@@ -446,4 +446,19 @@ fn feature_v1_models_keep_working_and_v2_needs_bands() {
         s["feature_version"] = json!(2);
     });
     assert!(Model::load(&env.models().join("bad")).is_err());
+}
+
+#[test]
+fn hold_floor_keeps_the_room_across_a_burst_interval() {
+    let env = Env::new();
+    env.install("v1", |s| s["t_hold_min"] = json!(30));
+    let mut cfg = WatchMatchSection { enabled: true, model_dir: env.models().to_string_lossy().into_owned(), model_version: "v1".into(), ..Default::default() };
+    let floored = WatchMatch::new(&cfg, Sink::open(LakeConfig::new(env.dir.path().join("lake_floor"))).unwrap(), Status::new(0));
+    scan(&floored, "w", T, NOON, &living());
+    assert_eq!(floored.effective(T + 44 * MIN), Some(Some(("wohnzimmer".into(), T))));
+    assert_eq!(floored.effective(T + 46 * MIN), Some(None));
+    cfg.hold_floor_min = 0;
+    let plain = WatchMatch::new(&cfg, Sink::open(LakeConfig::new(env.dir.path().join("lake_plain"))).unwrap(), Status::new(0));
+    scan(&plain, "w", T, NOON, &living());
+    assert_eq!(plain.effective(T + 31 * MIN), Some(None));
 }

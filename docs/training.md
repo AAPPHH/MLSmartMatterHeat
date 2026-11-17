@@ -45,7 +45,8 @@ Auf der heatd-Seite aktivierst du den Abgleich in `heatd.toml` (Docker: `deploy/
 enabled = true
 model_dir = "/models/watchroom"   # darin <version>/model.json + ONNX
 model_version = "latest"          # oder fester Versionsname; "latest" prüft stündlich auf ein neueres Modell
-scan_fresh_s = 180
+scan_fresh_s = 2100
+hold_floor_min = 45
 
 [watchmatch.state]                # Zustandsregeln, gleiche Werte wie im Training (CONFIG in training/src/heattrain/__main__.py)
 hr_rest_max = 75

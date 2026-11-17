@@ -15,7 +15,7 @@ poll_silence_s = 60
 # exploration_seed = 1
 occupied_setpoint = 21.0
 sleep_room = "schlafzimmer"
-presence_timeout_minutes = 30
+presence_timeout_minutes = 45
 still_contact_timeout_minutes = 180
 frost_setpoint = 7.0
 # weather and coordinates meta stay disabled until both are set
@@ -50,7 +50,8 @@ roof_rooms = ["schlafzimmer"]
 enabled = true
 model_dir = "/models/watchroom"
 model_version = "latest"
-scan_fresh_s = 180
+scan_fresh_s = 2100
+hold_floor_min = 45
 
 [watchmatch.state]
 hr_rest_max = 70
