@@ -1,7 +1,7 @@
 import math
 import numpy as np
 from heattrain.roomimm import LAMBDA_BOUNDS, RoomPar
-from heattrain.roomobs import D_MIN, LOG_SQRT_2_OVER_PI, P_FLOOR, SQRT2, SQRT2PI, Z_MIN
+from heattrain.roomobs import D_MIN, ema_kw, LOG_SQRT_2_OVER_PI, P_FLOOR, SQRT2, SQRT2PI, Z_MIN
 
 
 def valve_lag_states(u, alpha):
@@ -42,7 +42,7 @@ class Grid:
 
             nb = {k: (pad(np.asarray(d.nb[k][0], float)) if k in d.nb else np.zeros(self.n), pad(np.asarray(d.nb[k][1], float)) if k in d.nb else np.zeros(self.n)) for k in self.kinds[d.room]}
             self.cols[d.room] = {"y": pad(d.y), "yv": pad(d.yv), "u": pad(d.u), "sp": pad(d.sp), "tout": pad(d.tout), "wind": pad(d.wind), "rad": pad(d.rad), "night": pad(d.night.astype(float)), "yi": pad(d.yi),
-                                 "bad": pad(d.bad.astype(float), 1.0), "ya": [pad(np.asarray(a, float)) for a in (d.ext or {}).get("ya", [])], **{k: pad(np.asarray((d.ext or {}).get(k, np.full(d.n, np.nan)), float)) for k in ("co2", "rh", "th")}, "ncnt": [nb[k][0] for k in self.kinds[d.room]], "nsum": [nb[k][1] for k in self.kinds[d.room]]}
+                                 "bad": pad(d.bad.astype(float), 1.0), "pw": np.full(self.n, np.nan), "ya": [pad(np.asarray(a, float)) for a in (d.ext or {}).get("ya", [])], **{k: pad(np.asarray((d.ext or {}).get(k, np.full(d.n, np.nan)), float)) for k in ("co2", "rh", "th")}, "ncnt": [nb[k][0] for k in self.kinds[d.room]], "nsum": [nb[k][1] for k in self.kinds[d.room]]}
         self.times = self.t0 + np.arange(self.n) * self.dt
 
     def window(self, start, stop):
@@ -143,6 +143,10 @@ class Inputs:
                 nsum_ok[i] &= np.isfinite(np.asarray(s, float))
         self.dyn = np.isfinite(self.u) & np.isfinite(self.tout) & np.isfinite(self.wind) & np.isfinite(self.rad) & nsum_ok
         self.n = self.u.shape[1]
+        self.pq = np.zeros(self.u.shape)
+        for i, (n, q) in enumerate(zip(names, par)):
+            if q.app:
+                self.pq[i] = q.app_eta * ema_kw(grid.cols[n]["pw"], docs[n]["appliance"]["tau_min"])
         self.ue = np.array([valve_lag(self.u[i], RoomPar(docs[n]).alpha) for i, n in enumerate(names)]).reshape(self.u.shape)
 
 
@@ -407,7 +411,7 @@ class BatchHouse:
         tt = t.sum(-1, keepdims=True)
         nu = np.where(tt > 0, t / np.where(tt > 0, tt, 1.0), np.array([1.0, 0.0]))
         lam = xb[..., 2]
-        u, tout, wind, rad, cn, cs_ = (v[:, k][None, :, None] for v in (inp.ue, inp.tout, inp.wind, inp.rad, inp.cn, inp.cs))
+        u, tout, wind, rad, cn, cs_, pq = (v[:, k][None, :, None] for v in (inp.ue, inp.tout, inp.wind, inp.rad, inp.cn, inp.cs, inp.pq))
         a1, a2, b1, b2, b3, b4 = (v[None, :, None] for v in (self.a1, self.a2, self.b1, self.b2, self.b3, self.b4))
         ts = np.where(inp.night[:, k], self.ts_night, self.ts)[None, :, None]
         au = a1 * (u * self.st)
@@ -421,7 +425,7 @@ class BatchHouse:
         ug = u * self.st
         fp[..., 0, 0] += self.q_um[None, :, None] * ug * h
         fp[..., 1, 1] += self.q_ua[None, :, None] * ug * h
-        xn = np.stack([f11 * xb[..., 0] + f12 * xb[..., 1] + g1, f21 * xb[..., 0] + f22 * xb[..., 1] + g2, 1.0 + phi * (lam - 1.0)], -1)
+        xn = np.stack([f11 * xb[..., 0] + f12 * xb[..., 1] + g1, f21 * xb[..., 0] + f22 * xb[..., 1] + g2 + h * pq, 1.0 + phi * (lam - 1.0)], -1)
         pn = 0.5 * (fp + np.swapaxes(fp, -1, -2))
         self.x = np.where(ok[..., None, None], xn, self.x)
         self.p = np.where(ok[..., None, None, None], pn, self.p)

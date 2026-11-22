@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 from heattrain.roombatch import Grid, norm_cdf_np, run_batch, valve_lag_states
-from heattrain.roomfit import Exog, FoldFit, PcnnFit, Truth, base_doc, calibrate_air, coffee_plugs, episodes, fit_shock, shock_defaults, tune_windows, unusable_rooms
+from heattrain.roomfit import Exog, FoldFit, PcnnFit, Truth, base_doc, appliance_windows, attach_power, calibrate_air, coffee_plugs, episodes, load_plug_power, role_plugs, fit_shock, shock_defaults, tune_windows, unusable_rooms
 from heattrain.roomobs import evidence_blocks
 from heattrain.roomimm import RoomPar, plan
 from heattrain.roompcnn import FEATURES, pcnn_gate
@@ -27,9 +27,10 @@ def build_data(config, src):
     rooms, skipped = build_rooms(reports, weather, meta, cfg, load_events(src), load_devices(src))
     if not rooms:
         raise SystemExit(f"no usable rooms: {skipped}")
-    plugs = coffee_plugs(meta)
+    plugs, app = coffee_plugs(meta), role_plugs(meta, {*config["roommodel"]["appliance"]["roles"], "coffee"})
     for d in rooms:
         d.info["plugs"] = plugs.get(d.info["base_room"], [])
+        d.info["app_plugs"] = app.get(d.info["base_room"], [])
     return rooms, skipped
 
 
@@ -71,10 +72,13 @@ class Skill:
         self.Hs, self.floor = Hs, floor
         self.e, self.lp, self.n_room = {}, {}, {}
 
-    def add(self, room, H, errs, st, lp):
+    def add(self, room, H, errs, st, lp, win=None):
         for k, v in errs.items():
             self.e.setdefault((H, k), []).append(v)
             self.e.setdefault((room, H, k), []).append(v)
+            if win is not None and H in (20, 60):
+                self.e.setdefault((room, H, "window", k), []).append(v[win])
+                self.e.setdefault((room, H, "outside", k), []).append(v[~win])
             if H in (20, 60):
                 for s in STRATA:
                     self.e.setdefault((H, s, k), []).append(v[st == s])
@@ -98,6 +102,8 @@ class Skill:
             out["pooled"][f"H{H}"] = b
             for r in rooms:
                 out["rooms"][r][f"H{H}"] = self.block((r, H))
+                if (r, H, "window", "persistence") in self.e:
+                    out["rooms"][r][f"H{H}"].update({part: self.block((r, H, part)) for part in ("window", "outside")})
             if H in (20, 60):
                 out["pooled"][f"strata_H{H}"] = {s: self.block((H, s)) for s in STRATA}
         return out
@@ -121,7 +127,8 @@ def fold_nets(fold, full, ff, docs, house, pcnn, rc):
     return nets, X, info
 
 
-def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q, nets=None, X=None):
+def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q, nets=None, X=None, appliance=None):
+    appliance = appliance or {}
     phi = math.exp(-1.0 / fold["shock"]["tau_l"]) if rc["eval"]["decay_lam"] else 1.0
     for r, rf in rfs.items():
         p = rf.params(np.asarray(fold["th"][r])[None])
@@ -134,6 +141,7 @@ def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q, nets=None, X=None
         e_tr, _ = rf.errors(p, train, docs[r], start, phi, True)
         e_pc = rf.errors(p, test, docs[r], start, phi, True, q=nets[r].q_batch(X[r][rf.js[test]]))[0] if nets and nets.get(r) else e_te
         st = strata(rf, rf.js[test], spans[r])
+        win = appliance[r][rf.js[test]] if r in appliance else None
         y, js_te, Pc = rf.c["y"], rf.js[test], rf.Pc[test]
         for H in rf.Hs:
             tr_ok = rf.valid[H][train] & rf.sp_ok[train] & np.isfinite(e_tr[H][:, 0])
@@ -145,7 +153,7 @@ def fold_skill(fold, rfs, docs, rec, spans, skill, rc, grid_q, nets=None, X=None
             if nets is not None:
                 errs["imm_pcnn"] = e_pc[H][ok, 0]
             lp = {"persistence": interval_logscore(yh, Pc[ok], sd_p, grid_q), "imm_anchored": interval_logscore(yh, yh - errs["imm_anchored"], sd_i, grid_q)}
-            skill.add(r, H, errs, st[ok], lp)
+            skill.add(r, H, errs, st[ok], lp, None if win is None else win[ok])
 
 
 def flag_series(pw, level):
@@ -274,6 +282,8 @@ def tuned_trials(fold, full, docs, truth, rc, house):
 
 
 def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=None, shock=None, pcnn=None):
+    ap = rc["appliance"]
+    appliance = {r: appliance_windows(full.cols[r]["pw"], ap["on_kw"], ap["merge_min"], ap["trail_min"]) for r in full.names if np.isfinite(full.cols[r].get("pw", np.nan)).any()}
     skill = Skill(list(ff.rfs[next(iter(ff.rfs))].Hs), rc["eval"]["floor"])
     wparts, resets, per_fold = [], 0, []
     for f in folds:
@@ -288,7 +298,7 @@ def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=
         spans = truth.spans(full.names)
         spans_mask = {r: full.span_mask(spans[r]) for r in full.names}
         nets, X, ninfo = fold_nets(f, full, ff, docs, house, pcnn, rc) if pcnn else (None, None, None)
-        fold_skill(f, ff.rfs, docs, rec_a, spans_mask, skill, rc, house["trv_grid"] or 0.5, nets, X)
+        fold_skill(f, ff.rfs, docs, rec_a, spans_mask, skill, rc, house["trv_grid"] or 0.5, nets, X, appliance)
         wparts.append(window_metrics(full, rec_w, truth, f["cut"], f["hi"], rc))
         n_r = sum(1 for e in rs if f["cut"] <= e["step"] < f["hi"])
         resets += n_r
@@ -403,10 +413,12 @@ def fit_bundle(config, rooms, src, version=None):
     cfg, rc = config["thermal"], config["roommodel"]
     house = rc["house"]
     full = Grid(rooms, {d.room: {"c": dict.fromkeys(d.nb, 0.0)} for d in rooms})
+    power = load_plug_power(src)
+    attach_power(full, power, {d.room: d.info.get("app_plugs", []) for d in rooms}, cfg["device_stale_s"])
     truth = Truth(src, rc)
     ff, variants = FoldFit(rooms, full, cfg, rc), Variants(rooms, full, rc)
     folds, hold, chosen = rolling_origin(full, ff, variants, truth, rc, house)
-    pcnn = {"exog": Exog.from_lake(full, src, cfg, rc, rooms), "fit": PcnnFit(rc["pcnn"])}
+    pcnn = {"exog": Exog.from_lake(full, src, cfg, rc, rooms, power), "fit": PcnnFit(rc["pcnn"])}
     ship = evaluate_variant(folds, full, ff, variants, truth, rc, house, tuple(chosen["parts"]), chosen["effort"], pcnn=pcnn)
     gate = pcnn_gate(ship["skill"], rc["pcnn"]["gate"])
     t_fold = time.time() - t0

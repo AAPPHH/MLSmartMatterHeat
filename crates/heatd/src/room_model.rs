@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use crate::room_obs::{abs_hum, check_air, check_effort, check_gas, check_house, check_pcnn, check_pcnn_top, feature_row, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update, AirDoc, EffortDoc, GasDoc, Mat, PcnnDoc, PcnnTop};
+use crate::room_obs::{abs_hum, check_air, check_appliance, check_effort, check_gas, check_house, check_pcnn, check_pcnn_top, feature_row, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update, AirDoc, ApplianceDoc, EffortDoc, GasDoc, Mat, PcnnDoc, PcnnTop};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
@@ -49,6 +49,8 @@ pub struct RoomDoc {
     pub unusable: bool,
     #[serde(default)]
     pub pcnn: Option<PcnnDoc>,
+    #[serde(default)]
+    pub appliance: Option<ApplianceDoc>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +141,9 @@ impl Bundle {
             if !r.air.iter().all(check_air) || !r.effort.as_ref().is_none_or(check_effort) || !r.co2.as_ref().is_none_or(|g| check_gas(g, false)) || !r.hum.as_ref().is_none_or(|g| check_gas(g, true)) {
                 bail!("room model bundle {}: invalid observation parameters for {name}", self.version);
             }
+            if r.appliance.as_ref().is_some_and(|a| !check_appliance(a)) {
+                bail!("room model bundle {}: invalid appliance block for {name}", self.version);
+            }
             if r.pcnn.as_ref().is_some_and(|d| !check_pcnn(d)) {
                 bail!("room model bundle {}: invalid pcnn block for {name}", self.version);
             }
@@ -218,6 +223,7 @@ pub struct RoomPar {
     pub hum: Option<GasDoc>,
     pub unusable: bool,
     pub pcnn: Option<PcnnDoc>,
+    pub appliance: Option<ApplianceDoc>,
 }
 
 impl RoomPar {
@@ -238,6 +244,7 @@ impl RoomPar {
             hum: doc.hum.clone(),
             unusable: doc.unusable,
             pcnn: doc.pcnn.clone(),
+            appliance: doc.appliance,
         }
     }
 
@@ -298,11 +305,12 @@ pub struct RoomIn {
     pub co2: f64,
     pub rh: f64,
     pub th: f64,
+    pub pw: f64,
 }
 
 impl RoomIn {
     pub fn blank(kinds: usize) -> Self {
-        Self { y: f64::NAN, yv: f64::NAN, u: f64::NAN, sp: f64::NAN, tout: 0.0, wind: 0.0, rad: 0.0, night: false, ncnt: vec![0.0; kinds], nsum: vec![0.0; kinds], ya: Vec::new(), co2: f64::NAN, rh: f64::NAN, th: f64::NAN }
+        Self { y: f64::NAN, yv: f64::NAN, u: f64::NAN, sp: f64::NAN, tout: 0.0, wind: 0.0, rad: 0.0, night: false, ncnt: vec![0.0; kinds], nsum: vec![0.0; kinds], ya: Vec::new(), co2: f64::NAN, rh: f64::NAN, th: f64::NAN, pw: f64::NAN }
     }
 
     fn dynamic_ok(&self) -> bool {
@@ -360,6 +368,7 @@ pub struct RoomFilter {
     pub comps: Vec<Comp>,
     pub last: Out,
     pub lag: Option<[f64; 2]>,
+    pe: Option<f64>,
     hist: [VecDeque<f64>; 2],
 }
 
@@ -388,6 +397,7 @@ impl RoomFilter {
             comps: Vec::new(),
             last: Out::default(),
             lag: None,
+            pe: None,
             hist: [VecDeque::new(), VecDeque::new()],
         }
     }
@@ -398,6 +408,14 @@ impl RoomFilter {
             (Some(a), Some(b)) if h.len() == win + 1 && a.is_finite() && b.is_finite() => (b - a) / win as f64,
             _ => f64::NAN,
         }
+    }
+
+    pub fn appliance_kw(&self) -> f64 {
+        self.pe.unwrap_or(0.0)
+    }
+
+    pub fn q_app(&self) -> f64 {
+        self.par.appliance.map_or(0.0, |a| a.eta * self.appliance_kw())
     }
 
     pub fn pcnn_q(&self, inp: &RoomIn, hour: f64, weekend: bool, present: f64, coffee: f64) -> Option<f64> {
@@ -482,6 +500,9 @@ impl RoomFilter {
         self.skipped = true;
         if inp.u.is_finite() {
             self.lag = Some(self.par.lag(self.lag, inp.u));
+        }
+        if let Some(a) = self.par.appliance {
+            self.pe = a.ema(self.pe, inp.pw);
         }
         for (i, v) in [(0, inp.co2), (1, abs_hum(inp.th, inp.rh))] {
             if let Some(win) = [&self.par.co2, &self.par.hum][i].as_ref().map(GasDoc::window) {
@@ -621,6 +642,7 @@ impl RoomFilter {
         let mu = self.weights(w);
         let (cn, cs) = par.coupling(&inp.ncnt, &inp.nsum);
         let ue = self.lag.map_or(inp.u, |l| l[1]);
+        let hq = h * self.q_app();
         let (mut new_x, mut new_p, mut new_nu) = ([[0.0; 3]; 4], [[0.0; 9]; 4], [[0.0; 2]; 2]);
         for jt in 0..4 {
             let (st, mt) = (jt / 2, jt % 2);
@@ -649,7 +671,7 @@ impl RoomFilter {
             fp[0] += (par.q_r + par.q_um * ug) * h;
             fp[4] += (par.q_a + par.q_ua * ug) * h;
             fp[8] += self.q_l[mt];
-            new_x[jt] = [f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2, 1.0 + self.phi * (xb[2] - 1.0)];
+            new_x[jt] = [f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2 + hq, 1.0 + self.phi * (xb[2] - 1.0)];
             for i in 0..3 {
                 for k in 0..3 {
                     new_p[jt][3 * i + k] = 0.5 * (fp[3 * i + k] + fp[3 * k + i]);

@@ -199,6 +199,30 @@ pub fn gas_update(x: &mut [f64; 3], p: &mut Mat, c0: f64, c1: f64, obs: f64, sig
     0.5 * (2.0 / std::f64::consts::PI).ln() - (s_lo.sqrt() + s_hi.sqrt()).ln() - 0.5 * v * v / if low { s_lo } else { s_hi }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ApplianceDoc {
+    pub eta: f64,
+    pub tau_min: f64,
+}
+
+pub fn check_appliance(a: &ApplianceDoc) -> bool {
+    a.eta.is_finite() && a.eta >= 0.0 && a.tau_min.is_finite() && a.tau_min > 0.0
+}
+
+impl ApplianceDoc {
+    pub fn alpha(&self) -> f64 {
+        1.0 - (-1.0 / self.tau_min).exp()
+    }
+
+    pub fn ema(&self, state: Option<f64>, pw: f64) -> Option<f64> {
+        if !pw.is_finite() {
+            return None;
+        }
+        let pw = pw.max(0.0);
+        Some(state.map_or(pw, |s| s + self.alpha() * (pw - s)))
+    }
+}
+
 pub const FEATURES: [&str; 11] = ["sin_hour", "cos_hour", "weekend", "radiation", "outdoor", "present", "co2_rate", "co2_avail", "hum_rate", "hum_avail", "coffee"];
 const HIDDEN_MAX: usize = 64;
 

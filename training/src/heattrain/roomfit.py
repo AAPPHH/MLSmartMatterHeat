@@ -10,7 +10,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from heattrain.roombatch import BatchHouse, Grid, Inputs, REC_KEYS, abs_hum_np, norm_cdf_np, rate_np, run_batch, valve_lag, valve_lag_states
 from heattrain.roomimm import PEAK_MARGIN, RoomPar, norm_cdf
-from heattrain.roomobs import evidence_blocks
+from heattrain.roomobs import ema_kw, evidence_blocks
 from heattrain.roompcnn import FEATURES, Pcnn, feature_matrix
 from heattrain.thermal import build_rooms, epoch, fit, latest_meta, load_devices, load_events, load_lake, raw_batches, read_arrows
 
@@ -72,10 +72,14 @@ def lag_alpha(tau):
 
 class RoomFit:
     def __init__(self, c, n, kinds, rc, night_ok):
-        f = rc["fit"]
+        f, ap = rc["fit"], rc["appliance"]
         self.c, self.n, self.kinds, self.f = c, n, kinds, f
         self.r_grid, self.gap = rc["house"]["r_grid"], rc["house"]["reset_gap_min"]
-        self.names = [k for k in ROOM_KEYS if night_ok or k != "ts_night"] + [f"c_{k}" for k in kinds]
+        pw = np.asarray(c.get("pw", np.full(n, np.nan)), float)
+        self.app = bool(ap["roles"]) and int(np.isfinite(pw).sum()) >= ap["min_minutes"] and float(np.nanmax(np.where(np.isfinite(pw), pw, 0.0))) > 0.0
+        self.tau_app = ap["tau_min"]
+        self.pe = ema_kw(pw, self.tau_app) if self.app else np.zeros(n)
+        self.names = [k for k in ROOM_KEYS if night_ok or k != "ts_night"] + [f"c_{k}" for k in kinds] + (["eta"] if self.app else [])
         bnd = lambda k: f["bounds"]["c" if k.startswith("c_") else k]
         self.lo, self.hi = np.log([bnd(k)[0] for k in self.names]), np.log([bnd(k)[1] for k in self.names])
         self.prior = np.clip(np.log([f["init"]["c" if k.startswith("c_") else k] for k in self.names]), self.lo, self.hi)
@@ -114,6 +118,8 @@ class RoomFit:
         au = p["a1"] * np.nan_to_num(ue)
         ts = np.where(c["night"][:, None] > 0.5, p["ts_night"], p["ts"])
         g2 = h * (amb * np.nan_to_num(c["tout"])[:, None] + p["b4"] * np.nan_to_num(c["rad"])[:, None] / 100.0 + cs)
+        if self.app:
+            g2 = g2 + h * p["eta"] * self.pe[:, None]
         return 1.0 - h * (au + p["a2"]), h * p["a2"], h * p["b1"], 1.0 - h * (p["b1"] + amb + cn), h * au * ts, g2, amb, cn, cs, np.nan_to_num(ue)
 
     def states(self, p, coef, upto, doc):
@@ -197,6 +203,8 @@ class RoomFit:
         ts = np.where(at(c["night"]) > 0.5, p["ts_night"], p["ts"])
         g2 = h * (amb * tout + p["b4"] * rad / 100.0 + cs)
         hq = 0.0 if q is None else h * np.asarray(q, float).reshape(-1, 1)
+        if self.app:
+            hq = hq + h * p["eta"] * at(self.pe)
         alpha = np.where(p["tau_v"] > 0, 1.0 - np.exp(-1.0 / np.maximum(p["tau_v"], 1e-12)), 1.0)
         v0 = np.stack([self.lag_at(t, js) for t in p["tau_v"]], -1)
         w, g = p["w"], doc["valve_gain"]
@@ -287,7 +295,8 @@ class RoomFit:
 
     def doc(self, theta, base):
         p = {k: float(v[0]) for k, v in self.params(np.asarray(theta)[None]).items()}
-        return {**base, "params": {k: p[k] for k in ROOM_KEYS}, "c": {k: p[f"c_{k}"] for k in self.kinds}}
+        app = {"appliance": {"eta": p["eta"], "tau_min": self.tau_app}} if self.app else {}
+        return {**base, "params": {k: p[k] for k in ROOM_KEYS}, "c": {k: p[f"c_{k}"] for k in self.kinds}, **app}
 
 
 def init_theta(rf, d, cfg, rc, ns):
@@ -618,12 +627,38 @@ def local_clock(times, tz):
     return (local % 86400.0) / 3600.0, (((local // 86400.0).astype(np.int64) + 3) % 7 >= 5).astype(float)
 
 
-def coffee_plugs(meta):
+def role_plugs(meta, roles):
     out = {}
     for d in latest_meta(meta).get("devices", []):
-        if d.get("role") == "coffee" and d.get("room"):
+        if d.get("role") in roles and d.get("room"):
             out.setdefault(d["room"], []).append(d["node"])
     return out
+
+
+def coffee_plugs(meta):
+    return role_plugs(meta, ("coffee",))
+
+
+def appliance_windows(pw, on_kw, merge_min, trail_min):
+    on = np.nan_to_num(np.asarray(pw, float)) >= on_kw
+    mask, last, start = np.zeros(len(on), bool), None, None
+    for k in np.nonzero(on)[0].tolist():
+        if last is not None and k - last > merge_min:
+            mask[start:last + trail_min + 1] = True
+            start = None
+        start = k if start is None else start
+        last = k
+    if start is not None:
+        mask[start:last + trail_min + 1] = True
+    return mask
+
+
+def attach_power(grid, power, plugs, stale_s):
+    for r in grid.names:
+        held = [held_at(grid.times, *power[n], stale_s) for n in plugs.get(r, []) if n in power]
+        if held:
+            st = np.stack(held)
+            grid.cols[r]["pw"] = np.where(np.isfinite(st).any(0), np.where(np.isfinite(st), st, 0.0).sum(0), np.nan) / 1e6
 
 
 def held_at(times, t, v, stale_s):
@@ -650,8 +685,8 @@ class Exog:
             self.coffee[r] = on
 
     @classmethod
-    def from_lake(cls, grid, src, cfg, rc, rooms):
-        return cls(grid, cfg["timezone"], load_presence(src), load_plug_power(src), {d.room: d.info.get("plugs", []) for d in rooms}, rc["pcnn"], cfg["device_stale_s"])
+    def from_lake(cls, grid, src, cfg, rc, rooms, power=None):
+        return cls(grid, cfg["timezone"], load_presence(src), load_plug_power(src) if power is None else power, {d.room: d.info.get("plugs", []) for d in rooms}, rc["pcnn"], cfg["device_stale_s"])
 
     def matrix(self, room, doc):
         c = self.grid.cols[room]

@@ -2,7 +2,7 @@ import math
 from collections import deque
 from dataclasses import dataclass
 from heattrain.roompcnn import Pcnn, feature_row
-from heattrain.roomobs import abs_hum, check_house, check_room_doc, effort_coeffs, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update
+from heattrain.roomobs import abs_hum, ema_alpha, ema_step, check_house, check_room_doc, effort_coeffs, gas_coeffs, gas_update, lam_update, lg_pdf, obs_update, trv_update
 
 SQRT2 = math.sqrt(2.0)
 HORIZON = 60
@@ -59,6 +59,9 @@ class RoomPar:
         self.air = [(a["noise"] ** 2, a.get("offset", 0.0)) for a in doc.get("air") or []]
         self.effort, self.co2, self.hum = doc.get("effort"), doc.get("co2"), doc.get("hum")
         self.pcnn = Pcnn(doc["pcnn"], "room") if doc.get("pcnn") else None
+        app = doc.get("appliance")
+        self.app_eta, self.app_alpha = (app["eta"], ema_alpha(app["tau_min"])) if app else (0.0, 1.0)
+        self.app = app is not None
 
     def lag(self, state, u):
         if state is None or self.alpha == 1.0:
@@ -99,6 +102,7 @@ class RoomIn:
     co2: float = math.nan
     rh: float = math.nan
     th: float = math.nan
+    pw: float = math.nan
 
 
 class RoomFilter:
@@ -120,7 +124,11 @@ class RoomFilter:
         self.events = []
         self.comps = []
         self.lag = None
+        self.pe = None
         self.hist = {k: deque(maxlen=int(g["win_min"]) + 1) for k, g in (("co2", par.co2), ("ah", par.hum)) if g}
+
+    def q_app(self):
+        return 0.0 if self.pe is None else self.par.app_eta * self.pe
 
     def rate(self, key):
         h = self.hist.get(key)
@@ -172,6 +180,8 @@ class RoomFilter:
         par = self.par
         if math.isfinite(inp.u):
             self.lag = par.lag(self.lag, inp.u)
+        if par.app:
+            self.pe = ema_step(self.pe, inp.pw, par.app_alpha)
         for key, v in (("co2", inp.co2), ("ah", abs_hum(inp.th, inp.rh))):
             if key in self.hist:
                 self.hist[key].append(v)
@@ -295,7 +305,7 @@ class RoomFilter:
             fp[0] += (par.q_r + par.q_um * ug) * h
             fp[4] += (par.q_a + par.q_ua * ug) * h
             fp[8] += self.q_l[mt]
-            new_x.append([f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2, 1.0 + self.phi * (xb[2] - 1.0)])
+            new_x.append([f11 * xb[0] + f12 * xb[1] + g1, f21 * xb[0] + f22 * xb[1] + g2 + h * self.q_app(), 1.0 + self.phi * (xb[2] - 1.0)])
             new_p.append([0.5 * (fp[3 * i + k] + fp[3 * k + i]) for i in range(3) for k in range(3)])
         for s in range(2):
             t = new_nu[s][0] + new_nu[s][1]
@@ -384,7 +394,7 @@ def rollout(par, m, a, lam, s, sp, env):
     en, co, sens = [], [], []
     lag = env["lag"]
     sens0 = par.sensor(m, a)
-    hq = h * env.get("q", 0.0)
+    hq = h * (env.get("q", 0.0) + env.get("q_app", 0.0))
     for k in range(HORIZON):
         u = valve_demand(par, env, sens0, sp[k], par.sensor(m, a))
         lag = par.lag(lag, u)

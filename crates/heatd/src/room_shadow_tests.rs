@@ -338,12 +338,12 @@ fn a_real_exported_bundle_parses_runs_and_flags_the_degenerate_fits() {
     let bundle = Bundle::parse(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/room_model_real_bundle.json")).unwrap()).unwrap();
     assert_eq!(bundle.rooms.keys().map(String::as_str).collect::<Vec<_>>(), ["bad", "kueche", "schlafzimmer", "wohnzimmer"]);
     let mut house = House::new(&bundle);
-    let input = |room: &str| RoomIn { y: 20.5, yv: f64::NAN, u: 0.2, sp: 21.0, tout: 5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![1.0; bundle.rooms[room].c.len()], nsum: vec![20.0; bundle.rooms[room].c.len()], ya: vec![], co2: f64::NAN, rh: f64::NAN, th: f64::NAN };
+    let input = |room: &str| RoomIn { y: 20.5, yv: f64::NAN, u: 0.2, sp: 21.0, tout: 5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![1.0; bundle.rooms[room].c.len()], nsum: vec![20.0; bundle.rooms[room].c.len()], ya: vec![], co2: f64::NAN, rh: f64::NAN, th: f64::NAN, pw: f64::NAN };
     for _ in 0..40 {
         let outs = house.step(&bundle.rooms.keys().map(|r| (r.clone(), input(r))).collect());
         assert!(outs.values().all(|o| !o.ok || (o.m.is_finite() && o.a.is_finite() && o.lam.is_finite())));
     }
-    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, u_now: None, now_min: 0, probe: None, q_net: None, pcnn_active: false };
+    let env = |night: bool, target: f64| Env { tout: 5.0, wind: 3.0, rad: 0.0, night, ncnt: vec![], nsum: vec![], target, present: 1.0, sp_cur: Some(target), sp_live: target, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: bundle.house.r_grid, lag: None, y_last: None, u_now: None, now_min: 0, probe: None, q_net: None, pcnn_active: false, q_app: 0.0 };
     for (room, f) in &house.rooms {
         let kinds = bundle.rooms[room].c.len();
         let e = Env { ncnt: vec![1.0; kinds], nsum: vec![20.0; kinds], ..env(false, 22.0) };
@@ -379,6 +379,47 @@ fn net_rows(active: bool, here: bool, coffee_mw: f64, weekend: bool) -> Vec<crat
     state.room_model.observe_device(14, 0x0090, 8, coffee_mw, t);
     let ctxs: Vec<_> = ["b", "c"].iter().map(|r| crate::room_shadow::RoomCtx { here: here && *r == "b", ..ctx(r) }).collect();
     state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, weekend, &ctxs).rows
+}
+
+fn app_view(eta: Option<f64>, power: Option<(f64, i64)>) -> (crate::lake::ShadowDecision, Value) {
+    let mut text: Value = serde_json::from_str(&bundle_text()).unwrap();
+    if let Some(eta) = eta {
+        text["rooms"]["b"]["appliance"] = serde_json::json!({"eta": eta, "tau_min": 30.0});
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockController::new(1));
+    [5, 6, 7].iter().for_each(|n| mock.add_node(*n, 19.0, 19.0));
+    let state = state_with(dir.path(), mock, &format!("{ROOMS}{PLUG}[room_model]
+enabled = true
+"));
+    state.status.outdoor_obs(crate::lake::now_us(), 4.0, Some(3.0));
+    state.room_model.set_bundle(Bundle::parse(&text.to_string()).unwrap());
+    device_run(&state, 120, false);
+    let t = aligned() + 120 * MIN;
+    if let Some((mw, age_ms)) = power {
+        state.room_model.observe_device(14, 0x0090, 8, mw, t - age_ms);
+    }
+    let ctxs: Vec<_> = ["b", "c"].iter().map(|r| ctx(r)).collect();
+    let rows = state.room_model.step(&state.config, t, [4.0, 3.0, 0.0], 12.0, false, &ctxs).rows;
+    (rows.into_iter().find(|r| r.room == "b").unwrap(), state.room_model.view("b"))
+}
+
+#[test]
+fn the_appliance_heat_term_follows_the_live_plug_power_and_is_visible_in_the_view() {
+    let (base, base_view) = app_view(None, Some((1_500_000.0, 0)));
+    assert_eq!((base_view["appliance_w"].clone(), base_view["appliance_k_per_h"].clone()), (Value::Null, Value::Null));
+    let (hot, view) = app_view(Some(1.8), Some((1_500_000.0, 0)));
+    assert_eq!(view["appliance_w"].as_f64(), Some(1500.0));
+    assert!((view["appliance_k_per_h"].as_f64().unwrap() - 2.7).abs() < 1e-9);
+    let lift = hot.forecast_phys_c.unwrap() - base.forecast_phys_c.unwrap();
+    assert!(lift > 0.2 && lift < 2.7 * 20.0 / 60.0 + 1e-9, "the valve closing on the extra heat keeps the lift below the raw 20 min heat: {lift}");
+    assert!(hot.why.contains("Espresso-Maschine heizt mit etwa 1,5 kW mit, das sind 2,7 K/h"), "{}", hot.why);
+    for (what, power) in [("stale", Some((1_500_000.0, 3 * 3600 * 1000))), ("missing", None)] {
+        let (r, v) = app_view(Some(1.8), power);
+        assert_eq!(v["appliance_w"].as_f64(), Some(0.0), "{what}");
+        assert_eq!(r.forecast_phys_c, base.forecast_phys_c, "{what}: no heat from a plug that is not reporting");
+        assert!(!r.why.contains("Espresso"), "{what}");
+    }
 }
 
 #[test]

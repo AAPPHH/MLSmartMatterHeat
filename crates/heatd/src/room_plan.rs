@@ -47,6 +47,7 @@ pub struct Env {
     pub probe: Option<ProbeMemo>,
     pub q_net: Option<f64>,
     pub pcnn_active: bool,
+    pub q_app: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,7 +152,7 @@ fn valve_demand(par: &RoomPar, env: &Env, sens0: f64, setpoint: f64, sens: f64) 
 #[allow(clippy::too_many_arguments)]
 fn rollout(par: &RoomPar, mut m: f64, mut a: f64, lam: f64, s: f64, sp: &[f64], env: &Env, cn: f64, cs: f64, q: f64) -> Run {
     let h = 1.0 / 60.0;
-    let hq = h * q;
+    let hq = h * (q + env.q_app);
     let mut run = Run { en: Vec::new(), co: Vec::new(), sens: Vec::new(), term: 0.0 };
     let mut lag = env.lag;
     let sens0 = par.sensor(m, a);
