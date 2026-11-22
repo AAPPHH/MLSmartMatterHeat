@@ -25,7 +25,7 @@ fn inputs(fx: &Value, k: usize) -> BTreeMap<String, RoomIn> {
             let list = |key: &str| i[key][k].as_array().unwrap().iter().map(num).collect::<Vec<f64>>();
             (
                 name.to_string(),
-                RoomIn { y: at("y"), yv: at("yv"), u: at("u"), sp: at("sp"), tout: at("tout"), wind: at("wind"), rad: at("rad"), night: at("night") > 0.5, ncnt: list("ncnt"), nsum: list("nsum"), ya: list("ya"), co2: at("co2"), rh: at("rh"), th: at("th") },
+                RoomIn { y: at("y"), yv: at("yv"), u: at("u"), sp: at("sp"), tout: at("tout"), wind: at("wind"), rad: at("rad"), night: at("night") > 0.5, ncnt: list("ncnt"), nsum: list("nsum"), ya: list("ya"), co2: at("co2"), rh: at("rh"), th: at("th"), pw: f64::NAN },
             )
         })
         .collect()
@@ -59,6 +59,7 @@ fn env(e: &Value) -> Env {
         u_now: e["u_now"].as_f64(),
         now_min: e["now_min"].as_i64().unwrap_or(0),
         q_net: e["q_net"].as_f64(),
+        q_app: e["q_app"].as_f64().unwrap_or(0.0),
         pcnn_active: e["pcnn_active"].as_bool().unwrap_or(false),
         probe: e["probe"].as_object().map(|m| ProbeMemo { start: m["start"].as_i64().unwrap(), d: m["d"].as_u64().unwrap() as usize, base: m["base"].as_i64().unwrap(), block_until: m["block_until"].as_i64().unwrap(), target: num(&m["target"]), present: num(&m["present"]), ended: m["ended"].as_bool().unwrap(), unc: num(&m["unc"]), strikes: m["strikes"].as_i64().unwrap() }),
     }
@@ -152,6 +153,92 @@ fn filter_and_planner_match_the_python_fixture() {
     got.sort();
     assert_eq!(got, want_sorted);
     assert!(!want_sorted.is_empty());
+}
+
+fn app_bundle(eta: f64) -> Bundle {
+    let mut b = fixture()["bundle"].clone();
+    b["rooms"]["kueche"]["appliance"] = serde_json::json!({"eta": eta, "tau_min": 30.0});
+    Bundle::parse(&b.to_string()).unwrap()
+}
+
+fn app_inputs(fx: &Value, k: usize, pw: f64) -> BTreeMap<String, RoomIn> {
+    let mut row = inputs(fx, k);
+    row.get_mut("kueche").unwrap().pw = pw;
+    row
+}
+
+#[test]
+fn appliance_input_matches_the_python_fixture_including_a_stale_stretch() {
+    let fx = fixture();
+    let app = &fx["appliance"];
+    let mut raw = fx["bundle"].clone();
+    raw["rooms"]["kueche"]["appliance"] = app["doc"].clone();
+    let bundle = Bundle::parse(&raw.to_string()).unwrap();
+    let mut house = House::new(&bundle);
+    let want = &app["expected"];
+    for k in 0..app["steps"].as_u64().unwrap() as usize {
+        let out = house.step(&app_inputs(&fx, k, num(&app["pw"][k])))["kueche"];
+        assert_eq!(out.ok, want["ok"][k].as_bool().unwrap(), "ok at {k}");
+        if out.ok {
+            near(out.m, num(&want["m"][k]), TOL, &format!("m at {k}"));
+            near(out.a, num(&want["a"][k]), TOL, &format!("a at {k}"));
+        }
+        near(house.rooms["kueche"].q_app(), num(&want["q_app"][k]), TOL, &format!("q_app at {k}"));
+        if let (Some(p), true) = (app["plan"].as_object(), k as u64 == app["plan"]["step"].as_u64().unwrap()) {
+            let f = &house.rooms["kueche"];
+            let e = Env { q_app: f.q_app(), ..env(&app["plan"]["env"]) };
+            assert!(e.q_app > 0.5, "the plan step sits inside the running stretch");
+            compare_plan(&plan(&f.par, &bundle.shock, &f.comps, house.w[1], &e), &p["out"], "appliance plan");
+        }
+    }
+    assert!(num(&want["q_app"][150]) > 1.0 && num(&want["q_app"][230]) == 0.0 && num(&want["q_app"][59]) == 0.0);
+}
+
+#[test]
+fn appliance_power_heats_the_air_by_eta_times_power_and_stale_or_absent_power_adds_nothing() {
+    let fx = fixture();
+    let run = |bundle: &Bundle, pw: &dyn Fn(usize) -> f64| {
+        let mut house = House::new(bundle);
+        let mut air = Vec::new();
+        for k in 0..40 {
+            let mut row = app_inputs(&fx, k, pw(k));
+            let r = row.get_mut("kueche").unwrap();
+            (r.y, r.yv, r.co2, r.rh, r.th) = (if k == 0 { 20.0 } else { f64::NAN }, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+            r.ya.iter_mut().for_each(|v| *v = f64::NAN);
+            air.push(house.step(&row)["kueche"].a);
+        }
+        (air, house.rooms["kueche"].q_app())
+    };
+    let plain = Bundle::parse(&fixture()["bundle"].to_string()).unwrap();
+    let (base, _) = run(&plain, &|_| f64::NAN);
+    let (old_with_power, q_old) = run(&plain, &|_| 2.0);
+    assert_eq!((old_with_power, q_old), (base.clone(), 0.0), "a bundle without the block ignores the power");
+    let eta = 1.8;
+    let with = app_bundle(eta);
+    let (hot, q) = run(&with, &|_| 2.0);
+    near(hot[1] - base[1], eta * 2.0 / 60.0, 1e-9, "first minute of heat");
+    near(q, eta * 2.0, 1e-12, "q_app is eta times the held power");
+    assert!(hot[39] - base[39] > hot[1] - base[1]);
+    let (none, q_none) = run(&with, &|_| f64::NAN);
+    assert_eq!((none, q_none), (base.clone(), 0.0), "no reading gives no input");
+    let (gone, q_gone) = run(&with, &|k| if k < 10 { 2.0 } else { f64::NAN });
+    assert_eq!(q_gone, 0.0, "a reading gone stale resets the input to zero");
+    assert!(gone[9] - base[9] > 0.0);
+    let (neg, _) = run(&with, &|_| -5.0);
+    assert_eq!(neg, base, "a negative reading adds no heat");
+}
+
+#[test]
+fn appliance_block_is_validated_and_old_bundles_still_load() {
+    assert!(Bundle::parse(&fixture()["bundle"].to_string()).is_ok());
+    for (eta, tau) in [(-0.1, 30.0), (1.0, 0.0), (f64::NAN, 30.0)] {
+        let mut b = base_bundle();
+        b["rooms"]["kueche"]["appliance"] = serde_json::json!({"eta": eta, "tau_min": tau});
+        assert!(Bundle::parse(&b.to_string()).is_err(), "{eta} {tau}");
+    }
+    let mut b = base_bundle();
+    b["rooms"]["kueche"]["appliance"] = serde_json::json!({"eta": 1.0});
+    assert!(Bundle::parse(&b.to_string()).is_err());
 }
 
 fn base_bundle() -> Value {
@@ -298,7 +385,7 @@ fn erf_matches_reference_values() {
 }
 
 pub(crate) fn preset_env() -> Env {
-    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None, u_now: None, now_min: 0, probe: None, q_net: None, pcnn_active: false }
+    Env { tout: -5.0, wind: 3.0, rad: 0.0, night: false, ncnt: vec![], nsum: vec![], target: 21.0, present: 1.0, sp_cur: Some(21.0), sp_live: 21.0, frost: 7.0, boost_c: 24.0, boost_ok: false, raise_cost: 15.0, cold_cost: 1.0, r_grid: 0.25 / 12.0, lag: None, y_last: None, u_now: None, now_min: 0, probe: None, q_net: None, pcnn_active: false, q_app: 0.0 }
 }
 
 pub(crate) fn comps_at(m: f64, a: f64, lam: f64, p: f64) -> Vec<Comp> {

@@ -1,4 +1,5 @@
 import math
+import numpy as np
 
 SQRT2 = math.sqrt(2.0)
 SQRT2PI = math.sqrt(2.0 * math.pi)
@@ -6,6 +7,7 @@ P_FLOOR = 1e-300
 Z_MIN = 1e-6
 D_MIN = 1.0
 EFFORT_KEYS = ("sigma", "steady_u")
+APPLIANCE_KEYS = ("eta", "tau_min")
 GAS_KEYS = ("k", "gain", "sigma", "sigma_up", "min_excess", "win_min")
 LOG_SQRT_2_OVER_PI = 0.5 * math.log(2.0 / math.pi)
 
@@ -124,8 +126,31 @@ def evidence_blocks(ext, ev):
     return out
 
 
+def ema_alpha(tau):
+    return 1.0 - math.exp(-1.0 / tau)
+
+
+def ema_step(state, pw, alpha):
+    if not (isinstance(pw, (int, float)) and math.isfinite(pw)):
+        return None
+    pw = max(pw, 0.0)
+    return pw if state is None else state + alpha * (pw - state)
+
+
+def ema_kw(pw, tau):
+    alpha, state, out = ema_alpha(tau), None, np.zeros(len(pw))
+    for k, v in enumerate(np.asarray(pw, float).tolist()):
+        state = ema_step(state, v, alpha)
+        if state is not None:
+            out[k] = state
+    return out
+
+
 def check_room_doc(name, doc):
     bad = lambda what: ValueError(f"room model: invalid {what} for {name}")
+    a = doc.get("appliance")
+    if a is not None and not (set(APPLIANCE_KEYS) <= set(a) and finite_nonneg(a["eta"]) and finite_positive(a["tau_min"])):
+        raise bad("appliance block")
     for a in doc.get("air") or []:
         if not (finite_positive(a.get("noise")) and math.isfinite(a.get("offset", 0.0))):
             raise bad("air sensor")

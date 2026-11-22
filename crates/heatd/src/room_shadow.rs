@@ -34,6 +34,8 @@ pub const WEATHER_MAX_AGE_MIN: i64 = 180;
 const TEMP_RANGE: [f64; 2] = [0.0, 45.0];
 const VALVE_RANGE: [f64; 2] = [0.0, 100.0];
 const PLUG_POWER_ATTRIBUTE: u32 = 8;
+const APPLIANCE_NOTE_K: f64 = 0.05;
+const APPLIANCE_HORIZON_H: f64 = 20.0 / 60.0;
 
 #[derive(Debug, Default)]
 struct Feed {
@@ -99,6 +101,26 @@ pub struct RoomModel(Arc<Mutex<Inner>>);
 
 fn fmt_c(x: f64) -> String {
     if (x - x.round()).abs() < 1e-9 { format!("{x:.0}") } else { format!("{x:.1}") }
+}
+
+fn appliance_power(config: &crate::config::Config, devs: &HashMap<u64, DevFeed>, room: &str, now_ms: i64, stale_ms: i64) -> (f64, Option<String>) {
+    let mut total = f64::NAN;
+    let mut role = None;
+    for d in config.devices.iter().filter(|d| crate::devices::APPLIANCE_ROLES.contains(&d.role.as_str()) && d.room.as_deref() == Some(room)) {
+        if let Some((_, mw)) = devs.get(&d.node).and_then(|f| f.power).filter(|(t, _)| now_ms - t <= stale_ms) {
+            total = if total.is_nan() { mw / 1e6 } else { total + mw / 1e6 };
+            role.get_or_insert_with(|| d.role.clone());
+        }
+    }
+    (total, role)
+}
+
+pub(crate) fn appliance_sentence(room: &str, role: &str, kw: f64, q_app: f64) -> Option<String> {
+    let rise = q_app * APPLIANCE_HORIZON_H;
+    (rise >= APPLIANCE_NOTE_K).then(|| {
+        let who = if role == crate::devices::ROLE_COFFEE { "Die Espresso-Maschine" } else { "Ein Gerät" };
+        format!("{room}: {who} heizt mit etwa {} kW mit, das sind {} K/h Wärme in der Luft", fmt_de(kw), fmt_de((q_app * 10.0).round() / 10.0))
+    })
 }
 
 fn nan_null(v: f64) -> serde_json::Value {
@@ -374,7 +396,8 @@ impl RoomModel {
                     ncnt.push(n);
                     nsum.push(s);
                 }
-                inputs.insert(name.clone(), RoomIn { y, yv, u, sp, tout: weather[0], wind, rad, night, ncnt, nsum, ya, co2, rh, th });
+                let pw = if doc.appliance.is_some() { appliance_power(config, &inner.devs, name, now_ms, stale_ms).0 } else { f64::NAN };
+                inputs.insert(name.clone(), RoomIn { y, yv, u, sp, tout: weather[0], wind, rad, night, ncnt, nsum, ya, co2, rh, th, pw });
             }
             house.step(&inputs);
             inner.inputs = inputs;
@@ -422,6 +445,7 @@ impl RoomModel {
                 probe: inner.probes.get(&ctx.room).cloned(),
                 q_net,
                 pcnn_active: bundle.pcnn.as_ref().is_some_and(|t| t.active),
+                q_app: filter.q_app(),
             };
             let p = plan(&filter.par, &bundle.shock, &filter.comps, filt.p_supply, &env);
             if let Some(memo) = &p.probe_memo {
@@ -433,11 +457,16 @@ impl RoomModel {
                 (_, Some(event @ ("end" | "abort"))) => probe_end_sentence(&ctx.room, event, p.probed_min),
                 _ => sentence(&ctx.room, &p, &filt, ctx.live, bundle.house.boost_c),
             };
+            let role = appliance_power(config, &inner.devs, &ctx.room, now_ms, stale_ms).1;
+            let why = match role.and_then(|role| appliance_sentence(&ctx.room, &role, filter.appliance_kw(), filter.q_app())) {
+                Some(note) => format!("{why}; {note}"),
+                None => why,
+            };
             let storage = storage_sentence(&ctx.room, &p);
             inner.views.insert(
                 ctx.room.clone(),
                 serde_json::json!({"loss_ratio": nan_null(filt.lam), "mass_c": nan_null(filt.m), "air_c": nan_null(filt.a), "p_supply": filt.p_supply, "p_window": filt.p_window, "setpoint_shadow": p.setpoint,
-                                    "setpoint_live": ctx.live, "kind": p.kind, "why": why, "coast_min": p.coast_min, "stored_min": p.stored_min.map_or(serde_json::Value::Null, nan_null), "storage": storage, "probe_min": p.probe_min, "shadow_state": if p.unusable { "fit_unusable" } else { inner.state.unwrap_or("running") }, "model": bundle.version, "ts": now_ms}),
+                                    "setpoint_live": ctx.live, "kind": p.kind, "why": why, "coast_min": p.coast_min, "stored_min": p.stored_min.map_or(serde_json::Value::Null, nan_null), "storage": storage, "probe_min": p.probe_min, "shadow_state": if p.unusable { "fit_unusable" } else { inner.state.unwrap_or("running") }, "model": bundle.version, "ts": now_ms, "appliance_w": filter.par.appliance.map_or(serde_json::Value::Null, |_| serde_json::json!(filter.appliance_kw() * 1000.0)), "appliance_k_per_h": filter.par.appliance.map_or(serde_json::Value::Null, |_| serde_json::json!(filter.q_app()))}),
             );
             let flagged = filt.p_window >= 0.5;
             let ending = matches!(p.probe_event, Some("end" | "abort"));

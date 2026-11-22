@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import json
 import math
 import numpy as np
@@ -6,6 +7,7 @@ import pytest
 from heattrain.__main__ import CONFIG
 from heattrain.roomeval import fit_bundle
 from heattrain.roombatch import valve_lag_states
+from heattrain.roomobs import ema_kw
 from heattrain.roomfit import RoomFit, fit_shock, run_batch, shock_defaults, tune_windows
 from heattrain.roomimm import House, RoomIn, RoomPar, plan, rollout, storage
 from heattrain.thermal import RoomData, build_rooms, kalman
@@ -464,3 +466,89 @@ def test_probe_replay_probes_only_when_the_window_state_is_uncertain():
     unsure = replay_inputs(0.5).room("r", True)
     assert sure["plans"] > 0 and sure["probes"] == 0
     assert unsure["probes"] >= 1 and unsure["probes_per_day"] > 0 and unsure["probe_min"] > 0
+
+
+APP = {"eta": 1.8, "tau_min": 30.0}
+
+
+def app_house(steps=600, seed=3):
+    docs, inputs, g = sim_grid(steps, seed=seed)
+    pw = np.where(np.arange(steps) % 7 < 2, 1.5, 0.0)
+    pw[200:260] = np.nan
+    g.cols["kueche"]["pw"] = pw
+    ins = [dict(r, kueche=dataclasses.replace(r["kueche"], pw=float(pw[k]))) for k, r in enumerate(inputs)]
+    return docs, inputs, ins, g, pw
+
+
+def test_appliance_heat_is_identical_in_the_reference_and_the_batched_filter_and_old_docs_ignore_it():
+    docs, plain_in, ins, g, pw = app_house()
+    _, base = run(docs, plain_in)
+    _, ignored = run(docs, ins)
+    for key in base["kueche"]:
+        np.testing.assert_array_equal(base["kueche"][key], ignored["kueche"][key])
+    docs["kueche"]["appliance"] = dict(APP)
+    h, ref = run(docs, ins)
+    _, rec = run_batch(g, docs, [SHOCK], HOUSE, record=True)
+    for key in ("p_window", "lam", "p_supply", "a"):
+        np.testing.assert_allclose(rec[0]["kueche"][key], ref["kueche"][key], rtol=0, atol=1e-9, equal_nan=True)
+    assert np.nanmax(np.abs(ref["kueche"]["a"] - base["kueche"]["a"])) > 0.01
+
+
+def test_appliance_power_adds_eta_times_the_held_power_and_stale_power_adds_nothing():
+    docs, plain_in, _, _, _ = app_house(60)
+    def air(app, pw):
+        d = copy.deepcopy(docs)
+        if app:
+            d["kueche"]["appliance"] = dict(APP)
+        rows = []
+        for k, r in enumerate(plain_in):
+            q = dataclasses.replace(r["kueche"], y=20.0 if k == 0 else math.nan, yv=math.nan, ya=tuple(math.nan for _ in r["kueche"].ya), co2=math.nan, rh=math.nan, th=math.nan, pw=pw(k))
+            rows.append(dict(r, kueche=q))
+        h, rec = run(d, rows)
+        return rec["kueche"]["a"], h.rooms["kueche"].q_app()
+    base, _ = air(False, lambda k: math.nan)
+    hot, q = air(True, lambda k: 2.0)
+    assert abs(hot[1] - base[1] - APP["eta"] * 2.0 / 60.0) < 1e-12 and abs(q - APP["eta"] * 2.0) < 1e-12
+    none, q_none = air(True, lambda k: math.nan)
+    gone, q_gone = air(True, lambda k: 2.0 if k < 10 else math.nan)
+    assert (none == base).all() and q_none == 0.0 and q_gone == 0.0 and gone[9] > base[9]
+    neg, _ = air(True, lambda k: -3.0)
+    assert (neg == base).all()
+
+
+def test_fit_and_causal_roll_carry_the_appliance_term_like_the_planner():
+    n, tau = 400, 6.0
+    rng = np.random.default_rng(3)
+    doc = room_doc(coupling=False, tau_v=tau, w=0.3)
+    u = np.repeat(rng.choice([0.0, 0.3, 1.0], n // 20 + 1), 20)[:n]
+    pw = np.where(np.arange(n) > 80, 1.2, np.nan)
+    c = {"y": 20.0 + 0.5 * np.sin(np.arange(n) / 50.0), "yv": u.copy(), "u": u, "sp": np.where(np.arange(n) < 200, 21.0, 17.0), "tout": 4.0 + np.sin(np.arange(n) / 90.0), "wind": np.full(n, 3.0), "rad": np.full(n, 40.0),
+         "night": np.zeros(n), "yi": np.full(n, 20.0), "bad": np.zeros(n), "ncnt": [], "nsum": [], "pw": pw}
+    rc = copy.deepcopy(CONFIG["roommodel"])
+    rc["fit"].update(warm_min=10, stride=7)
+    rc["appliance"]["min_minutes"] = 100
+    rf = RoomFit(c, n, [], rc, False)
+    assert rf.app and rf.names[-1] == "eta"
+    off = copy.deepcopy(rc)
+    off["appliance"]["roles"] = []
+    assert not RoomFit(c, n, [], off, False).app and "eta" not in RoomFit(c, n, [], off, False).names
+    assert not RoomFit(dict(c, pw=np.full(n, np.nan)), n, [], rc, False).app
+    th = np.log([TRUE_P[k] if k in TRUE_P else 1.8 if k == "eta" else 1.0 for k in rf.names])[None]
+    p = rf.params(th)
+    coef = rf.coef(p)
+    plain = RoomFit(c, n, [], off, False)
+    g2_off = plain.coef(plain.params(np.log([TRUE_P[k] if k in TRUE_P else 1.0 for k in plain.names])[None]))[5]
+    pe = ema_kw(pw, rc["appliance"]["tau_min"])
+    np.testing.assert_allclose(coef[5] - g2_off, 1.8 * pe[:, None] / 60.0, atol=1e-12)
+    sel = (rf.js > 100) & (rf.js < 200)
+    js = rf.js[sel]
+    m0, a0 = np.full(len(js), 21.0), np.full(len(js), 19.5)
+    out = rf.roll_causal(p, doc, m0[:, None], a0[:, None], 1.0, sel, 1.0, 1.0)
+    lag = valve_lag_states(u, rf_alpha(tau))
+    par = RoomPar(dict(doc, appliance=dict(APP)))
+    for i in (0, len(js) // 2, len(js) - 1):
+        j = js[i]
+        env = {"tout": c["tout"][j], "wind": 3.0, "rad": 40.0, "night": False, "cn": 0.0, "cs": 0.0, "target": 21.0, "present": 1.0, "lag": [lag[0][j], lag[1][j]], "u_now": u[j], "sp_cur": c["sp"][j], "sp_live": c["sp"][j], "q_app": 1.8 * pe[j]}
+        _, _, sens, _ = rollout(par, 21.0, 19.5, 1.0, 1, [c["sp"][j]] * 60, env)
+        assert abs(out[20][i, 0] - sens[19]) < 1e-9 and abs(out[60][i, 0] - sens[59]) < 1e-9
+    assert pe[j] > 0.5

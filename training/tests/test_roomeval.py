@@ -170,3 +170,30 @@ def test_rooms_with_negative_heldout_skill_at_the_planner_horizon_are_unusable()
     block = lambda n, skill: {"H60": {"n": n, "skill": skill}}
     out = skill_unusable({"a": block(500, 0.1), "b": block(500, -0.3), "c": block(50, -0.5), "d": block(500, None)}, RC)
     assert set(out) == {"b"} and "-0.300" in out["b"][0]
+
+
+def test_attach_power_sums_the_plugs_per_room_in_kw_and_marks_stale_or_missing_as_nan():
+    from heattrain.roomfit import attach_power
+    grid = type("G", (), {})()
+    grid.names, grid.n, grid.times = ["kueche", "bad"], 10, 60.0 * np.arange(10)
+    grid.cols = {r: {"pw": np.full(10, np.nan)} for r in grid.names}
+    power = {9: (np.array([0.0, 300.0]), np.array([1_500_000.0, 500_000.0])), 10: (np.array([0.0]), np.array([250_000.0]))}
+    attach_power(grid, power, {"kueche": [9, 10], "bad": [77]}, 200.0)
+    pw = grid.cols["kueche"]["pw"]
+    assert (pw[:4] == 1.75).all() and np.isnan(pw[4]) and (pw[5:9] == 0.5).all() and np.isnan(pw[9])
+    assert np.isnan(grid.cols["bad"]["pw"]).all()
+
+
+def test_appliance_windows_merge_pulses_and_split_the_skill_into_inside_and_outside():
+    from heattrain.roomfit import appliance_windows
+    pw = np.zeros(300)
+    pw[[10, 11, 20, 21, 100, 101]] = 1.5
+    win = appliance_windows(pw, 0.05, 20, 60)
+    assert win[10] and win[81] and not win[82] and not win[99] and win[100] and win[161] and not win[162] and win.sum() == 134
+    skill = Skill([20, 60], 0.1)
+    inside = np.array([True, True, False, False])
+    errs = {"persistence": np.array([1.0, 1.0, 1.0, 1.0]), "imm_anchored": np.array([0.5, 0.5, 0.1, 0.1])}
+    skill.add("kueche", 20, errs, np.array(["steady"] * 4), {}, inside)
+    skill.add("kueche", 60, errs, np.array(["steady"] * 4), {}, inside)
+    b = skill.report(["kueche"])["rooms"]["kueche"]["H20"]
+    assert b["window"]["n"] == 2 and abs(b["window"]["imm_anchored"] - 0.5) < 1e-12 and abs(b["outside"]["imm_anchored"] - 0.1) < 1e-12

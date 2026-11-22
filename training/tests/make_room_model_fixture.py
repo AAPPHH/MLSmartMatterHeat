@@ -1,3 +1,5 @@
+import copy
+import dataclasses
 import json
 import math
 from pathlib import Path
@@ -154,8 +156,42 @@ def build():
         "bundle": {"kind": "room_model", "version": "20261101T000000Z", "dt_s": 60.0, "rooms": bundle_rooms, "shock": SHOCK, "house": {**HOUSE, "night_hours": [22, 5], "timezone": "Europe/Berlin"}, "pcnn": NET_TOP},
         "rooms": list(NAMES), "steps": STEPS,
         "inputs": {n: {key: clean([getattr(r[n], key) for r in inputs]) for key in ("y", "yv", "u", "sp", "tout", "wind", "rad")} | {"night": [int(r[n].night) for r in inputs], "ncnt": [list(r[n].ncnt) for r in inputs], "nsum": [clean(list(r[n].nsum)) for r in inputs], "ya": [clean(list(r[n].ya)) for r in inputs]} | {key: clean([getattr(r[n], key) for r in inputs]) for key in ("co2", "rh", "th")} for n in NAMES},
-        "expected": expected, "resets": [{"room": r["room"], "cause": r["cause"], "step": r["step"]} for r in h.resets], "plans": plans, "plan_cases": plan_cases(docs), "checks": checks(), "net_cases": net_cases(),
+        "expected": expected, "resets": [{"room": r["room"], "cause": r["cause"], "step": r["step"]} for r in h.resets], "plans": plans, "plan_cases": plan_cases(docs), "checks": checks(), "net_cases": net_cases(), "appliance": appliance_case(docs, inputs),
     }
+
+
+APPLIANCE = {"eta": 1.8, "tau_min": 30.0}
+APP_STEPS, APP_PLAN = 400, 330
+
+
+def app_power(k):
+    if k < 60 or k >= 360:
+        return 0.0
+    if 200 <= k < 260:
+        return math.nan
+    return 1.5 if k % 5 < 2 else 0.0
+
+
+def appliance_case(docs, inputs):
+    app_docs = {n: copy.deepcopy(d) for n, d in docs.items()}
+    app_docs["kueche"]["appliance"] = dict(APPLIANCE)
+    h, expected = House(app_docs, SHOCK, HOUSE), {"m": [], "a": [], "q_app": [], "ok": []}
+    pw, plan_case = [], None
+    for k in range(APP_STEPS):
+        pw.append(app_power(k))
+        row = dict(inputs[k])
+        row["kueche"] = dataclasses.replace(row["kueche"], pw=pw[-1])
+        out = h.step(row)["kueche"]
+        expected["ok"].append(bool(out["ok"]))
+        expected["m"].append(clean(out["m"]) if out["ok"] else None)
+        expected["a"].append(clean(out["a"]) if out["ok"] else None)
+        expected["q_app"].append(clean(h.rooms["kueche"].q_app()))
+        if k == APP_PLAN and out["ok"]:
+            f = h.rooms["kueche"]
+            env = clean_env({**plan_env(row["kueche"], k), "lag": f.lag, "y_last": last_report(inputs, "kueche", k), "probe": None, "q_net": None, "q_app": f.q_app(), "pcnn_active": False})
+            res = plan(RoomPar(app_docs["kueche"]), SHOCK, f.comps, h.w[1], env)
+            plan_case = {"step": k, "env": env, "out": {key: clean(res[key]) for key in PLAN_KEYS}}
+    return {"doc": dict(APPLIANCE), "steps": APP_STEPS, "pw": clean(pw), "expected": expected, "plan": plan_case}
 
 
 def clean_env(env):

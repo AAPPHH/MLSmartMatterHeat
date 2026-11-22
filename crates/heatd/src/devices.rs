@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::time::{sleep, Instant};
 
 pub const ROLE_COFFEE: &str = "coffee";
+pub const APPLIANCE_ROLES: [&str; 1] = [ROLE_COFFEE];
 const SOURCE_HEATD: &str = "heatd";
 const DAY_FILE: &str = "devices/coffee_days.json";
 const VIEW_RAW_CHARS: usize = 120;
