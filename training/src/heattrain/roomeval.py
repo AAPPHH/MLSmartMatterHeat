@@ -302,7 +302,7 @@ def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=
         wparts.append(window_metrics(full, rec_w, truth, f["cut"], f["hi"], rc))
         n_r = sum(1 for e in rs if f["cut"] <= e["step"] < f["hi"])
         resets += n_r
-        per_fold.append({"cut": f["cut"], "hi": f["hi"], "lambda_w": lw, "resets": n_r, "shock": {k: f["shock"][k] for k in ("q_calm", "q_jump", "p_jump", "tau_l")}, "tuning_refused": bool(tuning and tuning.get("refused")), "pcnn": ninfo})
+        per_fold.append({"cut": f["cut"], "hi": f["hi"], "lambda_w": lw, "resets": n_r, "shock": {k: f["shock"][k] for k in ("q_calm", "q_jump", "p_jump", "tau_l")}, "tuning_refused": bool(tuning and tuning.get("refused")), "pcnn": ninfo, "appliance": {r: d["appliance"] for r, d in docs.items() if "appliance" in d}})
     rep = skill.report(list(full.names))
     return {"skill": rep, "window": merge_windows(wparts), "resets": resets, "folds": per_fold}
 
@@ -464,13 +464,13 @@ def fit_bundle(config, rooms, src, version=None):
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
     sk = ship["skill"]
-    pick = lambda b: {k: b[k] for k in ("n", "skill", "pcnn_skill")}
+    pick = lambda b: {**{k: b[k] for k in ("n", "skill", "pcnn_skill")}, **{part: b[part] for part in ("window", "outside") if part in b}}
     probe_replay = ProbeReplay(full, docs, shock, rec, pcnn["exog"].present, rc).run()
     pcnn_report = {"active": active, "gate": gate, "rooms": nets_info, "folds": [fi["pcnn"] for fi in ship["folds"]], "skill": {"pooled": {h: pick(sk["pooled"][h]) for h in ("H20", "H60")}, "rooms": {r: {h: pick(b[h]) for h in ("H20", "H60")} for r, b in sk["rooms"].items()}}}
     report = {"version": version, "flags": flags_all, "pcnn": pcnn_report, "probe_replay": probe_replay, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
               "resets": len(resets), "reset_list": reset_list(full, resets, truth, rec), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
               "loglik": float(run.loglik[0]), "minutes": full.n, "sensor_start": variants.sensor_start, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"folds": t_fold, "total": time.time() - t0},
-              "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"]} for n, d in docs.items()}}
+              "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"], **({"appliance": d["appliance"]} if "appliance" in d else {})} for n, d in docs.items()}}
     return bundle, report
 
 
