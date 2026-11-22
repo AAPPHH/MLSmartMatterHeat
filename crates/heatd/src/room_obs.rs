@@ -206,7 +206,7 @@ pub struct ApplianceDoc {
 }
 
 pub fn check_appliance(a: &ApplianceDoc) -> bool {
-    a.eta.is_finite() && a.eta >= 0.0 && a.tau_min.is_finite() && a.tau_min > 0.0
+    a.eta.is_finite() && (0.0..=10.0).contains(&a.eta) && a.tau_min.is_finite() && a.tau_min > 0.0
 }
 
 impl ApplianceDoc {
