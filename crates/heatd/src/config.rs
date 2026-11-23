@@ -317,6 +317,37 @@ pub struct WindowSection {
     pub prompt_gap_min: f64,
     pub prompt_global_gap_min: f64,
     pub prompt_max_per_day: usize,
+    pub fusion: WindowFusion,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WindowFusion {
+    pub enabled: bool,
+    pub tables: String,
+    pub skip_humidity: Vec<String>,
+    pub window_min: f64,
+    pub min_samples: usize,
+    pub max_window_min: f64,
+    pub fresh_min: f64,
+    pub outdoor_co2_ppm: f64,
+    pub co2_floor_ppm: f64,
+    pub dt_floor_k: f64,
+    pub dt_ref_k: f64,
+    pub open_every_min: f64,
+    pub stay_min: f64,
+    pub logit_max: f64,
+    pub floor_margin: f64,
+    pub temper_scale: f64,
+    pub couple_llr: f64,
+    pub horizon_min: f64,
+    pub cool_k_per_h: f64,
+}
+
+impl Default for WindowFusion {
+    fn default() -> Self {
+        Self { enabled: true, tables: String::new(), skip_humidity: Vec::new(), window_min: 4.0, min_samples: 3, max_window_min: 20.0, fresh_min: 10.0, outdoor_co2_ppm: 420.0, co2_floor_ppm: 80.0, dt_floor_k: 3.0, dt_ref_k: 8.0, open_every_min: 1440.0, stay_min: 30.0, logit_max: 9.0, floor_margin: 1.0, temper_scale: 1.5, couple_llr: 3.0, horizon_min: 20.0, cool_k_per_h: 0.5 }
+    }
 }
 
 impl Default for WindowSection {
@@ -335,6 +366,7 @@ impl Default for WindowSection {
             prompt_gap_min: 10.0,
             prompt_global_gap_min: 30.0,
             prompt_max_per_day: 6,
+            fusion: WindowFusion::default(),
         }
     }
 }
