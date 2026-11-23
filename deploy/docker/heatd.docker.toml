@@ -227,3 +227,15 @@ enabled = true
 model_dir = "/models/room_model"
 raise_cost_min = 15.0
 cold_cost_min = 1.0
+
+[http]
+trusted_subnets = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"]
+max_body_bytes = 4194304
+request_timeout_s = 30
+
+[http.auth]
+admin_token_file = "/secrets/heatd_admin_token"
+watch_token_file = "/secrets/heatd_watch_token"
+admin_mode = "enforce"
+watch_mode = "log"
+metrics_require_admin = false

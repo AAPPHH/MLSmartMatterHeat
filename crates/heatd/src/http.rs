@@ -5,17 +5,22 @@ use crate::lake::{self, kind, Event, Label, Table, WatchRaw, WatchSensor};
 use crate::rules::{presence_event, Tracker};
 use crate::storage::{now_ms, AccessPoint, BatchBody, Motion, Power, ScanBody, Storage};
 use crate::watchmatch::{Signal, WatchMatch};
-use axum::extract::State;
+use crate::config::{AuthMode, HttpSection};
+use anyhow::{anyhow, bail, Context};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use matter_controller::MatterController;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -189,7 +194,14 @@ pub fn channel_of(freq: u16) -> Option<u8> {
     }
 }
 
+#[cfg(test)]
 pub fn router(state: AppState) -> Router {
+    let guard = Guard::unchecked(&state.config.http);
+    router_with(state, guard)
+}
+
+pub fn router_with(state: AppState, guard: Guard) -> Router {
+    let limit = guard.0.max_body;
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -214,7 +226,268 @@ pub fn router(state: AppState) -> Router {
         .route("/api/usage", get(usage))
         .route("/watch/update", get(update_manifest))
         .route("/watch/update.apk", get(update_apk))
+        .layer(DefaultBodyLimit::max(limit))
+        .layer(from_fn_with_state(guard, gate))
         .with_state(state)
+}
+
+pub const DEFAULT_TRUSTED: [&str; 8] = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"];
+const MIN_TOKEN_LEN: usize = 32;
+const PLACEHOLDERS: [&str; 7] = ["change", "placeholder", "example", "replace", "your-token", "your_token", "xxxx"];
+const LOG_EVERY: Duration = Duration::from_secs(600);
+const WATCH_PATHS: [&str; 16] = [
+    "/api/boost", "/api/experiment", "/api/label", "/api/label/void", "/api/labels/progress", "/api/scan", "/api/scans", "/api/setpoint", "/api/state",
+    "/watch/label", "/watch/label/void", "/watch/measurement", "/watch/sensors", "/watch/update", "/watch/update.apk", "/watch/window_label",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Net {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl Net {
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let (host, prefix) = text.trim().split_once('/').map_or((text.trim(), None), |(h, p)| (h, Some(p)));
+        let addr: IpAddr = host.parse().map_err(|_| anyhow!("bad address {host:?}"))?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            Some(p) => p.parse::<u8>().map_err(|_| anyhow!("bad prefix {p:?}"))?,
+            None => max,
+        };
+        if prefix > max {
+            bail!("prefix {prefix} exceeds {max}");
+        }
+        Ok(Self { addr, prefix })
+    }
+
+    fn bits(ip: IpAddr) -> (u128, u32) {
+        match ip {
+            IpAddr::V4(v) => (u32::from(v) as u128, 32),
+            IpAddr::V6(v) => (u128::from(v), 128),
+        }
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ((a, width), (b, other)) = (Self::bits(self.addr), Self::bits(ip.to_canonical()));
+        let shift = width - self.prefix as u32;
+        width == other && a.checked_shr(shift).unwrap_or(0) == b.checked_shr(shift).unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Open,
+    Watch,
+    Admin,
+}
+
+impl Scope {
+    pub fn of(path: &str, metrics_admin: bool) -> Self {
+        match path {
+            "/health" => Self::Open,
+            "/metrics" if !metrics_admin => Self::Open,
+            p if WATCH_PATHS.contains(&p) => Self::Watch,
+            _ => Self::Admin,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Watch => "watch",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presented {
+    Missing,
+    Invalid,
+    Watch,
+    Admin,
+}
+
+type Digest32 = [u8; 32];
+
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn read_token(role: &str, path: &str) -> anyhow::Result<Digest32> {
+    let token = std::fs::read_to_string(path).with_context(|| format!("http.auth: {role} token file {path}"))?;
+    let token = token.trim();
+    let lower = token.to_ascii_lowercase();
+    if token.len() < MIN_TOKEN_LEN || !token.chars().all(|c| c.is_ascii_graphic()) {
+        bail!("http.auth: {role} token must be at least {MIN_TOKEN_LEN} printable characters without whitespace");
+    }
+    if PLACEHOLDERS.iter().any(|p| lower.contains(p)) || token.chars().collect::<HashSet<_>>().len() < 8 {
+        bail!("http.auth: {role} token looks like a placeholder, generate a random one");
+    }
+    Ok(Sha256::digest(token.as_bytes()).into())
+}
+
+pub struct GuardState {
+    nets: Option<Vec<Net>>,
+    admin: Option<Digest32>,
+    watch: Option<Digest32>,
+    admin_mode: AuthMode,
+    watch_mode: AuthMode,
+    metrics_admin: bool,
+    max_body: usize,
+    timeout: Duration,
+    counts: Mutex<BTreeMap<(&'static str, &'static str, &'static str), u64>>,
+    rejected: AtomicU64,
+    seen: Mutex<HashMap<(String, &'static str), Instant>>,
+}
+
+#[derive(Clone)]
+pub struct Guard(Arc<GuardState>);
+
+impl Guard {
+    fn build(http: &HttpSection, nets: Option<Vec<Net>>, admin: Option<Digest32>, watch: Option<Digest32>) -> Self {
+        Self(Arc::new(GuardState {
+            nets,
+            admin,
+            watch,
+            admin_mode: if admin.is_some() { http.auth.admin_mode } else { AuthMode::Off },
+            watch_mode: if watch.is_some() { http.auth.watch_mode } else { AuthMode::Off },
+            metrics_admin: http.auth.metrics_require_admin,
+            max_body: http.max_body_bytes,
+            timeout: Duration::from_secs(http.request_timeout_s),
+            counts: Mutex::new(BTreeMap::new()),
+            rejected: AtomicU64::new(0),
+            seen: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    #[cfg(test)]
+    pub fn unchecked(http: &HttpSection) -> Self {
+        Self::build(http, None, None, None)
+    }
+
+    pub fn load(http: &HttpSection) -> anyhow::Result<Self> {
+        let nets = http.trusted_subnets.iter().map(|n| Net::parse(n)).collect::<anyhow::Result<Vec<_>>>()?;
+        let load = |role: &str, mode: AuthMode, file: &str| (mode != AuthMode::Off).then(|| read_token(role, file)).transpose();
+        let admin = load("admin", http.auth.admin_mode, &http.auth.admin_token_file)?;
+        let watch = load("watch", http.auth.watch_mode, &http.auth.watch_token_file)?;
+        if admin.is_some() && admin == watch {
+            bail!("http.auth: admin and watch tokens must differ");
+        }
+        for (role, mode) in [("admin", http.auth.admin_mode), ("watch", http.auth.watch_mode)] {
+            match mode {
+                AuthMode::Off => eprintln!("http auth: warning, {role} role is not protected (set [http.auth] {role}_mode), requests are accepted without a token"),
+                AuthMode::Log => eprintln!("http auth: {role} role in log mode, requests without a valid token are accepted and counted"),
+                AuthMode::Enforce => {}
+            }
+        }
+        Ok(Self::build(http, Some(nets), admin, watch))
+    }
+
+    pub fn presented(&self, header: Option<&str>) -> Presented {
+        let Some(token) = header.and_then(|h| h.split_once(' ')).filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer")).map(|(_, t)| t.trim()) else {
+            return Presented::Missing;
+        };
+        let digest = Sha256::digest(token.as_bytes());
+        let is_admin = self.0.admin.as_ref().is_some_and(|d| ct_eq(d, &digest));
+        let is_watch = self.0.watch.as_ref().is_some_and(|d| ct_eq(d, &digest));
+        match (is_admin, is_watch) {
+            (true, _) => Presented::Admin,
+            (_, true) => Presented::Watch,
+            _ => Presented::Invalid,
+        }
+    }
+
+    pub fn trusted(&self, peer: Option<IpAddr>) -> bool {
+        match (&self.0.nets, peer) {
+            (None, _) => true,
+            (Some(nets), Some(ip)) => nets.iter().any(|n| n.contains(ip)),
+            (Some(_), None) => false,
+        }
+    }
+
+    pub fn judge(&self, scope: Scope, presented: Presented) -> Option<(AuthMode, &'static str)> {
+        let (mode, ok) = match scope {
+            Scope::Open => return None,
+            Scope::Watch => (self.0.watch_mode, matches!(presented, Presented::Admin | Presented::Watch)),
+            Scope::Admin => (self.0.admin_mode, presented == Presented::Admin),
+        };
+        let result = match presented {
+            Presented::Missing => "missing",
+            Presented::Invalid => "invalid",
+            _ => "forbidden",
+        };
+        (mode != AuthMode::Off && !ok).then_some((mode, result))
+    }
+
+    fn note(&self, key: String, scope: &'static str, line: impl FnOnce() -> String) {
+        let mut seen = self.0.seen.lock().unwrap();
+        let due = seen.get(&(key.clone(), scope)).is_none_or(|t| t.elapsed() >= LOG_EVERY);
+        if due {
+            seen.insert((key, scope), Instant::now());
+            eprintln!("{}", line());
+        }
+    }
+
+    pub fn metrics(&self) -> String {
+        let mut out = String::from("# HELP heatd_http_auth_failures_total requests without sufficient token per scope, mode and result
+# TYPE heatd_http_auth_failures_total counter
+");
+        for ((scope, mode, result), n) in self.0.counts.lock().unwrap().iter() {
+            out.push_str(&format!("heatd_http_auth_failures_total{{scope=\"{scope}\",mode=\"{mode}\",result=\"{result}\"}} {n}
+"));
+        }
+        out.push_str(&format!("# HELP heatd_http_source_rejected_total requests from outside the trusted subnets
+# TYPE heatd_http_source_rejected_total counter
+heatd_http_source_rejected_total {}
+# HELP heatd_http_auth_enforcing 1 if the role rejects requests without a valid token
+# TYPE heatd_http_auth_enforcing gauge
+", self.0.rejected.load(Ordering::Relaxed)));
+        for (role, mode) in [("admin", self.0.admin_mode), ("watch", self.0.watch_mode)] {
+            out.push_str(&format!("heatd_http_auth_enforcing{{role=\"{role}\"}} {}
+", u8::from(mode == AuthMode::Enforce)));
+        }
+        out
+    }
+}
+
+fn refuse(status: StatusCode, message: &str) -> Response {
+    let mut response = (status, Json(json!({"error": message}))).into_response();
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(axum::http::header::WWW_AUTHENTICATE, axum::http::HeaderValue::from_static("Bearer"));
+    }
+    response
+}
+
+async fn gate(State(guard): State<Guard>, mut req: Request, next: Next) -> Response {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+    let who = peer.map_or_else(|| "unknown".to_string(), |ip| ip.to_string());
+    if !guard.trusted(peer) {
+        guard.0.rejected.fetch_add(1, Ordering::Relaxed);
+        guard.note(who.clone(), "source", || format!("http: request from {who} outside the trusted subnets rejected"));
+        return refuse(StatusCode::FORBIDDEN, "Verboten: Quelladresse nicht im vertrauten Netz");
+    }
+    let scope = Scope::of(req.uri().path(), guard.0.metrics_admin);
+    let header = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    if let Some((mode, result)) = guard.judge(scope, guard.presented(header)) {
+        let label = if mode == AuthMode::Enforce { "enforce" } else { "log" };
+        *guard.0.counts.lock().unwrap().entry((scope.name(), label, result)).or_insert(0) += 1;
+        guard.note(who.clone(), scope.name(), || format!("http auth: {} {} from {who} without sufficient token ({result}, {label})", req.method(), req.uri().path()));
+        if mode == AuthMode::Enforce {
+            return match result {
+                "forbidden" => refuse(StatusCode::FORBIDDEN, "Verboten: Token hat keine Berechtigung fuer diesen Endpunkt"),
+                _ => refuse(StatusCode::UNAUTHORIZED, "Nicht autorisiert: Bearer-Token fehlt oder ungueltig"),
+            };
+        }
+    }
+    let declared = req.headers().get(axum::http::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > guard.0.max_body) {
+        return refuse(StatusCode::PAYLOAD_TOO_LARGE, "Anfrage zu gross");
+    }
+    req.extensions_mut().insert(guard.clone());
+    let timeout = guard.0.timeout;
+    tokio::time::timeout(timeout, next.run(req)).await.unwrap_or_else(|_| refuse(StatusCode::REQUEST_TIMEOUT, "Zeitueberschreitung der Anfrage"))
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -224,7 +497,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(body)
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+async fn metrics(State(state): State<AppState>, Extension(guard): Extension<Guard>) -> impl IntoResponse {
     let now = now_ms();
     let mut ages = String::from("# HELP heatd_reading_age_seconds age of the last value per node and attribute
 # TYPE heatd_reading_age_seconds gauge
@@ -235,7 +508,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 # TYPE heatd_phone_present gauge
 heatd_phone_present {}
 ", u8::from(state.tracker.lock().unwrap().phone().vouch)));
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour)))
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour), guard.metrics()))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -3102,5 +3375,236 @@ nodes = [5]
         let off = harness(false);
         let (_, state) = call(&off.state, "GET", "/api/state", None).await;
         assert!(state["phone"].is_null() && !call_text(&off.state, "/metrics").await.1.contains("heatd_phone_present"));
+    }
+
+    const ADMIN_TOKEN: &str = "adm1n-9f3a7c1e5b2d4a6c8e0f1a3b5c7d9e2f";
+    const WATCH_TOKEN: &str = "w4tch-71c3e5a9b2d4f6081a3c5e7b9d2f4a60";
+
+    struct Secured {
+        h: Harness,
+        guard: Guard,
+        _tokens: tempfile::TempDir,
+    }
+
+    fn secured(admin_mode: &str, watch_mode: &str, http_extra: &str, auth_extra: &str) -> Secured {
+        let tokens = tempfile::tempdir().unwrap();
+        std::fs::write(tokens.path().join("admin"), format!("{ADMIN_TOKEN}\n")).unwrap();
+        std::fs::write(tokens.path().join("watch"), WATCH_TOKEN).unwrap();
+        let base = tokens.path().to_str().unwrap().replace('\\', "/");
+        let head = format!("away_guard_minutes = 0\n[http]\n{http_extra}\n[http.auth]\nadmin_token_file = '{base}/admin'\nwatch_token_file = '{base}/watch'\nadmin_mode = '{admin_mode}'\nwatch_mode = '{watch_mode}'\n{auth_extra}\n");
+        let h = harness_with(false, &head, "[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n");
+        let guard = Guard::load(&h.state.config.http).unwrap();
+        Secured { h, guard, _tokens: tokens }
+    }
+
+    impl Secured {
+        async fn via(&self, peer: &str, method: &str, uri: &str, bearer: Option<&str>, body: Option<String>) -> (StatusCode, Value, axum::http::HeaderMap) {
+            let mut builder = Request::builder().method(method).uri(uri).header("content-type", "application/json").header("origin", "http://evil.example");
+            if let Some(token) = bearer {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            let mut request = builder.body(body.map_or_else(Body::empty, Body::from)).unwrap();
+            request.extensions_mut().insert(ConnectInfo(format!("{peer}:50000").parse::<SocketAddr>().unwrap()));
+            let response = router_with(self.h.state.clone(), self.guard.clone()).oneshot(request).await.unwrap();
+            let (status, headers) = (response.status(), response.headers().clone());
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null), headers)
+        }
+
+        async fn code(&self, method: &str, uri: &str, bearer: Option<&str>) -> StatusCode {
+            self.via("192.168.1.10", method, uri, bearer, None).await.0
+        }
+    }
+
+    const ADMIN_URI: &str = "/api/usage?from=x&to=y";
+    const WATCH_URI: &str = "/api/state";
+
+    #[test]
+    fn subnets_match_v4_v6_and_mapped_addresses() {
+        let trusted = |ip: &str| DEFAULT_TRUSTED.iter().any(|n| Net::parse(n).unwrap().contains(ip.parse().unwrap()));
+        for ip in ["127.0.0.1", "::1", "10.1.2.3", "172.16.0.1", "172.31.255.254", "192.168.7.8", "169.254.1.1", "fd12::1", "fe80::1", "::ffff:192.168.1.5"] {
+            assert!(trusted(ip), "{ip}");
+        }
+        for ip in ["8.8.8.8", "172.32.0.1", "100.64.0.1", "2001:db8::1", "::ffff:8.8.8.8"] {
+            assert!(!trusted(ip), "{ip}");
+        }
+        assert!(Net::parse("192.0.2.0/24").unwrap().contains("192.0.2.200".parse().unwrap()));
+        assert!(!Net::parse("192.0.2.0/24").unwrap().contains("192.0.3.1".parse().unwrap()));
+        assert!(Net::parse("0.0.0.0/0").unwrap().contains("8.8.8.8".parse().unwrap()));
+        assert!(Net::parse("203.0.113.7").unwrap().contains("203.0.113.7".parse().unwrap()));
+        assert!(Net::parse("10.0.0.0/33").is_err() && Net::parse("nope").is_err() && Net::parse("::/129").is_err());
+    }
+
+    #[test]
+    fn constant_time_compare_agrees_with_equality() {
+        assert!(ct_eq(b"abc", b"abc") && ct_eq(b"", b""));
+        assert!(!ct_eq(b"abc", b"abd") && !ct_eq(b"abc", b"ab") && !ct_eq(b"abc", b"abcd") && !ct_eq(b"\0bc", b"abc"));
+    }
+
+    #[test]
+    fn startup_refuses_missing_short_and_placeholder_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            std::fs::write(dir.path().join(name), text).unwrap();
+            dir.path().join(name).to_str().unwrap().replace('\\', "/")
+        };
+        let load = |admin: String| {
+            let toml = format!("[http.auth]\nadmin_token_file = '{admin}'\nadmin_mode = 'enforce'\n");
+            Guard::load(&Config::parse(&toml).unwrap().http).map(|_| ()).map_err(|e| format!("{e:#}"))
+        };
+        assert!(load(file("good", ADMIN_TOKEN)).is_ok());
+        assert!(load(dir.path().join("absent").to_str().unwrap().replace('\\', "/")).unwrap_err().contains("admin token file"));
+        assert!(load(file("short", "abc123def456")).unwrap_err().contains("at least 32"));
+        assert!(load(file("blank", "   \n")).unwrap_err().contains("at least 32"));
+        assert!(load(file("spaced", &format!("{ADMIN_TOKEN} {ADMIN_TOKEN}"))).unwrap_err().contains("without whitespace"));
+        for placeholder in ["change-me-change-me-change-me-change-me", "CHANGEME0123456789abcdef0123456789", "placeholder-token-0123456789abcdef", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
+            assert!(load(file("ph", placeholder)).unwrap_err().contains("placeholder"), "{placeholder}");
+        }
+        let same = file("same", ADMIN_TOKEN);
+        let toml = format!("[http.auth]\nadmin_token_file = '{same}'\nadmin_mode = 'enforce'\nwatch_token_file = '{same}'\nwatch_mode = 'log'\n");
+        assert!(Guard::load(&Config::parse(&toml).unwrap().http).err().unwrap().to_string().contains("must differ"));
+    }
+
+    #[test]
+    fn config_refuses_active_mode_without_token_file_and_bad_limits() {
+        assert!(Config::parse("[http.auth]\nadmin_mode = 'enforce'\n").unwrap_err().to_string().contains("admin_token_file is empty"));
+        assert!(Config::parse("[http.auth]\nwatch_mode = 'log'\n").unwrap_err().to_string().contains("watch_token_file is empty"));
+        assert!(Config::parse("[http.auth]\nadmin_mode = 'sometimes'\n").is_err());
+        assert!(Config::parse("[http]\ntrusted_subnets = ['300.1.1.1/8']\n").is_err());
+        assert!(Config::parse("[http]\nmax_body_bytes = 0\n").is_err());
+        let default = Config::parse("").unwrap().http;
+        assert_eq!((default.auth.admin_mode, default.auth.watch_mode, default.trusted_subnets.len()), (AuthMode::Off, AuthMode::Off, DEFAULT_TRUSTED.len()));
+    }
+
+    #[tokio::test]
+    async fn off_mode_without_auth_section_changes_nothing() {
+        let h = harness(false);
+        assert_eq!(call(&h.state, "GET", WATCH_URI, None).await.0, StatusCode::OK);
+        assert_eq!(call(&h.state, "GET", ADMIN_URI, None).await.0, StatusCode::BAD_REQUEST);
+        let s = Secured { guard: Guard::unchecked(&h.state.config.http), h, _tokens: tempfile::tempdir().unwrap() };
+        assert_eq!(s.via("8.8.8.8", "GET", WATCH_URI, None, None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn enforce_requires_the_matching_role() {
+        let s = secured("enforce", "enforce", "", "");
+        for uri in [ADMIN_URI, WATCH_URI] {
+            assert_eq!(s.code("GET", uri, None).await, StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(s.code("GET", uri, Some("nope")).await, StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(s.code("GET", uri, Some(&ADMIN_TOKEN.to_uppercase())).await, StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(s.code("GET", uri, Some(&ADMIN_TOKEN[..ADMIN_TOKEN.len() - 1])).await, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        assert_eq!(s.code("GET", ADMIN_URI, Some(ADMIN_TOKEN)).await, StatusCode::BAD_REQUEST);
+        assert_eq!(s.code("GET", WATCH_URI, Some(ADMIN_TOKEN)).await, StatusCode::OK);
+        assert_eq!(s.code("GET", WATCH_URI, Some(WATCH_TOKEN)).await, StatusCode::OK);
+        let (status, body, _) = s.via("192.168.1.10", "GET", ADMIN_URI, Some(WATCH_TOKEN), None).await;
+        assert_eq!((status, body["error"].as_str().map(|e| e.starts_with("Verboten"))), (StatusCode::FORBIDDEN, Some(true)));
+        let (status, body, headers) = s.via("192.168.1.10", "GET", ADMIN_URI, None, None).await;
+        assert_eq!((status, body["error"].as_str().map(|e| e.starts_with("Nicht autorisiert")), headers.get("www-authenticate").map(|v| v.as_bytes())), (StatusCode::UNAUTHORIZED, Some(true), Some(&b"Bearer"[..])));
+        let lower = Request::builder().uri(WATCH_URI).header("authorization", format!("bearer {WATCH_TOKEN}")).body(Body::empty()).unwrap();
+        let mut lower = lower;
+        lower.extensions_mut().insert(ConnectInfo("192.168.1.10:1".parse::<SocketAddr>().unwrap()));
+        assert_eq!(router_with(s.h.state.clone(), s.guard.clone()).oneshot(lower).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn every_watch_endpoint_accepts_the_watch_token_and_everything_else_needs_admin() {
+        let s = secured("enforce", "enforce", "", "");
+        let watch = [("POST", "/api/scan"), ("POST", "/api/scans"), ("GET", "/api/state"), ("GET", "/api/boost"), ("POST", "/api/boost"), ("GET", "/api/experiment"), ("POST", "/api/experiment"), ("GET", "/api/setpoint"), ("POST", "/api/setpoint"), ("DELETE", "/api/setpoint"), ("POST", "/api/label"), ("POST", "/api/label/void"), ("GET", "/api/labels/progress"), ("POST", "/watch/measurement"), ("POST", "/watch/sensors"), ("POST", "/watch/label"), ("POST", "/watch/window_label"), ("POST", "/watch/label/void"), ("GET", "/watch/update"), ("GET", "/watch/update.apk")];
+        for (method, uri) in watch {
+            assert_ne!(s.code(method, uri, Some(WATCH_TOKEN)).await, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_ne!(s.code(method, uri, Some(WATCH_TOKEN)).await, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+        for (method, uri) in [("POST", "/api/snapshot"), ("POST", "/api/window"), ("POST", "/api/window_label"), ("POST", "/api/ambient"), ("GET", "/api/usage"), ("GET", "/nonexistent")] {
+            assert_eq!(s.code(method, uri, Some(WATCH_TOKEN)).await, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_ne!(s.code(method, uri, Some(ADMIN_TOKEN)).await, StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn log_mode_accepts_counts_and_reports_in_metrics() {
+        let s = secured("enforce", "log", "", "");
+        assert_eq!(s.code("GET", WATCH_URI, None).await, StatusCode::OK);
+        assert_eq!(s.code("GET", WATCH_URI, Some("bad")).await, StatusCode::OK);
+        assert_eq!(s.code("GET", WATCH_URI, Some(WATCH_TOKEN)).await, StatusCode::OK);
+        assert_eq!(s.code("GET", ADMIN_URI, None).await, StatusCode::UNAUTHORIZED);
+        let request = Request::builder().uri("/metrics").body(Body::empty()).unwrap();
+        let mut request = request;
+        request.extensions_mut().insert(ConnectInfo("192.168.1.10:1".parse::<SocketAddr>().unwrap()));
+        let response = router_with(s.h.state.clone(), s.guard.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        for line in [
+            "heatd_http_auth_failures_total{scope=\"watch\",mode=\"log\",result=\"missing\"} 1",
+            "heatd_http_auth_failures_total{scope=\"watch\",mode=\"log\",result=\"invalid\"} 1",
+            "heatd_http_auth_failures_total{scope=\"admin\",mode=\"enforce\",result=\"missing\"} 1",
+            "heatd_http_auth_enforcing{role=\"admin\"} 1",
+            "heatd_http_auth_enforcing{role=\"watch\"} 0",
+            "heatd_http_source_rejected_total 0",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_stays_open_and_metrics_can_require_admin() {
+        let open = secured("enforce", "enforce", "", "");
+        assert_eq!(open.code("GET", "/health", None).await, StatusCode::OK);
+        assert_eq!(open.code("GET", "/metrics", None).await, StatusCode::OK);
+        let closed = secured("enforce", "enforce", "", "metrics_require_admin = true");
+        assert_eq!(closed.code("GET", "/health", None).await, StatusCode::OK);
+        assert_eq!(closed.code("GET", "/metrics", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(closed.code("GET", "/metrics", Some(WATCH_TOKEN)).await, StatusCode::FORBIDDEN);
+        assert_eq!(closed.code("GET", "/metrics", Some(ADMIN_TOKEN)).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn source_check_runs_before_auth_and_rejects_public_addresses() {
+        let s = secured("enforce", "enforce", "", "");
+        for peer in ["127.0.0.1", "10.9.8.7", "192.168.1.20", "172.20.1.1"] {
+            assert_eq!(s.via(peer, "GET", WATCH_URI, Some(WATCH_TOKEN), None).await.0, StatusCode::OK, "{peer}");
+        }
+        for peer in ["8.8.8.8", "203.0.113.9", "100.64.0.5"] {
+            let (status, body, _) = s.via(peer, "GET", WATCH_URI, Some(WATCH_TOKEN), None).await;
+            assert_eq!((status, body["error"].as_str().map(|e| e.contains("Quelladresse"))), (StatusCode::FORBIDDEN, Some(true)), "{peer}");
+            assert_eq!(s.via(peer, "GET", "/health", None, None).await.0, StatusCode::FORBIDDEN, "{peer}");
+        }
+        let (status, ..) = s.via("203.0.113.9", "GET", WATCH_URI, None, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let missing = Request::builder().uri("/health").body(Body::empty()).unwrap();
+        assert_eq!(router_with(s.h.state.clone(), s.guard.clone()).oneshot(missing).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let custom = secured("enforce", "enforce", "trusted_subnets = ['203.0.113.0/24']", "");
+        assert_eq!(custom.via("203.0.113.9", "GET", WATCH_URI, Some(WATCH_TOKEN), None).await.0, StatusCode::OK);
+        assert_eq!(custom.via("192.168.1.2", "GET", WATCH_URI, Some(WATCH_TOKEN), None).await.0, StatusCode::FORBIDDEN);
+        let rejected = s.guard.metrics();
+        assert!(rejected.contains("heatd_http_source_rejected_total 8"), "{rejected}");
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_rejected_and_no_cors_headers_are_sent() {
+        let s = secured("off", "off", "max_body_bytes = 64", "");
+        let small = json!({"device": "w", "from": 2, "to": 1, "label": "a"}).to_string();
+        assert_eq!(s.via("192.168.1.10", "POST", "/api/label", None, Some(small)).await.0, StatusCode::BAD_REQUEST);
+        let big = json!({"device": "w", "from": 2, "to": 1, "label": "a".repeat(500)}).to_string();
+        let (status, _, headers) = s.via("192.168.1.10", "POST", "/api/label", None, Some(big.clone())).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(headers.keys().all(|k| !k.as_str().starts_with("access-control")));
+        let mut request = Request::builder().method("POST").uri("/api/label").header("content-type", "application/json").body(Body::from(big)).unwrap();
+        request.headers_mut().remove("content-length");
+        request.extensions_mut().insert(ConnectInfo("192.168.1.10:1".parse::<SocketAddr>().unwrap()));
+        let response = router_with(s.h.state.clone(), s.guard.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let options = s.via("192.168.1.10", "OPTIONS", "/api/label", None, None).await;
+        assert!(options.2.keys().all(|k| !k.as_str().starts_with("access-control")));
+    }
+
+    #[test]
+    fn example_configs_ship_placeholder_token_paths_and_the_safe_rollout_modes() {
+        for file in ["heatd.example.toml", "deploy/docker/heatd.docker.toml"] {
+            let text = std::fs::read_to_string(format!("{}/../../{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            let http = Config::parse(&text).unwrap().http;
+            assert_eq!((http.auth.admin_mode, http.auth.watch_mode, http.auth.metrics_require_admin), (AuthMode::Enforce, AuthMode::Log, false), "{file}");
+            assert!(http.auth.admin_token_file.ends_with("heatd_admin_token") && http.auth.watch_token_file.ends_with("heatd_watch_token"), "{file}");
+        }
     }
 }

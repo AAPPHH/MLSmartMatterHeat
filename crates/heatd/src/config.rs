@@ -512,6 +512,67 @@ impl Default for WatchSection {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    Off,
+    Log,
+    Enforce,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthSection {
+    pub admin_token_file: String,
+    pub watch_token_file: String,
+    pub admin_mode: AuthMode,
+    pub watch_mode: AuthMode,
+    pub metrics_require_admin: bool,
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self { admin_token_file: String::new(), watch_token_file: String::new(), admin_mode: AuthMode::Off, watch_mode: AuthMode::Off, metrics_require_admin: false }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HttpSection {
+    pub trusted_subnets: Vec<String>,
+    pub max_body_bytes: usize,
+    pub request_timeout_s: u64,
+    pub auth: AuthSection,
+}
+
+impl Default for HttpSection {
+    fn default() -> Self {
+        Self {
+            trusted_subnets: crate::http::DEFAULT_TRUSTED.iter().map(|s| s.to_string()).collect(),
+            max_body_bytes: 4 * 1024 * 1024,
+            request_timeout_s: 30,
+            auth: AuthSection::default(),
+        }
+    }
+}
+
+impl HttpSection {
+    pub fn validate(&self) -> Result<()> {
+        for net in &self.trusted_subnets {
+            crate::http::Net::parse(net).with_context(|| format!("http.trusted_subnets: {net}"))?;
+        }
+        if self.max_body_bytes == 0 || self.request_timeout_s == 0 {
+            return Err(anyhow!("http: max_body_bytes and request_timeout_s must be > 0"));
+        }
+        for (role, mode, file) in [("admin", self.auth.admin_mode, &self.auth.admin_token_file), ("watch", self.auth.watch_mode, &self.auth.watch_token_file)] {
+            if mode != AuthMode::Off && file.trim().is_empty() {
+                return Err(anyhow!("http.auth: {role}_mode is {mode:?} but {role}_token_file is empty"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -558,6 +619,7 @@ pub struct Config {
     pub failsafe: FailsafeSection,
     pub stale: StaleSection,
     pub watch: WatchSection,
+    pub http: HttpSection,
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
     pub node_health: crate::node_health::NodeHealthSection,
     pub devices: Vec<crate::devices::DeviceConfig>,
@@ -609,6 +671,7 @@ impl Default for Config {
             failsafe: FailsafeSection::default(),
             stale: StaleSection::default(),
             watch: WatchSection::default(),
+            http: HttpSection::default(),
             br_watchdog: Default::default(),
             node_health: Default::default(),
             devices: Vec::new(),
@@ -661,6 +724,7 @@ impl Config {
         if let Some(unknown) = config.building.roof_rooms.iter().find(|r| !known(r)) {
             return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
+        config.http.validate()?;
         crate::devices::validate(&config.devices, &config.rooms)?;
         if let Some(phone) = &config.presence.phone {
             crate::phone::parse_mac(&phone.mac)?;
