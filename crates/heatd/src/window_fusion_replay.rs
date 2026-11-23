@@ -318,6 +318,9 @@ fn replay_fusion() {
     println!("(a) bedroom phase A first frost {:?} (limit 07:33), phase B first {:?}, frost 08:06-08:45 continuous: {b}", a.map(clock), b_first.map(clock));
     println!("(b) 11-22 kitchen {:?}, living room {:?} (limit 09:46)", kitchen.map(clock), living.map(clock));
     println!("(c) worst room false openings per day: {worst:.2} (limit {MAX_FALSE_PER_ROOM_DAY})");
+    if !legacy {
+        assert!(a.is_some_and(|t| t <= utc("2026-11-23T07:33")) && b, "criterion (a) regressed");
+    }
     for e in out.episodes.iter().filter(|e| e.from >= utc("2026-11-22T09:00") && e.from <= utc("2026-11-23T09:00") && e.source != "manual") {
         println!("   {} {} .. {} {} {}", e.room, clock(e.from), e.to.map_or("open".into(), clock), e.source, e.text);
     }

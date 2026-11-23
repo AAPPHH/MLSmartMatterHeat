@@ -1066,8 +1066,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     }
     room_model_step(state, &wants, now, now_ms, (away, presence.as_ref().is_some_and(|p| p.sleep), detected.as_deref()), window_busy);
     state.boost.settle(&wants.iter().map(|w| (w.room.as_str(), w.reason)).collect::<Vec<_>>(), now_ms);
-    let away_fresh = away && presence.as_ref().is_some_and(|p| p.contact_age_minutes.is_some_and(|a| a <= state.config.still_contact_timeout_minutes));
-    let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().dialed(&r.nodes), away: away_fresh })).collect();
+    let fresh = away && presence.as_ref().is_some_and(|p| p.contact_age_minutes.is_some_and(|a| a <= state.config.still_contact_timeout_minutes));
+    let contexts: Vec<(String, crate::window::RoomCtx)> = state.config.rooms.iter().map(|r| (r.name.clone(), crate::window::RoomCtx { hold: state.commanded.lock().unwrap().dialed(&r.nodes), away, away_fresh: fresh })).collect();
     state.windows.lock().unwrap().set_context(contexts);
     let current = |commands: &Commands, node: u64| {
         commands.device.get(&node).copied().or(commands.target(node)).or_else(|| readings.iter().find(|r| r.node == node && r.attribute == "occupied_heating_setpoint").map(|r| r.value))

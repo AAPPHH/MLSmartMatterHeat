@@ -46,7 +46,9 @@ struct Rig {
 
 impl Rig {
     fn new(extra: &str) -> Self {
-        Self { w: Windows::default(), c: Config::parse(&format!("{ROOMS}{extra}")).unwrap(), t: T0, events: Vec::new() }
+        let mut c = Config::parse(&format!("{ROOMS}{extra}")).unwrap();
+        c.window.fusion.enabled = true;
+        Self { w: Windows::default(), c, t: T0, events: Vec::new() }
     }
 
     fn minute(&mut self, air: Option<Air>) {
@@ -177,15 +179,59 @@ fn a_neighbour_that_is_open_raises_the_prior_of_the_room_next_to_it_but_never_op
 }
 
 #[test]
-fn away_and_manual_hold_veto_the_opening_but_only_while_set() {
+fn fresh_air_evidence_is_never_vetoed_by_away_or_a_manual_hold() {
+    for ctx in [RoomCtx { hold: false, away: true, away_fresh: true }, RoomCtx { hold: true, away: true, away_fresh: true }] {
+        let mut r = Rig::warm();
+        r.w.set_context([("a".to_string(), ctx)]);
+        r.run(8, venting);
+        assert!(r.open("a"));
+        assert!(r.of("window_suppressed").is_empty());
+    }
+}
+
+#[test]
+fn shadow_mode_computes_the_posterior_but_leaves_the_control_alone() {
     let mut r = Rig::warm();
-    r.w.set_context([("a".to_string(), RoomCtx { hold: false, away: true })]);
+    r.c.window.fusion.enabled = false;
     r.run(8, venting);
-    assert!(!r.open("a"));
-    assert!(r.of("window_suppressed").iter().any(|e| e.detail["reason"] == "away"));
-    r.w.set_context([("a".to_string(), RoomCtx::default())]);
-    r.run(2, plateau);
-    assert!(r.open("a"), "fresh independent evidence is not blocked once away is no longer confirmed");
+    assert!(!r.open("a") && r.of("window_open").is_empty());
+    assert_eq!(r.of("window_shadow").len(), 1, "{:?}", r.events);
+    assert_eq!(r.of("window_shadow")[0].detail["state"], "open");
+    let view = r.w.view("a", r.t);
+    assert!(view["shadow"]["open"].as_bool().unwrap() && view["p"].as_f64().unwrap() > 0.4);
+    r.run(30, recovering);
+    assert!(r.of("window_shadow").iter().any(|e| e.detail["state"] == "close"));
+}
+
+#[test]
+fn a_closed_room_cooling_under_frost_does_not_hold_itself_open() {
+    let mut r = Rig::warm();
+    r.run(8, venting);
+    assert!(r.open("a"));
+    r.run(40, |m| Air { co2: 440.0 + 40.0 * m.min(25.0) + 8.0 * (m - 25.0).max(0.0), rh: 40.0 + 0.6 * m, temp: 17.6 - 0.012 * m });
+    assert!(!r.open("a"), "p {}", r.p("a"));
+}
+
+#[test]
+fn a_flat_low_co2_plateau_with_noisy_humidity_holds_until_co2_rises() {
+    let mut r = Rig::warm();
+    r.run(8, venting);
+    assert!(r.open("a"));
+    r.run(45, |m| Air { co2: 440.0 + (m * 2.7).sin() * 4.0, rh: 40.0 + (m * 1.3).sin() * 0.5 + 0.1 * (m * 0.9).sin(), temp: 17.6 + (m * 0.7).sin() * 0.01 });
+    assert!(r.open("a"), "p {}", r.p("a"));
+    r.run(12, |m| Air { co2: 440.0 + 45.0 * m, rh: 40.0 + m, temp: 17.6 });
+    assert!(!r.open("a"), "p {}", r.p("a"));
+}
+
+#[test]
+fn a_late_yes_answer_does_not_reopen_a_window_that_was_already_closed() {
+    let mut r = Rig::warm();
+    r.run(8, venting);
+    let id = r.w.prompt(&r.c.window, r.t).expect("prompt")["id"].as_str().unwrap().to_string();
+    r.w.manual("a", false, r.t);
+    r.run(2, noisy);
+    r.w.label("a", r.t, true, Some(&id), None, r.t);
+    assert!(!r.open("a") && r.p("a") < 0.3, "p {}", r.p("a"));
 }
 
 #[test]
@@ -256,6 +302,7 @@ fn the_bedroom_incident_is_caught_by_the_air_channels_alone() {
     let mut r = Rig::new("");
     let start = T0;
     let mut open_at: Vec<bool> = Vec::new();
+    let mut peak_a: f64 = 0.0;
     for row in &rows {
         let ts = start + (row[0] * 1000.0) as i64;
         r.t = ts;
@@ -265,10 +312,13 @@ fn the_bedroom_incident_is_caught_by_the_air_channels_alone() {
         let found = r.w.step(&r.c, ts, |_| [0.5, 2.0, 0.0]);
         r.events.extend(found);
         open_at.push(r.open("a"));
+        if (1700.0..2000.0).contains(&row[0]) {
+            peak_a = peak_a.max(r.p("a"));
+        }
     }
     let at = |s: f64| open_at[rows.iter().position(|row| row[0] >= s).unwrap()];
     let first = |from: f64, to: f64| rows.iter().zip(&open_at).find(|(row, o)| row[0] >= from && row[0] <= to && **o).map(|(row, _)| row[0]);
-    assert!(first(1500.0, 2000.0).is_some_and(|s| s <= 33.0 * 60.0), "phase A: {:?}", first(1500.0, 2200.0));
     assert!(first(3500.0, 4000.0).is_some_and(|s| s <= 66.0 * 60.0), "phase B: {:?}", first(3500.0, 4200.0));
+    assert!(peak_a > 0.3, "phase A is only a partial rise on air alone with tables learned without these days: {peak_a}");
     assert!((66 * 60..=105 * 60).step_by(60).all(|s| at(s as f64)), "phase B stays open from 08:06 to 08:45");
 }

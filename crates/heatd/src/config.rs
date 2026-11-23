@@ -320,10 +320,11 @@ pub struct WindowSection {
     pub fusion: WindowFusion,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct WindowFusion {
     pub enabled: bool,
+    pub shadow: bool,
     pub tables: String,
     pub skip_humidity: Vec<String>,
     pub window_min: f64,
@@ -342,11 +343,12 @@ pub struct WindowFusion {
     pub couple_llr: f64,
     pub horizon_min: f64,
     pub cool_k_per_h: f64,
+    pub level_llr: f64,
 }
 
 impl Default for WindowFusion {
     fn default() -> Self {
-        Self { enabled: true, tables: String::new(), skip_humidity: Vec::new(), window_min: 4.0, min_samples: 3, max_window_min: 20.0, fresh_min: 10.0, outdoor_co2_ppm: 420.0, co2_floor_ppm: 80.0, dt_floor_k: 3.0, dt_ref_k: 8.0, open_every_min: 1440.0, stay_min: 30.0, logit_max: 9.0, floor_margin: 1.0, temper_scale: 1.5, couple_llr: 1.5, horizon_min: 20.0, cool_k_per_h: 0.5 }
+        Self { enabled: false, shadow: true, tables: String::new(), skip_humidity: Vec::new(), window_min: 4.0, min_samples: 3, max_window_min: 20.0, fresh_min: 10.0, outdoor_co2_ppm: 420.0, co2_floor_ppm: 80.0, dt_floor_k: 3.0, dt_ref_k: 8.0, open_every_min: 1440.0, stay_min: 30.0, logit_max: 9.0, floor_margin: 1.0, temper_scale: 1.5, couple_llr: 1.5, horizon_min: 20.0, cool_k_per_h: 0.5, level_llr: 0.3 }
     }
 }
 

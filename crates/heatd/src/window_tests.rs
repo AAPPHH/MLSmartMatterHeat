@@ -143,12 +143,12 @@ fn vetoes_keep_single_rooms_closed() {
     assert_eq!(s.open(), vec!["kueche"]);
     assert!(s.of("window_suppressed").iter().any(|e| e.room == "wohnzimmer" && e.detail["reason"] == "setpoint"));
     let mut s = Sim::warm("");
-    s.w.set_context([("wohnzimmer".to_string(), RoomCtx { hold: true, away: false })]);
+    s.w.set_context([("wohnzimmer".to_string(), RoomCtx { hold: true, away: false, away_fresh: false })]);
     s.drops([0.3, 0.0, 0.3], 6);
     assert_eq!(s.open(), vec!["kueche"]);
     assert!(s.of("window_suppressed").iter().any(|e| e.detail["reason"] == "manual_hold"));
     let mut s = Sim::warm("");
-    s.w.set_context(["wohnzimmer", "kueche"].map(|r| (r.to_string(), RoomCtx { hold: false, away: true })));
+    s.w.set_context(["wohnzimmer", "kueche"].map(|r| (r.to_string(), RoomCtx { hold: false, away: true, away_fresh: true })));
     s.drops([0.3, 0.0, 0.3], 6);
     assert!(s.open().is_empty() && s.of("window_open").is_empty());
     assert_eq!(s.of("window_suppressed").len(), 2);
@@ -161,7 +161,7 @@ fn suppressed_window_alarms_still_block_boosts() {
     s.drops([0.3, 0.0, 0.3], 6);
     assert!(s.w.open_ago_min("wohnzimmer", s.t).is_some_and(|a| a < 1.0));
     assert!(s.w.open_ago_min("kueche", s.t).is_some_and(|a| a < 1.0));
-    for ctx in [RoomCtx { hold: true, away: false }, RoomCtx { hold: false, away: true }] {
+    for ctx in [RoomCtx { hold: true, away: false, away_fresh: false }, RoomCtx { hold: false, away: true, away_fresh: true }] {
         let mut s = Sim::warm("");
         s.w.set_context(["wohnzimmer", "kueche"].map(|r| (r.to_string(), ctx.clone())));
         s.drops([0.3, 0.0, 0.3], 6);

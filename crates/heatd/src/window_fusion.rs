@@ -11,6 +11,9 @@ const MIN_SPAN_MS: i64 = 90_000;
 const MEMORY: f64 = 0.85;
 const SHOWN: f64 = 0.4;
 const TAIL: f64 = 1e-6;
+const RECOVERY_DAMP: f64 = 0.3;
+const CO2_DEPRESSED_FRAC: f64 = 0.6;
+const CO2_REF_MIN_EXCESS: f64 = 150.0;
 const BUILTIN: &str = include_str!("window_fusion.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,12 +25,13 @@ pub enum Chan {
     House,
     Couple,
     Hard,
+    Level,
 }
 
-pub const CHANNELS: usize = 7;
+pub const CHANNELS: usize = 8;
 
 impl Chan {
-    pub const ALL: [Chan; CHANNELS] = [Chan::Trv, Chan::Co2, Chan::Rh, Chan::Temp, Chan::House, Chan::Couple, Chan::Hard];
+    pub const ALL: [Chan; CHANNELS] = [Chan::Trv, Chan::Co2, Chan::Rh, Chan::Temp, Chan::House, Chan::Couple, Chan::Hard, Chan::Level];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -38,6 +42,7 @@ impl Chan {
             Chan::House => "house",
             Chan::Couple => "neighbour",
             Chan::Hard => "answer",
+            Chan::Level => "level",
         }
     }
 
@@ -57,6 +62,8 @@ impl Chan {
             (Chan::Couple, false) => "Nachbarraum zu",
             (Chan::Hard, true) => "Antwort: offen",
             (Chan::Hard, false) => "Antwort: zu",
+            (Chan::Level, true) => "Luft bleibt kalt und trocken",
+            (Chan::Level, false) => "Luft erholt sich",
         }
     }
 }
@@ -202,6 +209,11 @@ impl Rates {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Reference {
+    pub co2: Option<f64>,
+}
+
 #[derive(Debug, Default)]
 pub struct AirRoom {
     nodes: BTreeMap<u64, [VecDeque<(i64, f64)>; 3]>,
@@ -253,6 +265,18 @@ impl AirRoom {
         (span >= MIN_SPAN_MS && span <= (cfg.max_window_min.max(cfg.window_min) * MIN_MS as f64) as i64).then_some(picked)
     }
 
+    fn level(&self, signal: Signal, now: i64) -> Option<f64> {
+        self.newest(signal, now)?.back().filter(|b| now - b.0 <= 10 * MIN_MS).map(|b| b.1)
+    }
+
+    pub fn reference(&self, now: i64) -> Reference {
+        Reference { co2: self.newest(Signal::Co2, now).and_then(|s| s.iter().filter(|p| p.0 <= now).map(|p| p.1).reduce(f64::max)) }
+    }
+
+    pub fn depressed(&self, cfg: &WindowFusion, now: i64, r: &Reference) -> bool {
+        r.co2.zip(self.level(Signal::Co2, now)).is_some_and(|(top, v)| top - cfg.outdoor_co2_ppm >= CO2_REF_MIN_EXCESS && v - cfg.outdoor_co2_ppm < CO2_DEPRESSED_FRAC * (top - cfg.outdoor_co2_ppm))
+    }
+
     pub fn latest_temp(&self, now: i64) -> Option<f64> {
         self.newest(Signal::Temp, now).and_then(|s| s.back()).map(|b| b.1)
     }
@@ -277,6 +301,8 @@ pub struct Inputs {
     pub pulse: Option<(Chan, f64)>,
     pub rates: Rates,
     pub gain: f64,
+    pub holding: bool,
+    pub depressed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +356,17 @@ impl Posterior {
         add[Chan::Co2 as usize] = inp.rates.co2.map_or(0.0, |r| k * t.temper.co2 * t.co2.at(r));
         add[Chan::Rh as usize] = inp.rates.rh.map_or(0.0, |r| k * t.temper.rh * t.rh.at(r));
         add[Chan::Temp as usize] = inp.rates.temp.map_or(0.0, |r| k * t.temper.temp * gain * t.temp.at(r));
+        if inp.holding {
+            for c in [Chan::Trv, Chan::Temp] {
+                add[c as usize] = add[c as usize].min(0.0);
+            }
+        }
+        if inp.holding && inp.depressed {
+            for c in [Chan::Co2, Chan::Rh] {
+                add[c as usize] = if add[c as usize] < 0.0 { add[c as usize] * RECOVERY_DAMP } else { add[c as usize] };
+            }
+            add[Chan::Level as usize] = cfg.level_llr;
+        }
         if let Some((chan, llr)) = inp.pulse {
             add[chan as usize] += llr;
         }
