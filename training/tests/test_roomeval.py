@@ -4,7 +4,7 @@ import math
 import numpy as np
 from heattrain.__main__ import CONFIG
 from heattrain.roombatch import Grid
-from heattrain.roomeval import Skill, criteria, interval_logscore, live_episodes, merge_windows, rmse, skill_unusable, window_metrics
+from heattrain.roomeval import Skill, Variants, choose_rooms, criteria, interval_logscore, live_episodes, merge_windows, rmse, room_verdict, skill_unusable, uniform, window_metrics
 from heattrain.roomfit import Truth, calibrate_air, episodes, label_loss, load_live_alarms
 
 RC = CONFIG["roommodel"]
@@ -23,9 +23,9 @@ class G:
         return m
 
 
-def truth(gt, labels=(), live=()):
+def truth(gt, labels=(), live=(), known=()):
     t = object.__new__(Truth)
-    t.rc, t.gt, t.labels, t.live = RC, list(gt), list(labels), list(live)
+    t.rc, t.gt, t.labels, t.live, t.known = RC, list(gt), list(labels), list(live), list(known)
     return t
 
 
@@ -197,3 +197,57 @@ def test_appliance_windows_merge_pulses_and_split_the_skill_into_inside_and_outs
     skill.add("kueche", 60, errs, np.array(["steady"] * 4), {}, inside)
     b = skill.report(["kueche"])["rooms"]["kueche"]["H20"]
     assert b["window"]["n"] == 2 and abs(b["window"]["imm_anchored"] - 0.5) < 1e-12 and abs(b["outside"]["imm_anchored"] - 0.1) < 1e-12
+
+
+def test_known_openings_report_the_first_flag_within_the_criterion_window_and_per_room_hits():
+    g = G(["r", "s"], 600)
+    t0 = g.times[0]
+    a = t0 + 300 * 60.0
+    known = [("r", a, a + 600.0), ("r", a + 3600.0, a + 4200.0)]
+    gt = [(x, y, [r]) for r, x, y in known]
+    pw = np.zeros(600)
+    pw[303:312] = 0.9
+    pw[368:372] = 0.9
+    r = {"r": {"p_window": pw, "lam": np.ones(600)}, "s": {"p_window": np.zeros(600), "lam": np.ones(600)}}
+    m = window_metrics(g, r, truth(gt, known=known), 0, 600, RC)
+    assert [k["first_min"] for k in m["known"]] == [3.0, None] and m["known"][1]["peak"] == 0.0
+    assert m["per_room"]["r"]["opens"] == 2 and m["per_room"]["r"]["hits"] == 1 and m["per_room"]["r"]["latency_min"] == [3.0] and m["per_room"]["s"]["opens"] == 0
+    assert merge_windows([m, m])["per_room"]["r"]["hits"] == 2
+
+
+def view(hits, fa, lead, temp):
+    return {"hits": hits, "opens": 2, "false_per_day": fa, "lead_min": lead, "temp": temp}
+
+
+def test_a_room_accepts_gas_for_hits_or_earlier_detection_without_false_alarms_or_temperature_loss():
+    sel = RC["evidence"]["select"]
+    ref = view(1, 0.1, 8.0, 0.10)
+    assert room_verdict(view(2, 0.1, 8.0, 0.10), ref, sel)["accepted"]
+    assert room_verdict(view(1, 0.1, 5.0, 0.10), ref, sel)["accepted"]
+    assert not room_verdict(view(1, 0.1, 7.5, 0.10), ref, sel)["accepted"]
+    assert not room_verdict(view(2, 0.9, 8.0, 0.10), ref, sel)["accepted"]
+    assert not room_verdict(view(2, 0.1, 8.0, 0.085), ref, sel)["accepted"]
+    assert not room_verdict(view(0, 0.1, None, 0.10), ref, sel)["accepted"]
+    assert room_verdict(view(2, 0.15, 8.0, 0.10), view(1, 0.5, 8.0, 0.10), sel)["accepted"]
+
+
+def test_choose_rooms_picks_the_best_accepted_candidate_per_room_and_keeps_the_rest_plain():
+    def run(hits, fa):
+        pr = lambda h, f: {"hits": h, "opens": 2, "false": 0, "false_per_day": f, "latency_min": [5.0] * h}
+        sk = {"H20": {"skill": 0.1}, "H60": {"skill": 0.1}}
+        return {"window": {"per_room": {"a": pr(hits[0], fa[0]), "b": pr(hits[1], fa[1])}}, "skill": {"rooms": {"a": sk, "b": sk}}}
+    out = {"ref": run((0, 0), (0.1, 0.1)), "gas_x": run((1, 0), (0.1, 0.1)), "gas_y": run((2, 0), (0.1, 0.1))}
+    cands = {"gas_x": {"parts": ("air",), "gas": {}}, "gas_y": {"parts": ("air", "gas"), "gas": {"co2": {"sigma": 9.0}}}}
+    plan = choose_rooms(out, "ref", list(cands), ["a", "b"], cands, RC["evidence"]["select"])
+    assert plan["a"]["parts"] == ("air", "gas") and plan["a"]["gas"] == {"co2": {"sigma": 9.0}} and plan["b"] == {"parts": (), "gas": {}}
+    assert out["gas_y"]["accepted"] and out["gas_y"]["rooms"]["b"]["accepted"] is False
+
+
+def test_variants_apply_parts_and_gas_overrides_per_room():
+    v = object.__new__(Variants)
+    blk = {"co2": {"sigma": 4.0, "node": 12}, "hum": {"sigma": 0.03, "node": 12}}
+    v.blocks = {"a": blk, "b": blk}
+    base = {"a": {}, "b": {}}
+    plan = {"a": {"parts": ("gas",), "gas": {"co2": {"sigma": 9.0}}}, "b": uniform(["b"])["b"]}
+    out = v.docs(base, plan)
+    assert out["a"]["co2"] == {"sigma": 9.0, "node": 12} and out["a"]["hum"]["sigma"] == 0.03 and "co2" not in out["b"] and blk["co2"]["sigma"] == 4.0

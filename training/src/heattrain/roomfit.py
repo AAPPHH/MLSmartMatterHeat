@@ -347,7 +347,8 @@ def load_live_alarms(path):
 class Truth:
     def __init__(self, src, rc):
         self.rc = rc
-        self.gt = load_ground_truth(src, rc["hold_min"])
+        self.known = [(k["room"], datetime.fromisoformat(k["open_utc"]).timestamp(), datetime.fromisoformat(k["close_utc"]).timestamp()) for k in rc.get("known", [])]
+        self.gt = load_ground_truth(src, rc["hold_min"]) + [(a, b, [r]) for r, a, b in self.known]
         self.labels = [x for x in load_window_labels(src) if x[0] > 1e6]
         self.live = load_live_alarms(src)
 

@@ -178,7 +178,7 @@ def window_metrics(grid, rec, truth, lo, hi, rc):
     ev, hit_s = rc["eval"], rc["shock"]["hit_min"] * 60.0
     names, spans = grid.names, truth.spans(grid.names)
     t = grid.times
-    res = {"opens": 0, "hits": 0, "latency_min": [], "missed": [], "false_episodes": 0, "valid_min": 0, "denials": 0, "denials_flagged": 0, "per_room": {}, "live_opens": 0, "live_hits": 0, "live_false": 0, "live_denials_flagged": 0}
+    res = {"opens": 0, "hits": 0, "latency_min": [], "missed": [], "false_episodes": 0, "valid_min": 0, "denials": 0, "denials_flagged": 0, "per_room": {}, "live_opens": 0, "live_hits": 0, "live_false": 0, "live_denials_flagged": 0, "known": []}
     for r in names:
         tt = t[lo:hi]
         eps = episodes(flag_series(rec[r]["p_window"][lo:hi], ev["pw_flag"]), tt, ev["min_episode_min"])
@@ -187,14 +187,18 @@ def window_metrics(grid, rec, truth, lo, hi, rc):
         outside = lambda e: not any(x <= e[0] <= y for x, y in spans[r])
         false = sum(1 for e in eps if outside(e))
         live_false = sum(1 for e in leps if t[lo] <= e[0] < t[hi - 1] and outside(e))
+        pr = {"opens": 0, "hits": 0, "latency_min": []}
         for room, a in truth.opens([r], t[lo], t[hi - 1]):
             mine = touching(eps, a, a + hit_s)
+            pr["opens"] += 1
             res["opens"] += 1
             res["live_opens"] += 1
             res["live_hits"] += int(bool(touching(leps, a, a + hit_s)))
             if mine:
+                pr["hits"] += 1
                 res["hits"] += 1
-                res["latency_min"].append(max(mine[0][0] - a, 0.0) / 60.0)
+                pr["latency_min"].append(max(mine[0][0] - a, 0.0) / 60.0)
+                res["latency_min"].append(pr["latency_min"][-1])
             else:
                 res["missed"].append([r, a])
         for room, a in truth.denials([r], t[lo], t[hi - 1]):
@@ -204,22 +208,28 @@ def window_metrics(grid, rec, truth, lo, hi, rc):
         res["false_episodes"] += false
         res["valid_min"] += valid
         res["live_false"] += live_false
-        res["per_room"][r] = {"false": false, "valid_min": valid, "live_false": live_false}
+        res["per_room"][r] = {"false": false, "valid_min": valid, "live_false": live_false, **pr}
+        for room, a, b in truth.known:
+            if room == r and t[lo] <= a < t[hi - 1]:
+                i0, i1 = np.searchsorted(t, a), np.searchsorted(t, a + ev["known_within_min"] * 60.0, side="right")
+                pw = np.nan_to_num(rec[r]["p_window"])[i0:i1]
+                up = np.nonzero(pw > ev["pw_flag"])[0]
+                res["known"].append({"room": r, "open": a, "first_min": float((t[i0 + up[0]] - a) / 60.0) if len(up) else None, "peak": float(pw.max()) if len(pw) else 0.0})
     return res
 
 
 def merge_windows(parts):
     out = {k: 0 for k in ("opens", "hits", "false_episodes", "valid_min", "denials", "denials_flagged", "live_opens", "live_hits", "live_false", "live_denials_flagged")}
-    out.update({"latency_min": [], "missed": [], "per_room": {}})
+    out.update({"latency_min": [], "missed": [], "known": [], "per_room": {}})
     for p in parts:
         for k in out:
-            if k in ("latency_min", "missed"):
+            if k in ("latency_min", "missed", "known"):
                 out[k] += p[k]
             elif k == "per_room":
                 for r, v in p[k].items():
-                    o = out[k].setdefault(r, {"false": 0, "valid_min": 0, "live_false": 0})
+                    o = out[k].setdefault(r, {"false": 0, "valid_min": 0, "live_false": 0, "opens": 0, "hits": 0, "latency_min": []})
                     for kk in o:
-                        o[kk] += v[kk]
+                        o[kk] += v.get(kk, [] if kk == "latency_min" else 0)
             else:
                 out[k] += p[k]
     days = lambda m: max(m / 1440.0, 1e-9)
@@ -237,17 +247,21 @@ class Variants:
         ss = [int(np.nonzero(np.isfinite(a))[0][0]) for c in full.cols.values() for a in c["ya"] if np.isfinite(a).any()]
         self.sensor_start = min(ss) if ss else None
 
-    def docs(self, base, parts, cal=None, effort=None):
+    def docs(self, base, plan, cal=None, effort=None):
         out = copy.deepcopy(base)
         for r, d in out.items():
-            b = self.blocks[r]
+            b, pl = self.blocks[r], plan[r]
             if effort:
                 d["effort"] = dict(effort)
-            if "air" in parts and cal and r in cal:
+            if "air" in pl["parts"] and cal and r in cal:
                 d["air"] = [{"node": a["node"], **c} for a, c in zip(b.get("air", []), cal[r])]
-            if "gas" in parts:
-                d.update({k: b[k] for k in ("co2", "hum") if k in b})
+            if "gas" in pl["parts"]:
+                d.update({k: {**b[k], **pl["gas"].get(k, {})} for k in ("co2", "hum") if k in b})
         return out
+
+
+def uniform(names, parts=(), gas=None):
+    return {r: {"parts": tuple(parts), "gas": gas or {}} for r in names}
 
 
 def make_folds(full, variants, rc):
@@ -281,7 +295,7 @@ def tuned_trials(fold, full, docs, truth, rc, house):
     return recs[0], recs[gi], lw, lj, resets[gi], tuning
 
 
-def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=None, shock=None, pcnn=None):
+def evaluate_variant(folds, full, ff, variants, truth, rc, house, plan, effort=None, shock=None, pcnn=None):
     ap = rc["appliance"]
     appliance = {r: appliance_windows(full.cols[r]["pw"], ap["on_kw"], ap["merge_min"], ap["trail_min"]) for r in full.names if np.isfinite(full.cols[r].get("pw", np.nan)).any()}
     skill = Skill(list(ff.rfs[next(iter(ff.rfs))].Hs), rc["eval"]["floor"])
@@ -289,11 +303,11 @@ def evaluate_variant(folds, full, ff, variants, truth, rc, house, parts, effort=
     for f in folds:
         f = dict(f, shock=shock_defaults(rc, **shock)) if shock else f
         cal = None
-        if "air" in parts and variants.sensor_start is not None and f["cut"] > variants.sensor_start:
+        if any("air" in pl["parts"] for pl in plan.values()) and variants.sensor_start is not None and f["cut"] > variants.sensor_start:
             ref_docs = f["docs0"]
             _, rref, _ = run_range(full, ref_docs, [f["shock"]], house, max(0, variants.sensor_start - 600), f["cut"])
             cal = calibrate_air(full, ref_docs, rc, variants.sensor_start, f["cut"], rref[0])
-        docs = variants.docs(f["docs0"], parts, cal, effort)
+        docs = variants.docs(f["docs0"], plan, cal, effort)
         rec_a, rec_w, lw, lj, rs, tuning = tuned_trials(f, full, docs, truth, rc, house)
         spans = truth.spans(full.names)
         spans_mask = {r: full.span_mask(spans[r]) for r in full.names}
@@ -312,31 +326,79 @@ def score(rep):
     return 0.5 * sum(p[h]["skill"] or 0.0 for h in ("H20", "H60"))
 
 
+def room_temp(v, r):
+    b = v["skill"]["rooms"][r]
+    return 0.5 * sum(b[h]["skill"] or 0.0 for h in ("H20", "H60"))
+
+
+def room_view(v, r):
+    w = v["window"]["per_room"][r]
+    return {"hits": w["hits"], "opens": w["opens"], "false_per_day": w["false_per_day"], "lead_min": float(np.mean(w["latency_min"])) if w["latency_min"] else None, "temp": room_temp(v, r)}
+
+
+def room_verdict(var, ref, sel):
+    w = sel["window"]
+    bad = []
+    if var["temp"] < ref["temp"] - w["temp_guard"]:
+        bad.append(f"temperature skill {var['temp']:.3f} vs {ref['temp']:.3f}")
+    if var["false_per_day"] > max(w["false_per_room_day"], ref["false_per_day"]):
+        bad.append(f"false alarms {var['false_per_day']:.2f}/day vs {ref['false_per_day']:.2f}")
+    if var["hits"] < ref["hits"]:
+        bad.append(f"hits {var['hits']} vs {ref['hits']}")
+    sooner = var["lead_min"] is not None and ref["lead_min"] is not None and ref["lead_min"] - var["lead_min"] >= w["min_lead_gain_min"]
+    if var["hits"] == ref["hits"] and not sooner:
+        bad.append("no more hits and no earlier detection")
+    return {"accepted": not bad, "why": bad, "var": var, "ref": ref}
+
+
+def choose_rooms(out, ref, keys, names, cands, sel):
+    plan = {}
+    for r in names:
+        ok = []
+        for k in keys:
+            vd = room_verdict(room_view(out[k], r), room_view(out[ref], r), sel)
+            out[k].setdefault("rooms", {})[r] = vd
+            if vd["accepted"]:
+                ok.append((vd["var"]["hits"], -vd["var"]["false_per_day"], -(vd["var"]["lead_min"] or 0.0), k))
+        plan[r] = dict(cands[max(ok)[3]]) if ok else {"parts": (), "gas": {}}
+    for k in keys:
+        out[k]["accepted"] = any(v["accepted"] for v in out[k]["rooms"].values())
+    return plan
+
+
 def rolling_origin(full, ff, variants, truth, rc, house):
     folds, warm = make_folds(full, variants, rc), None
     for f in folds:
         warm = run_fold(f, full, ff, truth, rc, warm)
     sensor = [f for f in folds if f["sensor"]]
-    ev = lambda fs, parts=(), effort=None, shock=None: evaluate_variant(fs, full, ff, variants, truth, rc, house, parts, effort, shock)
+    names = list(full.names)
+    ev = lambda fs, plan=None, effort=None, shock=None: evaluate_variant(fs, full, ff, variants, truth, rc, house, plan or uniform(names), effort, shock)
     out = {"trv": ev(folds)}
     sel = rc["evidence"]["select"]
     if not sel["enabled"]:
-        return folds, out, {"parts": ["air", "gas"], "effort": rc["evidence"]["effort"]}
+        return folds, out, {"rooms": uniform(names, ("air", "gas")), "effort": rc["evidence"]["effort"]}
     for i, sh in enumerate(rc["eval"]["shock_variants"]):
         out[f"shock_{i}"] = ev(folds, shock=sh)
         out[f"shock_{i}"]["shock_fixed"] = sh
-    cands = [(f"effort_{e['sigma']}_{e['steady_u']}", folds, "trv", (), e) for e in sel["effort"]]
+    for e in sel["effort"]:
+        key = f"effort_{e['sigma']}_{e['steady_u']}"
+        out[key] = ev(folds, None, e)
+        out[key]["gain"] = score(out[key]) - score(out["trv"])
+        out[key]["accepted"] = bool(out[key]["gain"] >= sel["min_gain"] and out[key]["resets"] <= out["trv"]["resets"] + sel["max_resets_up"])
+    be = max([k for k, v in out.items() if v.get("accepted") and k.startswith("effort_")], key=lambda k: out[k]["gain"], default=None)
+    effort = next(e for e in sel["effort"] if f"effort_{e['sigma']}_{e['steady_u']}" == be) if be else None
+    plan = uniform(names)
     if sensor:
         out["trv_sensor"] = ev(sensor)
-        cands += [("air", sensor, "trv_sensor", ("air",), None), ("air_gas", sensor, "trv_sensor", ("air", "gas"), None)]
-    for key, fs, ref, parts, effort in cands:
-        out[key] = ev(fs, parts, effort)
-        out[key]["gain"] = score(out[key]) - score(out[ref])
-        out[key]["accepted"] = bool(out[key]["gain"] >= sel["min_gain"] and out[key]["resets"] <= out[ref]["resets"] + sel["max_resets_up"])
-    best = lambda pre: max([k for k, v in out.items() if v.get("accepted") and (k.startswith("effort_") == pre)], key=lambda k: out[k]["gain"], default=None)
-    be, bs = best(True), best(False)
-    chosen = {"parts": ["air"] + (["gas"] if bs == "air_gas" else []) if bs else [], "effort": next(e for e in sel["effort"] if f"effort_{e['sigma']}_{e['steady_u']}" == be) if be else None}
-    return folds, out, chosen
+        ref = "trv_sensor" if not effort else "effort_sensor"
+        if effort:
+            out[ref] = ev(sensor, None, effort)
+        cands = {f"gas_{c['name']}": {"parts": tuple(c["parts"]), "gas": c.get("gas", {})} for c in sel["gas"]}
+        for key, c in cands.items():
+            out[key] = ev(sensor, uniform(names, c["parts"], c["gas"]), effort)
+            out[key]["gain"] = score(out[key]) - score(out[ref])
+        plan = choose_rooms(out, ref, list(cands), names, cands, sel)
+    return folds, out, {"rooms": plan, "effort": effort}
 
 
 def ship_key(chosen, hold):
@@ -419,7 +481,7 @@ def fit_bundle(config, rooms, src, version=None):
     ff, variants = FoldFit(rooms, full, cfg, rc), Variants(rooms, full, rc)
     folds, hold, chosen = rolling_origin(full, ff, variants, truth, rc, house)
     pcnn = {"exog": Exog.from_lake(full, src, cfg, rc, rooms, power), "fit": PcnnFit(rc["pcnn"])}
-    ship = evaluate_variant(folds, full, ff, variants, truth, rc, house, tuple(chosen["parts"]), chosen["effort"], pcnn=pcnn)
+    ship = evaluate_variant(folds, full, ff, variants, truth, rc, house, chosen["rooms"], chosen["effort"], pcnn=pcnn)
     gate = pcnn_gate(ship["skill"], rc["pcnn"]["gate"])
     t_fold = time.time() - t0
     docs0, th, info = ff.run(full.n, folds[-1]["th"], ext=False)
@@ -427,10 +489,10 @@ def fit_bundle(config, rooms, src, version=None):
     best, nll, trace = fit_shock(full.window(lo, full.n), docs0, rc, None, truth)
     shock = shock_defaults(rc, **best)
     cal = None
-    if "air" in chosen["parts"] and variants.sensor_start is not None:
+    if any("air" in pl["parts"] for pl in chosen["rooms"].values()) and variants.sensor_start is not None:
         _, rref, _ = run_range(full, docs0, [shock], house, max(0, variants.sensor_start - 600), full.n)
         cal = calibrate_air(full, docs0, rc, variants.sensor_start, full.n, rref[0])
-    docs = variants.docs(docs0, chosen["parts"], cal, chosen["effort"])
+    docs = variants.docs(docs0, chosen["rooms"], cal, chosen["effort"])
     bad = unusable_rooms(full, docs, rc)
     for r, why in skill_unusable(hold[ship_key(chosen, hold)]["skill"]["rooms"], rc).items():
         bad[r] = bad.get(r, []) + why
@@ -460,14 +522,15 @@ def fit_bundle(config, rooms, src, version=None):
     bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out,
               "pcnn": {"active": active, "coffee_on_mw": rc["pcnn"]["coffee_on_mw"], "features": list(FEATURES)}}
     shipped = hold[ship_key(chosen, hold)]
-    holdout = {"variant": ship_key(chosen, hold), "pooled": shipped["skill"]["pooled"], "rooms": shipped["skill"]["rooms"], "folds": shipped["folds"], "window": shipped["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day")}, "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
+    holdout = {"variant": ship_key(chosen, hold), "pooled": shipped["skill"]["pooled"], "rooms": shipped["skill"]["rooms"], "folds": shipped["folds"], "window": shipped["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day", "per_room", "known")}, "rooms": v.get("rooms"), "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
+    recent = merge_windows([window_metrics(full, rec, truth, max(0, full.n - int(rc["eval"]["recent_days"] * 1440)), full.n, rc)])
     sk = ship["skill"]
     pick = lambda b: {**{k: b[k] for k in ("n", "skill", "pcnn_skill")}, **{part: b[part] for part in ("window", "outside") if part in b}}
     probe_replay = ProbeReplay(full, docs, shock, rec, pcnn["exog"].present, rc).run()
     pcnn_report = {"active": active, "gate": gate, "rooms": nets_info, "folds": [fi["pcnn"] for fi in ship["folds"]], "skill": {"pooled": {h: pick(sk["pooled"][h]) for h in ("H20", "H60")}, "rooms": {r: {h: pick(b[h]) for h in ("H20", "H60")} for r, b in sk["rooms"].items()}}}
-    report = {"version": version, "flags": flags_all, "pcnn": pcnn_report, "probe_replay": probe_replay, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection,
+    report = {"version": version, "flags": flags_all, "pcnn": pcnn_report, "probe_replay": probe_replay, "holdout": holdout, "criteria": criteria(rc, hold, ship_key(chosen, hold), by_room, flags, [k for k, v in rc["shock"]["grid"].items() if best[k] in (min(v), max(v))]), "fit": info, "nll": nll, "trace": [{"shock": t, "nll": s} for t, s in trace], "tuning": tuning, "detection": detection, "detection_recent": recent,
               "resets": len(resets), "reset_list": reset_list(full, resets, truth, rec), "reset_by_room": by_room, "reset_causes": {c: by(c) for c in sorted({x["cause"] for x in resets})}, "ground_truth_events": len(truth.gt), "labels": len(truth.labels), "live_alarms": len(truth.live),
               "loglik": float(run.loglik[0]), "minutes": full.n, "sensor_start": variants.sensor_start, "masked_minutes": {d.room: d.info["n_masked"] for d in rooms}, "seconds": {"folds": t_fold, "total": time.time() - t0},
               "params": {n: {**d["params"], "c": d["c"], "valve_gain": d["valve_gain"], "sigma_u": d["sigma_u"], "valve_obs": d["valve_obs"], **({"appliance": d["appliance"]} if "appliance" in d else {})} for n, d in docs.items()}}
