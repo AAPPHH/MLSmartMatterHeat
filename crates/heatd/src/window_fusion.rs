@@ -142,8 +142,16 @@ fn log_phi(z: f64) -> f64 {
     -z2 / 2.0 - 0.5 * (2.0 * std::f64::consts::PI).ln() - (-z).ln() + (1.0 - 1.0 / z2 + 3.0 / (z2 * z2)).ln()
 }
 
-pub fn onesided(x: f64, scale: f64, sd: f64) -> f64 {
+fn exp_gauss(x: f64, scale: f64, sd: f64) -> f64 {
     -scale.ln() + sd * sd / (2.0 * scale * scale) - x / scale + log_phi((x - sd * sd / scale) / sd)
+}
+
+pub fn onesided(x: f64, scale: f64, sd: f64, ph: &Physics) -> f64 {
+    let share = ph.outlier_share.clamp(0.0, 0.99);
+    if share <= 0.0 {
+        return exp_gauss(x, scale, sd);
+    }
+    log_add((1.0 - share).ln() + exp_gauss(x, scale, sd), share.ln() + exp_gauss(x, scale, sd * ph.outlier_scale))
 }
 
 fn log_add(a: f64, b: f64) -> f64 {
@@ -190,7 +198,7 @@ impl Lik {
 pub fn gas_modes(o: Obs, excess: f64, ph: &Physics, lambda_h: [f64; 3], source: f64, door_frac: f64) -> Lik {
     let f = |l: f64| {
         let loss = l * excess / 60.0;
-        onesided(o.rate + loss, source, (o.sd.powi(2) + (ph.model_floor * loss).powi(2)).sqrt())
+        onesided(o.rate + loss, source, (o.sd.powi(2) + (ph.model_floor * loss).powi(2)).sqrt(), ph)
     };
     Lik { modes: [f(lambda_h[0]), f(lambda_h[1]), f(lambda_h[2])], door: Some(ph.door_lambda_h.map(|l| f(lambda_h[0] + l * door_frac))) }
 }
@@ -199,7 +207,7 @@ pub fn temp_modes(o: Obs, delta_k: f64, ph: &Physics, lambda_h: [f64; 3], valve_
     let heat = if valve.is_finite() { valve_gain * valve } else { 0.0 };
     let sd = (o.sd.powi(2) + ph.temp_model_k_min.powi(2)).sqrt();
     let scale = ph.temp_source_k_min + if valve.is_finite() { ph.temp_valve_k_min * valve } else { ph.temp_valve_k_min };
-    let f = |l: f64| onesided(o.rate + (ph.temp_base_loss_h + ph.temp_kappa * l) * delta_k / 60.0 - heat, scale, sd);
+    let f = |l: f64| onesided(o.rate + (ph.temp_base_loss_h + ph.temp_kappa * l) * delta_k / 60.0 - heat, scale, sd, ph);
     Lik::flat([f(lambda_h[0]), f(lambda_h[1]), f(lambda_h[2])])
 }
 
@@ -259,11 +267,49 @@ pub struct PhysFit {
     #[serde(default)]
     pub lambda_open: BTreeMap<String, f64>,
     #[serde(default)]
+    pub lambda_kipp: BTreeMap<String, f64>,
+    #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub episodes: Vec<FitEpisode>,
+    #[serde(default)]
     pub weight: Option<[f64; 4]>,
     #[serde(default)]
     pub trv_beta: Option<f64>,
     #[serde(default)]
     pub valve_gain_k_min: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct FitEpisode {
+    pub room: String,
+    pub from_ms: i64,
+    pub lambda_h: f64,
+}
+
+#[cfg(test)]
+impl PhysFit {
+    pub fn leave_out(&self, room: &str, from_ms: i64, open_lambda_h: f64) -> PhysFit {
+        let kept: Vec<&FitEpisode> = self.episodes.iter().filter(|e| !(e.room == room && e.from_ms == from_ms)).collect();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v.get(v.len() / 2).copied()
+        };
+        let class = |own: &str, open: bool| {
+            let pick = |only: Option<&str>| kept.iter().filter(|e| only.is_none_or(|r| e.room == r) && (e.lambda_h >= open_lambda_h) == open).map(|e| e.lambda_h).collect::<Vec<f64>>();
+            median(pick(Some(own))).or_else(|| median(pick(None)))
+        };
+        let mut out = PhysFit { weight: self.weight, trv_beta: self.trv_beta, valve_gain_k_min: self.valve_gain_k_min, episodes: self.episodes.clone(), ..Default::default() };
+        for room in self.episodes.iter().map(|e| e.room.clone()).collect::<std::collections::BTreeSet<_>>() {
+            if let Some(l) = class(&room, true) {
+                out.lambda_open.insert(room.clone(), l);
+            }
+            if let Some(l) = class(&room, false) {
+                out.lambda_kipp.insert(room, l);
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -280,6 +326,9 @@ impl Tables {
         let mut lambda_h = ph.lambda_h;
         if let Some(l) = fit.and_then(|f| f.lambda_open.get(room)) {
             lambda_h[2] = *l;
+        }
+        if let Some(l) = fit.and_then(|f| f.lambda_kipp.get(room)) {
+            lambda_h[1] = *l;
         }
         PhysRoom { lambda_h, weight: fit.and_then(|f| f.weight).unwrap_or(ph.weight), trv_beta: fit.and_then(|f| f.trv_beta).unwrap_or(ph.trv_beta), valve_gain: fit.and_then(|f| f.valve_gain_k_min).unwrap_or(ph.valve_gain_k_min) }
     }
@@ -378,6 +427,13 @@ pub struct Balance {
 }
 
 impl Balance {
+    #[cfg(test)]
+    pub fn flat(&self) -> [f64; 9] {
+        let cells = |o: Option<Obs>| o.map_or([f64::NAN; 3], |o| [o.rate, o.level, o.sd]);
+        let (a, b, c) = (cells(self.co2), cells(self.ah), cells(self.temp));
+        [a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]]
+    }
+
     pub fn any(&self) -> bool {
         self.co2.is_some() || self.ah.is_some() || self.temp.is_some()
     }
@@ -502,12 +558,14 @@ pub struct Posterior {
     pub couple: f64,
     pub contrib: [f64; CHANNELS],
     pub added: [f64; CHANNELS],
+    pub raw: [f64; CHANNELS],
+    pub physics: bool,
     pub independent: bool,
 }
 
 impl Default for Posterior {
     fn default() -> Self {
-        Self { mu: [1.0, 0.0, 0.0], own: f64::NAN, couple: 0.0, contrib: [0.0; CHANNELS], added: [0.0; CHANNELS], independent: false }
+        Self { mu: [1.0, 0.0, 0.0], own: f64::NAN, couple: 0.0, contrib: [0.0; CHANNELS], added: [0.0; CHANNELS], raw: [0.0; CHANNELS], physics: false, independent: false }
     }
 }
 
@@ -611,10 +669,11 @@ impl Posterior {
             }
         }
         if let Some((chan, llr)) = inp.pulse {
+            let llr = if b.any() { ph.pulse_air_llr } else { llr };
             ch[chan as usize] = Lik::flat([0.0, llr, llr]);
         }
         if inp.holding && inp.depressed {
-            ch[Chan::Level as usize] = Lik::flat([0.0, ph.level_llr, ph.level_llr]);
+            ch[Chan::Level as usize] = Lik::flat([0.0, cfg.level_llr, cfg.level_llr]);
         }
         let apply = |extra: [f64; 3]| {
             let top = extra.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -627,11 +686,20 @@ impl Posterior {
         };
         let base = logit(Self::open_p(&pred));
         let mut add = [0.0; CHANNELS];
+        let mut raw = [0.0; CHANNELS];
+        let rest = Self::stationary(&chain);
+        let rest_logit = logit(Self::open_p(&rest));
         for c in Chan::ALL {
             if ch[c as usize] != Lik::default() {
-                add[c as usize] = logit(Self::open_p(&apply(ch[c as usize].marginal(ph)))) - base;
+                let marginal = ch[c as usize].marginal(ph);
+                add[c as usize] = logit(Self::open_p(&apply(marginal))) - base;
+                let top = marginal.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let mixed: Vec<f64> = (0..3).map(|m| rest[m] * (marginal[m] - top).exp()).collect();
+                raw[c as usize] = logit(((mixed[1] + mixed[2]) / mixed.iter().sum::<f64>()).clamp(1e-12, 1.0 - 1e-12)) - rest_logit;
             }
         }
+        self.raw = raw;
+        self.physics = true;
         let active: Vec<Lik> = ch.iter().copied().filter(|l| *l != Lik::default()).collect();
         let total = [Lik::closed(&active, ph), active.iter().map(|l| l.modes[1]).sum(), active.iter().map(|l| l.modes[2]).sum()];
         let mut post = apply(total);
@@ -729,6 +797,6 @@ impl Posterior {
     }
 
     pub fn view(&self, open: bool) -> Value {
-        json!({"p": (self.p() * 1000.0).round() / 1000.0, "own_p": (self.own_p() * 1000.0).round() / 1000.0, "channels": self.breakdown(), "top": self.leaders(open).iter().map(|c| c.name()).collect::<Vec<_>>(), "reason": self.reason(open), "independent": self.independent})
+        json!({"p": (self.p() * 1000.0).round() / 1000.0, "own_p": (self.own_p() * 1000.0).round() / 1000.0, "channels": self.breakdown(), "top": self.leaders(open).iter().map(|c| c.name()).collect::<Vec<_>>(), "reason": self.reason(open), "independent": self.independent, "modes": self.physics.then(|| self.mu.map(|m| (m * 1000.0).round() / 1000.0))})
     }
 }

@@ -186,6 +186,8 @@ pub struct TraceRow {
     pub own: f64,
     pub total: f64,
     pub ch: [f64; crate::window_fusion::CHANNELS],
+    pub raw: [f64; crate::window_fusion::CHANNELS],
+    pub obs: [f64; 9],
 }
 
 fn mins(m: f64) -> i64 {
@@ -889,7 +891,7 @@ impl Windows {
             }
             #[cfg(test)]
             if let Some(trace) = self.trace.as_mut() {
-                trace.push(TraceRow { ts_ms, room: room.clone(), z: z.unwrap_or(f64::NAN), valve, co2: rates.co2.unwrap_or(f64::NAN), rh: rates.rh.unwrap_or(f64::NAN), temp: rates.temp.unwrap_or(f64::NAN), gate: gate.unwrap_or(""), own: w.fusion.own, total: w.fusion.total(), ch: w.fusion.added });
+                trace.push(TraceRow { ts_ms, room: room.clone(), z: z.unwrap_or(f64::NAN), valve, co2: rates.co2.unwrap_or(f64::NAN), rh: rates.rh.unwrap_or(f64::NAN), temp: rates.temp.unwrap_or(f64::NAN), gate: gate.unwrap_or(""), own: w.fusion.own, total: w.fusion.total(), ch: w.fusion.added, raw: w.fusion.raw, obs: inputs.balance.flat() });
             }
         }
         let owns: HashMap<String, f64> = rooms.iter().map(|r| (r.clone(), self.rooms.get(r).map_or(0.0, |w| w.fusion.own_p()))).collect();

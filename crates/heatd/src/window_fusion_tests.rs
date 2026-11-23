@@ -1,6 +1,6 @@
-use crate::config::Config;
+use crate::config::{Config, WindowFusion};
 use crate::window::*;
-use crate::window_fusion::{thresholds, Chan, Posterior, Tables};
+use crate::window_fusion::{absolute_humidity, gas_modes, thresholds, trv_modes, Balance, Chan, FitEpisode, Inputs, Lik, Obs, PhysFit, Posterior, Tables};
 use crate::window_model_tests::toy_bundle;
 use matter_controller::{CO2_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
 
@@ -341,4 +341,150 @@ fn the_bedroom_incident_phase_b_is_held_by_the_air_channels_alone_and_phase_a_ri
     assert!(first(3500.0, 4000.0).is_some_and(|s| s <= 66.0 * 60.0), "phase B: {:?}", first(3500.0, 4200.0));
     assert!(peak_a > 0.3, "phase A is only a partial rise on air alone with tables learned without these days: {peak_a}");
     assert!((66 * 60..=105 * 60).step_by(60).all(|s| at(s as f64)), "phase B stays open from 08:06 to 08:45");
+}
+
+fn physics_cfg() -> WindowFusion {
+    WindowFusion { engine: "physics".into(), ..WindowFusion::default() }
+}
+
+fn obs(rate: f64, level: f64, sd: f64) -> Obs {
+    Obs { rate, level, sd }
+}
+
+fn physics_step(p: &mut Posterior, cfg: &WindowFusion, inputs: &Inputs) {
+    p.update(cfg, &Tables::builtin(), inputs);
+}
+
+fn physics_inputs(cfg: &WindowFusion, balance: Balance) -> Inputs {
+    Inputs { phys: Some(Tables::builtin().phys_room(&cfg.physics, "a")), balance, out_c: 3.0, valve: 0.0, ..Inputs::default() }
+}
+
+#[test]
+fn the_balance_likelihood_is_one_sided_a_fall_beyond_closed_ventilation_is_nearly_impossible_a_rise_is_cheap() {
+    let ph = &physics_cfg().physics;
+    let l = |rate: f64| gas_modes(obs(rate, 1020.0, 9.6), 600.0, ph, ph.lambda_h, ph.co2_source_ppm_min, 1.0).modes;
+    let (flat, rise, fall) = (l(0.0), l(5.0), l(-60.0));
+    assert!(rise[0] - flat[0] > -2.0, "a source explains a rise under a closed window: {} {}", rise[0], flat[0]);
+    assert!(fall[0] - flat[0] < -10.0, "no source can pull the level down: {} {}", fall[0], flat[0]);
+    assert!(fall[2] - fall[0] > 10.0, "a fast fall is strong evidence for the open mode: {:?}", fall);
+    assert!(rise[2] - rise[0] < -5.0, "a rise argues against the open mode: {:?}", rise);
+    let slow = l(-14.0);
+    assert!(slow[1] > slow[0] && slow[1] > slow[2], "a moderate fall fits the tilted mode best: {slow:?}");
+}
+
+#[test]
+fn near_the_outdoor_level_the_gas_channels_carry_no_evidence() {
+    let cfg = physics_cfg();
+    let ph = &cfg.physics;
+    let at_outdoor = gas_modes(obs(-30.0, 425.0, 9.6), 5.0, ph, ph.lambda_h, ph.co2_source_ppm_min, 1.0).modes;
+    assert!((at_outdoor[2] - at_outdoor[0]).abs() < 1.0, "{at_outdoor:?}");
+    let mut p = Posterior::default();
+    let dry = Balance { ah: Some(obs(-0.2, absolute_humidity(80.0, 3.0) + 0.4, 0.02)), ..Balance::default() };
+    physics_step(&mut p, &cfg, &physics_inputs(&cfg, dry));
+    assert_eq!(p.added[Chan::Rh as usize], 0.0, "the humidity channel is gated off below 1 g/m3 of excess");
+    let wet = Balance { ah: Some(obs(-0.2, absolute_humidity(80.0, 3.0) + 3.0, 0.02)), ..Balance::default() };
+    physics_step(&mut p, &cfg, &physics_inputs(&cfg, wet));
+    assert!(p.added[Chan::Rh as usize] > 0.0);
+}
+
+fn door_or_window(temp_rate: f64, ah_rate: f64) -> Posterior {
+    let cfg = physics_cfg();
+    let mut p = Posterior::default();
+    let balance = Balance { co2: Some(obs(-35.0, 1100.0, 9.6)), ah: Some(obs(ah_rate, absolute_humidity(80.0, 3.0) + 3.5, 0.0095)), temp: Some(obs(temp_rate, 18.0, 0.003)) };
+    for _ in 0..4 {
+        physics_step(&mut p, &cfg, &physics_inputs(&cfg, balance));
+    }
+    p
+}
+
+#[test]
+fn the_night_door_pattern_gas_falls_but_the_air_stays_flat_does_not_open_a_real_window_does() {
+    let cfg = physics_cfg();
+    let (on, _) = thresholds(&cfg, 15.0, 1.0);
+    let door = door_or_window(0.0, -0.01);
+    let window = door_or_window(-0.06, -0.3);
+    assert!(door.own < on, "door pattern stays closed: own {} on {on}", door.own);
+    assert!(window.own > on, "a joint fall of gas and air temperature opens: own {} on {on}", window.own);
+}
+
+#[test]
+fn an_unchanged_thermostat_reading_gives_no_false_closed_evidence_beyond_the_uncensored_value() {
+    let ph = physics_cfg().physics;
+    let sigma = 0.5;
+    let plain = |z: f64| (ph.trv_open_z * z - ph.trv_open_z * ph.trv_open_z / 2.0) / (ph.trv_sd * ph.trv_sd);
+    for z in [-0.5, 0.0, 0.3] {
+        let l = trv_modes(z, sigma, false, &ph, ph.trv_beta).modes[2];
+        assert!(l >= plain(z).max(-ph.trv_cap) - 1e-9, "censored {l} vs uncensored {} at z {z}", plain(z));
+    }
+    let strong = trv_modes(3.0, sigma, false, &ph, ph.trv_beta).modes[2];
+    assert!(strong > 0.5 && strong <= ph.trv_cap, "{strong}");
+    assert!(trv_modes(3.0, sigma, true, &ph, ph.trv_beta).modes[2] < strong, "an open valve masks part of the drop");
+    assert_eq!(trv_modes(f64::NAN, sigma, false, &ph, ph.trv_beta), Lik::default());
+}
+
+#[test]
+fn physics_runs_on_priors_alone_and_a_missing_channel_contributes_exactly_zero() {
+    let t = Tables::builtin();
+    assert!(t.physics.is_none(), "the built-in table carries no physics fit");
+    let cfg = physics_cfg();
+    let room = t.phys_room(&cfg.physics, "a");
+    assert_eq!(room.lambda_h, cfg.physics.lambda_h);
+    assert_eq!(room.weight, cfg.physics.weight);
+    let mut p = Posterior::default();
+    for _ in 0..30 {
+        physics_step(&mut p, &cfg, &physics_inputs(&cfg, Balance::default()));
+    }
+    assert_eq!(p.added, [0.0; crate::window_fusion::CHANNELS]);
+    assert!((p.own - Posterior::prior(&cfg)).abs() < 1e-2, "no data keeps the prior: {} {}", p.own, Posterior::prior(&cfg));
+    assert!(!p.independent);
+    let mut q = Posterior::default();
+    let only_co2 = Balance { co2: Some(obs(-35.0, 1100.0, 9.6)), ..Balance::default() };
+    physics_step(&mut q, &cfg, &physics_inputs(&cfg, only_co2));
+    assert!(q.added[Chan::Rh as usize] == 0.0 && q.added[Chan::Temp as usize] == 0.0 && q.added[Chan::Trv as usize] == 0.0 && q.added[Chan::Co2 as usize] > 0.0);
+}
+
+#[test]
+fn the_fitted_lambda_of_other_episodes_replaces_the_prior_only_for_its_room() {
+    let fit = PhysFit {
+        episodes: vec![FitEpisode { room: "a".into(), from_ms: 1, lambda_h: 5.0 }, FitEpisode { room: "a".into(), from_ms: 2, lambda_h: 1.2 }, FitEpisode { room: "b".into(), from_ms: 3, lambda_h: 9.0 }],
+        ..PhysFit::default()
+    };
+    let held_out = fit.leave_out("a", 1, 3.0);
+    assert_eq!(held_out.lambda_open.get("a"), Some(&9.0), "no open fit left in the room, the pooled one is used");
+    assert_eq!(held_out.lambda_kipp.get("a"), Some(&1.2));
+    let full = fit.leave_out("a", 99, 3.0);
+    assert_eq!(full.lambda_open.get("a"), Some(&5.0));
+}
+
+#[test]
+fn the_physics_engine_opens_on_a_venting_room_holds_it_and_closes_on_recovery() {
+    let mut r = Rig::new("[window.fusion]\nengine = 'physics'\n");
+    r.run(25, noisy);
+    assert!(r.events.is_empty(), "{:?}", r.events);
+    r.run(10, venting);
+    assert!(r.open("a"), "p {}", r.p("a"));
+    r.run(30, recovering);
+    assert!(!r.open("a"), "p {}", r.p("a"));
+    assert_eq!(r.of("window_open").len(), 1);
+}
+
+#[test]
+fn the_bedroom_incident_is_found_by_the_physics_engine_without_any_fitted_table() {
+    let text = include_str!("../tests/fixtures/airwin/incident.csv");
+    let rows: Vec<Vec<f64>> = text.lines().skip(1).map(|l| l.split(',').map(|v| v.parse().unwrap()).collect()).collect();
+    let mut r = Rig::new("[window.fusion]\nengine = 'physics'\n");
+    let mut open_at: Vec<bool> = Vec::new();
+    for row in &rows {
+        let ts = T0 + (row[0] * 1000.0) as i64;
+        r.t = ts;
+        r.w.observe_air(&r.c, AIR_NODE, TEMPERATURE_MEASUREMENT_CLUSTER, row[1], ts);
+        r.w.observe_air(&r.c, AIR_NODE, HUMIDITY_MEASUREMENT_CLUSTER, row[2], ts);
+        r.w.observe_air(&r.c, AIR_NODE, CO2_CLUSTER, row[3], ts);
+        let found = r.w.step(&r.c, ts, |_| [0.5, 2.0, 0.0]);
+        r.events.extend(found);
+        open_at.push(r.open("a"));
+    }
+    let at = |s: f64| open_at[rows.iter().position(|row| row[0] >= s).unwrap()];
+    assert!((66 * 60..=105 * 60).step_by(60).all(|s| at(s as f64)), "phase B stays open from 08:06 to 08:45");
+    assert!(rows.iter().zip(&open_at).any(|(row, o)| *o && (1700.0..2300.0).contains(&row[0])), "phase A is found");
 }
