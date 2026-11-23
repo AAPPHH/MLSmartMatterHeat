@@ -1,3 +1,4 @@
+import copy
 import itertools
 import json
 import math
@@ -349,9 +350,12 @@ class Truth:
         self.rc = rc
         self.known = [(k["room"], datetime.fromisoformat(k["open_utc"]).timestamp(), datetime.fromisoformat(k["close_utc"]).timestamp()) for k in rc.get("known", [])]
         near = lambda r, t: any(r == kr and ka - 600.0 <= t <= kb + 600.0 for kr, ka, kb in self.known)
-        self.gt = [g for g in load_ground_truth(src, rc["hold_min"]) if not any(near(r, g[0]) for r in g[2])] + [(a, b, [r]) for r, a, b in self.known]
-        self.labels = [x for x in load_window_labels(src) if x[0] > 1e6 and not (x[2] and near(x[1], x[0]))]
+        raw_gt, raw_labels = load_ground_truth(src, rc["hold_min"]), [x for x in load_window_labels(src) if x[0] > 1e6]
+        self.gt = [g for g in raw_gt if not any(near(r, g[0]) for r in g[2])] + [(a, b, [r]) for r, a, b in self.known]
+        self.labels = [x for x in raw_labels if not (x[2] and near(x[1], x[0]))]
         self.live = load_live_alarms(src)
+        self.fit = copy.copy(self)
+        self.fit.known, self.fit.gt, self.fit.labels, self.fit.fit = [], raw_gt, raw_labels, None
 
     def spans(self, rooms):
         return window_spans(self.gt, self.labels, rooms, self.rc["shock"]["pad_min"] * 60)
@@ -499,6 +503,8 @@ def tune_windows(grid, rec, rc, gt, labels):
     if not any(r[3]["hits"] + r[3]["yes_hit"] for r in rows):
         return s["lambda_w"], s["lambda_jump"], {"candidates": cands, "refused": True, "warning": "no lambda_w detects any known opening; window threshold not exported, config default kept"}
     best = max(rows, key=lambda r: r[:3])
+    if not best[3]["hits"] + best[3]["yes_hit"]:
+        return s["lambda_w"], s["lambda_jump"], {"candidates": cands, "refused": True, "warning": "the best lambda_w detects no known opening; window threshold not exported, config default kept"}
     lam_j = []
     for a, b, open_rooms in gt:
         i0, i1 = np.searchsorted(grid.times, a + 600), np.searchsorted(grid.times, min(b, a + 2400), side="right")

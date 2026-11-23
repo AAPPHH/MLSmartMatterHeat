@@ -275,3 +275,14 @@ def test_truth_does_not_count_a_confirmed_opening_twice(monkeypatch):
     monkeypatch.setattr(rf, "load_live_alarms", lambda src: [])
     t = Truth("x", dict(RC, known=[{"room": "r", "open_utc": datetime.fromtimestamp(b, timezone.utc).isoformat(), "close_utc": datetime.fromtimestamp(b + 600, timezone.utc).isoformat()}]))
     assert [a - b for r, a in t.opens(["r"])] == [0.0, 9000.0, 9100.0] and len(t.labels) == 2
+    assert t.fit.known == [] and [a - b for a, _, _ in t.fit.gt] == [10.0, 9000.0] and len(t.fit.labels) == 3
+
+
+def test_tune_windows_refuses_when_the_best_threshold_detects_nothing(monkeypatch):
+    import heattrain.roomfit as rf
+    hits = {1.5: 2, 3.0: 0}
+    monkeypatch.setattr(rf, "detection", lambda grid, rec, lw, gt, labels, rc: {"hits": hits.get(lw, 0), "yes_hit": 0, "false_episodes": 40 if lw == 1.5 else 19, "no_flagged": 0})
+    rc = copy.deepcopy(RC)
+    rc["shock"].update(lambda_w_grid=[1.5, 3.0], fa_weight=10.0)
+    lw, lj, tuning = rf.tune_windows(None, {}, rc, [(0.0, 1.0, ["r"])], [])
+    assert tuning["refused"] and lw == rc["shock"]["lambda_w"] and lj == rc["shock"]["lambda_jump"]

@@ -213,9 +213,9 @@ def window_metrics(grid, rec, truth, lo, hi, rc):
             if room == r and t[lo] <= a < t[hi - 1]:
                 i0, i1 = np.searchsorted(t, a), np.searchsorted(t, a + ev["known_within_min"] * 60.0, side="right")
                 pw = np.nan_to_num(rec[r]["p_window"])[i0:i1]
-                up = np.nonzero(pw > ev["pw_flag"])[0]
+                first = [e[0] for e in eps if a <= e[0] <= t[i1 - 1]]
                 inside = np.nan_to_num(rec[r]["p_window"])[i0:np.searchsorted(t, b, side="right")]
-                res["known"].append({"room": r, "open": a, "pre": float(np.nan_to_num(rec[r]["p_window"])[max(i0 - 1, 0)]), "first_min": float((t[i0 + up[0]] - a) / 60.0) if len(up) else None, "peak": float(pw.max()) if len(pw) else 0.0, "min_inside": float(inside.min()) if len(inside) else 0.0, "frac_inside": float((inside > ev["pw_flag"]).mean()) if len(inside) else 0.0})
+                res["known"].append({"room": r, "open": a, "pre": float(np.nan_to_num(rec[r]["p_window"])[max(i0 - 1, 0)]), "first_min": float((first[0] - a) / 60.0) if first else None, "peak": float(pw.max()) if len(pw) else 0.0, "min_inside": float(inside.min()) if len(inside) else 0.0, "frac_inside": float((inside > ev["pw_flag"]).mean()) if len(inside) else 0.0})
     return res
 
 
@@ -278,7 +278,7 @@ def make_folds(full, variants, rc):
 
 def run_fold(fold, full, ff, truth, rc, warm):
     docs0, th, info = ff.run(fold["cut"], warm, ext=False)
-    best, nll, trace = fit_shock(full.window(max(0, fold["cut"] - int(rc["shock"]["days"] * 1440)), fold["cut"]), docs0, rc, None, truth)
+    best, nll, trace = fit_shock(full.window(max(0, fold["cut"] - int(rc["shock"]["days"] * 1440)), fold["cut"]), docs0, rc, None, truth.fit)
     fold.update(th=th, info=info, docs0=docs0, shock=shock_defaults(rc, **best), nll=nll)
     return th
 
@@ -291,7 +291,7 @@ def tuned_trials(fold, full, docs, truth, rc, house):
     cut_grid = full.window(start, fold["cut"])
     tr = {r: {k: v[start:fold["cut"]] for k, v in d.items()} for r, d in recs[0].items()}
     inside = lambda t: cut_grid.times[0] <= t < cut_grid.times[-1]
-    lw, lj, tuning = tune_windows(cut_grid, tr, rc, [g for g in truth.gt if inside(g[0])], [x for x in truth.labels if inside(x[0])])
+    lw, lj, tuning = tune_windows(cut_grid, tr, rc, [g for g in truth.fit.gt if inside(g[0])], [x for x in truth.fit.labels if inside(x[0])])
     gi = int(np.argmin([abs(x - lw) for x in grid_lw]))
     return recs[0], recs[gi], lw, lj, resets[gi], tuning
 
@@ -493,7 +493,7 @@ def fit_bundle(config, rooms, src, version=None):
     t_fold = time.time() - t0
     docs0, th, info = ff.run(full.n, folds[-1]["th"], ext=False)
     lo = max(0, full.n - int(rc["shock"]["days"] * 1440))
-    best, nll, trace = fit_shock(full.window(lo, full.n), docs0, rc, None, truth)
+    best, nll, trace = fit_shock(full.window(lo, full.n), docs0, rc, None, truth.fit)
     shock = shock_defaults(rc, **best)
     cal = None
     if any("air" in pl["parts"] for pl in chosen["rooms"].values()) and variants.sensor_start is not None:
@@ -506,7 +506,7 @@ def fit_bundle(config, rooms, src, version=None):
     for r in bad:
         docs[r]["unusable"] = True
     run, recs = run_batch(full, docs, [shock], house, record=True)
-    lw, lj, tuning = tune_windows(full, recs[0], rc, truth.gt, truth.labels)
+    lw, lj, tuning = tune_windows(full, recs[0], rc, truth.fit.gt, truth.fit.labels)
     shock = dict(shock, lambda_w=lw, lambda_jump=lj)
     run, recs = run_batch(full, docs, [shock], house, record=True)
     rec, resets = recs[0], run.resets(0)
@@ -532,7 +532,7 @@ def fit_bundle(config, rooms, src, version=None):
     holdout = {"variant": ship_key(chosen, hold), "pooled": shipped["skill"]["pooled"], "rooms": shipped["skill"]["rooms"], "folds": shipped["folds"], "window": shipped["window"], "ship": {"plan": chosen["rooms"], "window": {k: ship["window"][k] for k in ("hits", "opens", "false_per_room_day", "live_false_per_room_day", "per_room", "known")}, "pooled": {h: ship["skill"]["pooled"][h]["skill"] for h in ("H5", "H20", "H60")}, "rooms": {r: {h: b[h]["skill"] for h in ("H20", "H60")} for r, b in ship["skill"]["rooms"].items()}}, "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day", "per_room", "known")}, "rooms": v.get("rooms"), "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
-    recent = {"basis": "in-sample replay of the shipped bundle, shock and lambda_w tuned on truth including the known openings", **merge_windows([window_metrics(full, rec, truth, max(0, full.n - int(rc["eval"]["recent_days"] * 1440)), full.n, rc)])}
+    recent = {"basis": "in-sample replay of the shipped bundle, shock and lambda_w tuned on the ground truth and labels without the known openings, which only score", **merge_windows([window_metrics(full, rec, truth, max(0, full.n - int(rc["eval"]["recent_days"] * 1440)), full.n, rc)])}
     sk = ship["skill"]
     pick = lambda b: {**{k: b[k] for k in ("n", "skill", "pcnn_skill")}, **{part: b[part] for part in ("window", "outside") if part in b}}
     probe_replay = ProbeReplay(full, docs, shock, rec, pcnn["exog"].present, rc).run()
