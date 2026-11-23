@@ -256,8 +256,8 @@ max_body_bytes = 4194304
 request_timeout_s = 30
 
 [http.auth]
-admin_token_file = "/secrets/heatd_admin_token"
-watch_token_file = "/secrets/heatd_watch_token"
+admin_token_file = "secrets/heatd_admin_token"
+watch_token_file = "secrets/heatd_watch_token"
 admin_mode = "enforce"
 watch_mode = "log"
 metrics_require_admin = false

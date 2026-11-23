@@ -73,6 +73,7 @@ Run `heatd` without hardware:
 
 ```bash
 cp heatd.example.toml heatd.toml    # set controller = "mock", adjust rooms and node ids
+mkdir -p secrets && (umask 077; openssl rand -hex 32 > secrets/heatd_admin_token; openssl rand -hex 32 > secrets/heatd_watch_token)
 cargo run --release -p heatd -- serve
 curl http://127.0.0.1:8080/health
 ```
@@ -126,11 +127,11 @@ Shell tests: `bash deploy/netguard/test.sh`.
 
 The HTTP API is meant for a trusted home LAN and is protected in three layers (`crates/heatd/src/http.rs`, configured in `[http]` and described in German in `docs/heatd.md`):
 
-- Source check: before anything else, requests whose peer address is not loopback, RFC1918, IPv4 link-local, IPv6 ULA or link-local (or inside a subnet listed in `trusted_subnets`) get `403`.
+- Source check: before anything else, requests whose peer address is not loopback, RFC1918, IPv4 link-local, IPv6 ULA or link-local (plus any subnet added in `trusted_subnets`; loopback is always trusted) get `403`. A reverse proxy on the same host appears as loopback, so it must restrict clients to the LAN itself.
 - Bearer tokens with two roles: `admin` (everything) and `watch` (only the endpoints the watch app uses). Tokens are compared in constant time and live in files outside the repository (`secrets/`, gitignored); the configuration holds only their paths, and `heatd` refuses to start with a missing, too short or placeholder token. Each role has a rollout mode, `off`, `log` (accept and count requests without a token, visible in `/metrics`) or `enforce`, so tokens can be introduced without breaking installed clients. `/health` is always open; `/metrics` is open unless `metrics_require_admin` is set.
 - Limits: request body size and request timeout; no CORS headers are sent.
 
-`heatd` does not terminate TLS, so inside the LAN the traffic, tokens included, is plain HTTP. To encrypt it, put a reverse proxy with a certificate on the same host and bind `heatd` to `127.0.0.1` (`listen`). The API must not be exposed to the internet.
+A token-bearing watch APK must never be attached to a public release; public builds are made without `heatd.token`. `heatd` does not terminate TLS, so inside the LAN the traffic, tokens included, is plain HTTP. To encrypt it, put a reverse proxy with a certificate on the same host and bind `heatd` to `127.0.0.1` (`listen`). The API must not be exposed to the internet.
 
 ## License
 

@@ -342,6 +342,9 @@ pub struct GuardState {
     seen: Mutex<HashMap<(String, &'static str), Instant>>,
 }
 
+const ALWAYS_TRUSTED: [&str; 2] = ["127.0.0.0/8", "::1/128"];
+const SEEN_MAX: usize = 1024;
+
 #[derive(Clone)]
 pub struct Guard(Arc<GuardState>);
 
@@ -368,7 +371,10 @@ impl Guard {
     }
 
     pub fn load(http: &HttpSection) -> anyhow::Result<Self> {
-        let nets = http.trusted_subnets.iter().map(|n| Net::parse(n)).collect::<anyhow::Result<Vec<_>>>()?;
+        let nets = http.trusted_subnets.iter().map(String::as_str).chain(ALWAYS_TRUSTED).map(Net::parse).collect::<anyhow::Result<Vec<_>>>()?;
+        if http.auth.admin_mode == AuthMode::Off && http.auth.watch_mode != AuthMode::Off {
+            bail!("http.auth: watch_mode is set but admin_mode is off; enable the admin role too");
+        }
         let load = |role: &str, mode: AuthMode, file: &str| (mode != AuthMode::Off).then(|| read_token(role, file)).transpose();
         let admin = load("admin", http.auth.admin_mode, &http.auth.admin_token_file)?;
         let watch = load("watch", http.auth.watch_mode, &http.auth.watch_token_file)?;
@@ -425,6 +431,9 @@ impl Guard {
         let mut seen = self.0.seen.lock().unwrap();
         let due = seen.get(&(key.clone(), scope)).is_none_or(|t| t.elapsed() >= LOG_EVERY);
         if due {
+            if seen.len() >= SEEN_MAX {
+                seen.retain(|_, t| t.elapsed() < LOG_EVERY);
+            }
             seen.insert((key, scope), Instant::now());
             eprintln!("{}", line());
         }
@@ -487,7 +496,7 @@ async fn gate(State(guard): State<Guard>, mut req: Request, next: Next) -> Respo
     }
     req.extensions_mut().insert(guard.clone());
     let timeout = guard.0.timeout;
-    tokio::time::timeout(timeout, next.run(req)).await.unwrap_or_else(|_| refuse(StatusCode::REQUEST_TIMEOUT, "Zeitueberschreitung der Anfrage"))
+    tokio::time::timeout(timeout, next.run(req)).await.unwrap_or_else(|_| refuse(StatusCode::GATEWAY_TIMEOUT, "Zeitueberschreitung der Anfrage"))
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -3483,6 +3492,26 @@ nodes = [5]
         assert_eq!(call(&h.state, "GET", ADMIN_URI, None).await.0, StatusCode::BAD_REQUEST);
         let s = Secured { guard: Guard::unchecked(&h.state.config.http), h, _tokens: tempfile::tempdir().unwrap() };
         assert_eq!(s.via("8.8.8.8", "GET", WATCH_URI, None, None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn production_guard_on_default_section_checks_sources() {
+        let h = harness(false);
+        let s = Secured { guard: Guard::load(&h.state.config.http).unwrap(), h, _tokens: tempfile::tempdir().unwrap() };
+        assert_eq!(s.via("8.8.8.8", "GET", WATCH_URI, None, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(s.via("192.168.1.10", "GET", WATCH_URI, None, None).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn loopback_stays_trusted_with_custom_subnets() {
+        let mut http = HttpSection::default();
+        http.trusted_subnets = vec!["100.64.0.0/10".into()];
+        let g = Guard::load(&http).unwrap();
+        assert!(g.trusted(Some("127.0.0.1".parse().unwrap())) && g.trusted(Some("::1".parse().unwrap())) && g.trusted(Some("100.64.1.1".parse().unwrap())));
+        assert!(!g.trusted(Some("192.168.1.10".parse().unwrap())));
+        http.auth.watch_mode = AuthMode::Log;
+        http.auth.watch_token_file = "x".into();
+        assert!(Guard::load(&http).err().unwrap().to_string().contains("admin_mode is off"));
     }
 
     #[tokio::test]
