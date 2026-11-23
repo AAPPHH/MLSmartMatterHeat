@@ -2,6 +2,7 @@ import glob, json, os, sys, time, urllib.request
 
 CONFIG = {
     "heatd_url": "http://127.0.0.1:8090/api/ambient",
+    "token_file": "/opt/heatd-ambient/admin_token",
     "interval_s": 60,
     "sysfs": "/sys",
     "br_http": {"enabled": False, "url": "", "json_path": ["die_temperature_c"], "timeout_s": 5},
@@ -64,7 +65,11 @@ def post(cfg, source, readings):
     if not readings:
         return
     body = json.dumps({"source": source, "ts": int(time.time() * 1000), "readings": readings}).encode()
-    req = urllib.request.Request(cfg["heatd_url"], body, {"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("HEATD_TOKEN") or (read_text(cfg["token_file"]) if os.path.exists(cfg["token_file"]) else "")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(cfg["heatd_url"], body, headers)
     try:
         urllib.request.urlopen(req, timeout=10).read()
     except OSError as e:
