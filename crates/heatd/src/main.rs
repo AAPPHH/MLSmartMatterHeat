@@ -225,6 +225,7 @@ fn build_controller(config: &Config, serving: bool) -> Built {
 
 async fn serve(config: Config) -> Result<()> {
     let _lock = lock_storage(&config)?;
+    let guard = http::Guard::load(&config.http)?;
     let Built { controller, mock, feed, switch } = build_controller(&config, true);
     if let Some(mock) = mock {
         tokio::spawn(async move {
@@ -315,7 +316,7 @@ async fn serve(config: Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
     println!("heatd listening on {}", state.config.listen);
     let stopper = state.clone();
-    axum::serve(listener, http::router(state)).with_graceful_shutdown(async move {
+    axum::serve(listener, http::router_with(state, guard).into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(async move {
         shutdown_signal().await;
         failsafe::shutdown(&stopper).await;
     }).await?;

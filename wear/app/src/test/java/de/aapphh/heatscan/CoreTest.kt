@@ -42,6 +42,13 @@ class CoreTest {
     }
 
     @Test
+    fun bearerHeaderOnlyWithToken() {
+        assertNull(Poster.authHeader(""))
+        assertNull(Poster.authHeader("  \n"))
+        assertEquals("Bearer abc123", Poster.authHeader(" abc123\n"))
+    }
+
+    @Test
     fun noLabelSerializesAsNull() {
         val built = Payload.build(1L, "pixel-watch", null, aps)
         assertTrue(built.has("label"))

@@ -4,4 +4,5 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+Environment=HEATD_TOKEN_FILE=/opt/heatd-anchor/token
 ExecStart=/usr/bin/python3 /opt/heatd-anchor/wifi-anchor.py

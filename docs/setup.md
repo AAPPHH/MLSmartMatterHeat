@@ -52,7 +52,7 @@ sudo usermod -aG bluetooth $USER                                          # Pfli
 sudo cp deploy/99-thread-ra.conf /etc/sysctl.d/ && sudo sysctl --system   # Routen ins Thread-Netz annehmen (Interface-Name wlo1 in der Datei prüfen)
 git clone https://github.com/AAPPHH/MLSmartMatterHeat.git ~/MLSmartMatterHeat && cd ~/MLSmartMatterHeat
 cp deploy/docker/heatd.docker.toml heatd.toml                             # Räume, Node-IDs, Zeitpläne anpassen
-mkdir -p data models chip-storage secrets && scp <pc>:.../secrets/thread_dataset.hex secrets/
+mkdir -p data models chip-storage secrets && (umask 077; openssl rand -hex 32 > secrets/heatd_admin_token; openssl rand -hex 32 > secrets/heatd_watch_token) && scp <pc>:.../secrets/thread_dataset.hex secrets/
 scp <pc>:.../models/room_model.onnx models/                               # optional, ohne Modell liefert /api/scan keinen Raum
 cp deploy/docker/.env.example deploy/docker/.env                          # HEATD_UID/GID (id -u, id -g), HEATD_PORT, NINJA_JOBS eintragen
 ```
@@ -128,6 +128,7 @@ git clone https://github.com/AAPPHH/MLSmartMatterHeat.git ~/MLSmartMatterHeat &&
 cargo build --release -p heatd
 cp heatd.example.toml heatd.toml          # Räume, Node-IDs, Zeitpläne anpassen
 mkdir -p secrets && scp <pc>:.../secrets/thread_dataset.hex secrets/
+(umask 077; openssl rand -hex 32 > secrets/heatd_admin_token; openssl rand -hex 32 > secrets/heatd_watch_token)   # Token fuer [http.auth], siehe docs/heatd.md
 ```
 
 `[chip_tool]` in `heatd.toml`: `storage_dir` bleibt leer, dann nimmt der Snap seinen eigenen Ordner `~/snap/chip-tool/common`. `paa_trust_store` zeigt auf die Zertifikate von `install-paa.sh`. `bypass_attestation = true` ist nur der Notausgang, falls die Attestierung trotzdem scheitert.
@@ -183,4 +184,4 @@ Im Betrieb liegen zusätzlich folgende Werte im Speicher (`/api/state`) und in `
 
 Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen. Das Commissioning darf bis zu 180 s dauern (`commission_timeout_s`).
 
-Nach dem ersten Thermostat startest du `heatd` und prüfst mit `journalctl -u heatd -f` (Docker: `docker compose logs -f heatd`) und `curl localhost:8080/api/state`, ob Temperaturen ankommen. Das ist der erste echte Test des dauerhaften chip-tool-Prozesses.
+Nach dem ersten Thermostat startest du `heatd` und prüfst mit `journalctl -u heatd -f` (Docker: `docker compose logs -f heatd`) und `curl -H "Authorization: Bearer $(cat secrets/heatd_admin_token)" localhost:8080/api/state` (ohne `[http.auth]` genügt `curl localhost:8080/api/state`, siehe `docs/heatd.md`, Absicherung der HTTP-API), ob Temperaturen ankommen. Das ist der erste echte Test des dauerhaften chip-tool-Prozesses.

@@ -23,12 +23,14 @@ android {
         applicationId = "de.aapphh.heatscan"
         minSdk = 30
         targetSdk = 37
-        versionCode = 43
-        versionName = "4.4.3"
+        versionCode = 44
+        versionName = "4.4.4"
         val home = localProps.getProperty("heatscan.home", "HomeWiFi").replace("\\", "\\\\").replace("\"", "\\\"")
         buildConfigField("String", "HOME", "\"$home\"")
         val server = localProps.getProperty("heatscan.server", "http://192.0.2.1:8090").replace("\\", "\\\\").replace("\"", "\\\"")
         buildConfigField("String", "SERVER", "\"$server\"")
+        val token = localProps.getProperty("heatd.token", "").trim().replace("\\", "\\\\").replace("\"", "\\\"")
+        buildConfigField("String", "TOKEN", "\"$token\"")
     }
     signingConfigs {
         if (!keystoreProps.isEmpty) {

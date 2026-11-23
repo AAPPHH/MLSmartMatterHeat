@@ -1,4 +1,4 @@
-import json, re, subprocess, time, urllib.request
+import json, os, re, subprocess, time, urllib.request
 out = subprocess.run(["iw", "dev", "wlo1", "scan"], capture_output=True, text=True, timeout=60).stdout
 aps, cur = [], None
 for line in out.splitlines():
@@ -12,5 +12,7 @@ for line in out.splitlines():
         cur["rssi"] = round(float(s.group(1)))
 aps = [a for a in aps if "rssi" in a and "freq" in a]
 body = json.dumps({"ts": int(time.time() * 1000), "device": "minix-anchor", "motion": "still", "aps": aps}).encode()
-req = urllib.request.Request("http://127.0.0.1:8090/api/scan", body, {"Content-Type": "application/json"})
+token = os.environ.get("HEATD_TOKEN") or (open(os.environ["HEATD_TOKEN_FILE"]).read().strip() if os.environ.get("HEATD_TOKEN_FILE") else "")
+headers = {"Content-Type": "application/json", **({"Authorization": "Bearer " + token} if token else {})}
+req = urllib.request.Request("http://127.0.0.1:8090/api/scan", body, headers)
 print(urllib.request.urlopen(req, timeout=20).read().decode()[:200])
