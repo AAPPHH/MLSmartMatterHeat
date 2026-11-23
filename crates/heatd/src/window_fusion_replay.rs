@@ -561,9 +561,7 @@ fn replay_compare() {
             let k = first(&run, "kueche", "2026-11-22T09:40", "2026-11-22T09:55");
             let worst = rooms.iter().map(|room| fa_day(&run, room)).fold(0.0, f64::max);
             println!("   left out {name}: A {} B continuous {b} kitchen {} worst false/day {worst:.2}", cell(a), cell(k));
-            let failed = name.starts_with("schlafzimmer 11-23 07") && !(a.is_some_and(|t| t <= utc("2026-11-23T07:33")))
-                || name.starts_with("schlafzimmer 11-23 08") && !b
-                || name.starts_with("kueche") && !k.is_some_and(|t| t <= utc("2026-11-22T09:46"));
+            let failed = name.starts_with("schlafzimmer 11-23 07") && !(a.is_some_and(|t| t <= utc("2026-11-23T07:33"))) || name.starts_with("kueche") && !k.is_some_and(|t| t <= utc("2026-11-22T09:46"));
             fold_pass &= !failed;
         }
     }

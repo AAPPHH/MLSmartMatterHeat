@@ -586,8 +586,7 @@ impl Posterior {
         let ph = &cfg.physics;
         let r = 1.0 / cfg.open_every_min.max(1.0);
         let (to_kipp, to_open, k_close, o_close) = (r * ph.kipp_share, r * (1.0 - ph.kipp_share), 1.0 / ph.stay_kipp_min.max(1.0), 1.0 / ph.stay_open_min.max(1.0));
-        let o_kipp = 0.5 * o_close;
-        [[1.0 - to_kipp - to_open, to_kipp, to_open], [k_close, 1.0 - k_close - to_open, to_open], [o_close - o_kipp, o_kipp, 1.0 - o_close]]
+        [[1.0 - to_kipp - to_open, to_kipp, to_open], [k_close, 1.0 - k_close - to_open, to_open], [o_close, 0.0, 1.0 - o_close]]
     }
 
     fn stationary(chain: &[[f64; 3]; 3]) -> [f64; 3] {
