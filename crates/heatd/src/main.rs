@@ -62,6 +62,11 @@ mod supply_tests;
 mod budget_tests;
 #[cfg(test)]
 mod window_tests;
+mod window_fusion;
+#[cfg(test)]
+mod window_fusion_tests;
+#[cfg(test)]
+mod window_fusion_replay;
 mod window_model;
 #[cfg(test)]
 mod window_model_tests;

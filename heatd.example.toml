@@ -162,6 +162,19 @@ prompt_gap_min = 10.0
 prompt_global_gap_min = 30.0
 prompt_max_per_day = 6
 
+[window.fusion]
+enabled = false
+shadow = true
+window_min = 4.0
+temper_scale = 1.5
+couple_llr = 1.5
+open_every_min = 1440.0
+stay_min = 30.0
+horizon_min = 20.0
+cool_k_per_h = 0.5
+level_llr = 0.3
+level_max_min = 60.0
+
 [boost]
 enabled = true
 model_dir = "/models/boost"

@@ -1,17 +1,20 @@
 use crate::config::{Config, SupplySection, WindowSection};
 use crate::lake::{self, Table};
+use crate::window_fusion::{thresholds, AirRoom, Chan, Inputs, Posterior, Reference, Signal, Tables};
 use crate::window_model::{Channel, Detector, Scored};
 use arrow::array::{Array, Float64Array, Int64Array, TimestampMicrosecondArray, UInt32Array, UInt64Array};
 use chrono::{Local, TimeZone, Timelike};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 
 const MIN_MS: i64 = 60_000;
 const LATE_LABEL_MS: i64 = 300_000;
 const KEEP_MS: i64 = 3 * 3_600_000;
 const SUPPRESS_LOG_MS: i64 = 15 * MIN_MS;
 const LEAD_MS: i64 = 15 * MIN_MS;
+const COUPLE_SUPPORT: f64 = 0.5;
 const THERMOSTAT_CLUSTER: u32 = 513;
 pub const DETECTOR: &str = "v3";
 
@@ -27,6 +30,7 @@ pub const OCCUPIED_SETPOINT: &str = matter_controller::OCCUPIED_HEATING_SETPOINT
 pub struct RoomCtx {
     pub hold: bool,
     pub away: bool,
+    pub away_fresh: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,8 +94,30 @@ struct NodeWin {
     over_since: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct Pulse {
+    chan: Chan,
+    channel: String,
+    reason: String,
+    rooms: Vec<String>,
+    z: BTreeMap<String, Option<f64>>,
+    house: f64,
+    threshold: f64,
+    bundle: String,
+    scored_ms: i64,
+}
+
 #[derive(Debug, Default)]
 struct RoomWin {
+    fusion: Posterior,
+    air: AirRoom,
+    pulse: Option<Pulse>,
+    shadow_pulse: Option<Pulse>,
+    shadow: Option<i64>,
+    shadow_opens: u64,
+    shadow_indep: Option<i64>,
+    reference: Reference,
+    indep_ms: Option<i64>,
     active: Option<Active>,
     series: VecDeque<(i64, f64)>,
     floor_ms: i64,
@@ -138,6 +164,27 @@ pub struct Windows {
     prompt_times: VecDeque<i64>,
     det: Detector,
     last: Option<Scored>,
+    tables: Arc<Tables>,
+    fcfg: crate::config::WindowFusion,
+    fcfg_set: bool,
+    fusion_min: Option<i64>,
+    #[cfg(test)]
+    trace: Option<Vec<TraceRow>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct TraceRow {
+    pub ts_ms: i64,
+    pub room: String,
+    pub z: f64,
+    pub valve: f64,
+    pub co2: f64,
+    pub rh: f64,
+    pub temp: f64,
+    pub gate: &'static str,
+    pub own: f64,
+    pub total: f64,
 }
 
 fn mins(m: f64) -> i64 {
@@ -375,7 +422,11 @@ impl Windows {
             return None;
         }
         if prompt_id.is_some() {
-            let auto = self.rooms.get(room).and_then(|r| r.active.as_ref()).is_some_and(|a| a.source == "auto");
+            let auto = self.rooms.get(room).and_then(|r| r.active.as_ref()).is_some_and(|a| matches!(a.source, "auto" | "fusion"));
+            let held = self.rooms.get(room).is_some_and(|r| r.active.is_some());
+            if open && question == Some("open") && held {
+                self.hard(room, true);
+            }
             return if auto && !open { self.close(room, "label", now) } else { None };
         }
         let event = self.manual(room, open, now);
@@ -536,19 +587,73 @@ impl Windows {
         self.rooms.iter().filter(|(_, r)| r.active.is_some()).map(|(n, _)| n.clone()).collect()
     }
 
+    fn adopt(&mut self, config: &Config) {
+        if !self.fcfg_set || self.fcfg != config.window.fusion {
+            self.fcfg = config.window.fusion.clone();
+            self.tables = Arc::new(Tables::for_config(&self.fcfg));
+            self.fcfg_set = true;
+        }
+    }
+
+    fn hard(&mut self, room: &str, open: bool) {
+        let cfg = self.fcfg.clone();
+        let r = self.rooms.entry(room.into()).or_default();
+        r.fusion.hard(&cfg, open);
+        r.pulse = None;
+    }
+
+    #[cfg(test)]
+    pub fn set_trace(&mut self, on: bool) {
+        self.trace = on.then(Vec::new);
+    }
+
+    #[cfg(test)]
+    pub fn take_trace(&mut self) -> Vec<TraceRow> {
+        self.trace.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    pub fn observe_air(&mut self, config: &Config, node: u64, cluster: u32, value: f64, ts_ms: i64) {
+        self.adopt(config);
+        let Some(dev) = config.devices.iter().find(|d| d.node == node) else { return };
+        let (Some(room), Some((signal, v))) = (dev.room.as_ref(), Signal::of_cluster(cluster, value)) else { return };
+        let r = self.rooms.entry(room.clone()).or_default();
+        r.air.skip_humidity(config.window.fusion.skip_humidity.contains(&dev.role));
+        r.air.push(node, signal, ts_ms, v);
+    }
+
     fn close(&mut self, room: &str, reason: &'static str, now: i64) -> Option<WinEvent> {
+        let cfg = self.fcfg.clone();
+        let live = cfg.enabled;
         let r = self.rooms.get_mut(room)?;
         let a = r.active.take()?;
+        let detail = json!({"p": r.fusion.p(), "channels": r.fusion.breakdown(), "text": r.fusion.reason(false)});
+        match reason {
+            "label" | "manual" => {
+                r.fusion.hard(&cfg, false);
+                r.air.reset(now);
+            }
+            "fusion" => {}
+            _ if live => r.fusion.calm(&cfg),
+            _ => {}
+        }
+        r.pulse = None;
         r.manual_label = None;
         r.last_close = Some((reason, now));
         r.last_open_ms = Some(now);
         self.finished.push(Episode { room: room.into(), start_ms: a.first_ms, end_ms: now, reason, source: a.source, score: a.score });
-        Some(WinEvent { kind: lake::kind::WINDOW_CLOSE, room: room.into(), detail: json!({"room": room, "detector": DETECTOR, "reason": reason, "source": a.source, "open_minutes": (now - a.first_ms) as f64 / 60_000.0}) })
+        Some(WinEvent { kind: lake::kind::WINDOW_CLOSE, room: room.into(), detail: json!({"room": room, "detector": DETECTOR, "reason": reason, "source": a.source, "open_minutes": (now - a.first_ms) as f64 / 60_000.0, "fusion": detail}) })
     }
 
     pub fn manual(&mut self, room: &str, open: bool, now: i64) -> Option<WinEvent> {
         if !open {
-            return self.close(room, "manual", now);
+            let event = self.close(room, "manual", now);
+            if event.is_none() {
+                self.hard(room, false);
+                if let Some(r) = self.rooms.get_mut(room) {
+                    r.air.reset(now);
+                }
+            }
+            return event;
         }
         let r = self.rooms.entry(room.into()).or_default();
         match r.active.as_mut() {
@@ -560,28 +665,78 @@ impl Windows {
             None => r.active = Some(Active { source: "manual", first_ms: now, since_ms: now, score: None }),
         }
         r.manual_label = None;
+        self.hard(room, true);
         Some(WinEvent { kind: lake::kind::WINDOW_OPEN, room: room.into(), detail: json!({"room": room, "source": "manual"}) })
     }
 
+    fn gate(&self, cfg: &WindowSection, room: &str, now: i64, fresh: bool) -> Option<&'static str> {
+        let w = self.rooms.get(room);
+        if w.and_then(|w| w.last_close).is_some_and(|(_, at)| now - at < mins(cfg.rearm_min)) {
+            Some("rearm")
+        } else if w.and_then(|w| w.decrease_ms).is_some_and(|d| now - d <= mins(cfg.setpoint_guard_min)) {
+            Some("setpoint")
+        } else {
+            self.hold_away(room, fresh)
+        }
+    }
+
+    fn hold_away(&self, room: &str, fresh: bool) -> Option<&'static str> {
+        let ctx = self.ctx.get(room).cloned().unwrap_or_default();
+        if ctx.hold {
+            Some("manual_hold")
+        } else if if fresh { ctx.away_fresh } else { ctx.away } {
+            Some("away")
+        } else {
+            None
+        }
+    }
+
     pub fn step(&mut self, config: &Config, now: i64, weather: impl Fn(f64) -> [f64; 3]) -> Vec<WinEvent> {
+        self.adopt(config);
         let cfg = &config.window;
         let mut events: Vec<WinEvent> = config.rooms.iter().flat_map(|r| self.supply_tick(config, &r.name, now)).collect();
-        let due: Vec<(String, &'static str)> = self.rooms.iter().filter_map(|(n, r)| r.active.as_ref().and_then(|a| if a.source == "manual" { (now - a.since_ms >= mins(cfg.manual_max_min)).then_some((n.clone(), "manual_timeout")) } else { (now - a.since_ms >= mins(cfg.hold_min)).then_some((n.clone(), "timeout")) })).collect();
+        let due: Vec<(String, &'static str)> = self
+            .rooms
+            .iter()
+            .filter_map(|(n, r)| {
+                let a = r.active.as_ref()?;
+                if a.source == "manual" {
+                    (now - a.since_ms >= mins(cfg.manual_max_min)).then_some((n.clone(), "manual_timeout"))
+                } else {
+                    (now - a.since_ms.max(r.indep_ms.unwrap_or(i64::MIN)) >= mins(cfg.hold_min)).then_some((n.clone(), "timeout"))
+                }
+            })
+            .collect();
         events.extend(due.into_iter().filter_map(|(room, reason)| self.close(&room, reason, now)));
         if !cfg.enabled {
             return events;
         }
         let age = self.det.bundle().map_or(180.0, |b| b.weather_max_age_min);
         let supply = self.rooms.values().any(|r| r.supply.is_some());
-        for minute in self.det.advance(config, now, weather(age), supply) {
+        let wx = weather(age);
+        let scored = self.det.advance(config, now, wx, supply);
+        let running = cfg.fusion.enabled || cfg.fusion.shadow;
+        let mut ran = false;
+        for minute in &scored {
             for (name, z) in &minute.z {
                 self.rooms.entry(name.clone()).or_default().z = Some(*z).filter(|z| z.is_finite());
             }
             let channels = self.det.bundle().map(|b| minute.alarms(b)).unwrap_or_default();
             if !channels.is_empty() {
-                events.extend(self.alarm(config, &minute, &channels, now));
+                events.extend(self.alarm(config, minute, &channels, now));
             }
-            self.last = Some(minute);
+            let idx = minute.ts_ms.div_euclid(MIN_MS);
+            if running && self.fusion_min.is_none_or(|c| idx > c) {
+                events.extend(self.fusion_minute(config, minute.ts_ms, Some(minute), wx[0]));
+                ran = true;
+            }
+            self.fusion_min = self.fusion_min.max(Some(idx));
+            self.last = Some(minute.clone());
+        }
+        let target = now.div_euclid(MIN_MS);
+        if running && !ran && self.fusion_min.is_none_or(|c| target > c) {
+            self.fusion_min = Some(target);
+            events.extend(self.fusion_minute(config, target * MIN_MS, None, wx[0]));
         }
         events.extend(self.emit_finished(cfg, now));
         events
@@ -608,29 +763,22 @@ impl Windows {
                 }
             }
         }
-        let (mut free, mut events) = (Vec::new(), Vec::new());
+        let (mut free, mut events, mut shadow_only) = (Vec::new(), Vec::new(), Vec::new());
+        let shadow = cfg.fusion.shadow && !cfg.fusion.enabled;
         for (room, channel) in targets {
-            let ctx = self.ctx.get(&room.name).cloned().unwrap_or_default();
-            let w = self.rooms.entry(room.name.clone()).or_default();
-            if w.active.is_some() {
+            if self.rooms.get(&room.name).is_some_and(|w| w.active.is_some()) {
                 continue;
             }
-            let why = if w.last_close.is_some_and(|(_, at)| now - at < mins(cfg.rearm_min)) {
-                Some("rearm")
-            } else if w.decrease_ms.is_some_and(|d| now - d <= mins(cfg.setpoint_guard_min)) {
-                Some("setpoint")
-            } else if ctx.hold {
-                Some("manual_hold")
-            } else if ctx.away {
-                Some("away")
-            } else {
-                None
-            };
+            let why = self.gate(cfg, &room.name, now, cfg.fusion.enabled);
             let threshold = bundle.threshold(match channel { Channel::House => "house", Channel::Room(name) => name });
             let Some(why) = why else {
                 free.push((room.name.clone(), channel, threshold));
                 continue;
             };
+            if shadow && self.gate(cfg, &room.name, now, true).is_none() {
+                shadow_only.push((room.name.clone(), channel, threshold));
+            }
+            let w = self.rooms.entry(room.name.clone()).or_default();
             w.last_open_ms = w.last_open_ms.max(Some(now));
             if w.logged.get(why).is_some_and(|t| now - t < SUPPRESS_LOG_MS) {
                 continue;
@@ -639,22 +787,172 @@ impl Windows {
             w.logged.insert(why, now);
             events.push(WinEvent { kind: lake::kind::WINDOW_SUPPRESSED, room: room.name.clone(), detail: json!({"room": room.name, "detector": DETECTOR, "reason": why, "house": m.house, "threshold": threshold}) });
         }
-        let zs: BTreeMap<&String, Option<f64>> = m.z.iter().map(|(k, v)| (k, v.is_finite().then_some(*v))).collect();
-        let names: Vec<&String> = free.iter().map(|f| &f.0).collect();
-        for (name, channel, threshold) in &free {
+        let zs: BTreeMap<String, Option<f64>> = m.z.iter().map(|(k, v)| (k.clone(), v.is_finite().then_some(*v))).collect();
+        let names: Vec<String> = free.iter().map(|f| f.0.clone()).collect();
+        for (name, channel, threshold) in free.iter().chain(shadow_only.iter()) {
+            let (chan, channel_name) = match channel { Channel::House => (Chan::House, "house".to_string()), Channel::Room(room) => (Chan::Trv, room.clone()) };
+            let pulse = Pulse { chan, channel: channel_name, reason: m.reason(&bundle, name, channel), rooms: names.clone(), z: zs.clone(), house: m.house, threshold: *threshold, bundle: bundle.version.clone(), scored_ms: m.ts_ms };
             let w = self.rooms.entry(name.clone()).or_default();
-            let own = zs.get(name).copied().flatten().unwrap_or(f64::NAN);
-            w.active = Some(Active { source: "auto", first_ms: now, since_ms: now, score: Some((m.house, own)) });
-            w.auto_opens += 1;
-            let channel_name = match channel { Channel::House => "house", Channel::Room(room) => room };
-            events.push(WinEvent { kind: lake::kind::WINDOW_OPEN, room: name.clone(), detail: json!({"room": name, "source": "auto", "detector": DETECTOR, "channel": channel_name, "reason": m.reason(&bundle, name, channel), "rooms": names, "z": zs, "house": m.house, "threshold": threshold, "bundle": bundle.version, "scored_ms": m.ts_ms}) });
+                if shadow {
+                w.shadow_pulse = Some(pulse.clone());
+            }
+            if free.iter().any(|f| &f.0 == name) {
+                w.pulse = Some(pulse);
+            }
         }
-        let mut by_z: Vec<&(String, &Channel, f64)> = free.iter().collect();
-        by_z.sort_by(|a, b| zs.get(&a.0).copied().flatten().unwrap_or(f64::MIN).total_cmp(&zs.get(&b.0).copied().flatten().unwrap_or(f64::MIN)));
-        for (name, channel, _) in by_z {
-            self.raise(cfg, name, "open", Some(m.reason(&bundle, name, channel)), now);
+        if !cfg.fusion.enabled {
+            events.extend(self.legacy_open(config, now));
         }
         events
+    }
+
+    fn legacy_open(&mut self, config: &Config, now: i64) -> Vec<WinEvent> {
+        let pending: Vec<(String, Pulse)> = self.rooms.iter_mut().filter_map(|(n, r)| r.pulse.take().map(|p| (n.clone(), p))).collect();
+        pending.into_iter().map(|(name, p)| self.open_event(config, &name, &p, "auto", now)).collect()
+    }
+
+    fn open_event(&mut self, config: &Config, room: &str, p: &Pulse, source: &'static str, now: i64) -> WinEvent {
+        let own = p.z.get(room).copied().flatten().unwrap_or(f64::NAN);
+        let w = self.rooms.entry(room.into()).or_default();
+        w.active = Some(Active { source, first_ms: now, since_ms: now, score: Some((p.house, own)) });
+        w.reference = w.air.reference(now);
+        w.auto_opens += 1;
+        let text = if source == "fusion" || p.reason.is_empty() { w.fusion.reason(true) } else { p.reason.clone() };
+        let fusion = json!({"p": w.fusion.p(), "own_p": w.fusion.own_p(), "channels": w.fusion.breakdown(), "text": w.fusion.reason(true)});
+        self.raise(&config.window, room, "open", Some(text.clone()), now);
+        WinEvent { kind: lake::kind::WINDOW_OPEN, room: room.into(), detail: json!({"room": room, "source": source, "detector": DETECTOR, "channel": p.channel, "reason": text, "rooms": p.rooms, "z": p.z, "house": p.house, "threshold": p.threshold, "bundle": p.bundle, "scored_ms": p.scored_ms, "fusion": fusion}) }
+    }
+
+    fn neighbours(config: &Config, room: &str) -> Vec<String> {
+        let has_thermostat = |name: &str| config.rooms.iter().any(|r| r.name == name && !r.nodes.is_empty());
+        let linked = |from: &str, kinds: &[&str]| -> Vec<String> { config.neighbours.iter().filter(|n| kinds.contains(&n.kind.as_str())).filter_map(|n| if n.a == from { Some(n.b.clone()) } else if n.b == from { Some(n.a.clone()) } else { None }).collect() };
+        let mut out = Vec::new();
+        for direct in linked(room, &["wall", "open"]) {
+            if has_thermostat(&direct) {
+                out.push(direct);
+            } else if config.neighbours.iter().any(|n| n.kind == "wall" && ((n.a == room && n.b == direct) || (n.b == room && n.a == direct))) {
+                out.extend(linked(&direct, &["wall"]).into_iter().filter(|r| r != room && has_thermostat(r)));
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn fusion_minute(&mut self, config: &Config, ts_ms: i64, scored: Option<&Scored>, out_c: f64) -> Vec<WinEvent> {
+        let (cfg, fcfg) = (&config.window, &config.window.fusion);
+        let live = fcfg.enabled;
+        let tables = self.tables.clone();
+        let (on, off) = thresholds(fcfg, config.room_model.raise_cost_min, config.room_model.cold_cost_min);
+        let rooms: Vec<String> = config.rooms.iter().filter(|r| !r.nodes.is_empty()).map(|r| r.name.clone()).collect();
+        let bundle = self.det.bundle().map(|b| (b.open_valve_pct, b.rooms.iter().map(|(n, m)| (n.clone(), m.sigma)).collect::<BTreeMap<String, f64>>()));
+        for room in &rooms {
+            let gate = self.gate(cfg, room, ts_ms, true);
+            let w = self.rooms.entry(room.clone()).or_default();
+            let z = scored.and_then(|m| m.z.get(room)).copied().filter(|v| v.is_finite());
+            let valve = scored.and_then(|m| m.valve.get(room)).copied().unwrap_or(f64::NAN);
+            let veto = scored.is_some_and(|m| m.veto);
+            let sigma = bundle.as_ref().and_then(|b| b.1.get(room)).copied();
+            let open_valve = bundle.as_ref().is_some_and(|b| valve.is_finite() && valve > b.0);
+            let trv = match (z, sigma) {
+                (Some(z), Some(sigma)) if gate.is_none() && !veto => Some(tables.trv.llr(z, sigma, open_valve)),
+                _ => None,
+            };
+            let rates = w.air.rates(fcfg, ts_ms, out_c);
+            let inside = w.air.latest_temp(ts_ms).or_else(|| w.series.back().map(|s| s.1));
+            let gain = inside.filter(|_| out_c.is_finite()).map_or(1.0, |t| ((t - out_c) / fcfg.dt_ref_k).clamp(0.25, 1.0));
+            let pulse = if live { w.pulse.take() } else { w.shadow_pulse.take() };
+            let holding = if live { w.active.is_some() } else { w.shadow.is_some() };
+            let depressed = holding && w.air.depressed(fcfg, ts_ms, &w.reference);
+            let inputs = Inputs { trv, pulse: pulse.as_ref().map(|p| (p.chan, tables.alarm_llr)), rates, gain, holding, depressed };
+            w.fusion.update(fcfg, &tables, &inputs);
+            if pulse.is_some() && !w.fusion.independent && w.fusion.own < on + 0.5 {
+                w.fusion.own = (on + 0.5).min(fcfg.logit_max);
+            }
+            if live {
+                if rates.any() {
+                    w.indep_ms = Some(ts_ms);
+                }
+                w.pulse = pulse;
+            } else {
+                w.shadow_pulse = pulse;
+                if rates.any() {
+                    w.shadow_indep = Some(ts_ms);
+                }
+            }
+            #[cfg(test)]
+            if let Some(trace) = self.trace.as_mut() {
+                trace.push(TraceRow { ts_ms, room: room.clone(), z: z.unwrap_or(f64::NAN), valve, co2: rates.co2.unwrap_or(f64::NAN), rh: rates.rh.unwrap_or(f64::NAN), temp: rates.temp.unwrap_or(f64::NAN), gate: gate.unwrap_or(""), own: w.fusion.own, total: w.fusion.total() });
+            }
+        }
+        let owns: HashMap<String, f64> = rooms.iter().map(|r| (r.clone(), self.rooms.get(r).map_or(0.0, |w| w.fusion.own_p()))).collect();
+        for room in &rooms {
+            let shift = Self::neighbours(config, room).iter().filter_map(|n| owns.get(n)).fold(0.0_f64, |a, b| a.max(*b)) * fcfg.couple_llr;
+            self.rooms.entry(room.clone()).or_default().fusion.set_couple(shift);
+        }
+        let mut events = Vec::new();
+        for room in &rooms {
+            let w = self.rooms.get(room);
+            let total = w.map_or(f64::NEG_INFINITY, |w| w.fusion.total());
+            let active = if live { w.and_then(|w| w.active.as_ref()).map(|a| a.source) } else { w.and_then(|w| w.shadow).map(|_| "shadow") };
+            let independent = w.is_some_and(|w| w.fusion.independent);
+            let supported = independent || w.is_some_and(|w| w.pulse.is_some() || w.shadow_pulse.is_some() || w.fusion.couple >= COUPLE_SUPPORT);
+            if !live {
+                let blocked = self.hold_away(room, true).is_some_and(|why| why == "manual_hold" || !independent);
+                events.extend(self.shadow_step(room, total, on, off, supported && !blocked, independent, active.is_some(), ts_ms, mins(cfg.hold_min)));
+                if let Some(w) = self.rooms.get_mut(room) {
+                    w.shadow_pulse = None;
+                }
+                continue;
+            }
+            match active {
+                None if total >= on && supported => events.extend(self.fusion_open(config, room, ts_ms)),
+                Some(source) if source != "manual" && total <= off && independent => events.extend(self.close(room, "fusion", ts_ms)),
+                _ => {}
+            }
+            if let Some(w) = self.rooms.get_mut(room) {
+                w.pulse = None;
+                w.shadow_pulse = None;
+            }
+        }
+        events
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shadow_step(&mut self, room: &str, total: f64, on: f64, off: f64, supported: bool, independent: bool, open: bool, ts_ms: i64, hold_ms: i64) -> Option<WinEvent> {
+        let w = self.rooms.get_mut(room)?;
+        let timed_out = w.shadow.is_some_and(|since| ts_ms - since.max(w.shadow_indep.unwrap_or(i64::MIN)) >= hold_ms);
+        let state = match (open, total >= on && supported, total <= off && independent || timed_out && !independent) {
+            (false, true, _) => "open",
+            (true, _, true) => "close",
+            _ => return None,
+        };
+        w.shadow = (state == "open").then_some(ts_ms);
+        w.reference = w.air.reference(ts_ms);
+        w.shadow_opens += u64::from(state == "open");
+        let detail = json!({"room": room, "state": state, "p": w.fusion.p(), "channels": w.fusion.breakdown(), "text": w.fusion.reason(state == "open")});
+        Some(WinEvent { kind: lake::kind::WINDOW_SHADOW, room: room.into(), detail })
+    }
+
+    fn fusion_open(&mut self, config: &Config, room: &str, ts_ms: i64) -> Option<WinEvent> {
+        let w = self.rooms.get(room)?;
+        let pulse = w.pulse.clone();
+        let independent = w.fusion.independent;
+        let veto = self.hold_away(room, true).filter(|why| *why == "manual_hold" || !independent);
+        if let Some(why) = veto {
+            let w = self.rooms.get_mut(room)?;
+            w.last_open_ms = w.last_open_ms.max(Some(ts_ms));
+            if w.logged.get(why).is_some_and(|t| ts_ms - t < SUPPRESS_LOG_MS) {
+                return None;
+            }
+            w.suppressed += 1;
+            w.logged.insert(why, ts_ms);
+            return Some(WinEvent { kind: lake::kind::WINDOW_SUPPRESSED, room: room.into(), detail: json!({"room": room, "detector": DETECTOR, "reason": why, "fusion": {"p": w.fusion.p(), "channels": w.fusion.breakdown()}}) });
+        }
+        let coupled = self.rooms.get(room).is_some_and(|w| w.fusion.couple >= COUPLE_SUPPORT);
+        let source = if independent || coupled || pulse.is_none() { "fusion" } else { "auto" };
+        let pulse = pulse.unwrap_or_else(|| Pulse { chan: Chan::Trv, channel: "fusion".into(), reason: String::new(), rooms: vec![room.into()], z: BTreeMap::new(), house: f64::NAN, threshold: f64::NAN, bundle: self.det.version().unwrap_or("").into(), scored_ms: ts_ms });
+        Some(self.open_event(config, room, &pulse, source, ts_ms))
     }
 
     pub fn view(&self, room: &str, now: i64) -> Value {
@@ -672,19 +970,25 @@ impl Windows {
             "no_supply_since": r.supply,
             "z": r.z,
             "model": self.det.version(),
+            "p": r.fusion.p(),
+            "tables": self.tables.version,
+            "text": r.fusion.reason(a.is_some()),
+            "fusion": r.fusion.view(a.is_some() || r.shadow.is_some()),
+            "shadow": json!({"open": r.shadow.is_some(), "since_ts": r.shadow, "opens": r.shadow_opens}),
         })
     }
 
     pub fn metrics(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        for (name, help, kind) in [("heatd_window_state", "window detection state per room (0 closed, 1 open)", "gauge"), ("heatd_window_auto_opens_total", "automatic window openings per room since start", "counter"), ("heatd_window_suppressed_total", "vetoed window alarms per room since start", "counter"), ("heatd_window_z", "latest window evidence z per room (absent while unscorable)", "gauge")] {
+        for (name, help, kind) in [("heatd_window_state", "window detection state per room (0 closed, 1 open)", "gauge"), ("heatd_window_auto_opens_total", "automatic window openings per room since start", "counter"), ("heatd_window_suppressed_total", "vetoed window alarms per room since start", "counter"), ("heatd_window_z", "latest window evidence z per room (absent while unscorable)", "gauge"), ("heatd_window_p", "window fusion posterior P(open) per room", "gauge")] {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
             for (room, r) in &self.rooms {
                 let v = match name {
                     "heatd_window_state" => f64::from(u8::from(r.active.is_some())),
                     "heatd_window_auto_opens_total" => r.auto_opens as f64,
                     "heatd_window_suppressed_total" => r.suppressed as f64,
+                    "heatd_window_p" => r.fusion.p(),
                     _ => match r.z {
                         Some(z) => z,
                         None => continue,

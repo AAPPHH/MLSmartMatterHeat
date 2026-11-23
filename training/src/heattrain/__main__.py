@@ -6,6 +6,7 @@ from heattrain.thermal import thermal
 from heattrain.roomeval import roommodel
 from heattrain.thermalml import thermalml
 from heattrain.watchroom import eval_model, train
+from heattrain.airwin import run_airwin
 from heattrain.windowml import run_windowml, run_windowroom, window_bundle
 
 CONFIG = {
@@ -178,6 +179,8 @@ COMMANDS = {"roommodel": run_roommodel, "boostmark": run_boostmark, "boostlearn"
 
 
 def main(argv):
+    if len(argv) in (5, 6) and argv[1] == "airwin":
+        return run_airwin(*argv[2:])
     if len(argv) in (3, 4) and argv[1] == "windowml":
         return run_window(CONFIG, *argv[2:])
     if len(argv) in (2, 3, 4) and argv[1] == "windowroom":
@@ -185,7 +188,7 @@ def main(argv):
     if len(argv) == 5 and argv[1] == "boostlearn":
         return run_boost(CONFIG, argv[2], argv[3], argv[4] == "validate")
     if len(argv) != 4 or argv[1] not in COMMANDS:
-        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | roommodel <lake> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | boostmark <models_dir> ok|fail | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model]")
+        sys.exit("usage: python -m heattrain watchroom <data_root> <models_dir> | eval <data_root> <model_dir> | thermal <data_root_or_raw_dir> <models_dir> | thermalml <data_root_or_raw_dir> <models_dir> | roommodel <lake> <models_dir> | boiler <lake> <out_dir> | boostlearn <lake> <models_dir> [validate] | boostcheck <lake> <models_dir> | boostmark <models_dir> ok|fail | window <lake> <models_dir> | windowml <ClassName|module:Class> [lake] | windowroom [lake] [model,model] | airwin <trace.csv> <dump_dir> <out.json> [exclude_days MM-DD,MM-DD]")
     COMMANDS[argv[1]](CONFIG, argv[2], argv[3])
 
 
