@@ -210,6 +210,7 @@ pulse_llr = 2.0
 pulse_air_llr = 0.0
 outlier_share = 0.0
 outlier_scale = 4.0
+refractory_min = 10.0
 
 [boost]
 enabled = true

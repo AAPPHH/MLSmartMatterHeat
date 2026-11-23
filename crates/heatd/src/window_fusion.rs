@@ -549,6 +549,7 @@ pub struct Inputs {
     pub out_c: f64,
     pub valve: f64,
     pub trv_obs: Option<(f64, f64, bool)>,
+    pub ts_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -561,11 +562,13 @@ pub struct Posterior {
     pub raw: [f64; CHANNELS],
     pub physics: bool,
     pub independent: bool,
+    pub was_holding: bool,
+    pub quiet_until_ms: i64,
 }
 
 impl Default for Posterior {
     fn default() -> Self {
-        Self { mu: [1.0, 0.0, 0.0], own: f64::NAN, couple: 0.0, contrib: [0.0; CHANNELS], added: [0.0; CHANNELS], raw: [0.0; CHANNELS], physics: false, independent: false }
+        Self { mu: [1.0, 0.0, 0.0], own: f64::NAN, couple: 0.0, contrib: [0.0; CHANNELS], added: [0.0; CHANNELS], raw: [0.0; CHANNELS], physics: false, independent: false, was_holding: false, quiet_until_ms: i64::MIN }
     }
 }
 
@@ -659,7 +662,11 @@ impl Posterior {
         if let Some((z, sigma, valve_open)) = inp.trv_obs {
             ch[Chan::Trv as usize] = trv_modes(z, sigma, valve_open, ph, room.trv_beta).scaled(w[3]);
         }
-        if inp.holding {
+        if self.was_holding && !inp.holding {
+            self.quiet_until_ms = inp.ts_ms + (ph.refractory_min * MIN_MS as f64) as i64;
+        }
+        self.was_holding = inp.holding;
+        if inp.holding || inp.ts_ms < self.quiet_until_ms {
             for c in [Chan::Trv, Chan::Temp] {
                 let l = &mut ch[c as usize];
                 if l.modes[1].max(l.modes[2]) > l.modes[0] {

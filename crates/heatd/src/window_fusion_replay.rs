@@ -570,5 +570,5 @@ fn replay_compare() {
     let c_ok = worst[2] <= MAX_FALSE_PER_ROOM_DAY && door.is_empty();
     let d_ok = wb.iter().all(|room| tf(pb, room).0 >= tf(&runs[0], room).0 && tf(pb, room).1 <= tf(&runs[0], room).1);
     println!("(a) {} (b) {} (c) {} (d) {} (e literal) {} (e verified) {} loeo {}", pass(a_ok), pass(b_ok), pass(c_ok), pass(d_ok), pass(extra_ok_confirmed), pass(extra_ok_verified), pass(fold_pass));
-    assert!(a_ok && b_ok && d_ok && door.is_empty() && worst[2] <= 2.0 * MAX_FALSE_PER_ROOM_DAY && extra_ok_verified && fold_pass, "physics criteria regressed");
+    assert!(a_ok && b_ok && c_ok && d_ok && extra_ok_confirmed && fold_pass, "pre-fixed criteria (a)-(e) not all met, see the criteria lines above");
 }

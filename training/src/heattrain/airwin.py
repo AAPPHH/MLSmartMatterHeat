@@ -437,7 +437,7 @@ def physics_fit(config, dump, spans, trace=None, pos=None):
         out["noise"] = noise_priors(cfg, noise, cfg["default_weight"])
         out["noise_stats"] = noise
     if trace is not None and pos is not None:
-        out["weight"], out["scale"] = tempering(cfg, trace, pos, cfg["default_weight"])
+        out["weight"], _ = tempering(cfg, trace, pos, cfg["default_weight"])
     return out
 
 

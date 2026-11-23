@@ -385,6 +385,7 @@ pub struct Physics {
     pub pulse_air_llr: f64,
     pub outlier_share: f64,
     pub outlier_scale: f64,
+    pub refractory_min: f64,
 }
 
 impl Default for Physics {
@@ -403,7 +404,7 @@ impl Default for Physics {
             temp_sigma_k: 0.0218,
             temp_window_min: 8.0,
             temp_kappa: 0.03,
-            temp_base_loss_h: 0.0,
+            temp_base_loss_h: 0.03,
             temp_source_k_min: 0.003,
             temp_valve_k_min: 0.02,
             temp_model_k_min: 0.003,
@@ -423,6 +424,7 @@ impl Default for Physics {
             pulse_air_llr: 0.0,
             outlier_share: 0.0,
             outlier_scale: 4.0,
+            refractory_min: 10.0,
         }
     }
 }
@@ -633,6 +635,9 @@ impl Config {
             for blackout in &room.exploration.blackout {
                 blackout.minutes()?;
             }
+        }
+        if !["learned", "physics"].contains(&config.window.fusion.engine.as_str()) {
+            return Err(anyhow!("window.fusion: unknown engine {} (expected learned or physics)", config.window.fusion.engine));
         }
         if config.br_watchdog.enabled && config.br_watchdog.url.trim().is_empty() {
             return Err(anyhow!("br_watchdog: enabled but url is empty (set [br_watchdog] url)"));

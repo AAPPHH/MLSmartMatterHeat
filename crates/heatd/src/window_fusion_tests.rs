@@ -387,6 +387,24 @@ fn near_the_outdoor_level_the_gas_channels_carry_no_evidence() {
     assert!(p.added[Chan::Rh as usize] > 0.0);
 }
 
+#[test]
+fn temperature_evidence_stays_quiet_for_a_refractory_time_after_the_hold_ends() {
+    let cfg = physics_cfg();
+    let mut p = Posterior::default();
+    let cooling = Balance { temp: Some(obs(-0.05, 18.0, 0.003)), ..Balance::default() };
+    let step = |p: &mut Posterior, holding: bool, ts_min: i64| {
+        let inputs = Inputs { holding, ts_ms: ts_min * 60_000, ..physics_inputs(&cfg, cooling) };
+        physics_step(p, &cfg, &inputs);
+    };
+    step(&mut p, true, 0);
+    step(&mut p, false, 1);
+    assert_eq!(p.added[Chan::Temp as usize], 0.0, "no restart on the release minute");
+    step(&mut p, false, 5);
+    assert_eq!(p.added[Chan::Temp as usize], 0.0, "still inside the refractory time");
+    step(&mut p, false, 20);
+    assert!(p.added[Chan::Temp as usize] > 0.0, "temperature evidence returns afterwards");
+}
+
 fn door_or_window(temp_rate: f64, ah_rate: f64) -> Posterior {
     let cfg = physics_cfg();
     let mut p = Posterior::default();

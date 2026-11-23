@@ -873,7 +873,7 @@ impl Windows {
             let holding = if live { w.active.is_some() } else { w.shadow.is_some() };
             let depressed = holding && w.air.depressed(fcfg, ts_ms, &w.reference);
             let physics = fcfg.engine == "physics";
-            let inputs = Inputs { trv, pulse: pulse.as_ref().map(|p| (p.chan, if physics { fcfg.physics.pulse_llr } else { tables.alarm_llr })), rates, gain, holding, depressed, phys: physics.then(|| tables.phys_room(&fcfg.physics, room)), balance: if physics { w.air.balance(fcfg, ts_ms) } else { Default::default() }, out_c, valve: if valve.is_finite() { valve / 100.0 } else { f64::NAN }, trv_obs };
+            let inputs = Inputs { trv, pulse: pulse.as_ref().map(|p| (p.chan, if physics { fcfg.physics.pulse_llr } else { tables.alarm_llr })), rates, gain, holding, depressed, phys: physics.then(|| tables.phys_room(&fcfg.physics, room)), balance: if physics { w.air.balance(fcfg, ts_ms) } else { Default::default() }, out_c, valve: if valve.is_finite() { valve / 100.0 } else { f64::NAN }, trv_obs, ts_ms };
             w.fusion.update(fcfg, &tables, &inputs);
             if pulse.is_some() && !w.fusion.independent && w.fusion.own < on + 0.5 {
                 w.fusion.set_own(fcfg, (on + 0.5).min(fcfg.logit_max));
