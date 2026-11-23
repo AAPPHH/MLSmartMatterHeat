@@ -21,6 +21,7 @@ data class Ap(val bssid: String, val rssi: Int, val freq: Int)
 object Defaults {
     val SERVER: String = BuildConfig.SERVER
     val HOME: String = BuildConfig.HOME
+    val TOKEN: String = BuildConfig.TOKEN
     val ROOMS = listOf("wohnzimmer", "schlafzimmer", "bad", "kueche", "flur")
     const val NONE = "keiner"
     val LABELS = ROOMS + NONE
@@ -1485,9 +1486,13 @@ object Poster {
         return Reply(code, text)
     }
 
-    fun connect(server: String, path: String, network: Network?): HttpURLConnection {
+    fun authHeader(token: String): String? = token.trim().takeIf { it.isNotEmpty() }?.let { "Bearer $it" }
+
+    fun connect(server: String, path: String, network: Network?, token: String = Defaults.TOKEN): HttpURLConnection {
         val url = URL(server.trim().trimEnd('/') + path)
-        return (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        val conn = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        authHeader(token)?.let { conn.setRequestProperty("Authorization", it) }
+        return conn
     }
 
     fun send(server: String, path: String, body: String, network: Network?): Reply {
