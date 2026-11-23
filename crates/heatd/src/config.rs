@@ -544,6 +544,9 @@ impl Config {
         crate::devices::validate(&config.devices, &config.rooms)?;
         if let Some(phone) = &config.presence.phone {
             crate::phone::parse_mac(&phone.mac)?;
+            if [phone.sweep_min, phone.absent_grace_min].iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return Err(anyhow!("presence.phone: sweep_min and absent_grace_min must be finite and >= 0"));
+            }
             if !phone.subnet.trim().is_empty() {
                 crate::phone::Subnet::parse(&phone.subnet)?;
             }

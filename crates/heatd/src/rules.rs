@@ -534,7 +534,6 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn observe(&mut self, device: &str, ts: i64, away: bool, motion: Option<Motion>, power: Option<Power>) -> Option<Transition> {
-        let vouched = self.phone.vouch;
         let t = self.devices.entry(device.to_string()).or_default();
         if ts < t.last_ts {
             return None;
@@ -547,9 +546,6 @@ impl Tracker {
             t.moved = false;
             t.silent = false;
             return std::mem::take(&mut t.confirmed).then_some(Transition::Arrived);
-        }
-        if vouched {
-            return None;
         }
         t.away_since.get_or_insert(ts);
         t.moved |= motion == Some(Motion::Moving) && power != Some(Power::Offbody);

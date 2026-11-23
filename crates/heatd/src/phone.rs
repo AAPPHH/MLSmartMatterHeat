@@ -106,10 +106,10 @@ impl Prober {
         if let Some(ip) = self.last_ip {
             self.poke(ip);
             std::thread::sleep(KNOWN_WAIT);
-            if let Some(found) = self.lookup() {
-                self.last_ip = Some(found);
-                return Some(found);
-            }
+        }
+        if let Some(found) = self.lookup() {
+            self.last_ip = Some(found);
+            return Some(found);
         }
         if self.last_sweep.is_some_and(|t| t.elapsed() < self.sweep_every) {
             return None;
@@ -117,8 +117,9 @@ impl Prober {
         self.last_sweep = Some(Instant::now());
         self.subnet.hosts().for_each(|ip| self.poke(ip));
         std::thread::sleep(SWEEP_WAIT);
-        self.last_ip = self.lookup();
-        self.last_ip
+        let found = self.lookup();
+        self.last_ip = found.or(self.last_ip);
+        found
     }
 }
 
@@ -171,30 +172,38 @@ fn apply(state: &AppState, grace_ms: i64, found: Option<Ipv4Addr>) {
 
 pub fn spawn(state: AppState) {
     let Some(cfg) = state.config.presence.phone.clone() else { return };
-    let mut prober = match Prober::new(&cfg) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("phone presence disabled: {e}");
-            return;
-        }
-    };
     let grace_ms = (cfg.absent_grace_min * 60_000.0) as i64;
     tokio::spawn(async move {
+        let mut prober: Option<Prober> = None;
         let mut tick = tokio::time::interval(Duration::from_secs(cfg.probe_s.max(1)));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let Ok((back, found)) = tokio::task::spawn_blocking(move || {
-                let found = prober.probe();
-                (prober, found)
+            let mut current = match prober.take() {
+                Some(p) => p,
+                None => match Prober::new(&cfg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("phone presence waiting: {e}");
+                        continue;
+                    }
+                },
+            };
+            match tokio::task::spawn_blocking(move || {
+                let found = current.probe();
+                (current, found)
             })
             .await
-            else {
-                eprintln!("phone probe task failed");
-                return;
-            };
-            prober = back;
-            apply(&state, grace_ms, found);
+            {
+                Ok((back, found)) => {
+                    prober = Some(back);
+                    apply(&state, grace_ms, found);
+                }
+                Err(_) => {
+                    eprintln!("phone probe task failed");
+                    apply(&state, -1, None);
+                }
+            }
         }
     });
 }
