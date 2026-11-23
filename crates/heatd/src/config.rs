@@ -276,11 +276,28 @@ pub struct PresenceSection {
     pub restore: bool,
     pub tracker_lookback_h: f64,
     pub heartbeat_silence_minutes: f64,
+    pub phone: Option<PhoneSection>,
 }
 
 impl Default for PresenceSection {
     fn default() -> Self {
-        Self { restore: true, tracker_lookback_h: 72.0, heartbeat_silence_minutes: 75.0 }
+        Self { restore: true, tracker_lookback_h: 72.0, heartbeat_silence_minutes: 75.0, phone: None }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PhoneSection {
+    pub mac: String,
+    pub subnet: String,
+    pub probe_s: u64,
+    pub sweep_min: f64,
+    pub absent_grace_min: f64,
+}
+
+impl Default for PhoneSection {
+    fn default() -> Self {
+        Self { mac: String::new(), subnet: String::new(), probe_s: 60, sweep_min: 10.0, absent_grace_min: 20.0 }
     }
 }
 
@@ -525,6 +542,12 @@ impl Config {
             return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
         crate::devices::validate(&config.devices, &config.rooms)?;
+        if let Some(phone) = &config.presence.phone {
+            crate::phone::parse_mac(&phone.mac)?;
+            if !phone.subnet.trim().is_empty() {
+                crate::phone::Subnet::parse(&phone.subnet)?;
+            }
+        }
         Ok(config)
     }
 

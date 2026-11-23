@@ -27,6 +27,9 @@ mod lake;
 mod lake_tests;
 mod migrate;
 mod node_health;
+mod phone;
+#[cfg(test)]
+mod phone_tests;
 #[cfg(test)]
 mod node_health_tests;
 mod report;
@@ -301,6 +304,7 @@ async fn serve(config: Config) -> Result<()> {
         br_watchdog::spawn(state.clone());
     }
     node_health::spawn(state.clone());
+    phone::spawn(state.clone());
     capture::spawn(state.clone(), capture::Timing::default());
     devices::spawn(state.clone(), devices::LoopTiming::default());
     let listener = tokio::net::TcpListener::bind(&state.config.listen).await.with_context(|| format!("bind {}", state.config.listen))?;
