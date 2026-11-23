@@ -67,7 +67,7 @@ CONFIG = {
         "evidence": {"air": {"noise": 0.15, "offset": 0.0, "min_pairs": 60}, "effort": {"sigma": 0.06, "steady_u": 0.05},
                      "select": {"enabled": True, "min_gain": 0.003, "max_resets_up": 10, "effort": [{"sigma": 0.06, "steady_u": 0.05}, {"sigma": 0.25, "steady_u": 0.15}],
                     "window": {"false_per_room_day": 0.2, "temp_guard": 0.01, "min_lead_gain_min": 2.0, "known_within_min": 6, "known_pre_max": 0.5},
-                    "gas": [{"name": "air", "parts": ["air"]}, {"name": "air_gas", "parts": ["air", "gas"]}]},
+                    "gas": [{"name": "air", "parts": ["air"]}, {"name": "air_gas", "parts": ["air", "gas"]}, {"name": "gas_w5", "parts": ["gas"], "gas": {"co2": {"min_excess": 40.0, "win_min": 5}, "hum": {"min_excess": 0.3, "win_min": 5}}}, {"name": "gas_w8_loose", "parts": ["gas"], "gas": {"co2": {"min_excess": 40.0, "win_min": 8, "sigma": 8.0, "sigma_up": 16.0}, "hum": {"min_excess": 0.3, "win_min": 8, "sigma": 0.06, "sigma_up": 0.4}}}]},
                      "co2": {"out": 420.0, "min_excess": 150.0, "k": 0.004, "gain": 4.0, "sigma": 4.0, "sigma_up": 12.0, "win_min": 10},
                      "hum": {"rh_out": 85.0, "min_excess": 0.8, "k": 0.004, "gain": 4.0, "sigma": 0.03, "sigma_up": 0.3, "win_min": 10}},
     },
