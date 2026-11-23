@@ -115,6 +115,7 @@ struct RoomWin {
     shadow_pulse: Option<Pulse>,
     shadow: Option<i64>,
     shadow_opens: u64,
+    shadow_indep: Option<i64>,
     reference: Reference,
     indep_ms: Option<i64>,
     active: Option<Active>,
@@ -622,6 +623,7 @@ impl Windows {
 
     fn close(&mut self, room: &str, reason: &'static str, now: i64) -> Option<WinEvent> {
         let cfg = self.fcfg.clone();
+        let live = cfg.enabled;
         let r = self.rooms.get_mut(room)?;
         let a = r.active.take()?;
         let detail = json!({"p": r.fusion.p(), "channels": r.fusion.breakdown(), "text": r.fusion.reason(false)});
@@ -631,7 +633,8 @@ impl Windows {
                 r.air.reset(now);
             }
             "fusion" => {}
-            _ => r.fusion.calm(&cfg),
+            _ if live => r.fusion.calm(&cfg),
+            _ => {}
         }
         r.pulse = None;
         r.manual_label = None;
@@ -760,7 +763,8 @@ impl Windows {
                 }
             }
         }
-        let (mut free, mut events) = (Vec::new(), Vec::new());
+        let (mut free, mut events, mut shadow_only) = (Vec::new(), Vec::new(), Vec::new());
+        let shadow = cfg.fusion.shadow && !cfg.fusion.enabled;
         for (room, channel) in targets {
             if self.rooms.get(&room.name).is_some_and(|w| w.active.is_some()) {
                 continue;
@@ -771,6 +775,9 @@ impl Windows {
                 free.push((room.name.clone(), channel, threshold));
                 continue;
             };
+            if shadow && self.gate(cfg, &room.name, now, true).is_none() {
+                shadow_only.push((room.name.clone(), channel, threshold));
+            }
             let w = self.rooms.entry(room.name.clone()).or_default();
             w.last_open_ms = w.last_open_ms.max(Some(now));
             if w.logged.get(why).is_some_and(|t| now - t < SUPPRESS_LOG_MS) {
@@ -782,14 +789,16 @@ impl Windows {
         }
         let zs: BTreeMap<String, Option<f64>> = m.z.iter().map(|(k, v)| (k.clone(), v.is_finite().then_some(*v))).collect();
         let names: Vec<String> = free.iter().map(|f| f.0.clone()).collect();
-        for (name, channel, threshold) in &free {
+        for (name, channel, threshold) in free.iter().chain(shadow_only.iter()) {
             let (chan, channel_name) = match channel { Channel::House => (Chan::House, "house".to_string()), Channel::Room(room) => (Chan::Trv, room.clone()) };
             let pulse = Pulse { chan, channel: channel_name, reason: m.reason(&bundle, name, channel), rooms: names.clone(), z: zs.clone(), house: m.house, threshold: *threshold, bundle: bundle.version.clone(), scored_ms: m.ts_ms };
             let w = self.rooms.entry(name.clone()).or_default();
-            if cfg.fusion.shadow && !cfg.fusion.enabled {
+                if shadow {
                 w.shadow_pulse = Some(pulse.clone());
             }
-            w.pulse = Some(pulse);
+            if free.iter().any(|f| &f.0 == name) {
+                w.pulse = Some(pulse);
+            }
         }
         if !cfg.fusion.enabled {
             events.extend(self.legacy_open(config, now));
@@ -865,6 +874,11 @@ impl Windows {
                     w.indep_ms = Some(ts_ms);
                 }
                 w.pulse = pulse;
+            } else {
+                w.shadow_pulse = pulse;
+                if rates.any() {
+                    w.shadow_indep = Some(ts_ms);
+                }
             }
             #[cfg(test)]
             if let Some(trace) = self.trace.as_mut() {
@@ -882,9 +896,13 @@ impl Windows {
             let total = w.map_or(f64::NEG_INFINITY, |w| w.fusion.total());
             let active = if live { w.and_then(|w| w.active.as_ref()).map(|a| a.source) } else { w.and_then(|w| w.shadow).map(|_| "shadow") };
             let independent = w.is_some_and(|w| w.fusion.independent);
-            let supported = independent || w.is_some_and(|w| w.pulse.is_some() || w.fusion.couple >= COUPLE_SUPPORT);
+            let supported = independent || w.is_some_and(|w| w.pulse.is_some() || w.shadow_pulse.is_some() || w.fusion.couple >= COUPLE_SUPPORT);
             if !live {
-                events.extend(self.shadow_step(room, total, on, off, supported, independent, active.is_some(), ts_ms));
+                let blocked = self.hold_away(room, true).is_some_and(|why| why == "manual_hold" || !independent);
+                events.extend(self.shadow_step(room, total, on, off, supported && !blocked, independent, active.is_some(), ts_ms, mins(cfg.hold_min)));
+                if let Some(w) = self.rooms.get_mut(room) {
+                    w.shadow_pulse = None;
+                }
                 continue;
             }
             match active {
@@ -894,15 +912,17 @@ impl Windows {
             }
             if let Some(w) = self.rooms.get_mut(room) {
                 w.pulse = None;
+                w.shadow_pulse = None;
             }
         }
         events
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn shadow_step(&mut self, room: &str, total: f64, on: f64, off: f64, supported: bool, independent: bool, open: bool, ts_ms: i64) -> Option<WinEvent> {
+    fn shadow_step(&mut self, room: &str, total: f64, on: f64, off: f64, supported: bool, independent: bool, open: bool, ts_ms: i64, hold_ms: i64) -> Option<WinEvent> {
         let w = self.rooms.get_mut(room)?;
-        let state = match (open, total >= on && supported, total <= off && independent) {
+        let timed_out = w.shadow.is_some_and(|since| ts_ms - since.max(w.shadow_indep.unwrap_or(i64::MIN)) >= hold_ms);
+        let state = match (open, total >= on && supported, total <= off && independent || timed_out && !independent) {
             (false, true, _) => "open",
             (true, _, true) => "close",
             _ => return None,
@@ -918,7 +938,7 @@ impl Windows {
         let w = self.rooms.get(room)?;
         let pulse = w.pulse.clone();
         let independent = w.fusion.independent;
-        let veto = if independent { None } else { self.hold_away(room, true) };
+        let veto = self.hold_away(room, true).filter(|why| *why == "manual_hold" || !independent);
         if let Some(why) = veto {
             let w = self.rooms.get_mut(room)?;
             w.last_open_ms = w.last_open_ms.max(Some(ts_ms));

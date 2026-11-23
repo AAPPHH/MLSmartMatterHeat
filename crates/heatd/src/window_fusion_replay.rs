@@ -160,7 +160,7 @@ fn replay(dump: &Dump, config: &Config, from_ms: i64, to_ms: i64, with_trace: bo
         }
         let wx = dump.weather_at(now, age_ms);
         for event in w.step(config, now, |_| wx) {
-            record(&mut episodes, event, now);
+            record(&mut episodes, event, now, config.window.fusion.shadow && !config.window.fusion.enabled);
         }
         if with_trace {
             trace.extend(w.take_trace());
@@ -170,9 +170,15 @@ fn replay(dump: &Dump, config: &Config, from_ms: i64, to_ms: i64, with_trace: bo
     Outcome { episodes, trace }
 }
 
-fn record(episodes: &mut Vec<Episode>, event: WinEvent, now: i64) {
+fn record(episodes: &mut Vec<Episode>, event: WinEvent, now: i64, shadow: bool) {
     let room = event.room.clone();
-    match event.kind {
+    let kind = match (event.kind, event.detail["state"].as_str()) {
+        ("window_shadow", Some("open")) => "window_open",
+        ("window_shadow", _) => "window_close",
+        _ if shadow => return,
+        (k, _) => k,
+    };
+    match kind {
         "window_open" => episodes.push(Episode { room, from: now, to: None, source: event.detail["source"].as_str().unwrap_or("").into(), text: event.detail["reason"].as_str().unwrap_or("").into() }),
         "window_close" => {
             if let Some(e) = episodes.iter_mut().rev().find(|e| e.room == room && e.to.is_none()) {
@@ -237,7 +243,9 @@ fn dump_dir() -> PathBuf {
 
 fn config_for(dump: &Dump, legacy: bool) -> Config {
     let mut config = dump.config.clone();
-    config.window.fusion.enabled = !legacy;
+    let shadow = std::env::var("HEATD_AIRWIN_SHADOW").is_ok();
+    config.window.fusion.enabled = !legacy && !shadow;
+    config.window.fusion.shadow = !legacy;
     if let Ok(path) = std::env::var("HEATD_AIRWIN_TABLES") {
         config.window.fusion.tables = path;
     }
@@ -301,6 +309,9 @@ fn replay_fusion() {
             *m.entry(e.source.as_str()).or_default() += 1;
             m
         });
+        let long = mine.iter().filter(|e| e.to.unwrap_or(to) - e.from > 25 * MIN).count();
+        let frost: f64 = mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) as f64 / MIN as f64).sum::<f64>() / days;
+        println!("{room}: frost {frost:.0} min/day, episodes over 25 min {long}, longest {} min", mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) / MIN).max().unwrap_or(0));
         println!("{room}: openings {} ({:.2}/day) true {} false {} ({:.2}/day, strict {strict_false} = {:.2}/day) sources {by_source:?}; held-out days false {held_false}/{held_days} ({:.2}/day)", mine.len(), mine.len() as f64 / days, verdicts.iter().filter(|v| **v == "true").count(), falses, falses as f64 / days, strict_false as f64 / days, if held_days > 0.0 { held_false as f64 / held_days } else { f64::NAN });
         worst = worst.max(if held_days > 0.0 { held_false as f64 / held_days } else { falses as f64 / days });
         if std::env::var("HEATD_AIRWIN_LIST").is_ok() {

@@ -68,7 +68,7 @@ impl Sim {
     }
 
     fn kinds(&self) -> Vec<&'static str> {
-        self.events.iter().map(|e| e.kind).collect()
+        self.events.iter().map(|e| e.kind).filter(|k| *k != "window_shadow").collect()
     }
 
     fn of(&self, kind: &str) -> Vec<&WinEvent> {

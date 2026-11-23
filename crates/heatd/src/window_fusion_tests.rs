@@ -179,14 +179,17 @@ fn a_neighbour_that_is_open_raises_the_prior_of_the_room_next_to_it_but_never_op
 }
 
 #[test]
-fn fresh_air_evidence_is_never_vetoed_by_away_or_a_manual_hold() {
-    for ctx in [RoomCtx { hold: false, away: true, away_fresh: true }, RoomCtx { hold: true, away: true, away_fresh: true }] {
-        let mut r = Rig::warm();
-        r.w.set_context([("a".to_string(), ctx)]);
-        r.run(8, venting);
-        assert!(r.open("a"));
-        assert!(r.of("window_suppressed").is_empty());
-    }
+fn fresh_air_evidence_is_never_vetoed_by_away_but_a_manual_hold_still_vetoes() {
+    let mut r = Rig::warm();
+    r.w.set_context([("a".to_string(), RoomCtx { hold: false, away: true, away_fresh: true })]);
+    r.run(8, venting);
+    assert!(r.open("a"));
+    assert!(r.of("window_suppressed").is_empty());
+    let mut held = Rig::warm();
+    held.w.set_context([("a".to_string(), RoomCtx { hold: true, away: false, away_fresh: false })]);
+    held.run(8, venting);
+    assert!(!held.open("a"));
+    assert!(held.of("window_suppressed").iter().any(|e| e.detail["reason"] == "manual_hold"));
 }
 
 #[test]
@@ -210,6 +213,22 @@ fn a_closed_room_cooling_under_frost_does_not_hold_itself_open() {
     assert!(r.open("a"));
     r.run(40, |m| Air { co2: 440.0 + 40.0 * m.min(25.0) + 8.0 * (m - 25.0).max(0.0), rh: 40.0 + 0.6 * m, temp: 17.6 - 0.012 * m });
     assert!(!r.open("a"), "p {}", r.p("a"));
+}
+
+#[test]
+fn a_shut_empty_room_with_flat_low_co2_is_released_within_the_level_horizon() {
+    let mut r = Rig::warm();
+    r.run(8, venting);
+    assert!(r.open("a"));
+    let mut closed_at = None;
+    for m in 1..=150 {
+        r.minute(Some(Air { co2: 445.0 + (m as f64 * 1.7).sin() * 3.0, rh: 40.0 + 0.02 * m as f64, temp: 17.6 + 0.4 * (m as f64 / 15.0).min(1.0) - 0.004 * (m as f64 - 15.0).max(0.0) }));
+        if closed_at.is_none() && !r.open("a") {
+            closed_at = Some(m);
+        }
+    }
+    let at = closed_at.expect("released");
+    assert!(at <= 110, "frost held {at} min");
 }
 
 #[test]
@@ -237,7 +256,8 @@ fn a_late_yes_answer_does_not_reopen_a_window_that_was_already_closed() {
 #[test]
 fn rooms_without_an_air_channel_behave_exactly_like_the_old_detector() {
     let run = |fusion: bool| {
-        let c = Config::parse(&format!("[window.fusion]\nenabled = {fusion}\n[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms]]\nname = 'kueche'\nnodes = [8]\n")).unwrap();
+        let c = Config::parse(&format!("[window.fusion]\nenabled = {fusion}
+shadow = false\n[[rooms]]\nname = 'wohnzimmer'\nnodes = [5]\n[[rooms]]\nname = 'kueche'\nnodes = [8]\n")).unwrap();
         let mut w = Windows::default();
         w.set_model(toy_bundle(&[("wohnzimmer", 5, 1.0), ("kueche", 8, 1.0)], 3.0));
         let mut log: Vec<Logged> = Vec::new();
@@ -296,7 +316,7 @@ fn the_cost_knobs_fix_the_posterior_thresholds_with_hysteresis() {
 }
 
 #[test]
-fn the_bedroom_incident_is_caught_by_the_air_channels_alone() {
+fn the_bedroom_incident_phase_b_is_held_by_the_air_channels_alone_and_phase_a_rises_partially() {
     let text = include_str!("../tests/fixtures/airwin/incident.csv");
     let rows: Vec<Vec<f64>> = text.lines().skip(1).map(|l| l.split(',').map(|v| v.parse().unwrap()).collect()).collect();
     let mut r = Rig::new("");

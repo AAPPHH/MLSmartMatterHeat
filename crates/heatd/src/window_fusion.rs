@@ -212,6 +212,7 @@ impl Rates {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Reference {
     pub co2: Option<f64>,
+    pub since_ms: i64,
 }
 
 #[derive(Debug, Default)]
@@ -270,11 +271,11 @@ impl AirRoom {
     }
 
     pub fn reference(&self, now: i64) -> Reference {
-        Reference { co2: self.newest(Signal::Co2, now).and_then(|s| s.iter().filter(|p| p.0 <= now).map(|p| p.1).reduce(f64::max)) }
+        Reference { co2: self.newest(Signal::Co2, now).and_then(|s| s.iter().filter(|p| p.0 <= now).map(|p| p.1).reduce(f64::max)), since_ms: now }
     }
 
     pub fn depressed(&self, cfg: &WindowFusion, now: i64, r: &Reference) -> bool {
-        r.co2.zip(self.level(Signal::Co2, now)).is_some_and(|(top, v)| top - cfg.outdoor_co2_ppm >= CO2_REF_MIN_EXCESS && v - cfg.outdoor_co2_ppm < CO2_DEPRESSED_FRAC * (top - cfg.outdoor_co2_ppm))
+        now - r.since_ms <= (cfg.level_max_min * MIN_MS as f64) as i64 && r.co2.zip(self.level(Signal::Co2, now)).is_some_and(|(top, v)| top - cfg.outdoor_co2_ppm >= CO2_REF_MIN_EXCESS && v - cfg.outdoor_co2_ppm < CO2_DEPRESSED_FRAC * (top - cfg.outdoor_co2_ppm))
     }
 
     pub fn latest_temp(&self, now: i64) -> Option<f64> {
