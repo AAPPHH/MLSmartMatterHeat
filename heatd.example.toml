@@ -173,6 +173,7 @@ stay_min = 30.0
 horizon_min = 20.0
 cool_k_per_h = 0.5
 level_llr = 0.3
+level_max_min = 60.0
 
 [boost]
 enabled = true
