@@ -4,7 +4,7 @@ The thermal model has no room thermometer and no measurement of the house heat l
 
 ## Minix collector
 
-`deploy/ambient/ambient.py` runs as `deploy/ambient/ambient.service` (root, Minix Ubuntu 24.04, `Restart=always`). Install: copy `ambient.py` to `/opt/heatd-ambient/`, copy the unit to `/etc/systemd/system/`, `systemctl enable --now ambient`. Every 60 s it posts to `http://127.0.0.1:8090/api/ambient`:
+`deploy/ambient/ambient.py` runs as `deploy/ambient/ambient.service` (root, Minix Ubuntu 24.04, `Restart=always`). Install: copy `ambient.py` to `/opt/heatd-ambient/`, copy the unit to `/etc/systemd/system/`, `systemctl enable --now ambient`. Every 60 s it posts to `http://127.0.0.1:8090/api/ambient` (admin role: the token comes from `HEATD_TOKEN` or the file `token_file`, default `/opt/heatd-ambient/admin_token`, mode 600, a copy of `secrets/heatd_admin_token`; without a token no header is sent):
 
 - `nvme_c` (C): `/sys/class/hwmon/hwmon*/` with `name == nvme`, `temp1_input` in millidegrees.
 - `pkg_w` (W): CPU package power from the delta of `/sys/class/powercap/intel-rapl:0/energy_uj` between two samples (counter wrap corrected with `max_energy_range_uj`; the first sample after start is skipped). Needs root.

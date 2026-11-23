@@ -145,6 +145,47 @@ Vorrang und Abbruch: Rückkehr nach Hause (Away zu Raum erkannt) oder Abbrechen 
 | `GET` | `/api/usage?from=&to=` | Nutzung je Tag im Zeitraum (`YYYY-MM-DD`, höchstens 93 Tage) |
 | `GET` | `/health`, `/metrics` | Gesundheit je Node, Prometheus |
 
-Die API hat keine Authentifizierung und gehört nur ins LAN.
+### Absicherung der HTTP-API
+
+Sicherheitsmodell in drei Schichten, umgesetzt in `crates/heatd/src/http.rs` und konfiguriert in `[http]`:
+
+1. **Quelladresse.** Vor allem anderen prüft heatd die Adresse des Peers. Erlaubt sind Loopback, RFC1918 (`10/8`, `172.16/12`, `192.168/16`), IPv4-Link-Local sowie IPv6 ULA (`fc00::/7`) und Link-Local (`fe80::/10`); alles andere bekommt `403`, auch `/health`. Eigene Netze (z. B. ein VPN mit `100.64.0.0/10`) trägst du in `[http] trusted_subnets` ein; die Liste ersetzt den Standard.
+2. **Bearer-Token mit zwei Rollen.** `Authorization: Bearer <token>`, verglichen über SHA-256-Digests in konstanter Zeit. `admin` darf alles; `watch` darf nur die Endpunkte der Uhr: `/api/scan`, `/api/scans`, `/api/state`, `/api/boost`, `/api/experiment`, `/api/setpoint`, `/api/label`, `/api/label/void`, `/api/labels/progress` und `/watch/measurement`, `/watch/sensors`, `/watch/label`, `/watch/label/void`, `/watch/window_label`, `/watch/update`, `/watch/update.apk`. Alles andere, auch unbekannte Pfade, verlangt `admin`. Ein `admin`-Token ist auch an den Uhr-Endpunkten gültig. `/health` ist immer offen, `/metrics` standardmäßig (mit `metrics_require_admin = true` nur für `admin`). Fehler: `401` (Token fehlt oder ist falsch, mit `WWW-Authenticate: Bearer`) und `403` (Token gültig, Rolle reicht nicht), jeweils als `{"error": "..."}`.
+3. **Grenzen.** `max_body_bytes` (Standard 4 MiB, sonst `413`) und `request_timeout_s` (Standard 30 s, sonst `408`). Es werden keine CORS-Header gesetzt, Browser-Seiten anderer Herkunft können die API also nicht ansprechen.
+
+Die Token liegen in Dateien außerhalb des Repos (`secrets/`, gitignored, Modus 600); die Konfiguration enthält nur Pfade. Beim Start liest heatd die Dateien aller Rollen mit Modus `log` oder `enforce` und startet nicht bei: fehlender Datei, weniger als 32 Zeichen, Leerraum im Token, Platzhalter (enthält `change`, `placeholder`, `example`, `replace`, `xxxx` oder hat weniger als 8 verschiedene Zeichen) oder gleichem Token für beide Rollen.
+
+```toml
+[http]
+trusted_subnets = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"]
+max_body_bytes = 4194304
+request_timeout_s = 30
+
+[http.auth]
+admin_token_file = "/secrets/heatd_admin_token"
+watch_token_file = "/secrets/heatd_watch_token"
+admin_mode = "enforce"
+watch_mode = "log"
+metrics_require_admin = false
+```
+
+Modi je Rolle: `off` (nichts prüfen), `log` (Anfragen ohne ausreichendes Token werden angenommen, gezählt und je Peer und Rolle höchstens alle 10 min geloggt) und `enforce` (ablehnen). Ohne Abschnitt `[http.auth]` verhält sich heatd wie vorher und warnt beim Start. `/metrics` zeigt `heatd_http_auth_failures_total{scope,mode,result}` (`result` = `missing`, `invalid` oder `forbidden`), `heatd_http_source_rejected_total` und `heatd_http_auth_enforcing{role}`.
+
+Ausrollen, ohne die installierte Uhr-App zu brechen:
+
+1. Token erzeugen: `umask 077; openssl rand -hex 32 > secrets/heatd_admin_token; openssl rand -hex 32 > secrets/heatd_watch_token`. Im Docker-Betrieb ist `secrets/` read-only nach `/secrets` gemountet; der Container-Benutzer muss die Dateien lesen können.
+2. `[http.auth]` wie oben setzen (`admin_mode = "enforce"`, `watch_mode = "log"`) und heatd neu starten. Eigene Aufrufer (Skripte, curl, Grafana bei geschütztem `/metrics`) senden ab jetzt den Admin-Token. Die alte Uhr-App läuft weiter; ihre Anfragen erscheinen als `heatd_http_auth_failures_total{scope="watch",mode="log"}` und in `docker compose logs heatd`.
+3. Neue Uhr-App (ab 4.4.4) mit `heatd.token=<Inhalt von secrets/heatd_watch_token>` in `wear/local.properties` bauen und auf der Uhr installieren.
+4. Wenn der Zähler `scope="watch"` stillsteht und das Log keine Anfragen ohne Token mehr zeigt: `watch_mode = "enforce"` setzen und neu starten. `heatd_http_auth_enforcing` ist dann für beide Rollen `1`.
+
+Aufruf auf dem Server (ssh + curl), Token direkt aus der Datei:
+
+```bash
+curl -fsS -H "Authorization: Bearer $(cat secrets/heatd_admin_token)" http://127.0.0.1:8090/api/state
+```
+
+Skripte unter `deploy/` lesen den Admin-Token aus der Umgebung oder einer Datei: `deploy/ambient/ambient.py` aus `HEATD_TOKEN` oder `token_file` (Standard `/opt/heatd-ambient/admin_token`, Modus 600), `deploy/anchor/wifi-anchor.py` aus `HEATD_TOKEN` oder `HEATD_TOKEN_FILE`. `deploy/docker/minix-up.sh` verlangt beide Token-Dateien in `secrets/`, kopiert sie mit und nutzt den Admin-Token für die Endpunktprüfung. Gesundheitscheck im Compose-File und Failsafe-Timer rufen nur `/health` auf und brauchen keinen Token.
+
+heatd terminiert kein TLS. Im LAN läuft die Verbindung im Klartext, die Token sind für jeden lesbar, der im Heimnetz mitschneiden kann. Wer das nicht will, stellt einen Reverse-Proxy (z. B. Caddy oder nginx) mit Zertifikat auf denselben Host, lässt heatd mit `listen = "127.0.0.1:8090"` nur lokal lauschen und setzt in der Uhr-App `heatscan.server=https://<host>` (die Uhr muss dem Zertifikat vertrauen). Der Proxy erscheint heatd als Loopback; die Token gelten weiter. Die API gehört nicht ins Internet.
 
 **Router-Failsafe-Heartbeat:** Der Watchdog (`br_watchdog.rs`) sendet den Heartbeat, solange heatd selbst lebt, also der letzte Regelschritt höchstens `control_stale_s` (120 s) alt ist. Der Zustand der Thermostat-Abos beeinflusst ihn nicht: ein Mesh, das neu abonniert, lässt den Router nicht auf 18 °C fallen, nur ein toter oder eingefrorener heatd. Die Thermostat-Erreichbarkeit bleibt Alarm und Bericht (`thread_down`).

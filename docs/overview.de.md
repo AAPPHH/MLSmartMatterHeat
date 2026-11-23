@@ -44,7 +44,7 @@ cp heatd.example.toml heatd.toml       # Räume, Node-IDs, Zeitpläne anpassen; 
 cargo run --release -p heatd -- serve  # HTTP auf listen (Standard 0.0.0.0:8080), GET /health
 ```
 
-Echter Betrieb (Border Router flashen, Docker-Deployment, Failsafe, Commissioning): [docs/setup.md](setup.md). Die API hat keine Authentifizierung und gehört nur ins LAN.
+Echter Betrieb (Border Router flashen, Docker-Deployment, Failsafe, Commissioning): [docs/setup.md](setup.md). Die API ist durch Quelladressen-Prüfung und Bearer-Token mit zwei Rollen abgesichert und gehört nur ins LAN, siehe [docs/heatd.md](heatd.md), Absicherung der HTTP-API.
 
 ## Repository
 

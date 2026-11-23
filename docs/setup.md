@@ -183,4 +183,4 @@ Im Betrieb liegen zusätzlich folgende Werte im Speicher (`/api/state`) und in `
 
 Der Minix spricht das Thermostat per Bluetooth an (`hci0`), übergibt das Thread-Dataset, und danach läuft alles über den Border Router. Das Thermostat muss dabei frisch zurückgesetzt und im Pairing-Modus sein und nah am Minix liegen. Das Commissioning darf bis zu 180 s dauern (`commission_timeout_s`).
 
-Nach dem ersten Thermostat startest du `heatd` und prüfst mit `journalctl -u heatd -f` (Docker: `docker compose logs -f heatd`) und `curl localhost:8080/api/state`, ob Temperaturen ankommen. Das ist der erste echte Test des dauerhaften chip-tool-Prozesses.
+Nach dem ersten Thermostat startest du `heatd` und prüfst mit `journalctl -u heatd -f` (Docker: `docker compose logs -f heatd`) und `curl -H "Authorization: Bearer $(cat secrets/heatd_admin_token)" localhost:8080/api/state` (ohne `[http.auth]` genügt `curl localhost:8080/api/state`, siehe `docs/heatd.md`, Absicherung der HTTP-API), ob Temperaturen ankommen. Das ist der erste echte Test des dauerhaften chip-tool-Prozesses.
