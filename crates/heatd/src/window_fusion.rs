@@ -1,4 +1,4 @@
-use crate::config::WindowFusion;
+use crate::config::{Physics, WindowFusion};
 use anyhow::{Context, Result};
 use matter_controller::{CO2_CLUSTER, HUMIDITY_MEASUREMENT_CLUSTER, TEMPERATURE_MEASUREMENT_CLUSTER};
 use serde::Deserialize;
@@ -73,6 +73,15 @@ pub enum Signal {
     Co2,
     Rh,
     Temp,
+    Ah,
+}
+
+const SIGNALS: usize = 4;
+const AH_PER_RH_PCT: f64 = 0.154;
+const AH_PAIR_MS: i64 = 3 * MIN_MS;
+
+pub fn absolute_humidity(rh_pct: f64, temp_c: f64) -> f64 {
+    216.7 * rh_pct / 100.0 * 6.112 * (17.62 * temp_c / (243.12 + temp_c)).exp() / (273.15 + temp_c)
 }
 
 impl Signal {
@@ -125,6 +134,100 @@ fn phi(x: f64) -> f64 {
     0.5 * (1.0 + erf.copysign(x))
 }
 
+fn log_phi(z: f64) -> f64 {
+    if z > -4.0 {
+        return phi(z).max(1e-300).ln();
+    }
+    let z2 = z * z;
+    -z2 / 2.0 - 0.5 * (2.0 * std::f64::consts::PI).ln() - (-z).ln() + (1.0 - 1.0 / z2 + 3.0 / (z2 * z2)).ln()
+}
+
+fn exp_gauss(x: f64, scale: f64, sd: f64) -> f64 {
+    -scale.ln() + sd * sd / (2.0 * scale * scale) - x / scale + log_phi((x - sd * sd / scale) / sd)
+}
+
+pub fn onesided(x: f64, scale: f64, sd: f64, ph: &Physics) -> f64 {
+    let share = ph.outlier_share.clamp(0.0, 0.99);
+    if share <= 0.0 {
+        return exp_gauss(x, scale, sd);
+    }
+    log_add((1.0 - share).ln() + exp_gauss(x, scale, sd), share.ln() + exp_gauss(x, scale, sd * ph.outlier_scale))
+}
+
+fn log_add(a: f64, b: f64) -> f64 {
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+pub const DOORS: usize = 3;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Lik {
+    pub modes: [f64; 3],
+    pub door: Option<[f64; DOORS]>,
+}
+
+impl Lik {
+    pub fn flat(modes: [f64; 3]) -> Self {
+        Self { modes, door: None }
+    }
+
+    pub fn scaled(self, k: f64) -> Self {
+        Self { modes: self.modes.map(|x| x * k), door: self.door.map(|d| d.map(|x| x * k)) }
+    }
+
+    pub fn marginal(&self, ph: &Physics) -> [f64; 3] {
+        let mut m = self.modes;
+        m[0] = Lik::closed(std::slice::from_ref(self), ph);
+        m
+    }
+
+    pub fn closed(liks: &[Lik], ph: &Physics) -> f64 {
+        let plain: f64 = liks.iter().map(|l| l.modes[0]).sum();
+        let share = ph.door_share.clamp(0.0, 0.99);
+        if share <= 0.0 || liks.iter().all(|l| l.door.is_none()) {
+            return plain;
+        }
+        (0..DOORS).fold((1.0 - share).ln() + plain, |acc, g| {
+            let joint: f64 = liks.iter().map(|l| l.door.map_or(l.modes[0], |d| d[g])).sum();
+            log_add(acc, (share / DOORS as f64).ln() + joint)
+        })
+    }
+}
+
+pub fn gas_modes(o: Obs, excess: f64, ph: &Physics, lambda_h: [f64; 3], source: f64, door_frac: f64) -> Lik {
+    let f = |l: f64| {
+        let loss = l * excess / 60.0;
+        onesided(o.rate + loss, source, (o.sd.powi(2) + (ph.model_floor * loss).powi(2)).sqrt(), ph)
+    };
+    Lik { modes: [f(lambda_h[0]), f(lambda_h[1]), f(lambda_h[2])], door: Some(ph.door_lambda_h.map(|l| f(lambda_h[0] + l * door_frac))) }
+}
+
+pub fn temp_modes(o: Obs, delta_k: f64, ph: &Physics, lambda_h: [f64; 3], valve_gain: f64, valve: f64) -> Lik {
+    let heat = if valve.is_finite() { valve_gain * valve } else { 0.0 };
+    let sd = (o.sd.powi(2) + ph.temp_model_k_min.powi(2)).sqrt();
+    let scale = ph.temp_source_k_min + if valve.is_finite() { ph.temp_valve_k_min * valve } else { ph.temp_valve_k_min };
+    let f = |l: f64| onesided(o.rate + (ph.temp_base_loss_h + ph.temp_kappa * l) * delta_k / 60.0 - heat, scale, sd, ph);
+    Lik::flat([f(lambda_h[0]), f(lambda_h[1]), f(lambda_h[2])])
+}
+
+pub fn trv_modes(z: f64, sigma: f64, valve_open: bool, ph: &Physics, beta: f64) -> Lik {
+    if !z.is_finite() || !sigma.is_finite() || sigma <= 0.0 {
+        return Lik::default();
+    }
+    let (h, sd) = (ph.trv_censor_k / sigma, ph.trv_sd);
+    let open = ph.trv_open_z * if valve_open { 1.0 - beta } else { 1.0 };
+    let mean = [0.0, ph.trv_kipp_frac * open, open];
+    let cell = |m: f64| phi((z + h - m) / sd) - phi((z - h - m) / sd);
+    let base = cell(0.0);
+    let diff = |m: f64| {
+        let c = cell(m);
+        let l = if c < TAIL || base < TAIL { (m * z - m * m / 2.0) / (sd * sd) } else { (c / base).ln() };
+        l.clamp(-ph.trv_cap, ph.trv_cap)
+    };
+    Lik::flat([0.0, diff(mean[1]), diff(mean[2])])
+}
+
 impl TrvPar {
     pub fn llr(&self, z: f64, sigma: f64, valve_open: bool) -> f64 {
         if !z.is_finite() || !sigma.is_finite() || sigma <= 0.0 {
@@ -155,6 +258,80 @@ pub struct Tables {
     pub trv: TrvPar,
     pub temper: Temper,
     pub alarm_llr: f64,
+    #[serde(default)]
+    pub physics: Option<PhysFit>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PhysFit {
+    #[serde(default)]
+    pub lambda_open: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub lambda_kipp: BTreeMap<String, f64>,
+    #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub episodes: Vec<FitEpisode>,
+    #[serde(default)]
+    pub weight: Option<[f64; 4]>,
+    #[serde(default)]
+    pub trv_beta: Option<f64>,
+    #[serde(default)]
+    pub valve_gain_k_min: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct FitEpisode {
+    pub room: String,
+    pub from_ms: i64,
+    pub lambda_h: f64,
+}
+
+#[cfg(test)]
+impl PhysFit {
+    pub fn leave_out(&self, room: &str, from_ms: i64, open_lambda_h: f64) -> PhysFit {
+        let kept: Vec<&FitEpisode> = self.episodes.iter().filter(|e| !(e.room == room && e.from_ms == from_ms)).collect();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v.get(v.len() / 2).copied()
+        };
+        let class = |own: &str, open: bool| {
+            let pick = |only: Option<&str>| kept.iter().filter(|e| only.is_none_or(|r| e.room == r) && (e.lambda_h >= open_lambda_h) == open).map(|e| e.lambda_h).collect::<Vec<f64>>();
+            median(pick(Some(own))).or_else(|| median(pick(None)))
+        };
+        let mut out = PhysFit { weight: self.weight, trv_beta: self.trv_beta, valve_gain_k_min: self.valve_gain_k_min, episodes: self.episodes.clone(), ..Default::default() };
+        for room in self.episodes.iter().map(|e| e.room.clone()).collect::<std::collections::BTreeSet<_>>() {
+            if let Some(l) = class(&room, true) {
+                out.lambda_open.insert(room.clone(), l);
+            }
+            if let Some(l) = class(&room, false) {
+                out.lambda_kipp.insert(room, l);
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PhysRoom {
+    pub lambda_h: [f64; 3],
+    pub weight: [f64; 4],
+    pub trv_beta: f64,
+    pub valve_gain: f64,
+}
+
+impl Tables {
+    pub fn phys_room(&self, ph: &Physics, room: &str) -> PhysRoom {
+        let fit = self.physics.as_ref();
+        let mut lambda_h = ph.lambda_h;
+        if let Some(l) = fit.and_then(|f| f.lambda_open.get(room)) {
+            lambda_h[2] = *l;
+        }
+        if let Some(l) = fit.and_then(|f| f.lambda_kipp.get(room)) {
+            lambda_h[1] = *l;
+        }
+        PhysRoom { lambda_h, weight: fit.and_then(|f| f.weight).unwrap_or(ph.weight), trv_beta: fit.and_then(|f| f.trv_beta).unwrap_or(ph.trv_beta), valve_gain: fit.and_then(|f| f.valve_gain_k_min).unwrap_or(ph.valve_gain_k_min) }
+    }
 }
 
 impl Default for Tables {
@@ -217,17 +394,49 @@ pub struct Reference {
 
 #[derive(Debug, Default)]
 pub struct AirRoom {
-    nodes: BTreeMap<u64, [VecDeque<(i64, f64)>; 3]>,
+    nodes: BTreeMap<u64, [VecDeque<(i64, f64)>; SIGNALS]>,
     floor_ms: i64,
     skip_rh: bool,
 }
 
-fn slope_per_min(points: &[(i64, f64)]) -> (f64, f64) {
+fn fit_per_min(points: &[(i64, f64)]) -> (f64, f64, f64) {
     let n = points.len() as f64;
     let (mx, my) = (points.iter().map(|p| p.0 as f64).sum::<f64>() / n, points.iter().map(|p| p.1).sum::<f64>() / n);
     let var: f64 = points.iter().map(|p| (p.0 as f64 - mx).powi(2)).sum();
     let slope = if var > 0.0 { points.iter().map(|p| (p.0 as f64 - mx) * (p.1 - my)).sum::<f64>() / var * MIN_MS as f64 } else { 0.0 };
-    (slope, my)
+    (slope, my, var / (MIN_MS as f64).powi(2))
+}
+
+fn slope_per_min(points: &[(i64, f64)]) -> (f64, f64) {
+    let (slope, mean, _) = fit_per_min(points);
+    (slope, mean)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Obs {
+    pub rate: f64,
+    pub level: f64,
+    pub sd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Balance {
+    pub co2: Option<Obs>,
+    pub ah: Option<Obs>,
+    pub temp: Option<Obs>,
+}
+
+impl Balance {
+    #[cfg(test)]
+    pub fn flat(&self) -> [f64; 9] {
+        let cells = |o: Option<Obs>| o.map_or([f64::NAN; 3], |o| [o.rate, o.level, o.sd]);
+        let (a, b, c) = (cells(self.co2), cells(self.ah), cells(self.temp));
+        [a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]]
+    }
+
+    pub fn any(&self) -> bool {
+        self.co2.is_some() || self.ah.is_some() || self.temp.is_some()
+    }
 }
 
 impl AirRoom {
@@ -235,15 +444,33 @@ impl AirRoom {
         self.skip_rh = skip;
     }
 
-    pub fn push(&mut self, node: u64, signal: Signal, ts_ms: i64, value: f64) {
-        let series = &mut self.nodes.entry(node).or_default()[signal as usize];
+    fn store(series: &mut VecDeque<(i64, f64)>, ts_ms: i64, value: f64) {
         if series.back().is_some_and(|b| b.0 > ts_ms) {
             return;
+        }
+        if series.back().is_some_and(|b| b.0 == ts_ms) {
+            series.pop_back();
         }
         series.push_back((ts_ms, value));
         while series.front().is_some_and(|s| s.0 < ts_ms - KEEP_MS) {
             series.pop_front();
         }
+    }
+
+    pub fn push(&mut self, node: u64, signal: Signal, ts_ms: i64, value: f64) {
+        let entry = self.nodes.entry(node).or_default();
+        Self::store(&mut entry[signal as usize], ts_ms, value);
+        let other = match signal {
+            Signal::Rh => Signal::Temp,
+            Signal::Temp => Signal::Rh,
+            _ => return,
+        };
+        let Some(&(ots, ov)) = entry[other as usize].back() else { return };
+        if (ts_ms - ots).abs() > AH_PAIR_MS {
+            return;
+        }
+        let (rh, t) = if signal == Signal::Rh { (value, ov) } else { (ov, value) };
+        Self::store(&mut entry[Signal::Ah as usize], ts_ms.max(ots), absolute_humidity(rh, t));
     }
 
     pub fn reset(&mut self, now_ms: i64) {
@@ -255,15 +482,19 @@ impl AirRoom {
     }
 
     fn points(&self, cfg: &WindowFusion, signal: Signal, now: i64) -> Option<Vec<(i64, f64)>> {
+        self.points_in(cfg, signal, now, cfg.window_min)
+    }
+
+    fn points_in(&self, cfg: &WindowFusion, signal: Signal, now: i64, window_min: f64) -> Option<Vec<(i64, f64)>> {
         let usable: Vec<(i64, f64)> = self.newest(signal, now)?.iter().copied().filter(|s| s.0 <= now && s.0 > self.floor_ms).collect();
         if usable.last().is_none_or(|l| now - l.0 > (cfg.fresh_min * MIN_MS as f64) as i64) {
             return None;
         }
-        let from = now - (cfg.window_min * MIN_MS as f64) as i64;
+        let from = now - (window_min * MIN_MS as f64) as i64;
         let inside: Vec<(i64, f64)> = usable.iter().copied().filter(|s| s.0 > from).collect();
         let picked = if inside.len() >= cfg.min_samples { inside } else if usable.len() >= cfg.min_samples { usable[usable.len() - cfg.min_samples..].to_vec() } else { return None };
         let span = picked.last()?.0 - picked[0].0;
-        (span >= MIN_SPAN_MS && span <= (cfg.max_window_min.max(cfg.window_min) * MIN_MS as f64) as i64).then_some(picked)
+        (span >= MIN_SPAN_MS && span <= (cfg.max_window_min.max(window_min) * MIN_MS as f64) as i64).then_some(picked)
     }
 
     fn level(&self, signal: Signal, now: i64) -> Option<f64> {
@@ -280,6 +511,15 @@ impl AirRoom {
 
     pub fn latest_temp(&self, now: i64) -> Option<f64> {
         self.newest(Signal::Temp, now).and_then(|s| s.back()).map(|b| b.1)
+    }
+
+    pub fn balance(&self, cfg: &WindowFusion, now: i64) -> Balance {
+        let ph = &cfg.physics;
+        let obs = |signal: Signal, window: f64, sigma: f64| {
+            let (rate, level, sxx) = fit_per_min(&self.points_in(cfg, signal, now, window)?);
+            (sxx > 0.0).then(|| Obs { rate, level, sd: sigma / sxx.sqrt() })
+        };
+        Balance { co2: obs(Signal::Co2, cfg.window_min, ph.co2_sigma_ppm), ah: obs(Signal::Ah, cfg.window_min, ph.rh_sigma_pct * AH_PER_RH_PCT).filter(|_| !self.skip_rh), temp: obs(Signal::Temp, ph.temp_window_min, ph.temp_sigma_k) }
     }
 
     pub fn rates(&self, cfg: &WindowFusion, now: i64, outdoor_c: f64) -> Rates {
@@ -304,20 +544,31 @@ pub struct Inputs {
     pub gain: f64,
     pub holding: bool,
     pub depressed: bool,
+    pub phys: Option<PhysRoom>,
+    pub balance: Balance,
+    pub out_c: f64,
+    pub valve: f64,
+    pub trv_obs: Option<(f64, f64, bool)>,
+    pub ts_ms: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct Posterior {
+    pub mu: [f64; 3],
     pub own: f64,
     pub couple: f64,
     pub contrib: [f64; CHANNELS],
     pub added: [f64; CHANNELS],
+    pub raw: [f64; CHANNELS],
+    pub physics: bool,
     pub independent: bool,
+    pub was_holding: bool,
+    pub quiet_until_ms: i64,
 }
 
 impl Default for Posterior {
     fn default() -> Self {
-        Self { own: f64::NAN, couple: 0.0, contrib: [0.0; CHANNELS], added: [0.0; CHANNELS], independent: false }
+        Self { mu: [1.0, 0.0, 0.0], own: f64::NAN, couple: 0.0, contrib: [0.0; CHANNELS], added: [0.0; CHANNELS], raw: [0.0; CHANNELS], physics: false, independent: false, was_holding: false, quiet_until_ms: i64::MIN }
     }
 }
 
@@ -327,8 +578,50 @@ impl Posterior {
     }
 
     pub fn prior(cfg: &WindowFusion) -> f64 {
+        if cfg.engine == "physics" {
+            return logit(1.0 - Self::stationary(&Self::chain(cfg))[0]);
+        }
         let (open, close) = Self::rates_of(cfg);
         logit(open / (open + close))
+    }
+
+    pub fn chain(cfg: &WindowFusion) -> [[f64; 3]; 3] {
+        let ph = &cfg.physics;
+        let r = 1.0 / cfg.open_every_min.max(1.0);
+        let (to_kipp, to_open, k_close, o_close) = (r * ph.kipp_share, r * (1.0 - ph.kipp_share), 1.0 / ph.stay_kipp_min.max(1.0), 1.0 / ph.stay_open_min.max(1.0));
+        [[1.0 - to_kipp - to_open, to_kipp, to_open], [k_close, 1.0 - k_close - to_open, to_open], [o_close, 0.0, 1.0 - o_close]]
+    }
+
+    fn stationary(chain: &[[f64; 3]; 3]) -> [f64; 3] {
+        let mut mu = [1.0, 0.0, 0.0];
+        for _ in 0..400 {
+            mu = Self::forward(&mu, chain);
+        }
+        mu
+    }
+
+    fn forward(mu: &[f64; 3], chain: &[[f64; 3]; 3]) -> [f64; 3] {
+        let mut out = [0.0; 3];
+        for (i, row) in chain.iter().enumerate() {
+            for (j, t) in row.iter().enumerate() {
+                out[j] += mu[i] * t;
+            }
+        }
+        out
+    }
+
+    fn open_p(mu: &[f64; 3]) -> f64 {
+        (mu[1] + mu[2]).clamp(1e-12, 1.0 - 1e-12)
+    }
+
+    pub fn set_own(&mut self, cfg: &WindowFusion, own: f64) {
+        self.own = own;
+        if cfg.engine != "physics" {
+            return;
+        }
+        let p = sigmoid(own);
+        let share = if self.mu[1] + self.mu[2] > 1e-12 { self.mu[2] / (self.mu[1] + self.mu[2]) } else { 1.0 - cfg.physics.kipp_share };
+        self.mu = [1.0 - p, p * (1.0 - share), p * share];
     }
 
     pub fn total(&self) -> f64 {
@@ -343,7 +636,99 @@ impl Posterior {
         sigmoid(self.own)
     }
 
+    fn update_physics(&mut self, cfg: &WindowFusion, inp: &Inputs, room: &PhysRoom) {
+        let ph = &cfg.physics;
+        let chain = Self::chain(cfg);
+        if !self.own.is_finite() {
+            self.mu = Self::stationary(&chain);
+            self.own = logit(Self::open_p(&self.mu));
+        }
+        let pred = Self::forward(&self.mu, &chain);
+        let mut ch = [Lik::default(); CHANNELS];
+        let w = room.weight;
+        let b = &inp.balance;
+        if let Some(o) = b.co2 {
+            ch[Chan::Co2 as usize] = gas_modes(o, (o.level - cfg.outdoor_co2_ppm).max(0.0), ph, room.lambda_h, ph.co2_source_ppm_min, 1.0).scaled(w[0]);
+        }
+        if inp.out_c.is_finite() {
+            let ah_out = absolute_humidity(ph.outdoor_rh_pct, inp.out_c);
+            if let Some(o) = b.ah.filter(|o| (o.level - ah_out).abs() >= ph.ah_gate_g) {
+                ch[Chan::Rh as usize] = gas_modes(o, o.level - ah_out, ph, room.lambda_h, ph.ah_source_g_min, ph.door_ah_frac).scaled(w[1]);
+            }
+            if let Some(o) = b.temp.filter(|o| o.level - inp.out_c >= cfg.dt_floor_k) {
+                ch[Chan::Temp as usize] = temp_modes(o, o.level - inp.out_c, ph, room.lambda_h, room.valve_gain, inp.valve).scaled(w[2]);
+            }
+        }
+        if let Some((z, sigma, valve_open)) = inp.trv_obs {
+            ch[Chan::Trv as usize] = trv_modes(z, sigma, valve_open, ph, room.trv_beta).scaled(w[3]);
+        }
+        if self.was_holding && !inp.holding {
+            self.quiet_until_ms = inp.ts_ms + (ph.refractory_min * MIN_MS as f64) as i64;
+        }
+        self.was_holding = inp.holding;
+        if inp.holding || inp.ts_ms < self.quiet_until_ms {
+            for c in [Chan::Trv, Chan::Temp] {
+                let l = &mut ch[c as usize];
+                if l.modes[1].max(l.modes[2]) > l.modes[0] {
+                    *l = Lik::flat([l.modes[0]; 3]);
+                }
+            }
+        }
+        if let Some((chan, llr)) = inp.pulse {
+            let llr = if b.any() { ph.pulse_air_llr } else { llr };
+            ch[chan as usize] = Lik::flat([0.0, llr, llr]);
+        }
+        if inp.holding && inp.depressed {
+            ch[Chan::Level as usize] = Lik::flat([0.0, cfg.level_llr, cfg.level_llr]);
+        }
+        let apply = |extra: [f64; 3]| {
+            let top = extra.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let mut post = [0.0; 3];
+            for (m, slot) in post.iter_mut().enumerate() {
+                *slot = pred[m] * (extra[m] - top).exp();
+            }
+            let total: f64 = post.iter().sum();
+            post.map(|x| x / total)
+        };
+        let base = logit(Self::open_p(&pred));
+        let mut add = [0.0; CHANNELS];
+        let mut raw = [0.0; CHANNELS];
+        let rest = Self::stationary(&chain);
+        let rest_logit = logit(Self::open_p(&rest));
+        for c in Chan::ALL {
+            if ch[c as usize] != Lik::default() {
+                let marginal = ch[c as usize].marginal(ph);
+                add[c as usize] = logit(Self::open_p(&apply(marginal))) - base;
+                let top = marginal.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let mixed: Vec<f64> = (0..3).map(|m| rest[m] * (marginal[m] - top).exp()).collect();
+                raw[c as usize] = logit(((mixed[1] + mixed[2]) / mixed.iter().sum::<f64>()).clamp(1e-12, 1.0 - 1e-12)) - rest_logit;
+            }
+        }
+        self.raw = raw;
+        self.physics = true;
+        let active: Vec<Lik> = ch.iter().copied().filter(|l| *l != Lik::default()).collect();
+        let total = [Lik::closed(&active, ph), active.iter().map(|l| l.modes[1]).sum(), active.iter().map(|l| l.modes[2]).sum()];
+        let mut post = apply(total);
+        let (lo, hi) = (Self::prior(cfg) - cfg.floor_margin, cfg.logit_max);
+        let p = Self::open_p(&post);
+        let clamped = sigmoid(logit(p).clamp(lo, hi));
+        if (clamped - p).abs() > 1e-15 {
+            let k = clamped / p;
+            post = [1.0 - clamped, post[1] * k, post[2] * k];
+        }
+        self.mu = post;
+        self.own = logit(Self::open_p(&post));
+        self.independent = b.any();
+        for c in Chan::ALL {
+            self.contrib[c as usize] = self.contrib[c as usize] * MEMORY + add[c as usize];
+        }
+        self.added = add;
+    }
+
     pub fn update(&mut self, cfg: &WindowFusion, t: &Tables, inp: &Inputs) {
+        if let (true, Some(room)) = (cfg.engine == "physics", inp.phys.as_ref()) {
+            return self.update_physics(cfg, inp, room);
+        }
         let (open, close) = Self::rates_of(cfg);
         if !self.own.is_finite() {
             self.own = Self::prior(cfg);
@@ -385,14 +770,14 @@ impl Posterior {
     }
 
     pub fn hard(&mut self, cfg: &WindowFusion, open: bool) {
-        self.own = if open { cfg.logit_max * 0.6 } else { Self::prior(cfg) - 2.0 };
+        self.set_own(cfg, if open { cfg.logit_max * 0.6 } else { Self::prior(cfg) - 2.0 });
         self.couple = 0.0;
         self.contrib = [0.0; CHANNELS];
         self.contrib[Chan::Hard as usize] = if open { 1.0 } else { -1.0 };
     }
 
     pub fn calm(&mut self, cfg: &WindowFusion) {
-        self.own = Self::prior(cfg);
+        self.set_own(cfg, Self::prior(cfg));
         self.contrib = [0.0; CHANNELS];
     }
 
@@ -418,6 +803,6 @@ impl Posterior {
     }
 
     pub fn view(&self, open: bool) -> Value {
-        json!({"p": (self.p() * 1000.0).round() / 1000.0, "own_p": (self.own_p() * 1000.0).round() / 1000.0, "channels": self.breakdown(), "top": self.leaders(open).iter().map(|c| c.name()).collect::<Vec<_>>(), "reason": self.reason(open), "independent": self.independent})
+        json!({"p": (self.p() * 1000.0).round() / 1000.0, "own_p": (self.own_p() * 1000.0).round() / 1000.0, "channels": self.breakdown(), "top": self.leaders(open).iter().map(|c| c.name()).collect::<Vec<_>>(), "reason": self.reason(open), "independent": self.independent, "modes": self.physics.then(|| self.mu.map(|m| (m * 1000.0).round() / 1000.0))})
     }
 }

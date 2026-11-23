@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::window::{TraceRow, WinEvent, Windows, LOCAL_TEMPERATURE, OCCUPIED_SETPOINT, PI_HEATING_DEMAND};
+use crate::window_fusion::PhysFit;
 use crate::window_model::Bundle;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -227,6 +228,11 @@ fn verdict(dump: &Dump, e: &Episode, confirmed: &[(String, i64, i64)], strict: b
     "false"
 }
 
+fn answered_true(dump: &Dump, confirmed: &[(String, i64, i64)], e: &Episode) -> bool {
+    let end = e.to.unwrap_or(e.from);
+    confirmed.iter().any(|c| c.0 == e.room && c.1 <= end && c.2 >= e.from) || dump.answers.iter().any(|a| a.2 && a.1 == e.room && a.0 >= e.from - 30 * MIN && a.0 <= end + 30 * MIN)
+}
+
 fn confirmed() -> Vec<(String, i64, i64)> {
     let room = |r: &str, a: &str, b: &str| (r.to_string(), utc(a), utc(b));
     vec![
@@ -246,6 +252,7 @@ fn config_for(dump: &Dump, legacy: bool) -> Config {
     let shadow = std::env::var("HEATD_AIRWIN_SHADOW").is_ok();
     config.window.fusion.enabled = !legacy && !shadow;
     config.window.fusion.shadow = !legacy;
+    config.window.fusion.engine = std::env::var("HEATD_AIRWIN_ENGINE").unwrap_or_else(|_| "physics".into());
     if let Ok(path) = std::env::var("HEATD_AIRWIN_TABLES") {
         config.window.fusion.tables = path;
     }
@@ -264,6 +271,46 @@ fn config_for(dump: &Dump, legacy: bool) -> Config {
             "open_every_min" => f.open_every_min = v,
             "fresh_min" => f.fresh_min = v,
             "horizon_min" => f.horizon_min = v,
+            "lambda_zu" => f.physics.lambda_h[0] = v,
+            "lambda_kipp" => f.physics.lambda_h[1] = v,
+            "lambda_open" => f.physics.lambda_h[2] = v,
+            "kipp_share" => f.physics.kipp_share = v,
+            "stay_kipp_min" => f.physics.stay_kipp_min = v,
+            "stay_open_min" => f.physics.stay_open_min = v,
+            "co2_sigma" => f.physics.co2_sigma_ppm = v,
+            "co2_source" => f.physics.co2_source_ppm_min = v,
+            "rh_sigma" => f.physics.rh_sigma_pct = v,
+            "ah_source" => f.physics.ah_source_g_min = v,
+            "ah_gate" => f.physics.ah_gate_g = v,
+            "outdoor_rh" => f.physics.outdoor_rh_pct = v,
+            "temp_sigma" => f.physics.temp_sigma_k = v,
+            "temp_window" => f.physics.temp_window_min = v,
+            "kappa" => f.physics.temp_kappa = v,
+            "base_loss" => f.physics.temp_base_loss_h = v,
+            "temp_source" => f.physics.temp_source_k_min = v,
+            "temp_valve" => f.physics.temp_valve_k_min = v,
+            "temp_model" => f.physics.temp_model_k_min = v,
+            "valve_gain" => f.physics.valve_gain_k_min = v,
+            "door_share" => f.physics.door_share = v,
+            "door_l1" => f.physics.door_lambda_h[0] = v,
+            "door_l2" => f.physics.door_lambda_h[1] = v,
+            "door_l3" => f.physics.door_lambda_h[2] = v,
+            "door_ah" => f.physics.door_ah_frac = v,
+            "model_floor" => f.physics.model_floor = v,
+            "trv_sd" => f.physics.trv_sd = v,
+            "trv_open_z" => f.physics.trv_open_z = v,
+            "trv_kipp" => f.physics.trv_kipp_frac = v,
+            "trv_beta" => f.physics.trv_beta = v,
+            "trv_cap" => f.physics.trv_cap = v,
+            "w_co2" => f.physics.weight[0] = v,
+            "w_ah" => f.physics.weight[1] = v,
+            "w_temp" => f.physics.weight[2] = v,
+            "w_trv" => f.physics.weight[3] = v,
+            "pulse_llr" => f.physics.pulse_llr = v,
+            "level_llr" => f.level_llr = v,
+            "outlier_share" => f.physics.outlier_share = v,
+            "outlier_scale" => f.physics.outlier_scale = v,
+            "pulse_air" => f.physics.pulse_air_llr = v,
             other => panic!("unknown override {other}"),
         }
     }
@@ -271,9 +318,9 @@ fn config_for(dump: &Dump, legacy: bool) -> Config {
 }
 
 fn write_trace(path: &str, trace: &[TraceRow]) {
-    let mut out = String::from("ms,room,z,valve,co2,rh,temp,gate,own,total\n");
+    let mut out = String::from("ms,room,z,valve,co2,rh,temp,gate,own,total,l_trv,l_co2,l_rh,l_temp,r_trv,r_co2,r_rh,r_temp,o_co2_rate,o_co2_level,o_co2_sd,o_ah_rate,o_ah_level,o_ah_sd,o_t_rate,o_t_level,o_t_sd\n");
     for t in trace.iter().filter(|t| t.ts_ms % MIN == 0) {
-        out += &format!("{},{},{},{},{},{},{},{},{:.3},{:.3}\n", t.ts_ms, t.room, t.z, t.valve, t.co2, t.rh, t.temp, t.gate, t.own, t.total);
+        out += &format!("{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.1},{:.4},{:.5},{:.3},{:.5},{:.5},{:.3},{:.5}\n", t.ts_ms, t.room, t.z, t.valve, t.co2, t.rh, t.temp, t.gate, t.own, t.total, t.ch[0], t.ch[1], t.ch[2], t.ch[3], t.raw[0], t.raw[1], t.raw[2], t.raw[3], t.obs[0], t.obs[1], t.obs[2], t.obs[3], t.obs[4], t.obs[5], t.obs[6], t.obs[7], t.obs[8]);
     }
     std::fs::write(path, out).unwrap();
 }
@@ -310,8 +357,11 @@ fn replay_fusion() {
             m
         });
         let long = mine.iter().filter(|e| e.to.unwrap_or(to) - e.from > 25 * MIN).count();
-        let frost: f64 = mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) as f64 / MIN as f64).sum::<f64>() / days;
-        println!("{room}: frost {frost:.0} min/day, episodes over 25 min {long}, longest {} min", mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) / MIN).max().unwrap_or(0));
+        let minutes = |e: &Episode| (e.to.unwrap_or(to) - e.from) as f64 / MIN as f64;
+        let frost: f64 = mine.iter().map(|e| minutes(e)).sum::<f64>() / days;
+        let verified: f64 = mine.iter().zip(&verdicts).filter(|(_, v)| **v == "true").map(|(e, _)| minutes(e)).sum::<f64>() / days;
+        let answered: f64 = mine.iter().filter(|e| answered_true(&dump, &conf, e)).map(|e| minutes(e)).sum::<f64>() / days;
+        println!("{room}: frost {frost:.0} min/day (verified {verified:.0}, confirmed or answered {answered:.1}), episodes over 25 min {long}, longest {} min", mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) / MIN).max().unwrap_or(0));
         println!("{room}: openings {} ({:.2}/day) true {} false {} ({:.2}/day, strict {strict_false} = {:.2}/day) sources {by_source:?}; held-out days false {held_false}/{held_days} ({:.2}/day)", mine.len(), mine.len() as f64 / days, verdicts.iter().filter(|v| **v == "true").count(), falses, falses as f64 / days, strict_false as f64 / days, if held_days > 0.0 { held_false as f64 / held_days } else { f64::NAN });
         worst = worst.max(if held_days > 0.0 { held_false as f64 / held_days } else { falses as f64 / days });
         if std::env::var("HEATD_AIRWIN_LIST").is_ok() {
@@ -335,4 +385,190 @@ fn replay_fusion() {
     for e in out.episodes.iter().filter(|e| e.from >= utc("2026-11-22T09:00") && e.from <= utc("2026-11-23T09:00") && e.source != "manual") {
         println!("   {} {} .. {} {} {}", e.room, clock(e.from), e.to.map_or("open".into(), clock), e.source, e.text);
     }
+}
+
+struct Run {
+    name: &'static str,
+    episodes: Vec<Episode>,
+    verdicts: Vec<&'static str>,
+}
+
+impl Run {
+    fn new(name: &'static str, dump: &Dump, config: &Config, from: i64, to: i64, conf: &[(String, i64, i64)]) -> Self {
+        let episodes: Vec<Episode> = replay(dump, config, from, to, false).episodes.into_iter().filter(|e| e.from >= from).collect();
+        let verdicts = episodes.iter().map(|e| verdict(dump, e, conf, false)).collect();
+        Self { name, episodes, verdicts }
+    }
+
+    fn mine(&self, room: &str) -> impl Iterator<Item = (&Episode, &'static str)> + '_ {
+        let room = room.to_string();
+        self.episodes.iter().zip(self.verdicts.iter().copied()).filter(move |(e, _)| e.room == room)
+    }
+
+    fn minutes(e: &Episode, to: i64) -> f64 {
+        (e.to.unwrap_or(to) - e.from) as f64 / MIN as f64
+    }
+
+    fn frost(&self, room: &str, to: i64, pick: impl Fn(&Episode, &'static str) -> bool) -> f64 {
+        self.mine(room).filter(|(e, v)| pick(e, v)).map(|(e, _)| Self::minutes(e, to)).sum()
+    }
+}
+
+fn valve_series(dump: &Dump) -> BTreeMap<String, Vec<(i64, f64)>> {
+    let mut out: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+    for (ms, feed) in &dump.feeds {
+        if let Feed::Trv(node, attr, v) = feed {
+            if *attr == PI_HEATING_DEMAND {
+                if let Some(room) = dump.config.rooms.iter().find(|r| r.nodes.contains(node)) {
+                    out.entry(room.name.clone()).or_default().push((*ms, *v));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn valve_at(series: Option<&Vec<(i64, f64)>>, at: i64) -> f64 {
+    series.map_or(0.0, |s| s.get(s.partition_point(|x| x.0 <= at).saturating_sub(1)).map_or(0.0, |x| x.1))
+}
+
+fn event_metrics(run: &Run, conf: &[(String, i64, i64)]) -> (usize, Vec<f64>) {
+    let mut latencies = Vec::new();
+    for (room, from, _) in conf {
+        let hit = first_open(&run.episodes, room, from - 2 * MIN, from + 15 * MIN);
+        if let Some(t) = hit {
+            latencies.push(((t - from).max(0)) as f64 / MIN as f64);
+        }
+    }
+    latencies.sort_by(|a, b| a.total_cmp(b));
+    (conf.len(), latencies)
+}
+
+fn quantile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+}
+
+fn physics_folds(config: &Config, dump: &Dump, from: i64, to: i64, fits: &Path) -> Vec<(String, Run)> {
+    let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fits).expect("fits json")).unwrap();
+    let fit: PhysFit = serde_json::from_value(raw["physics"].clone()).expect("physics section");
+    let dir = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    for (i, e) in fit.episodes.iter().enumerate() {
+        let part = fit.leave_out(&e.room, e.from_ms, 3.0);
+        let mut tables: serde_json::Value = serde_json::from_str(include_str!("window_fusion.json")).unwrap();
+        tables["physics"] = serde_json::json!({"lambda_open": part.lambda_open, "lambda_kipp": part.lambda_kipp});
+        let path = dir.path().join(format!("fold{i}.json"));
+        std::fs::write(&path, tables.to_string()).unwrap();
+        let mut c = config.clone();
+        c.window.fusion.tables = path.to_string_lossy().into_owned();
+        out.push((format!("{} {}", e.room, clock(e.from_ms)), Run::new("physics-loeo", dump, &c, from, to, &confirmed())));
+    }
+    out
+}
+
+fn pass(ok: bool) -> &'static str {
+    if ok { "PASS" } else { "FAIL" }
+}
+
+#[test]
+#[ignore]
+fn replay_compare() {
+    let dir = dump_dir();
+    let (from, to) = (utc("2026-11-09T20:00"), utc("2026-11-23T08:59"));
+    let dump = Dump::load(&dir, from - 2 * DAY);
+    let days = (to - from) as f64 / DAY as f64;
+    let conf = confirmed();
+    let v3_cfg = config_for(&dump, true);
+    let mut learned_cfg = config_for(&dump, false);
+    learned_cfg.window.fusion.engine = "learned".into();
+    let mut physics_cfg = config_for(&dump, false);
+    physics_cfg.window.fusion.engine = "physics".into();
+    let runs = [Run::new("v3", &dump, &v3_cfg, from, to, &conf), Run::new("learned", &dump, &learned_cfg, from, to, &conf), Run::new("physics", &dump, &physics_cfg, from, to, &conf)];
+    let rooms: Vec<String> = dump.config.rooms.iter().filter(|r| !r.nodes.is_empty()).map(|r| r.name.clone()).collect();
+    println!("replay {} .. {} ({days:.1} days), priors only for physics", clock(from), clock(to));
+    for room in &rooms {
+        for r in &runs {
+            let (n, f) = (r.mine(room).count(), r.mine(room).filter(|(_, v)| *v == "false").count());
+            let strict = r.mine(room).filter(|(e, _)| verdict(&dump, e, &conf, true) == "false").count();
+            let all = r.frost(room, to, |_, _| true) / days;
+            let verified = r.frost(room, to, |_, v| v == "true") / days;
+            let answered = r.frost(room, to, |e, _| answered_true(&dump, &conf, e)) / days;
+            println!("{room:13} {:8} openings {n:3} ({:.2}/day) false {f:2} ({:.2}/day, strict {:.2}) frost {all:5.0} min/day (verified {verified:5.0}, confirmed or answered {answered:4.1})", r.name, n as f64 / days, f as f64 / days, strict as f64 / days);
+        }
+    }
+    let mut truth: Vec<(String, i64, i64)> = conf.clone();
+    for r in &runs {
+        truth.extend(r.episodes.iter().zip(&r.verdicts).filter(|(_, v)| **v == "true").map(|(e, _)| (e.room.clone(), e.from, e.to.unwrap_or(to))));
+    }
+    let valves = valve_series(&dump);
+    let cold_k = dump.config.window.fusion.cool_k_per_h;
+    let cold_cost = dump.config.room_model.cold_cost_min;
+    for r in &runs {
+        let (events, lat) = event_metrics(r, &conf);
+        let total = r.episodes.len();
+        let true_n = r.verdicts.iter().filter(|v| **v == "true").count();
+        let mut missed = 0.0;
+        for (room, a, b) in &truth {
+            for t in (*a..*b).step_by(MIN as usize) {
+                if t >= from && t <= to && !open_at(&r.episodes, room, t) {
+                    missed += valve_at(valves.get(room), t) / 100.0;
+                }
+            }
+        }
+        let cold: f64 = r.episodes.iter().zip(&r.verdicts).filter(|(_, v)| **v == "false").map(|(e, _)| cold_k / 60.0 * Run::minutes(e, to).powi(2) / 2.0).sum();
+        println!("{:8} confirmed recall {}/{events} latency median {:.1} P90 {:.1} min, precision {:.2} ({true_n}/{total}), cost = missed valve min {missed:.0} + {cold_cost} x cold K*min {cold:.1} = {:.0}", r.name, lat.len(), quantile(&lat, 0.5), quantile(&lat, 0.9), true_n as f64 / total.max(1) as f64, missed + cold_cost * cold);
+    }
+    let first = |r: &Run, room: &str, a: &str, b: &str| first_open(&r.episodes, room, utc(a), utc(b));
+    let cell = |t: Option<i64>| t.map_or("-".to_string(), |t| clock(t).split(' ').nth(1).unwrap_or("").to_string());
+    println!("criteria     {:>9} {:>9} {:>9}", runs[0].name, runs[1].name, runs[2].name);
+    let a_first: Vec<Option<i64>> = runs.iter().map(|r| first(r, "schlafzimmer", "2026-11-23T07:20", "2026-11-23T07:40")).collect();
+    let b_first: Vec<Option<i64>> = runs.iter().map(|r| first(r, "schlafzimmer", "2026-11-23T07:55", "2026-11-23T08:20")).collect();
+    let b_cont: Vec<bool> = runs.iter().map(|r| covered(&r.episodes, "schlafzimmer", utc("2026-11-23T08:06"), utc("2026-11-23T08:45"))).collect();
+    let kitchen: Vec<Option<i64>> = runs.iter().map(|r| first(r, "kueche", "2026-11-22T09:40", "2026-11-22T09:55")).collect();
+    let living: Vec<Option<i64>> = runs.iter().map(|r| first(r, "wohnzimmer", "2026-11-22T09:40", "2026-11-22T09:55")).collect();
+    let fa_day = |r: &Run, room: &str| r.mine(room).filter(|(_, v)| *v == "false").count() as f64 / days;
+    println!("(a) A frost  {:>9} {:>9} {:>9} (limit 07:33)", cell(a_first[0]), cell(a_first[1]), cell(a_first[2]));
+    println!("(a) B first  {:>9} {:>9} {:>9} (limit 08:06)", cell(b_first[0]), cell(b_first[1]), cell(b_first[2]));
+    println!("(a) B 08:06-08:45 continuous {} {} {}", b_cont[0], b_cont[1], b_cont[2]);
+    println!("(b) kitchen  {:>9} {:>9} {:>9} (limit 09:46), living room {} {} {}", cell(kitchen[0]), cell(kitchen[1]), cell(kitchen[2]), cell(living[0]), cell(living[1]), cell(living[2]));
+    let worst: Vec<f64> = runs.iter().map(|r| rooms.iter().map(|room| fa_day(r, room)).fold(0.0, f64::max)).collect();
+    println!("(c) worst false/room/day {:.2} {:.2} {:.2} (limit {MAX_FALSE_PER_ROOM_DAY})", worst[0], worst[1], worst[2]);
+    let door: Vec<&Episode> = runs[2].mine("schlafzimmer").filter(|(e, _)| {
+        let hour = (e.from % DAY) / (60 * MIN);
+        (1..5).contains(&hour) && drop_around(dump.air_temp.get("schlafzimmer"), e.from, (15 * MIN, 4 * MIN), (4 * MIN, 30 * MIN)) > -0.1
+    }).map(|(e, _)| e).collect();
+    println!("(c) night bedroom door pattern openings (01-05 UTC, air drop under 0.1 K): physics {}", door.len());
+    let (wb, pb) = (["wohnzimmer", "bad"], &runs[2]);
+    let tf = |r: &Run, room: &str| (r.mine(room).filter(|(_, v)| *v == "true").count(), r.mine(room).filter(|(_, v)| *v == "false").count());
+    for room in wb {
+        println!("(d) {room}: v3 true/false {:?}, physics {:?}", tf(&runs[0], room), tf(pb, room));
+    }
+    let bed = |r: &Run| (r.frost("schlafzimmer", to, |_, _| true) / days, r.frost("schlafzimmer", to, |_, v| v == "true") / days, r.frost("schlafzimmer", to, |e, _| answered_true(&dump, &conf, e)) / days);
+    let (b3, bl, bp) = (bed(&runs[0]), bed(&runs[1]), bed(&runs[2]));
+    let allowed = 1.5 * b3.0;
+    let extra_ok_confirmed = bp.0 <= allowed + bp.2;
+    let extra_ok_verified = bp.0 <= allowed + (bp.1 - b3.1).max(0.0);
+    println!("(e) bedroom frost min/day v3 {:.0}, learned {:.0}, physics {:.0} (limit {allowed:.0}); extra within confirmed or answered: {}; extra within physically verified episodes (air or thermostat drop): {}", b3.0, bl.0, bp.0, pass(extra_ok_confirmed), pass(extra_ok_verified));
+    let mut fold_pass = true;
+    if let Ok(path) = std::env::var("HEATD_AIRWIN_FITS") {
+        println!("leave-one-episode-out (lambda fitted on the other episodes)");
+        for (name, run) in physics_folds(&physics_cfg, &dump, from, to, Path::new(&path)) {
+            let a = first(&run, "schlafzimmer", "2026-11-23T07:20", "2026-11-23T07:40");
+            let b = covered(&run.episodes, "schlafzimmer", utc("2026-11-23T08:06"), utc("2026-11-23T08:45"));
+            let k = first(&run, "kueche", "2026-11-22T09:40", "2026-11-22T09:55");
+            let worst = rooms.iter().map(|room| fa_day(&run, room)).fold(0.0, f64::max);
+            println!("   left out {name}: A {} B continuous {b} kitchen {} worst false/day {worst:.2}", cell(a), cell(k));
+            let failed = name.starts_with("schlafzimmer 11-23 07") && !(a.is_some_and(|t| t <= utc("2026-11-23T07:33"))) || name.starts_with("kueche") && !k.is_some_and(|t| t <= utc("2026-11-22T09:46"));
+            fold_pass &= !failed;
+        }
+    }
+    let a_ok = a_first[2].is_some_and(|t| t <= utc("2026-11-23T07:33")) && b_first[2].is_some_and(|t| t <= utc("2026-11-23T08:06")) && b_cont[2];
+    let b_ok = kitchen[2].is_some_and(|t| t <= utc("2026-11-22T09:46"));
+    let c_ok = worst[2] <= MAX_FALSE_PER_ROOM_DAY && door.is_empty();
+    let d_ok = wb.iter().all(|room| tf(pb, room).0 >= tf(&runs[0], room).0 && tf(pb, room).1 <= tf(&runs[0], room).1);
+    println!("(a) {} (b) {} (c) {} (d) {} (e literal) {} (e verified) {} loeo {}", pass(a_ok), pass(b_ok), pass(c_ok), pass(d_ok), pass(extra_ok_confirmed), pass(extra_ok_verified), pass(fold_pass));
+    assert!(a_ok && b_ok && c_ok && d_ok && extra_ok_confirmed && fold_pass, "pre-fixed criteria (a)-(e) not all met, see the criteria lines above");
 }
