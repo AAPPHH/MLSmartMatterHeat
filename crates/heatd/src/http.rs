@@ -231,7 +231,11 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 ");
     state.latest.all().iter().for_each(|r| ages.push_str(&format!("heatd_reading_age_seconds{{node=\"{}\",attribute=\"{}\"}} {}
 ", r.node, r.attribute, ((now - r.ts) as f64 / 1000.0).max(0.0))));
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour)))
+    let phone = state.config.presence.phone.as_ref().map_or(String::new(), |_| format!("# HELP heatd_phone_present 1 if the phone vouches for presence (seen in the LAN within the grace)
+# TYPE heatd_phone_present gauge
+heatd_phone_present {}
+", u8::from(state.tracker.lock().unwrap().phone().vouch)));
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour)))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -701,6 +705,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
     let readings = state.latest.all();
     let (now, now_us) = (now_ms(), crate::lake::now_us());
     let setpoints = state.storage.last_setpoints()?;
+    let (phone, presence) = phone_presence_view(&state, now);
     let windows = state.windows.lock().unwrap();
     let open = windows.open_rooms();
     let commands = state.commanded.lock().unwrap();
@@ -740,7 +745,23 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "room_model": state.room_model.view(&room.name), "manual": room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| h.view()), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "experiment": commands.messfahrt.view(now_ms()), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "phone": phone, "presence": presence, "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "experiment": commands.messfahrt.view(now_ms()), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+}
+
+fn phone_presence_view(state: &AppState, now: i64) -> (Value, Value) {
+    let (vouch, phone) = {
+        let tracker = state.tracker.lock().unwrap();
+        (tracker.phone().vouch, tracker.phone().view(now))
+    };
+    let presence = crate::rules::current_presence(state, now).ok().flatten().map(|p| {
+        let occupancy = match p.occupancy(&state.config) {
+            crate::rules::Occupancy::Room(r) => r.to_string(),
+            crate::rules::Occupancy::Away => "away".into(),
+            crate::rules::Occupancy::Unknown => "unknown".into(),
+        };
+        json!({"occupancy": occupancy, "source": p.source, "why": vouch.then_some(crate::phone::WHY)})
+    });
+    (if state.config.presence.phone.is_some() { phone } else { Value::Null }, json!(presence))
 }
 
 fn devices_view(state: &AppState) -> anyhow::Result<Vec<Value>> {
@@ -3059,5 +3080,27 @@ nodes = [5]
         assert_eq!((status, body["window_open"].clone()), (StatusCode::OK, json!(["wohnzimmer"])));
         let (_, body) = call(&h.state, "POST", "/api/window", Some(json!({"room": "wohnzimmer", "open": false}).to_string())).await;
         assert_eq!(body["window_open"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn phone_block_metric_and_presence_reason() {
+        let h = harness_with(false, "[presence.phone]
+mac = 'aa:bb:cc:dd:ee:ff'
+subnet = '192.0.2.0/24'
+", "[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+");
+        let (_, before) = call(&h.state, "GET", "/api/state", None).await;
+        assert_eq!((before["phone"]["present"].clone(), before["presence"].clone()), (json!(false), Value::Null));
+        assert!(call_text(&h.state, "/metrics").await.1.contains("heatd_phone_present 0"));
+        h.state.tracker.lock().unwrap().phone_probe(now_ms(), Some(42), 1_200_000);
+        let (_, after) = call(&h.state, "GET", "/api/state", None).await;
+        assert_eq!((after["phone"]["present"].clone(), after["phone"]["ip_last_octet"].clone(), after["phone"]["why"].clone()), (json!(true), json!(42), json!("Handy im WLAN")));
+        assert_eq!((after["presence"]["occupancy"].clone(), after["presence"]["source"].clone(), after["presence"]["why"].clone()), (json!("unknown"), json!("phone_wifi"), json!("Handy im WLAN")));
+        assert!(call_text(&h.state, "/metrics").await.1.contains("heatd_phone_present 1"));
+        let off = harness(false);
+        let (_, state) = call(&off.state, "GET", "/api/state", None).await;
+        assert!(state["phone"].is_null() && !call_text(&off.state, "/metrics").await.1.contains("heatd_phone_present"));
     }
 }

@@ -35,6 +35,14 @@ neighbours = [
     { a = "flur", b = "schlafzimmer", kind = "open" },
 ]
 
+# phone in the home LAN means someone is home (unprivileged ARP probe, feature off when absent)
+# [presence.phone]
+# mac = "aa:bb:cc:dd:ee:ff"
+# subnet = "192.0.2.0/24"
+# probe_s = 60
+# sweep_min = 10
+# absent_grace_min = 20
+
 [heat_source]
 kind = "oil"
 scope = "central"

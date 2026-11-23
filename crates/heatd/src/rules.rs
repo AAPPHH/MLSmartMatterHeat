@@ -1,6 +1,7 @@
 use crate::config::{Config, Room};
 use crate::http::AppState;
 use crate::explore::{Experiment, Inputs, Lifecycle};
+use crate::phone::{self, PhoneLink, PhoneUpdate};
 use crate::lake::{self, kind, Decision, DecisionInputs, Label};
 use crate::storage::{now_ms, Motion, Power, Reading};
 use anyhow::Result;
@@ -528,6 +529,7 @@ struct Track {
 #[derive(Debug, Default)]
 pub struct Tracker {
     devices: HashMap<String, Track>,
+    phone: PhoneLink,
 }
 
 impl Tracker {
@@ -566,7 +568,24 @@ impl Tracker {
         t.leaving = leaving;
     }
 
+    pub fn phone_probe(&mut self, now_ms: i64, found: Option<u8>, grace_ms: i64) -> PhoneUpdate {
+        let before = self.phone.vouch;
+        self.phone.note(now_ms, found, grace_ms);
+        let arrived = (self.phone.vouch && self.devices.values().any(|t| t.confirmed)).then(|| {
+            self.devices.values_mut().for_each(|t| (t.confirmed, t.away_since, t.moved, t.silent) = (false, None, false, false));
+            Transition::Arrived
+        });
+        PhoneUpdate { arrived, changed: (self.phone.vouch != before).then_some(self.phone.vouch) }
+    }
+
+    pub fn phone(&self) -> &PhoneLink {
+        &self.phone
+    }
+
     pub fn poll(&mut self, now_ms: i64, guard_minutes: f64, silence_minutes: Option<f64>) -> Vec<(String, Transition)> {
+        if self.phone.vouch {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if let Some(silence) = silence_minutes {
             for (device, t) in self.devices.iter_mut().filter(|(_, t)| !t.confirmed && t.streak >= HEARTBEAT_MIN_STREAK && (t.last_home || t.leaving)) {
@@ -597,7 +616,7 @@ impl Tracker {
     }
 
     pub fn away(&self, device: &str, status_away: bool) -> bool {
-        self.devices.get(device).is_some_and(|t| t.confirmed && (status_away || t.silent))
+        !self.phone.vouch && self.devices.get(device).is_some_and(|t| t.confirmed && (status_away || t.silent))
     }
 }
 
@@ -606,7 +625,7 @@ pub fn presence_event(device: &str, transition: Transition) -> lake::Event {
         Transition::Left { since } => (kind::PRESENCE_LEAVE, Some(since * 1000)),
         Transition::Arrived => (kind::PRESENCE_ARRIVE, None),
     };
-    let mut event = lake::Event::now(name, "heatd").with_detail(json!({"source": "watch_wifi", "device": device}));
+    let mut event = lake::Event::now(name, "heatd").with_detail(json!({"source": if device == phone::DEVICE { phone::SOURCE } else { "watch_wifi" }, "device": device}));
     if let Some(ts) = ts {
         event.ts = ts;
     }
@@ -628,8 +647,12 @@ pub(crate) fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<P
         .stay()
         .filter(|(_, _, ts)| minutes(*ts) <= state.config.presence_timeout_minutes)
         .filter(|(device, _, ts)| !statuses.iter().any(|s| &s.device == device && s.motion == Some(Motion::Moving) && s.state_ts > *ts));
+    let phone_age = {
+        let tracker = state.tracker.lock().unwrap();
+        tracker.phone().vouch.then(|| tracker.phone().age_minutes(now_ms)).flatten()
+    };
     if prediction.is_none() && status.is_none() && stay.is_none() && !matched.as_ref().is_some_and(Option::is_some) {
-        return Ok(None);
+        return Ok(phone_age.map(|age| Presence { room: None, prediction_age_minutes: None, motion: None, power: None, away: false, contact_age_minutes: Some(age), source: phone::SOURCE, sleep: false, bedtime: false }));
     }
     let away = status.as_ref().is_some_and(|s| state.tracker.lock().unwrap().away(&s.device, s.away));
     let (model_room, model_age) = match matched {
@@ -651,7 +674,7 @@ pub(crate) fn current_presence(state: &AppState, now_ms: i64) -> Result<Option<P
         motion: status.as_ref().and_then(|s| s.motion),
         power: status.as_ref().and_then(|s| s.power),
         away,
-        contact_age_minutes: status.as_ref().map(|s| minutes(s.contact_ms)),
+        contact_age_minutes: status.as_ref().map(|s| minutes(s.contact_ms)).into_iter().chain(phone_age).reduce(f64::min),
     }))
 }
 
