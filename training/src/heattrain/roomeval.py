@@ -215,7 +215,7 @@ def window_metrics(grid, rec, truth, lo, hi, rc):
                 pw = np.nan_to_num(rec[r]["p_window"])[i0:i1]
                 up = np.nonzero(pw > ev["pw_flag"])[0]
                 inside = np.nan_to_num(rec[r]["p_window"])[i0:np.searchsorted(t, b, side="right")]
-                res["known"].append({"room": r, "open": a, "first_min": float((t[i0 + up[0]] - a) / 60.0) if len(up) else None, "peak": float(pw.max()) if len(pw) else 0.0, "min_inside": float(inside.min()) if len(inside) else 0.0, "frac_inside": float((inside > ev["pw_flag"]).mean()) if len(inside) else 0.0})
+                res["known"].append({"room": r, "open": a, "pre": float(np.nan_to_num(rec[r]["p_window"])[max(i0 - 1, 0)]), "first_min": float((t[i0 + up[0]] - a) / 60.0) if len(up) else None, "peak": float(pw.max()) if len(pw) else 0.0, "min_inside": float(inside.min()) if len(inside) else 0.0, "frac_inside": float((inside > ev["pw_flag"]).mean()) if len(inside) else 0.0})
     return res
 
 
@@ -334,30 +334,36 @@ def room_temp(v, r):
 
 def room_view(v, r):
     w = v["window"]["per_room"][r]
-    return {"hits": w["hits"], "opens": w["opens"], "false_per_day": w["false_per_day"], "lead_min": float(np.mean(w["latency_min"])) if w["latency_min"] else None, "temp": room_temp(v, r)}
+    return {"hits": w["hits"], "opens": w["opens"], "false_per_day": w["false_per_day"], "lead_min": float(np.mean(w["latency_min"])) if w["latency_min"] else None, "temp": room_temp(v, r), "known": [k for k in v["window"]["known"] if k["room"] == r]}
 
 
-def room_verdict(var, ref, sel):
+def room_verdict(var, ref, sel, need=0):
     w = sel["window"]
     bad = []
-    if var["temp"] < ref["temp"] - w["temp_guard"]:
+    if var["temp"] < ref["temp"] - w["temp_guard"] * abs(ref["temp"]):
         bad.append(f"temperature skill {var['temp']:.3f} vs {ref['temp']:.3f}")
-    if var["false_per_day"] > max(w["false_per_room_day"], ref["false_per_day"]):
-        bad.append(f"false alarms {var['false_per_day']:.2f}/day vs {ref['false_per_day']:.2f}")
+    if var["false_per_day"] > w["false_per_room_day"]:
+        bad.append(f"false alarms {var['false_per_day']:.2f}/day over {w['false_per_room_day']}")
     if var["hits"] < ref["hits"]:
         bad.append(f"hits {var['hits']} vs {ref['hits']}")
+    if need:
+        if len(var["known"]) < need:
+            bad.append(f"known opening not in the evaluated folds ({len(var['known'])} of {need})")
+        for k in var["known"]:
+            if k["first_min"] is None or k["pre"] > w["known_pre_max"]:
+                bad.append(f"known opening at {datetime.fromtimestamp(k['open'], timezone.utc):%H:%M}: p_window not above the flag within {w['known_within_min']} min" if k["first_min"] is None else f"known opening at {datetime.fromtimestamp(k['open'], timezone.utc):%H:%M}: flag already up before the opening")
     sooner = var["lead_min"] is not None and ref["lead_min"] is not None and ref["lead_min"] - var["lead_min"] >= w["min_lead_gain_min"]
     if var["hits"] == ref["hits"] and not sooner:
         bad.append("no more hits and no earlier detection")
     return {"accepted": not bad, "decidable": ref["opens"] > 0, "why": bad if ref["opens"] > 0 else ["no labelled opening in the sensor folds, not decidable"] + bad, "var": var, "ref": ref}
 
 
-def choose_rooms(out, ref, keys, names, cands, sel):
+def choose_rooms(out, ref, keys, names, cands, sel, need=None):
     plan = {}
     for r in names:
         ok = []
         for k in keys:
-            vd = room_verdict(room_view(out[k], r), room_view(out[ref], r), sel)
+            vd = room_verdict(room_view(out[k], r), room_view(out[ref], r), sel, (need or {}).get(r, 0))
             out[k].setdefault("rooms", {})[r] = vd
             if vd["accepted"]:
                 ok.append((vd["var"]["hits"], -vd["var"]["false_per_day"], -(vd["var"]["lead_min"] or 0.0), k))
@@ -398,7 +404,7 @@ def rolling_origin(full, ff, variants, truth, rc, house):
         for key, c in cands.items():
             out[key] = ev(sensor, uniform(names, c["parts"], c["gas"]), effort)
             out[key]["gain"] = score(out[key]) - score(out[ref])
-        plan = choose_rooms(out, ref, list(cands), names, cands, sel)
+        plan = choose_rooms(out, ref, list(cands), names, cands, sel, {r: sum(1 for x in truth.known if x[0] == r) for r in names})
     return folds, out, {"rooms": plan, "effort": effort}
 
 

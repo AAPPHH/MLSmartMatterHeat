@@ -348,8 +348,9 @@ class Truth:
     def __init__(self, src, rc):
         self.rc = rc
         self.known = [(k["room"], datetime.fromisoformat(k["open_utc"]).timestamp(), datetime.fromisoformat(k["close_utc"]).timestamp()) for k in rc.get("known", [])]
-        self.gt = load_ground_truth(src, rc["hold_min"]) + [(a, b, [r]) for r, a, b in self.known]
-        self.labels = [x for x in load_window_labels(src) if x[0] > 1e6]
+        near = lambda r, t: any(r == kr and ka - 600.0 <= t <= kb + 600.0 for kr, ka, kb in self.known)
+        self.gt = [g for g in load_ground_truth(src, rc["hold_min"]) if not any(near(r, g[0]) for r in g[2])] + [(a, b, [r]) for r, a, b in self.known]
+        self.labels = [x for x in load_window_labels(src) if x[0] > 1e6 and not (x[2] and near(x[1], x[0]))]
         self.live = load_live_alarms(src)
 
     def spans(self, rooms):

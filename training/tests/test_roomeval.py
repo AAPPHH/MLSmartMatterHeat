@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import copy
 import json
 import math
@@ -215,8 +216,8 @@ def test_known_openings_report_the_first_flag_within_the_criterion_window_and_pe
     assert merge_windows([m, m])["per_room"]["r"]["hits"] == 2
 
 
-def view(hits, fa, lead, temp):
-    return {"hits": hits, "opens": 2, "false_per_day": fa, "lead_min": lead, "temp": temp}
+def view(hits, fa, lead, temp, known=()):
+    return {"hits": hits, "opens": 2, "false_per_day": fa, "lead_min": lead, "temp": temp, "known": list(known)}
 
 
 def test_a_room_accepts_gas_for_hits_or_earlier_detection_without_false_alarms_or_temperature_loss():
@@ -228,7 +229,16 @@ def test_a_room_accepts_gas_for_hits_or_earlier_detection_without_false_alarms_o
     assert not room_verdict(view(2, 0.9, 8.0, 0.10), ref, sel)["accepted"]
     assert not room_verdict(view(2, 0.1, 8.0, 0.085), ref, sel)["accepted"]
     assert not room_verdict(view(0, 0.1, None, 0.10), ref, sel)["accepted"]
-    assert room_verdict(view(2, 0.15, 8.0, 0.10), view(1, 0.5, 8.0, 0.10), sel)["accepted"]
+    assert not room_verdict(view(2, 0.25, 8.0, 0.10), view(1, 0.5, 8.0, 0.10), sel)["accepted"]
+    assert room_verdict(view(2, 0.1, 8.0, 0.0995), view(1, 0.1, 8.0, 0.10), sel)["accepted"]
+    assert not room_verdict(view(2, 0.1, 8.0, 0.098), ref, sel)["accepted"]
+    hit = {"open": 1e9, "first_min": 3.0, "pre": 0.0}
+    miss = dict(hit, first_min=None)
+    carried = dict(hit, pre=0.9)
+    assert room_verdict(view(2, 0.1, 8.0, 0.10, [hit, hit]), ref, sel, 2)["accepted"]
+    assert not room_verdict(view(2, 0.1, 8.0, 0.10, [hit, miss]), ref, sel, 2)["accepted"]
+    assert not room_verdict(view(2, 0.1, 8.0, 0.10, [hit, carried]), ref, sel, 2)["accepted"]
+    assert not room_verdict(view(2, 0.1, 8.0, 0.10, [hit]), ref, sel, 2)["accepted"]
     nothing = room_verdict(dict(view(0, 0.0, None, 0.10), opens=0), dict(view(0, 0.0, None, 0.10), opens=0), sel)
     assert not nothing["accepted"] and not nothing["decidable"] and "not decidable" in nothing["why"][0]
 
@@ -237,7 +247,7 @@ def test_choose_rooms_picks_the_best_accepted_candidate_per_room_and_keeps_the_r
     def run(hits, fa):
         pr = lambda h, f: {"hits": h, "opens": 2, "false": 0, "false_per_day": f, "latency_min": [5.0] * h}
         sk = {"H20": {"skill": 0.1}, "H60": {"skill": 0.1}}
-        return {"window": {"per_room": {"a": pr(hits[0], fa[0]), "b": pr(hits[1], fa[1])}}, "skill": {"rooms": {"a": sk, "b": sk}}}
+        return {"window": {"per_room": {"a": pr(hits[0], fa[0]), "b": pr(hits[1], fa[1])}, "known": []}, "skill": {"rooms": {"a": sk, "b": sk}}}
     out = {"ref": run((0, 0), (0.1, 0.1)), "gas_x": run((1, 0), (0.1, 0.1)), "gas_y": run((2, 0), (0.1, 0.1))}
     cands = {"gas_x": {"parts": ("air",), "gas": {}}, "gas_y": {"parts": ("air", "gas"), "gas": {"co2": {"sigma": 9.0}}}}
     plan = choose_rooms(out, "ref", list(cands), ["a", "b"], cands, RC["evidence"]["select"])
@@ -255,3 +265,13 @@ def test_variants_apply_parts_and_gas_overrides_per_room():
     dropped = v.docs(base, {"a": {"parts": ("gas",), "gas": {"hum": None}}, "b": plan["b"]})
     assert "hum" not in dropped["a"] and dropped["a"]["co2"]["sigma"] == 4.0
     assert out["a"]["co2"] == {"sigma": 9.0, "node": 12} and out["a"]["hum"]["sigma"] == 0.03 and "co2" not in out["b"] and blk["co2"]["sigma"] == 4.0
+
+
+def test_truth_does_not_count_a_confirmed_opening_twice(monkeypatch):
+    import heattrain.roomfit as rf
+    b = 1.7e9
+    monkeypatch.setattr(rf, "load_ground_truth", lambda src, hold: [(b + 10, b + 500, ["r"]), (b + 9000, b + 9500, ["r"])])
+    monkeypatch.setattr(rf, "load_window_labels", lambda src: [(b + 100, "r", True), (b + 200, "r", False), (b + 9100, "r", True)])
+    monkeypatch.setattr(rf, "load_live_alarms", lambda src: [])
+    t = Truth("x", dict(RC, known=[{"room": "r", "open_utc": datetime.fromtimestamp(b, timezone.utc).isoformat(), "close_utc": datetime.fromtimestamp(b + 600, timezone.utc).isoformat()}]))
+    assert [a - b for r, a in t.opens(["r"])] == [0.0, 9000.0, 9100.0] and len(t.labels) == 2
