@@ -229,6 +229,8 @@ def test_a_room_accepts_gas_for_hits_or_earlier_detection_without_false_alarms_o
     assert not room_verdict(view(2, 0.1, 8.0, 0.085), ref, sel)["accepted"]
     assert not room_verdict(view(0, 0.1, None, 0.10), ref, sel)["accepted"]
     assert room_verdict(view(2, 0.15, 8.0, 0.10), view(1, 0.5, 8.0, 0.10), sel)["accepted"]
+    nothing = room_verdict(dict(view(0, 0.0, None, 0.10), opens=0), dict(view(0, 0.0, None, 0.10), opens=0), sel)
+    assert not nothing["accepted"] and not nothing["decidable"] and "not decidable" in nothing["why"][0]
 
 
 def test_choose_rooms_picks_the_best_accepted_candidate_per_room_and_keeps_the_rest_plain():
@@ -250,4 +252,6 @@ def test_variants_apply_parts_and_gas_overrides_per_room():
     base = {"a": {}, "b": {}}
     plan = {"a": {"parts": ("gas",), "gas": {"co2": {"sigma": 9.0}}}, "b": uniform(["b"])["b"]}
     out = v.docs(base, plan)
+    dropped = v.docs(base, {"a": {"parts": ("gas",), "gas": {"hum": None}}, "b": plan["b"]})
+    assert "hum" not in dropped["a"] and dropped["a"]["co2"]["sigma"] == 4.0
     assert out["a"]["co2"] == {"sigma": 9.0, "node": 12} and out["a"]["hum"]["sigma"] == 0.03 and "co2" not in out["b"] and blk["co2"]["sigma"] == 4.0

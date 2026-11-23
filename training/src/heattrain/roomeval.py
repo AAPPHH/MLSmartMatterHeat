@@ -214,7 +214,8 @@ def window_metrics(grid, rec, truth, lo, hi, rc):
                 i0, i1 = np.searchsorted(t, a), np.searchsorted(t, a + ev["known_within_min"] * 60.0, side="right")
                 pw = np.nan_to_num(rec[r]["p_window"])[i0:i1]
                 up = np.nonzero(pw > ev["pw_flag"])[0]
-                res["known"].append({"room": r, "open": a, "first_min": float((t[i0 + up[0]] - a) / 60.0) if len(up) else None, "peak": float(pw.max()) if len(pw) else 0.0})
+                inside = np.nan_to_num(rec[r]["p_window"])[i0:np.searchsorted(t, b, side="right")]
+                res["known"].append({"room": r, "open": a, "first_min": float((t[i0 + up[0]] - a) / 60.0) if len(up) else None, "peak": float(pw.max()) if len(pw) else 0.0, "min_inside": float(inside.min()) if len(inside) else 0.0, "frac_inside": float((inside > ev["pw_flag"]).mean()) if len(inside) else 0.0})
     return res
 
 
@@ -256,7 +257,7 @@ class Variants:
             if "air" in pl["parts"] and cal and r in cal:
                 d["air"] = [{"node": a["node"], **c} for a, c in zip(b.get("air", []), cal[r])]
             if "gas" in pl["parts"]:
-                d.update({k: {**b[k], **pl["gas"].get(k, {})} for k in ("co2", "hum") if k in b})
+                d.update({k: {**b[k], **pl["gas"].get(k, {})} for k in ("co2", "hum") if k in b and pl["gas"].get(k, {}) is not None})
         return out
 
 
@@ -348,7 +349,7 @@ def room_verdict(var, ref, sel):
     sooner = var["lead_min"] is not None and ref["lead_min"] is not None and ref["lead_min"] - var["lead_min"] >= w["min_lead_gain_min"]
     if var["hits"] == ref["hits"] and not sooner:
         bad.append("no more hits and no earlier detection")
-    return {"accepted": not bad, "why": bad, "var": var, "ref": ref}
+    return {"accepted": not bad, "decidable": ref["opens"] > 0, "why": bad if ref["opens"] > 0 else ["no labelled opening in the sensor folds, not decidable"] + bad, "var": var, "ref": ref}
 
 
 def choose_rooms(out, ref, keys, names, cands, sel):
@@ -522,10 +523,10 @@ def fit_bundle(config, rooms, src, version=None):
     bundle = {"kind": "room_model", "version": version, "dt_s": full.dt, "rooms": docs, "shock": {k: shock[k] for k in ("tau_l", "q_calm", "q_jump", "p_jump", "hold_min", "lambda_jump", "lambda_w", "p_l0")}, "house": house_out,
               "pcnn": {"active": active, "coffee_on_mw": rc["pcnn"]["coffee_on_mw"], "features": list(FEATURES)}}
     shipped = hold[ship_key(chosen, hold)]
-    holdout = {"variant": ship_key(chosen, hold), "pooled": shipped["skill"]["pooled"], "rooms": shipped["skill"]["rooms"], "folds": shipped["folds"], "window": shipped["window"], "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day", "per_room", "known")}, "rooms": v.get("rooms"), "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
+    holdout = {"variant": ship_key(chosen, hold), "pooled": shipped["skill"]["pooled"], "rooms": shipped["skill"]["rooms"], "folds": shipped["folds"], "window": shipped["window"], "ship": {"plan": chosen["rooms"], "window": {k: ship["window"][k] for k in ("hits", "opens", "false_per_room_day", "live_false_per_room_day", "per_room", "known")}, "pooled": {h: ship["skill"]["pooled"][h]["skill"] for h in ("H5", "H20", "H60")}, "rooms": {r: {h: b[h]["skill"] for h in ("H20", "H60")} for r, b in ship["skill"]["rooms"].items()}}, "variants": {k: {"gain": v.get("gain"), "accepted": v.get("accepted"), "resets": v["resets"], "pooled": {h: {"skill": v["skill"]["pooled"][h]["skill"], "oracle_skill": v["skill"]["pooled"][h]["oracle_skill"], "n": v["skill"]["pooled"][h]["n"]} for h in ("H5", "H20", "H60")}, "window": {k2: v["window"][k2] for k2 in ("hits", "opens", "false_per_room_day", "live_false_per_room_day", "per_room", "known")}, "rooms": v.get("rooms"), "shock_fixed": v.get("shock_fixed"), "resets_per_fold": [f["resets"] for f in v["folds"]]} for k, v in hold.items()}, "chosen": chosen}
     by = lambda key: {r: sum(1 for x in resets if x["room"] == r and x["cause"] == key) for r in full.names}
     detection = merge_windows([window_metrics(full, rec, truth, 0, full.n, rc)])
-    recent = merge_windows([window_metrics(full, rec, truth, max(0, full.n - int(rc["eval"]["recent_days"] * 1440)), full.n, rc)])
+    recent = {"basis": "in-sample replay of the shipped bundle, shock and lambda_w tuned on truth including the known openings", **merge_windows([window_metrics(full, rec, truth, max(0, full.n - int(rc["eval"]["recent_days"] * 1440)), full.n, rc)])}
     sk = ship["skill"]
     pick = lambda b: {**{k: b[k] for k in ("n", "skill", "pcnn_skill")}, **{part: b[part] for part in ("window", "outside") if part in b}}
     probe_replay = ProbeReplay(full, docs, shock, rec, pcnn["exog"].present, rc).run()
