@@ -185,6 +185,7 @@ pub struct TraceRow {
     pub gate: &'static str,
     pub own: f64,
     pub total: f64,
+    pub ch: [f64; crate::window_fusion::CHANNELS],
 }
 
 fn mins(m: f64) -> i64 {
@@ -854,8 +855,13 @@ impl Windows {
             let veto = scored.is_some_and(|m| m.veto);
             let sigma = bundle.as_ref().and_then(|b| b.1.get(room)).copied();
             let open_valve = bundle.as_ref().is_some_and(|b| valve.is_finite() && valve > b.0);
+            let usable = gate.is_none() && !veto;
             let trv = match (z, sigma) {
-                (Some(z), Some(sigma)) if gate.is_none() && !veto => Some(tables.trv.llr(z, sigma, open_valve)),
+                (Some(z), Some(sigma)) if usable => Some(tables.trv.llr(z, sigma, open_valve)),
+                _ => None,
+            };
+            let trv_obs = match (z, sigma) {
+                (Some(z), Some(sigma)) if usable => Some((z, sigma, open_valve)),
                 _ => None,
             };
             let rates = w.air.rates(fcfg, ts_ms, out_c);
@@ -864,10 +870,11 @@ impl Windows {
             let pulse = if live { w.pulse.take() } else { w.shadow_pulse.take() };
             let holding = if live { w.active.is_some() } else { w.shadow.is_some() };
             let depressed = holding && w.air.depressed(fcfg, ts_ms, &w.reference);
-            let inputs = Inputs { trv, pulse: pulse.as_ref().map(|p| (p.chan, tables.alarm_llr)), rates, gain, holding, depressed };
+            let physics = fcfg.engine == "physics";
+            let inputs = Inputs { trv, pulse: pulse.as_ref().map(|p| (p.chan, if physics { fcfg.physics.pulse_llr } else { tables.alarm_llr })), rates, gain, holding, depressed, phys: physics.then(|| tables.phys_room(&fcfg.physics, room)), balance: if physics { w.air.balance(fcfg, ts_ms) } else { Default::default() }, out_c, valve: if valve.is_finite() { valve / 100.0 } else { f64::NAN }, trv_obs };
             w.fusion.update(fcfg, &tables, &inputs);
             if pulse.is_some() && !w.fusion.independent && w.fusion.own < on + 0.5 {
-                w.fusion.own = (on + 0.5).min(fcfg.logit_max);
+                w.fusion.set_own(fcfg, (on + 0.5).min(fcfg.logit_max));
             }
             if live {
                 if rates.any() {
@@ -882,7 +889,7 @@ impl Windows {
             }
             #[cfg(test)]
             if let Some(trace) = self.trace.as_mut() {
-                trace.push(TraceRow { ts_ms, room: room.clone(), z: z.unwrap_or(f64::NAN), valve, co2: rates.co2.unwrap_or(f64::NAN), rh: rates.rh.unwrap_or(f64::NAN), temp: rates.temp.unwrap_or(f64::NAN), gate: gate.unwrap_or(""), own: w.fusion.own, total: w.fusion.total() });
+                trace.push(TraceRow { ts_ms, room: room.clone(), z: z.unwrap_or(f64::NAN), valve, co2: rates.co2.unwrap_or(f64::NAN), rh: rates.rh.unwrap_or(f64::NAN), temp: rates.temp.unwrap_or(f64::NAN), gate: gate.unwrap_or(""), own: w.fusion.own, total: w.fusion.total(), ch: w.fusion.added });
             }
         }
         let owns: HashMap<String, f64> = rooms.iter().map(|r| (r.clone(), self.rooms.get(r).map_or(0.0, |w| w.fusion.own_p()))).collect();

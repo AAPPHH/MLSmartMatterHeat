@@ -227,6 +227,11 @@ fn verdict(dump: &Dump, e: &Episode, confirmed: &[(String, i64, i64)], strict: b
     "false"
 }
 
+fn answered_true(dump: &Dump, confirmed: &[(String, i64, i64)], e: &Episode) -> bool {
+    let end = e.to.unwrap_or(e.from);
+    confirmed.iter().any(|c| c.0 == e.room && c.1 <= end && c.2 >= e.from) || dump.answers.iter().any(|a| a.2 && a.1 == e.room && a.0 >= e.from - 30 * MIN && a.0 <= end + 30 * MIN)
+}
+
 fn confirmed() -> Vec<(String, i64, i64)> {
     let room = |r: &str, a: &str, b: &str| (r.to_string(), utc(a), utc(b));
     vec![
@@ -246,6 +251,7 @@ fn config_for(dump: &Dump, legacy: bool) -> Config {
     let shadow = std::env::var("HEATD_AIRWIN_SHADOW").is_ok();
     config.window.fusion.enabled = !legacy && !shadow;
     config.window.fusion.shadow = !legacy;
+    config.window.fusion.engine = std::env::var("HEATD_AIRWIN_ENGINE").unwrap_or_else(|_| "physics".into());
     if let Ok(path) = std::env::var("HEATD_AIRWIN_TABLES") {
         config.window.fusion.tables = path;
     }
@@ -264,6 +270,44 @@ fn config_for(dump: &Dump, legacy: bool) -> Config {
             "open_every_min" => f.open_every_min = v,
             "fresh_min" => f.fresh_min = v,
             "horizon_min" => f.horizon_min = v,
+            "lambda_zu" => f.physics.lambda_h[0] = v,
+            "lambda_kipp" => f.physics.lambda_h[1] = v,
+            "lambda_open" => f.physics.lambda_h[2] = v,
+            "kipp_share" => f.physics.kipp_share = v,
+            "stay_kipp_min" => f.physics.stay_kipp_min = v,
+            "stay_open_min" => f.physics.stay_open_min = v,
+            "co2_sigma" => f.physics.co2_sigma_ppm = v,
+            "co2_source" => f.physics.co2_source_ppm_min = v,
+            "rh_sigma" => f.physics.rh_sigma_pct = v,
+            "ah_source" => f.physics.ah_source_g_min = v,
+            "ah_gate" => f.physics.ah_gate_g = v,
+            "outdoor_rh" => f.physics.outdoor_rh_pct = v,
+            "temp_sigma" => f.physics.temp_sigma_k = v,
+            "temp_window" => f.physics.temp_window_min = v,
+            "kappa" => f.physics.temp_kappa = v,
+            "base_loss" => f.physics.temp_base_loss_h = v,
+            "temp_source" => f.physics.temp_source_k_min = v,
+            "temp_valve" => f.physics.temp_valve_k_min = v,
+            "temp_model" => f.physics.temp_model_k_min = v,
+            "valve_gain" => f.physics.valve_gain_k_min = v,
+            "door_share" => f.physics.door_share = v,
+            "door_l1" => f.physics.door_lambda_h[0] = v,
+            "door_l2" => f.physics.door_lambda_h[1] = v,
+            "door_l3" => f.physics.door_lambda_h[2] = v,
+            "door_ah" => f.physics.door_ah_frac = v,
+            "model_floor" => f.physics.model_floor = v,
+            "trv_sd" => f.physics.trv_sd = v,
+            "trv_open_z" => f.physics.trv_open_z = v,
+            "trv_kipp" => f.physics.trv_kipp_frac = v,
+            "trv_beta" => f.physics.trv_beta = v,
+            "trv_cap" => f.physics.trv_cap = v,
+            "w_co2" => f.physics.weight[0] = v,
+            "w_ah" => f.physics.weight[1] = v,
+            "w_temp" => f.physics.weight[2] = v,
+            "w_trv" => f.physics.weight[3] = v,
+            "pulse_llr" => f.physics.pulse_llr = v,
+            "level_llr" => f.level_llr = v,
+            "plevel" => f.physics.level_llr = v,
             other => panic!("unknown override {other}"),
         }
     }
@@ -271,9 +315,9 @@ fn config_for(dump: &Dump, legacy: bool) -> Config {
 }
 
 fn write_trace(path: &str, trace: &[TraceRow]) {
-    let mut out = String::from("ms,room,z,valve,co2,rh,temp,gate,own,total\n");
+    let mut out = String::from("ms,room,z,valve,co2,rh,temp,gate,own,total,l_trv,l_co2,l_rh,l_temp\n");
     for t in trace.iter().filter(|t| t.ts_ms % MIN == 0) {
-        out += &format!("{},{},{},{},{},{},{},{},{:.3},{:.3}\n", t.ts_ms, t.room, t.z, t.valve, t.co2, t.rh, t.temp, t.gate, t.own, t.total);
+        out += &format!("{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n", t.ts_ms, t.room, t.z, t.valve, t.co2, t.rh, t.temp, t.gate, t.own, t.total, t.ch[0], t.ch[1], t.ch[2], t.ch[3]);
     }
     std::fs::write(path, out).unwrap();
 }
@@ -310,8 +354,11 @@ fn replay_fusion() {
             m
         });
         let long = mine.iter().filter(|e| e.to.unwrap_or(to) - e.from > 25 * MIN).count();
-        let frost: f64 = mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) as f64 / MIN as f64).sum::<f64>() / days;
-        println!("{room}: frost {frost:.0} min/day, episodes over 25 min {long}, longest {} min", mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) / MIN).max().unwrap_or(0));
+        let minutes = |e: &Episode| (e.to.unwrap_or(to) - e.from) as f64 / MIN as f64;
+        let frost: f64 = mine.iter().map(|e| minutes(e)).sum::<f64>() / days;
+        let verified: f64 = mine.iter().zip(&verdicts).filter(|(_, v)| **v == "true").map(|(e, _)| minutes(e)).sum::<f64>() / days;
+        let answered: f64 = mine.iter().filter(|e| answered_true(&dump, &conf, e)).map(|e| minutes(e)).sum::<f64>() / days;
+        println!("{room}: frost {frost:.0} min/day (verified {verified:.0}, confirmed or answered {answered:.1}), episodes over 25 min {long}, longest {} min", mine.iter().map(|e| (e.to.unwrap_or(to) - e.from) / MIN).max().unwrap_or(0));
         println!("{room}: openings {} ({:.2}/day) true {} false {} ({:.2}/day, strict {strict_false} = {:.2}/day) sources {by_source:?}; held-out days false {held_false}/{held_days} ({:.2}/day)", mine.len(), mine.len() as f64 / days, verdicts.iter().filter(|v| **v == "true").count(), falses, falses as f64 / days, strict_false as f64 / days, if held_days > 0.0 { held_false as f64 / held_days } else { f64::NAN });
         worst = worst.max(if held_days > 0.0 { held_false as f64 / held_days } else { falses as f64 / days });
         if std::env::var("HEATD_AIRWIN_LIST").is_ok() {

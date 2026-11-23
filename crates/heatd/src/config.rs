@@ -345,11 +345,87 @@ pub struct WindowFusion {
     pub cool_k_per_h: f64,
     pub level_llr: f64,
     pub level_max_min: f64,
+    pub engine: String,
+    pub physics: Physics,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Physics {
+    pub lambda_h: [f64; 3],
+    pub kipp_share: f64,
+    pub stay_kipp_min: f64,
+    pub stay_open_min: f64,
+    pub co2_sigma_ppm: f64,
+    pub co2_source_ppm_min: f64,
+    pub rh_sigma_pct: f64,
+    pub ah_source_g_min: f64,
+    pub ah_gate_g: f64,
+    pub outdoor_rh_pct: f64,
+    pub temp_sigma_k: f64,
+    pub temp_window_min: f64,
+    pub temp_kappa: f64,
+    pub temp_base_loss_h: f64,
+    pub temp_source_k_min: f64,
+    pub temp_valve_k_min: f64,
+    pub temp_model_k_min: f64,
+    pub valve_gain_k_min: f64,
+    pub door_share: f64,
+    pub door_lambda_h: [f64; 3],
+    pub door_ah_frac: f64,
+    pub model_floor: f64,
+    pub trv_sd: f64,
+    pub trv_open_z: f64,
+    pub trv_kipp_frac: f64,
+    pub trv_beta: f64,
+    pub trv_censor_k: f64,
+    pub trv_cap: f64,
+    pub weight: [f64; 4],
+    pub pulse_llr: f64,
+    pub level_llr: f64,
+}
+
+impl Default for Physics {
+    fn default() -> Self {
+        Self {
+            lambda_h: [0.4, 1.5, 8.0],
+            kipp_share: 0.4,
+            stay_kipp_min: 60.0,
+            stay_open_min: 15.0,
+            co2_sigma_ppm: 10.0,
+            co2_source_ppm_min: 4.0,
+            rh_sigma_pct: 0.6,
+            ah_source_g_min: 0.05,
+            ah_gate_g: 1.0,
+            outdoor_rh_pct: 80.0,
+            temp_sigma_k: 0.03,
+            temp_window_min: 8.0,
+            temp_kappa: 0.06,
+            temp_base_loss_h: 0.0,
+            temp_source_k_min: 0.000125,
+            temp_valve_k_min: 0.02,
+            temp_model_k_min: 0.01,
+            valve_gain_k_min: 0.008,
+            door_share: 0.075,
+            door_lambda_h: [1.0, 2.5, 5.0],
+            door_ah_frac: 0.6,
+            model_floor: 0.025,
+            trv_sd: 1.0,
+            trv_open_z: 2.0,
+            trv_kipp_frac: 0.5,
+            trv_beta: 0.5,
+            trv_censor_k: 0.25,
+            trv_cap: 3.0,
+            weight: [0.03125, 0.0625, 0.1, 0.05],
+            pulse_llr: 2.0,
+            level_llr: 0.15,
+        }
+    }
 }
 
 impl Default for WindowFusion {
     fn default() -> Self {
-        Self { enabled: false, shadow: true, tables: String::new(), skip_humidity: Vec::new(), window_min: 4.0, min_samples: 3, max_window_min: 20.0, fresh_min: 10.0, outdoor_co2_ppm: 420.0, co2_floor_ppm: 80.0, dt_floor_k: 3.0, dt_ref_k: 8.0, open_every_min: 1440.0, stay_min: 30.0, logit_max: 9.0, floor_margin: 1.0, temper_scale: 1.5, couple_llr: 1.5, horizon_min: 20.0, cool_k_per_h: 0.5, level_llr: 0.3, level_max_min: 60.0 }
+        Self { enabled: false, shadow: true, tables: String::new(), skip_humidity: Vec::new(), window_min: 4.0, min_samples: 3, max_window_min: 20.0, fresh_min: 10.0, outdoor_co2_ppm: 420.0, co2_floor_ppm: 80.0, dt_floor_k: 3.0, dt_ref_k: 8.0, open_every_min: 1440.0, stay_min: 30.0, logit_max: 9.0, floor_margin: 1.0, temper_scale: 1.5, couple_llr: 1.5, horizon_min: 20.0, cool_k_per_h: 0.5, level_llr: 0.3, level_max_min: 60.0, engine: "learned".into(), physics: Physics::default() }
     }
 }
 
