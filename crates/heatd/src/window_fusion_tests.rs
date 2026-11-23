@@ -171,7 +171,7 @@ fn a_neighbour_that_is_open_raises_the_prior_of_the_room_next_to_it_but_never_op
     let before = r.p("b");
     r.run(8, venting);
     assert!(r.open("a"));
-    assert!(r.p("b") > before + 0.1, "b {} -> {}", before, r.p("b"));
+    assert!(r.p("b") > 2.0 * before, "b {} -> {}", before, r.p("b"));
     assert!(!r.open("b"), "a posterior shift without own evidence does not freeze a room");
     assert_eq!(Chan::Couple.name(), "neighbour");
 }
