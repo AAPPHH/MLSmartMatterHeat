@@ -426,6 +426,7 @@ pub struct Desired {
     pub sleep: bool,
     pub window_open: bool,
     pub experiment_id: Option<String>,
+    pub comfort_k: f64,
 }
 
 fn scheduled(room: &Room, now: NaiveDateTime) -> Option<f64> {
@@ -496,14 +497,15 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
                     _ => (base, base_reason, "schedule"),
                 }
             };
-            let setpoint = if matches!(reason, "home" | "occupied" | "schedule") || (reason == "default" && !(sleeping || night)) { setpoint + offset } else { setpoint };
+            let comfort_k = if !(sleeping || night) && matches!(reason, "home" | "occupied" | "schedule" | "default") { offset } else { 0.0 };
+            let setpoint = setpoint + comfort_k;
             let label = match occupancy {
                 Occupancy::Room(_) => "room",
                 Occupancy::Away => "away",
                 Occupancy::Unknown => "unknown",
             };
             let id = experiment.filter(|_| reason == "exploration").map(|e| e.id.clone());
-            room.nodes.iter().map(move |&node| Desired { node, room: room.name.clone(), setpoint, reason, rule, base, occupancy: label, source, sleep: sleeping, window_open: window, experiment_id: id.clone() })
+            room.nodes.iter().map(move |&node| Desired { node, room: room.name.clone(), setpoint, reason, rule, base, occupancy: label, source, sleep: sleeping, window_open: window, experiment_id: id.clone(), comfort_k })
         })
         .collect()
 }
@@ -761,6 +763,9 @@ fn proposal(state: &AppState, want: &Desired, now_ms: i64, old: Option<f64>, rea
 
 fn proposal_extra(state: &AppState, want: &Desired) -> String {
     let mut extra = json!({"phase": "proposal", "reason": want.reason, "source": want.source, "sleep": want.sleep});
+    if want.comfort_k > 0.0 {
+        extra["weather_offset_k"] = json!(want.comfort_k);
+    }
     if let Some(note) = window_note(state, want) {
         extra["note"] = json!(note);
     }
@@ -1360,6 +1365,11 @@ home_setpoint = 20.0
 [[rooms]]
 name = 'kueche'
 nodes = [8]
+[[rooms.schedules]]
+days = ['weekdays', 'weekend']
+from = '22:00'
+to = '06:00'
+setpoint = 16.0
 ").unwrap();
         let held = p.as_ref().and_then(|p| p.detected(&config)).into_iter().collect();
         desired(now, &config, p.as_ref(), &held, windows, &HashMap::new(), outdoor).into_iter().find(|d| d.node == node).map(|d| (d.setpoint, d.reason)).unwrap()
@@ -1375,7 +1385,7 @@ nodes = [8]
         assert_eq!(weather_get(at(27, 15, 0), home(), &HashSet::new(), None, 5), (20.0, "home"));
         assert_eq!(weather_get(at(27, 15, 0), home(), &HashSet::new(), Some(15.0), 5), (20.0, "home"));
         assert_eq!(weather_get(at(27, 3, 0), home(), &HashSet::new(), cold, 5), (18.0, "night"));
-        assert_eq!(weather_get(at(27, 3, 0), home(), &HashSet::new(), cold, 8), (18.0, "default"));
+        assert_eq!(weather_get(at(27, 3, 0), home(), &HashSet::new(), cold, 8), (16.0, "schedule"));
         let away = Some(Presence { away: true, ..home().unwrap() });
         assert_eq!(weather_get(at(27, 15, 0), away, &HashSet::new(), cold, 5), (18.0, "away"));
         let windows: HashSet<String> = ["wohnzimmer".to_string()].into();

@@ -3513,13 +3513,11 @@ nodes = [5]
 
     #[tokio::test]
     async fn loopback_stays_trusted_with_custom_subnets() {
-        let mut http = HttpSection::default();
-        http.trusted_subnets = vec!["100.64.0.0/10".into()];
+        let http = HttpSection { trusted_subnets: vec!["100.64.0.0/10".into()], ..Default::default() };
         let g = Guard::load(&http).unwrap();
         assert!(g.trusted(Some("127.0.0.1".parse().unwrap())) && g.trusted(Some("::1".parse().unwrap())) && g.trusted(Some("100.64.1.1".parse().unwrap())));
         assert!(!g.trusted(Some("192.168.1.10".parse().unwrap())));
-        http.auth.watch_mode = AuthMode::Log;
-        http.auth.watch_token_file = "x".into();
+        let http = HttpSection { auth: crate::config::AuthSection { watch_mode: AuthMode::Log, watch_token_file: "x".into(), ..http.auth.clone() }, ..http };
         assert!(Guard::load(&http).err().unwrap().to_string().contains("admin_mode is off"));
     }
 
