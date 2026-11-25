@@ -213,6 +213,10 @@ impl Status {
         [out.map_or(f64::NAN, |o| o.1), out.and_then(|o| o.2).unwrap_or(f64::NAN), inner.radiation.filter(|o| fresh(o.0)).map_or(f64::NAN, |o| o.1)]
     }
 
+    pub fn outdoor_temp_within(&self, now_us: i64, max_age_us: i64) -> Option<f64> {
+        self.0.lock().unwrap().outdoor.filter(|o| now_us - o.0 <= max_age_us.min(OUTDOOR_MAX_AGE_US)).map(|o| o.1)
+    }
+
     pub fn outdoor(&self, now_us: i64) -> Option<(f64, Option<f64>)> {
         self.0.lock().unwrap().outdoor.filter(|o| now_us - o.0 <= OUTDOOR_MAX_AGE_US).map(|o| (o.1, o.2))
     }
@@ -406,5 +410,18 @@ impl Status {
             let _ = writeln!(out, "heatd_watch_battery_percent_per_hour {rate}");
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod comfort_tests {
+    use super::*;
+
+    #[test]
+    fn outdoor_temp_within_respects_max_age() {
+        let s = Status::default();
+        s.outdoor_obs(1_000_000_000, 4.0, None);
+        assert_eq!(s.outdoor_temp_within(1_000_000_000 + 60_000_000, 180 * 60_000_000), Some(4.0));
+        assert_eq!(s.outdoor_temp_within(1_000_000_000 + 181 * 60_000_000, 180 * 60_000_000), None);
     }
 }
