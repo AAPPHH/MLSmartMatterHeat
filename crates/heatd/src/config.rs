@@ -82,6 +82,49 @@ impl Default for Exploration {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ComfortSection {
+    pub weather: WeatherComfort,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WeatherComfort {
+    pub enabled: bool,
+    pub warm_c: f64,
+    pub cold_c: f64,
+    pub max_k: f64,
+    pub step_k: f64,
+    pub max_age_min: f64,
+}
+
+impl Default for WeatherComfort {
+    fn default() -> Self {
+        Self { enabled: false, warm_c: 10.0, cold_c: 0.0, max_k: 1.0, step_k: 0.5, max_age_min: 180.0 }
+    }
+}
+
+impl WeatherComfort {
+    pub fn offset(&self, outdoor_c: Option<f64>) -> f64 {
+        let Some(t) = outdoor_c.filter(|t| self.enabled && t.is_finite()) else { return 0.0 };
+        let share = ((self.warm_c - t) / (self.warm_c - self.cold_c)).clamp(0.0, 1.0);
+        (share * self.max_k / self.step_k + 1e-9).floor() * self.step_k
+    }
+
+    pub fn max_age_us(&self) -> i64 {
+        (self.max_age_min * 60_000_000.0) as i64
+    }
+
+    fn validate(&self) -> Result<()> {
+        let finite = [self.warm_c, self.cold_c, self.max_k, self.step_k, self.max_age_min].iter().all(|v| v.is_finite());
+        if !finite || self.cold_c >= self.warm_c || !(0.0..=3.0).contains(&self.max_k) || self.step_k <= 0.0 || self.max_age_min < 0.0 {
+            return Err(anyhow!("comfort.weather: need cold_c < warm_c, max_k in 0..=3, step_k > 0, max_age_min >= 0"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Blackout {
     pub from: String,
@@ -615,6 +658,7 @@ pub struct Config {
     pub presence: PresenceSection,
     pub supply: SupplySection,
     pub boost: BoostSection,
+    pub comfort: ComfortSection,
     pub room_model: crate::room_shadow::RoomModelSection,
     pub failsafe: FailsafeSection,
     pub stale: StaleSection,
@@ -667,6 +711,7 @@ impl Default for Config {
             presence: PresenceSection::default(),
             supply: SupplySection::default(),
             boost: BoostSection::default(),
+            comfort: ComfortSection::default(),
             room_model: Default::default(),
             failsafe: FailsafeSection::default(),
             stale: StaleSection::default(),
@@ -725,6 +770,7 @@ impl Config {
             return Err(anyhow!("building.roof_rooms: unknown room {unknown}"));
         }
         config.http.validate()?;
+        config.comfort.weather.validate()?;
         crate::devices::validate(&config.devices, &config.rooms)?;
         if let Some(phone) = &config.presence.phone {
             crate::phone::parse_mac(&phone.mac)?;
@@ -782,6 +828,20 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weather_comfort_offset_edges_and_validation() {
+        let w = WeatherComfort { enabled: true, ..Default::default() };
+        let got = [Some(15.0), Some(10.0), Some(5.0), Some(3.0), Some(0.0), Some(-8.0), None, Some(f64::NAN)].map(|t| w.offset(t));
+        assert_eq!(got, [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(WeatherComfort::default().offset(Some(-5.0)), 0.0);
+        assert_eq!(WeatherComfort { max_k: 2.0, ..w.clone() }.offset(Some(4.0)), 1.0);
+        let parse = |t: &str| Config::parse(&format!("[comfort.weather]
+{t}
+"));
+        assert!(parse("enabled = true").is_ok());
+        assert!(parse("cold_c = 12.0").is_err() && parse("max_k = 3.5").is_err() && parse("step_k = 0.0").is_err());
+    }
 
     #[test]
     fn parses_example_config() {

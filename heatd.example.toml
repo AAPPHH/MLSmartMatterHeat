@@ -223,6 +223,14 @@ measure_min = 60.0
 after_window_min = 180.0
 homecoming_min_away_min = 60.0
 
+# [comfort.weather]
+# enabled = true
+# warm_c = 10.0
+# cold_c = 0.0
+# max_k = 1.0
+# step_k = 0.5
+# max_age_min = 180
+
 [failsafe]
 setpoint = 18.0
 max_c = 22.0

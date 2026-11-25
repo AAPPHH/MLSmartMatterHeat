@@ -517,7 +517,11 @@ async fn metrics(State(state): State<AppState>, Extension(guard): Extension<Guar
 # TYPE heatd_phone_present gauge
 heatd_phone_present {}
 ", u8::from(state.tracker.lock().unwrap().phone().vouch)));
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour), guard.metrics()))
+    let comfort = format!("# HELP heatd_comfort_weather_offset_k weather dependent comfort offset added to awake setpoints
+# TYPE heatd_comfort_weather_offset_k gauge
+heatd_comfort_weather_offset_k {}
+", state.config.comfort.weather.offset(crate::rules::comfort_outdoor(&state)));
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}{comfort}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour), guard.metrics()))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -983,6 +987,11 @@ async fn scans(State(state): State<AppState>, Json(body): Json<BatchBody>) -> Ap
     Ok(Json(response))
 }
 
+fn comfort_view(state: &AppState) -> Value {
+    let outdoor = crate::rules::comfort_outdoor(state);
+    json!({"enabled": state.config.comfort.weather.enabled, "outdoor_c": outdoor, "weather_offset_k": state.config.comfort.weather.offset(outdoor)})
+}
+
 async fn api_state(State(state): State<AppState>) -> ApiResult {
     let readings = state.latest.all();
     let (now, now_us) = (now_ms(), crate::lake::now_us());
@@ -1027,7 +1036,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
             json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "room_model": state.room_model.view(&room.name), "manual": room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| h.view()), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
         })
         .collect();
-    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "phone": phone, "presence": presence, "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "experiment": commands.messfahrt.view(now_ms()), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
+    Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "phone": phone, "presence": presence, "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "comfort": comfort_view(&state), "experiment": commands.messfahrt.view(now_ms()), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
 }
 
 fn phone_presence_view(state: &AppState, now: i64) -> (Value, Value) {
@@ -2791,7 +2800,7 @@ name = 'flur'
     fn wanted(h: &Harness, now: i64) -> Vec<(String, f64, &'static str, &'static str, bool)> {
         let noon = NaiveDate::from_ymd_opt(2025, 10, 27).unwrap().and_hms_opt(12, 0, 0).unwrap();
         let presence = crate::rules::current_presence(&h.state, now).unwrap();
-        crate::rules::desired(noon, &h.state.config, presence.as_ref(), &presence.as_ref().and_then(|p| p.detected(&h.state.config)).into_iter().collect(), &Default::default(), &Default::default()).into_iter().map(|d| (d.room, d.setpoint, d.reason, d.source, d.sleep)).collect()
+        crate::rules::desired(noon, &h.state.config, presence.as_ref(), &presence.as_ref().and_then(|p| p.detected(&h.state.config)).into_iter().collect(), &Default::default(), &Default::default(), None).into_iter().map(|d| (d.room, d.setpoint, d.reason, d.source, d.sleep)).collect()
     }
 
     #[tokio::test]

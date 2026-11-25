@@ -461,7 +461,12 @@ pub(crate) fn morning_hour(boost: &crate::config::BoostSection, now: NaiveDateTi
     (boost.morning_hours[0]..boost.morning_hours[1]).contains(&hour)
 }
 
-pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
+pub fn comfort_outdoor(state: &AppState) -> Option<f64> {
+    state.status.outdoor_temp_within(lake::now_us(), state.config.comfort.weather.max_age_us())
+}
+
+pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>, outdoor_c: Option<f64>) -> Vec<Desired> {
+    let offset = config.comfort.weather.offset(outdoor_c);
     let occupancy = presence.map_or(Occupancy::Unknown, |p| p.occupancy(config));
     let (source, sleeping) = presence.map_or(("", false), |p| (p.source, p.sleep));
     let night = in_sleep_hours(config, now) && !(presence.is_some() && !sleeping && morning_hour(&config.boost, now));
@@ -491,6 +496,7 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
                     _ => (base, base_reason, "schedule"),
                 }
             };
+            let setpoint = if matches!(reason, "home" | "occupied" | "schedule") || (reason == "default" && !(sleeping || night)) { setpoint + offset } else { setpoint };
             let label = match occupancy {
                 Occupancy::Room(_) => "room",
                 Occupancy::Away => "away",
@@ -1055,7 +1061,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         log("occupancy event", state.sink.append(lake::Event { ts: to * 1000, ..event }));
     }
     let readings = state.latest.all();
-    let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
+    let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring, comfort_outdoor(state)).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (presence.is_some(), away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
     crate::experiment::apply_calls(state, &experiment, &mut wants, &readings);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
@@ -1330,7 +1336,52 @@ sleep_hours = '3-3'
 
     fn raw(now: NaiveDateTime, config: &Config, p: Option<&Presence>, windows: &HashSet<String>, exploring: &HashMap<String, Experiment>) -> Vec<Desired> {
         let held = p.and_then(|p| p.detected(config)).into_iter().collect();
-        desired(now, config, p, &held, windows, exploring)
+        desired(now, config, p, &held, windows, exploring, None)
+    }
+
+    fn weather_get(now: NaiveDateTime, p: Option<Presence>, windows: &HashSet<String>, outdoor: Option<f64>, node: u64) -> (f64, &'static str) {
+        let config = Config::parse("default_setpoint = 18.0
+away_setpoint = 18.0
+occupied_setpoint = 20.0
+frost_setpoint = 7.0
+sleep_room = 'schlafzimmer'
+[comfort.weather]
+enabled = true
+[watchmatch.state]
+sleep_hours = '22-6'
+[[rooms]]
+name = 'wohnzimmer'
+nodes = [5]
+home_setpoint = 20.0
+[[rooms]]
+name = 'schlafzimmer'
+nodes = [6]
+home_setpoint = 20.0
+[[rooms]]
+name = 'kueche'
+nodes = [8]
+").unwrap();
+        let held = p.as_ref().and_then(|p| p.detected(&config)).into_iter().collect();
+        desired(now, &config, p.as_ref(), &held, windows, &HashMap::new(), outdoor).into_iter().find(|d| d.node == node).map(|d| (d.setpoint, d.reason)).unwrap()
+    }
+
+    #[test]
+    fn weather_offset_applies_only_to_awake_comfort_reasons() {
+        let home = || presence("flur", 1.0);
+        let cold = Some(0.0);
+        assert_eq!(weather_get(at(27, 15, 0), home(), &HashSet::new(), cold, 5), (21.0, "home"));
+        assert_eq!(weather_get(at(27, 15, 0), home(), &HashSet::new(), cold, 8), (19.0, "default"));
+        assert_eq!(weather_get(at(27, 15, 0), presence("wohnzimmer", 1.0), &HashSet::new(), cold, 5), (21.0, "occupied"));
+        assert_eq!(weather_get(at(27, 15, 0), home(), &HashSet::new(), None, 5), (20.0, "home"));
+        assert_eq!(weather_get(at(27, 15, 0), home(), &HashSet::new(), Some(15.0), 5), (20.0, "home"));
+        assert_eq!(weather_get(at(27, 3, 0), home(), &HashSet::new(), cold, 5), (18.0, "night"));
+        assert_eq!(weather_get(at(27, 3, 0), home(), &HashSet::new(), cold, 8), (18.0, "default"));
+        let away = Some(Presence { away: true, ..home().unwrap() });
+        assert_eq!(weather_get(at(27, 15, 0), away, &HashSet::new(), cold, 5), (18.0, "away"));
+        let windows: HashSet<String> = ["wohnzimmer".to_string()].into();
+        assert_eq!(weather_get(at(27, 15, 0), home(), &windows, cold, 5), (7.0, "window_open"));
+        let sleeping = Some(Presence { sleep: true, ..home().unwrap() });
+        assert_eq!(weather_get(at(27, 15, 0), sleeping, &HashSet::new(), cold, 6), (18.0, "sleep"));
     }
 
     fn lookup(now: NaiveDateTime, p: Option<Presence>, windows: &[&str], node: u64) -> (f64, &'static str) {
