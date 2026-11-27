@@ -641,6 +641,7 @@ object Quarters {
     const val WIDE = "kueche"
     const val MAX_FONT = 1.1f
     const val BADGE_DP = 16f
+    const val MIC_DP = 22f
     const val BADGE_X = 0.205f
     const val BADGE_Y = -0.39f
 
@@ -1495,12 +1496,12 @@ object Poster {
         return conn
     }
 
-    fun send(server: String, path: String, body: String, network: Network?): Reply {
+    fun send(server: String, path: String, body: String, network: Network?, readTimeoutMs: Int = 8000): Reply {
         val conn = connect(server, path, network)
         try {
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
-            conn.readTimeout = 8000
+            conn.readTimeout = readTimeoutMs
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             conn.outputStream.use { it.write(body.toByteArray()) }

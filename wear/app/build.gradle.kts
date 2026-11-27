@@ -23,8 +23,8 @@ android {
         applicationId = "de.aapphh.heatscan"
         minSdk = 30
         targetSdk = 37
-        versionCode = 44
-        versionName = "4.4.4"
+        versionCode = 45
+        versionName = "4.5.0"
         val home = localProps.getProperty("heatscan.home", "HomeWiFi").replace("\\", "\\\\").replace("\"", "\\\"")
         buildConfigField("String", "HOME", "\"$home\"")
         val server = localProps.getProperty("heatscan.server", "http://192.0.2.1:8090").replace("\\", "\\\\").replace("\"", "\\\"")
@@ -71,6 +71,7 @@ dependencies {
     implementation("androidx.wear.compose:compose-foundation:1.7.1")
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("androidx.core:core-ktx:1.19.1")
+    implementation("androidx.wear:wear-input:1.2.0")
     implementation("androidx.wear.tiles:tiles:1.6.2")
     implementation("androidx.wear.protolayout:protolayout:1.4.2")
     implementation("androidx.wear.protolayout:protolayout-expression:1.4.2")
