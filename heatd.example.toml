@@ -231,6 +231,15 @@ homecoming_min_away_min = 60.0
 # step_k = 0.5
 # max_age_min = 180
 
+[assistant]
+enabled = false
+key_file = "secrets/gemini_api_key"
+model = "gemini-flash-latest"
+endpoint = "https://generativelanguage.googleapis.com/v1beta"
+timeout_s = 20
+max_turns = 6
+pending_ttl_s = 300
+
 [failsafe]
 setpoint = 18.0
 max_c = 22.0

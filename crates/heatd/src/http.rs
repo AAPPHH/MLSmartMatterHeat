@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::infer::{Explanation, RoomModel};
 use crate::explore::Explorer;
+use crate::plan;
 use crate::lake::{self, kind, Event, Label, Table, WatchRaw, WatchSensor};
 use crate::rules::{presence_event, Tracker};
 use crate::storage::{now_ms, AccessPoint, BatchBody, Motion, Power, ScanBody, Storage};
@@ -43,6 +44,8 @@ pub struct AppState {
     pub room_model: crate::room_shadow::RoomModel,
     pub failsafe: crate::failsafe::Failsafe,
     pub devices: crate::devices::Devices,
+    pub plans: crate::plan::Plans,
+    pub assistant: crate::assistant::Assistant,
 }
 
 impl AppState {
@@ -224,6 +227,7 @@ pub fn router_with(state: AppState, guard: Guard) -> Router {
         .route("/watch/label/void", post(label_void))
         .route("/api/ambient", post(ambient))
         .route("/api/usage", get(usage))
+        .merge(crate::plan_http::routes())
         .route("/watch/update", get(update_manifest))
         .route("/watch/update.apk", get(update_apk))
         .layer(DefaultBodyLimit::max(limit))
@@ -235,9 +239,10 @@ pub const DEFAULT_TRUSTED: [&str; 8] = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", 
 const MIN_TOKEN_LEN: usize = 32;
 const PLACEHOLDERS: [&str; 7] = ["change", "placeholder", "example", "replace", "your-token", "your_token", "xxxx"];
 const LOG_EVERY: Duration = Duration::from_secs(600);
-const WATCH_PATHS: [&str; 16] = [
+const WATCH_PATHS: [&str; 20] = [
     "/api/boost", "/api/experiment", "/api/label", "/api/label/void", "/api/labels/progress", "/api/scan", "/api/scans", "/api/setpoint", "/api/state",
     "/watch/label", "/watch/label/void", "/watch/measurement", "/watch/sensors", "/watch/update", "/watch/update.apk", "/watch/window_label",
+    "/api/assistant", "/api/assistant/confirm", "/api/plans", "/api/plans/preview",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -287,7 +292,7 @@ impl Scope {
         match path {
             "/health" => Self::Open,
             "/metrics" if !metrics_admin => Self::Open,
-            p if WATCH_PATHS.contains(&p) => Self::Watch,
+            p if WATCH_PATHS.contains(&p) || p.starts_with("/api/plans/") => Self::Watch,
             _ => Self::Admin,
         }
     }
@@ -521,7 +526,7 @@ heatd_phone_present {}
 # TYPE heatd_comfort_weather_offset_k gauge
 heatd_comfort_weather_offset_k {}
 ", state.config.comfort.weather.offset(crate::rules::comfort_outdoor(&state)));
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}{comfort}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour), guard.metrics()))
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], format!("{}{}{}{}{ages}{phone}{comfort}{}{}", state.status.metrics(crate::lake::now_us()), state.windows.lock().unwrap().metrics(), state.boost.metrics(), state.commanded.lock().unwrap().budget.metrics(&state.config.rooms, now, state.config.raise_budget_per_hour), crate::plan::metrics(&state, chrono::Local::now().naive_local()), guard.metrics()))
 }
 
 const MAX_FUTURE_MS: i64 = 300_000;
@@ -1000,6 +1005,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
     let windows = state.windows.lock().unwrap();
     let open = windows.open_rooms();
     let commands = state.commanded.lock().unwrap();
+    let (plans, local) = (state.plans.list(), chrono::Local::now().naive_local());
     let rooms: Vec<Value> = state
         .config
         .rooms
@@ -1033,7 +1039,7 @@ async fn api_state(State(state): State<AppState>) -> ApiResult {
                     })
                 })
                 .collect();
-            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "room_model": state.room_model.view(&room.name), "manual": room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| h.view()), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "nodes": nodes})
+            json!({"name": room.name, "window_open": open.contains(&room.name), "window": windows.view(&room.name, now_ms()), "boost": state.boost.view(&room.name), "room_model": state.room_model.view(&room.name), "manual": room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| h.view()), "raise_budget": commands.budget.view(room, now, state.config.raise_budget_per_hour), "plans": plan::active_in(&plans, &room.name, local).iter().map(|p| p.view()).collect::<Vec<_>>(), "nodes": nodes})
         })
         .collect();
     Ok(Json(json!({"alerts": crate::node_health::alerts(&state), "phone": phone, "presence": presence, "rooms": rooms, "devices": devices_view(&state)?, "supply": windows.supply_view(&state.config, now_ms()), "failsafe": state.failsafe.view(), "matter_devices": state.devices.view(crate::lake::now_us()), "boost": state.boost.summary(), "comfort": comfort_view(&state), "experiment": commands.messfahrt.view(now_ms()), "br_watchdog": state.status.br_view(crate::lake::now_us())})))
@@ -1486,6 +1492,8 @@ mod tests {
             room_model: Default::default(),
             batch_seq: Arc::new(AtomicU64::new(1)),
             devices: Default::default(),
+            plans: Default::default(),
+            assistant: Default::default(),
         };
         Harness { state, mock, _dir: dir }
     }
@@ -3580,6 +3588,16 @@ nodes = [5]
         ] {
             assert!(text.contains(line), "{line}\n{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn plan_and_assistant_routes_accept_the_watch_token_and_refuse_anonymous_calls() {
+        let s = secured("enforce", "enforce", "", "");
+        assert_eq!(s.code("DELETE", "/api/plans/x", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(s.code("DELETE", "/api/plans/x", Some(WATCH_TOKEN)).await, StatusCode::NOT_FOUND);
+        assert_eq!(s.code("GET", "/api/plans", Some(WATCH_TOKEN)).await, StatusCode::OK);
+        assert_eq!(s.code("POST", "/api/assistant", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(s.code("POST", "/api/assistant/confirm", Some(WATCH_TOKEN)).await, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

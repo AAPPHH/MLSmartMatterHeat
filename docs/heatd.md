@@ -121,6 +121,31 @@ Anwesenheitswächter (nie laufen, solange jemand zu Hause ist; die Uhr kann tage
 
 Vorrang und Abbruch: Rückkehr nach Hause (Away zu Raum erkannt) oder Abbrechen beenden sofort, danach gelten die normalen Regeln samt Heimkehr-Logik (Grund `homecoming` oder `cancel`). Meldet der Anwesenheitsverfolger keine bestätigte Abwesenheit mehr (Ankunft, ein Uhr-Scan aus dem Heimnetz, oder der letzte bekannte Uhrzustand war zu Hause), endet die Fahrt mit Grund `away_lost`; bloß veralteter Uhrkontakt während der Abwesenheit ist normal und beendet sie nicht. Ein offenes Fenster (automatisch oder manuell) oder eine manuelle Vorgabe beendet nur den Teil dieses Raums (`window`, `manual_hold`); eine Vorgabe verhindert, dass der Raum überhaupt mitmacht. Failsafe, Router-Watchdog und Knotenüberwachung bleiben unberührt. Die Sollwerte laufen über den normalen Schreibweg und das Schreib-Gate, ohne Rate-Limit und ohne Anhebungs-Budget (Entscheidungsgrund `experiment`, Regel `experiment_abkuehlen` oder `experiment_takt`); Boost, Exploration und Überschwingungs-Reset sind im Raum gesperrt. Ein Neustart stellt scharfe und laufende Fahrten aus den Events `experiment_armed`, `experiment_started`, `experiment_step` und `experiment_ended` wieder her; eine laufende Fahrt geht nur weiter, wenn der Nutzer noch weg ist und Zeit bleibt, sonst endet sie mit Grund `restart`. Tagesbericht: Abschnitt "Messfahrten" mit Türzustand, Start, Ende, Grund, je Raum geplanten und ausgeführten Schritten sowie Sensor-Minimum und -Maximum. Uhr: Seite Technik, Abschnitt Messfahrt (Türen zu, Türen offen, Abbrechen).
 
+## Pläne und Sprachassistent
+
+Pläne (`plan.rs`) sind dauerhafte Wünsche an die Regeln: "morgen ab 15 Uhr Bad 22 Grad", "Montag bis Freitag tagsüber weg", "jeden Samstag Wohnzimmer bis 23 Uhr 21 Grad". Ein Plan hat `rooms` (Raumnamen oder `["all"]`), `action`, `when`, `label` (höchstens 80 Zeichen) und `source` (`api` oder `assistant`).
+
+- `action`: `{"type":"setpoint","celsius":22}` (von `frost_setpoint` bis 26, 0,5er Schritte), `{"type":"offset","k":-1}` (-3 bis +3 in 0,5er Schritten, addiert auf den Sollwert, der sonst gelten würde), `{"type":"away"}` (erzwingt `away_setpoint`, auch wenn die Anwesenheit "zu Hause" sagt), `{"type":"frost"}`.
+- `when`: `{"type":"once","from":"2026-12-01T15:00","to":"2026-12-01T22:00"}` (lokale Zeit, höchstens 60 Tage) oder `{"type":"weekly","days":["saturday"],"from":"18:00","to":"23:00","valid_from":"2026-12-01","valid_until":"2026-12-31"}`. `days` wie bei den Zeitplänen (`weekdays`, `weekend`, Wochentagsnamen), über Mitternacht erlaubt (gleiche Semantik wie `[[rooms.schedules]]`); `valid_from` und `valid_until` gelten für den Starttag des Fensters. Lokale Zeit ist dieselbe Zeitzone wie bei den Zeitplänen. Abgelaufene Pläne werden entfernt.
+- Es gibt höchstens 64 Pläne. Sie liegen in `<data_dir>/plans.json` (atomar geschrieben, beim Start geladen); jedes Anlegen und Löschen schreibt ein Event `plan_change`.
+- Vorrang je Raum: offenes Fenster, Plan `frost`, Abwesenheit, Plan `away`, Exploration, Plan `setpoint` oder `offset`, "besetzt", Basis (Zeitplan, Nacht, Zuhause, Standard). Ein Plan ersetzt die Basis (Grund `plan`, Regel `plan`) und wird vor dem Schlaf-Sollwert geprüft. Mehrere passende Pläne derselben Art: der zuletzt angelegte gewinnt. Manuelle Vorgaben (`/api/setpoint`, Uhr) bleiben stärker. Der Wetter-Komfortzuschlag kommt nicht auf einen Plan. `frost` und `away` sperren Boost, Exploration und Überschwingungs-Reset im Raum. Ohne Pläne ändert sich nichts. Plan-ID und Label stehen in `inputs.extra.plan` des Entscheidungslogs, aktive Pläne je Raum in `/api/state` (`rooms[].plans`) und als Metrik `heatd_plan_active{room}`.
+- `POST /api/plans/preview` rechnet die Sollwerte je Raum für die nächsten Stunden (15-min-Raster, zusammengefasst zu Abschnitten) aus Zeitplänen, Nacht- und Schlaffenster und Plänen, mit Anwesenheit "zu Hause", ohne Fenster und ohne Vorgabe.
+
+| Methode | Pfad | |
+|---|---|---|
+| `GET` | `/api/plans` | `{plans:[...]}` |
+| `POST` | `/api/plans` | Plan ohne `id` → `{plan, summary}` (400 mit Grund auf Deutsch) |
+| `DELETE` | `/api/plans/{id}` | löscht, 404 wenn unbekannt |
+| `POST` | `/api/plans/preview` | `{plans?:[Plan ohne id], hours?:1..336 (Standard 168)}` → `{rooms:{raum:[{from,to,celsius,reason}]}}` |
+| `POST` | `/api/assistant` | `{text}` (1 bis 500 Zeichen) → `{reply, pending: null \| {id, summary, expires_s}}`; 503 `assistant disabled`, 504 Zeitüberschreitung, 502 Modellfehler |
+| `POST` | `/api/assistant/confirm` | `{id, accept}` → `{reply}`; 404 unbekannt oder abgelaufen |
+
+Alle sechs Pfade gehören zum Scope `watch` (Token der Uhr genügt).
+
+Der Assistent (`assistant.rs`) ruft die Gemini-API (`generateContent`, Function Calling) im blockierenden Thread auf. Werkzeuge: `get_state`, `list_plans`, `preview_plans` (lesend, laufen sofort in der Schleife) und `create_plan`, `delete_plan`, `set_hold`, `clear_hold` (schreibend). Schreibende Aufrufe werden nur geprüft (Fehler gehen als Funktionsantwort an das Modell zurück, damit es korrigieren kann) und als eine ausstehende Aktion mit deutscher Zusammenfassung gesammelt; erst `/api/assistant/confirm` mit `accept: true` führt sie aus, `false` oder Ablauf (`pending_ttl_s`) verwirft sie. An Gemini gehen nur Raumnamen, Temperaturen, Sollwerte, Pläne und Vorgaben, keine Anwesenheitsquelle, kein Handy, keine MAC, kein WLAN, keine Position, keine Uhr- oder Sensor-IDs. Jeder Austausch steht als Event `assistant` im Lake (ohne Schlüssel). Die Gesamtdauer einer Anfrage bleibt unter `http.request_timeout_s`.
+
+Einrichtung: im Google AI Studio einen API-Schlüssel anlegen, in `secrets/gemini_api_key` ablegen (`/secrets/` ist in `.gitignore`) und in `heatd.toml` `[assistant] enabled = true` setzen (Schlüsseldatei, `model`, `endpoint`, `timeout_s`, `max_turns`, `pending_ttl_s` siehe `heatd.example.toml`). Ohne Schlüssel bleibt der Assistent aus und antwortet mit 503. Hinweis: Im kostenlosen Kontingent darf Google die gesendeten Daten zur Verbesserung seiner Produkte nutzen; wer das nicht will, nimmt ein bezahltes Kontingent.
+
 ## API
 
 | Methode | Pfad | |

@@ -41,6 +41,8 @@ fn env(extra: &str) -> Env {
         room_model: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         devices: Default::default(),
+        plans: Default::default(),
+        assistant: Default::default(),
     };
     Env { state, mock, t: T0, _dir: dir }
 }

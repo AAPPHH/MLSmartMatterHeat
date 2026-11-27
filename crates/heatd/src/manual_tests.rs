@@ -51,6 +51,8 @@ pub(crate) fn env_with(head: &str) -> Env {
         boost: Default::default(),
         batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         devices: Default::default(),
+        plans: Default::default(),
+        assistant: Default::default(),
         room_model: Default::default(),
     };
     Env { state, mock, dir, t: now_ms() }

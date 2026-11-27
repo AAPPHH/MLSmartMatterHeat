@@ -1,6 +1,9 @@
 #[cfg(test)]
 #[path = "../tests/acceptance.rs"]
 mod acceptance;
+mod assistant;
+#[cfg(test)]
+mod assistant_tests;
 mod boost;
 mod boostlearn;
 mod br_watchdog;
@@ -28,6 +31,10 @@ mod lake_tests;
 mod migrate;
 mod node_health;
 mod phone;
+mod plan;
+mod plan_http;
+#[cfg(test)]
+mod plan_tests;
 #[cfg(test)]
 mod phone_tests;
 #[cfg(test)]
@@ -274,6 +281,8 @@ async fn serve(config: Config) -> Result<()> {
         room_model,
         failsafe: failsafe::Failsafe::new(&config.failsafe, Some(Path::new(&config.data_dir).join("failsafe"))),
         devices,
+        plans: plan::Plans::open(Path::new(&config.data_dir).join("plans.json"), chrono::Local::now().naive_local()),
+        assistant: assistant::Assistant::live(&config.assistant),
         sink: sink.clone(),
         latest: Default::default(),
         status,
