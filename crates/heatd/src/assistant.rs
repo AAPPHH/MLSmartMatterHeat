@@ -89,8 +89,8 @@ pub enum Failure {
 enum Call {
     Create(NewPlan),
     Delete(String),
-    SetHold { room: String, celsius: f64, hold_min: f64 },
-    ClearHold { room: String },
+    SetHold { room: String, celsius: f64, hold_min: f64},
+    ClearHold { room: String},
 }
 
 struct Pending {
@@ -124,16 +124,15 @@ fn plan_schema() -> Value {
             "valid_from": {"type": "STRING", "description": "nur weekly, optional YYYY-MM-DD"},
             "valid_until": {"type": "STRING", "description": "nur weekly, optional YYYY-MM-DD"},
             "label": {"type": "STRING", "description": "kurzer Name, höchstens 80 Zeichen"}
-        },
+       },
         "required": ["rooms", "action", "when_type", "from", "to"]
     })
 }
 
 fn declarations() -> Value {
-    let none = json!({"type": "OBJECT", "properties": {}});
     json!([{"functionDeclarations": [
-        {"name": "get_state", "description": "Aktueller Zustand aller Räume: Temperatur, Sollwert, Grund, Fenster, aktive Pläne, Halten.", "parameters": none},
-        {"name": "list_plans", "description": "Alle gespeicherten Pläne mit id.", "parameters": none},
+        {"name": "get_state", "description": "Aktueller Zustand aller Räume: Temperatur, Sollwert, Fenster, aktive Pläne, Halten."},
+        {"name": "list_plans", "description": "Alle gespeicherten Pläne mit id."},
         {"name": "preview_plans", "description": "Sollwerte je Raum für die nächsten Stunden, optional mit zusätzlichen noch nicht gespeicherten Plänen. Vor jedem Vorschlag benutzen.", "parameters": {"type": "OBJECT", "properties": {"plans": {"type": "ARRAY", "items": plan_schema()}, "hours": {"type": "INTEGER", "description": "1 bis 336, Standard 72"}}}},
         {"name": "create_plan", "description": "Plan anlegen. Wird erst nach Bestätigung durch den Nutzer gespeichert.", "parameters": {"type": "OBJECT", "properties": {"plan": plan_schema()}, "required": ["plan"]}},
         {"name": "delete_plan", "description": "Plan löschen. Wird erst nach Bestätigung ausgeführt.", "parameters": {"type": "OBJECT", "properties": {"id": {"type": "STRING"}}, "required": ["id"]}},
@@ -158,16 +157,16 @@ fn plan_from_args(args: &Value) -> Result<NewPlan, String> {
     let text = |k: &str| args[k].as_str().map(str::to_string);
     let list = |k: &str| args[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>());
     let action = match args["action"].as_str() {
-        Some("setpoint") => Action::Setpoint { celsius: args["celsius"].as_f64().ok_or("celsius fehlt")? },
-        Some("offset") => Action::Offset { k: args["k"].as_f64().ok_or("k fehlt")? },
+        Some("setpoint") => Action::Setpoint { celsius: args["celsius"].as_f64().ok_or("celsius fehlt")?},
+        Some("offset") => Action::Offset { k: args["k"].as_f64().ok_or("k fehlt")?},
         Some("away") => Action::Away,
         Some("frost") => Action::Frost,
         _ => return Err("action muss setpoint, offset, away oder frost sein".into()),
     };
     let (from, to) = (text("from").ok_or("from fehlt")?, text("to").ok_or("to fehlt")?);
     let when = match args["when_type"].as_str() {
-        Some("once") => When::Once { from, to },
-        Some("weekly") => When::Weekly { days: list("days").ok_or("days fehlt")?, from, to, valid_from: text("valid_from"), valid_until: text("valid_until") },
+        Some("once") => When::Once { from, to},
+        Some("weekly") => When::Weekly { days: list("days").ok_or("days fehlt")?, from, to, valid_from: text("valid_from"), valid_until: text("valid_until")},
         _ => return Err("when_type muss once oder weekly sein".into()),
     };
     Ok(NewPlan { rooms: list("rooms").ok_or("rooms fehlt")?, action, when, label: text("label").unwrap_or_default(), source: "assistant".into() })
@@ -189,7 +188,7 @@ fn state_view(state: &AppState, now: NaiveDateTime) -> Value {
             let temp = room.nodes.iter().find_map(|n| readings.iter().find(|r| r.node == *n && r.attribute == "local_temperature")).map(|r| r.value);
             let setpoint = room.nodes.iter().find_map(|n| setpoints.iter().find(|s| s.node == *n));
             let hold = room.nodes.iter().find_map(|n| commands.hold(*n)).map(|h| json!({"celsius": h.value, "minutes_left": ((h.until_ms - now_ms) as f64 / 60_000.0).max(0.0).round()}));
-            json!({"room": room.name, "temperature": temp, "setpoint": setpoint.map(|s| s.value), "reason": setpoint.map(|s| s.reason.clone()), "window_open": windows.contains(&room.name), "plans": plan::active_in(&plans, &room.name, now).iter().map(|p| p.view()).collect::<Vec<_>>(), "hold": hold})
+            json!({"room": room.name, "temperature": temp, "setpoint": setpoint.map(|s| s.value), "window_open": windows.contains(&room.name), "plans": plan::active_in(&plans, &room.name, now).iter().map(|p| p.view()).collect::<Vec<_>>(), "hold": hold})
         })
         .collect();
     json!({"rooms": rooms})

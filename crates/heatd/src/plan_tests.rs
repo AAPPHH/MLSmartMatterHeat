@@ -113,6 +113,22 @@ fn offset_adds_to_the_base_that_would_apply_and_is_clamped() {
 }
 
 #[test]
+fn offset_applies_on_top_of_occupied_and_weather_comfort() {
+    let config = Config::parse(&format!("{CONFIG}[comfort.weather]
+enabled = true
+")).unwrap();
+    let plans = [plan("a", 1, &["bad", "wohnzimmer"], Action::Offset { k: 1.0 }, once("2026-11-27T00:00", "2026-11-28T00:00"))];
+    let run = |held: &[&str], outdoor: Option<f64>| {
+        let held: HashSet<String> = held.iter().map(|h| h.to_string()).collect();
+        desired_planned(at(27, 12, 0), &config, Some(&home()), &held, &HashSet::new(), &HashMap::new(), outdoor, &plans).into_iter().map(|d| (d.room, d.setpoint, d.reason)).collect::<Vec<_>>()
+    };
+    assert_eq!(get(&run(&["wohnzimmer"], None), "wohnzimmer"), (22.0, "plan"));
+    assert_eq!(get(&run(&[], Some(-5.0)), "wohnzimmer"), (23.0, "plan"));
+    assert_eq!(get(&run(&["wohnzimmer"], Some(-5.0)), "wohnzimmer"), (23.0, "plan"));
+    assert_eq!(get(&run(&[], None), "bad"), (21.0, "plan"));
+}
+
+#[test]
 fn priority_window_frost_away_presence_then_setpoint() {
     let span = once("2026-11-27T00:00", "2026-11-28T00:00");
     let frost = plan("f", 1, &["bad"], Action::Frost, span.clone());

@@ -206,3 +206,26 @@ fn a_failed_write_in_a_turn_drops_the_valid_writes_of_that_turn() {
     assert!(answers.iter().all(|a| a["functionResponse"]["response"]["error"].is_string()));
     assert!(state.assistant.confirm(&state, "any", true, chrono::Local::now().naive_local(), 0).is_err());
 }
+
+#[test]
+fn stored_setpoint_reasons_never_reach_the_model() {
+    for reason in ["away", "sleep", "occupied", "night", "home"] {
+        let (state, fake, _dir) = setup(vec![calls(&[("get_state", json!({}))]), text("ok")], "");
+        state.storage.insert_setpoint(crate::storage::now_ms(), 6, "bad", 21.0, reason).unwrap();
+        ask(&state, "x").unwrap();
+        let seen = fake.seen.lock().unwrap();
+        let wire = seen[1]["contents"].to_string();
+        assert!(wire.contains("\"setpoint\":21.0") && !wire.contains(reason) && !wire.contains("\"reason\""), "{reason}");
+    }
+}
+
+#[test]
+fn parameterless_declarations_omit_parameters() {
+    let (state, fake, _dir) = setup(vec![text("ok")], "");
+    ask(&state, "x").unwrap();
+    let seen = fake.seen.lock().unwrap();
+    let decls = seen[0]["tools"][0]["functionDeclarations"].as_array().unwrap();
+    for d in decls.iter().filter(|d| matches!(d["name"].as_str(), Some("get_state" | "list_plans"))) {
+        assert!(d.get("parameters").is_none());
+    }
+}

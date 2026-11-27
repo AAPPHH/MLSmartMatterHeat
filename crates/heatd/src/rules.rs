@@ -487,6 +487,12 @@ pub fn desired_planned(now: NaiveDateTime, config: &Config, presence: Option<&Pr
             let window = window_open.contains(&room.name);
             let experiment = exploring.get(&room.name);
             let found = crate::plan::resolve(plans, &room.name, now);
+            let (normal, normal_reason, normal_rule) = match held.contains(&room.name) {
+                _ if sleep_here => (base, "sleep", "presence"),
+                true if !(sleeping || night) => (config.occupied_setpoint, "occupied", "presence"),
+                _ => (base, base_reason, "schedule"),
+            };
+            let normal_k = if !(sleeping || night) && matches!(normal_reason, "home" | "occupied" | "schedule" | "default") { offset } else { 0.0 };
             let mut hit = None;
             let (setpoint, reason, rule) = if window {
                 (config.frost_setpoint, "window_open", "window")
@@ -502,13 +508,9 @@ pub fn desired_planned(now: NaiveDateTime, config: &Config, presence: Option<&Pr
                 (e.setpoint.max(config.frost_setpoint), "exploration", "exploration")
             } else if let Some(p) = found.value {
                 hit = Some(p.hit());
-                (p.value(base, config.frost_setpoint), "plan", "plan")
+                (p.value(normal + normal_k, config.frost_setpoint), "plan", "plan")
             } else {
-                match held.contains(&room.name) {
-                    _ if sleep_here => (base, "sleep", "presence"),
-                    true if !(sleeping || night) => (config.occupied_setpoint, "occupied", "presence"),
-                    _ => (base, base_reason, "schedule"),
-                }
+                (normal, normal_reason, normal_rule)
             };
             let comfort_k = if !(sleeping || night) && matches!(reason, "home" | "occupied" | "schedule" | "default") { offset } else { 0.0 };
             let setpoint = setpoint + comfort_k;
