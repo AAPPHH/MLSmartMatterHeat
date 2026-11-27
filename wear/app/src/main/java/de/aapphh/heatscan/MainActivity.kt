@@ -125,7 +125,7 @@ class MainActivity : ComponentActivity() {
         val p = voice.pending ?: return
         val said = voice.transcript
         voice = VoiceUi(said, busy = true)
-        Remote.confirm(this, p.id, accept) { r -> runOnUiThread { voice = VoiceUi(said, false, r.text, !r.ok) } }
+        Remote.confirm(this, p.id, accept) { r -> runOnUiThread { voice = VoiceUi(said, false, r.text, !r.ok, Assistant.retained(p, r)) } }
     }
 
     private fun listen() {

@@ -113,12 +113,13 @@ object Boost {
 
 data class Pending(val id: String, val summary: String, val expiresS: Double)
 
-data class AssistantResult(val ok: Boolean, val text: String, val pending: Pending? = null)
+data class AssistantResult(val ok: Boolean, val text: String, val pending: Pending? = null, val gone: Boolean = false)
 
 object Assistant {
     const val PATH = "/api/assistant"
     const val CONFIRM_PATH = "/api/assistant/confirm"
     const val TIMEOUT_MS = 30_000
+    const val WIFI_WAIT_MS = 10_000L
     const val MAX_CHARS = 500
     const val NO_WIFI = "Nur im WLAN zu Hause"
     const val OFF = "Assistent ist aus"
@@ -157,7 +158,7 @@ object Assistant {
     }
 
     fun result(code: Int, text: String): AssistantResult {
-        if (code !in 200..299) return failed(error(code))
+        if (code !in 200..299) return failed(error(code)).copy(gone = code == 404)
         return try {
             val o = JSONObject(text)
             val reply = o.optString("reply").trim()
@@ -169,6 +170,8 @@ object Assistant {
     fun confirmed(code: Int, text: String): AssistantResult = result(code, text).let { if (it.ok) it.copy(pending = null) else it }
 
     fun failed(line: String): AssistantResult = AssistantResult(false, line)
+
+    fun retained(previous: Pending?, r: AssistantResult): Pending? = if (r.ok || r.gone) null else previous
 
     fun transcript(raw: String?): String? = raw?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_CHARS)
 }
@@ -240,10 +243,11 @@ object Remote {
 
     private fun call(c: Context, path: String, body: String, parse: (Int, String) -> AssistantResult, done: (AssistantResult) -> Unit) {
         val store = Store(c.applicationContext)
-        val net = wifi() ?: return done(Assistant.failed(Assistant.NO_WIFI))
         run {
             done(try {
-                Poster.send(store.server, path, body, net, Assistant.TIMEOUT_MS).let { parse(it.code, it.text) }
+                val svc = ScanService.instance
+                val reply = svc?.withWifi(Assistant.WIFI_WAIT_MS) { net -> Poster.send(store.server, path, body, net, Assistant.TIMEOUT_MS).let { parse(it.code, it.text) } }
+                reply ?: Assistant.failed(Assistant.NO_WIFI)
             } catch (e: SocketTimeoutException) {
                 Assistant.failed(Assistant.SLOW)
             } catch (e: Exception) {

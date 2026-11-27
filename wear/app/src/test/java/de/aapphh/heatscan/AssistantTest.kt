@@ -67,4 +67,11 @@ class AssistantTest {
         assertNull(Assistant.transcript("   "))
         assertEquals("Hallo", Assistant.transcript(" Hallo "))
     }
+    @Test fun failedConfirmKeepsPending() {
+        val p = Pending("a", "x", 1.0)
+        assertEquals(p, Assistant.retained(p, Assistant.confirmed(504, "")))
+        assertEquals(p, Assistant.retained(p, Assistant.failed(Assistant.NO_WIFI)))
+        assertNull(Assistant.retained(p, Assistant.confirmed(404, "")))
+        assertNull(Assistant.retained(p, Assistant.confirmed(200, "{\"reply\":\"ok\"}")))
+    }
 }
