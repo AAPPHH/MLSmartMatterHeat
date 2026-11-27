@@ -1087,7 +1087,7 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     }
     let readings = state.latest.all();
     state.plans.prune(now);
-    let mut wants: Vec<Desired> = desired_planned(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring, comfort_outdoor(state), &state.plans.list()).into_iter().map(|w| Desired { setpoint: if w.reason == "plan" { clamp_boost(&readings, w.node, w.setpoint, state.failsafe.boost_max_c()) } else { clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()) }, ..w }).collect();
+    let mut wants: Vec<Desired> = desired_planned(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring, comfort_outdoor(state), &state.plans.list()).into_iter().map(|w| Desired { setpoint: match w.plan.as_ref().filter(|_| w.reason == "plan") { Some(h) if h.once => clamp_boost(&readings, w.node, w.setpoint, state.failsafe.boost_max_c()), _ => clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()) }, ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (presence.is_some(), away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
     crate::experiment::apply_calls(state, &experiment, &mut wants, &readings);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);

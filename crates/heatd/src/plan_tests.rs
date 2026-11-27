@@ -215,13 +215,13 @@ fn preview_merges_fifteen_minute_steps_into_segments() {
     let rows = |out: &serde_json::Value, room: &str| -> Vec<(String, String, f64, String)> { out["rooms"][room].as_array().unwrap().iter().map(|s| (s["from"].as_str().unwrap().into(), s["to"].as_str().unwrap().into(), s["celsius"].as_f64().unwrap(), s["reason"].as_str().unwrap().into())).collect() };
     let out = plan::preview(&c, &plans, at(27, 14, 50), 3);
     assert_eq!(rows(&out, "bad"), vec![
-        ("2026-11-27T14:45:00".into(), "2026-11-27T15:00:00".into(), 20.0, "default".into()),
-        ("2026-11-27T15:00:00".into(), "2026-11-27T16:30:00".into(), 23.0, "plan".into()),
-        ("2026-11-27T16:30:00".into(), "2026-11-27T17:45:00".into(), 20.0, "default".into()),
+        ("2026-11-27T14:45".into(), "2026-11-27T15:00".into(), 20.0, "default".into()),
+        ("2026-11-27T15:00".into(), "2026-11-27T16:30".into(), 23.0, "plan".into()),
+        ("2026-11-27T16:30".into(), "2026-11-27T17:45".into(), 20.0, "default".into()),
     ]);
     assert!(out["rooms"].get("flur").is_none());
     let sched = plan::preview(&c, &[], at(27, 5, 0), 4);
-    assert_eq!(rows(&sched, "bad").iter().map(|r| (r.0.clone(), r.2, r.3.clone())).collect::<Vec<_>>(), vec![("2026-11-27T05:00:00".into(), 20.0, "default".into()), ("2026-11-27T06:00:00".into(), 22.0, "schedule".into()), ("2026-11-27T08:00:00".into(), 20.0, "default".into())]);
+    assert_eq!(rows(&sched, "bad").iter().map(|r| (r.0.clone(), r.2, r.3.clone())).collect::<Vec<_>>(), vec![("2026-11-27T05:00".into(), 20.0, "default".into()), ("2026-11-27T06:00".into(), 22.0, "schedule".into()), ("2026-11-27T08:00".into(), 20.0, "default".into())]);
     let high = [plan("h", 1, &["bad"], Action::Setpoint { celsius: 24.0 }, once("2026-11-27T15:00", "2026-11-27T16:00"))];
     assert!(rows(&plan::preview(&c, &high, at(27, 15, 0), 1), "bad").iter().all(|r| r.2 == 24.0));
     let capped = Config::parse(&format!("{CONFIG}[failsafe]
@@ -287,4 +287,30 @@ async fn active_plan_drives_the_device_and_shows_up_in_state_and_metrics() {
     e.t += 60_000;
     crate::rules::control_step(&e.state, now, e.t).await.unwrap();
     assert_eq!(e.device(6).await, 19.0);
+}
+
+#[test]
+fn weekly_plans_stay_under_the_normal_ceiling_and_only_once_plans_use_the_boost_ceiling() {
+    let c = config();
+    let weekly_high = [plan("w", 1, &["bad"], Action::Setpoint { celsius: 25.0 }, weekly(&["friday"], "15:00", "16:00", None, None))];
+    let rows = |out: &serde_json::Value| -> Vec<f64> { out["rooms"]["bad"].as_array().unwrap().iter().map(|s| s["celsius"].as_f64().unwrap()).collect() };
+    assert!(rows(&plan::preview(&c, &weekly_high, at(27, 15, 0), 1)).iter().all(|v| *v == 22.0));
+    let once_high = [plan("o", 1, &["bad"], Action::Setpoint { celsius: 25.0 }, once("2026-11-27T15:00", "2026-11-27T16:00"))];
+    assert!(rows(&plan::preview(&c, &once_high, at(27, 15, 0), 1)).iter().all(|v| *v == 25.0));
+}
+
+#[test]
+fn restore_quarantines_a_broken_file_and_skips_single_bad_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plans.json");
+    let now = at(27, 12, 0);
+    std::fs::write(&path, "{not json").unwrap();
+    assert!(Plans::open(path.clone(), now).list().is_empty());
+    assert!(!path.exists());
+    let bad: Vec<_> = std::fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with("plans.json.bad-")).collect();
+    assert_eq!(bad.len(), 1);
+    let good = plan("g", 1, &["bad"], Action::Frost, weekly(&["monday"], "10:00", "12:00", None, None));
+    std::fs::write(&path, serde_json::to_string(&json!({"plans": [good, {"id": "x", "rooms": 5}]})).unwrap()).unwrap();
+    let kept = Plans::open(path.clone(), now).list();
+    assert_eq!(kept.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["g"]);
 }

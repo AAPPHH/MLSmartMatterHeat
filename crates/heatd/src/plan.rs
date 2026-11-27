@@ -6,6 +6,7 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +18,7 @@ pub const STEP_MIN: i64 = 15;
 pub const MAX_PREVIEW_HOURS: u32 = 336;
 pub const DEFAULT_PREVIEW_HOURS: u32 = 168;
 const DT_FORMATS: [&str; 3] = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"];
-const DT_OUT: &str = "%Y-%m-%dT%H:%M:%S";
+const DT_PLAN: &str = "%Y-%m-%dT%H:%M";
 const DAY_NAMES: [&str; 7] = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
 const LONG_NAMES: [&str; 7] = ["montags", "dienstags", "mittwochs", "donnerstags", "freitags", "samstags", "sonntags"];
 
@@ -76,6 +77,13 @@ pub struct Hit {
     pub id: String,
     pub label: String,
     pub off: bool,
+    pub once: bool,
+}
+
+impl Hit {
+    pub fn ceiling(&self, max_c: f64, boost_max_c: f64) -> f64 {
+        if self.once { boost_max_c } else { max_c }
+    }
 }
 
 pub struct Resolved<'a> {
@@ -129,7 +137,7 @@ impl Plan {
     }
 
     pub fn hit(&self) -> Hit {
-        Hit { id: self.id.clone(), label: self.label.clone(), off: matches!(self.action, Action::Away | Action::Frost) }
+        Hit { id: self.id.clone(), label: self.label.clone(), off: matches!(self.action, Action::Away | Action::Frost), once: matches!(self.when, When::Once { .. }) }
     }
 
     pub fn value(&self, base: f64, frost: f64) -> f64 {
@@ -197,7 +205,7 @@ pub fn validate(config: &Config, new: &NewPlan, now: NaiveDateTime) -> Result<Ne
             if t <= now {
                 return Err("Der Zeitraum liegt schon in der Vergangenheit".into());
             }
-            (*from, *to) = (f.format("%Y-%m-%dT%H:%M").to_string(), t.format("%Y-%m-%dT%H:%M").to_string());
+            (*from, *to) = (f.format(DT_PLAN).to_string(), t.format(DT_PLAN).to_string());
         }
         When::Weekly { days, from, to, valid_from, valid_until } => {
             if days.is_empty() || parse_weekdays(days).is_err() {
@@ -268,14 +276,28 @@ pub struct Plans {
 
 impl Plans {
     pub fn open(path: PathBuf, now: NaiveDateTime) -> Self {
-        let items: Vec<Plan> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| eprintln!("plans: {e}")).ok())
-            .and_then(|v| serde_json::from_value(v["plans"].clone()).map_err(|e| eprintln!("plans: {e}")).ok())
-            .unwrap_or_default();
+        let items = Self::restore(&path);
         let plans = Self { items: Arc::new(Mutex::new(items)), path: Some(Arc::new(path)) };
         plans.prune(now);
         plans
+    }
+
+    fn restore(path: &PathBuf) -> Vec<Plan> {
+        let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) => v["plans"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|e| serde_json::from_value::<Plan>(e.clone()).map_err(|err| eprintln!("plans: skipped entry: {err}")).ok()).collect())
+                .unwrap_or_default(),
+            Err(e) => {
+                let bad = path.with_extension(format!("json.bad-{}", chrono::Utc::now().timestamp_millis()));
+                eprintln!("plans: {e}, moved to {}", bad.display());
+                if let Err(r) = std::fs::rename(path, &bad) {
+                    eprintln!("plans: rename failed: {r}");
+                }
+                Vec::new()
+            }
+        }
     }
 
     pub fn list(&self) -> Vec<Plan> {
@@ -292,7 +314,10 @@ impl Plans {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(&tmp, text)?;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
             std::fs::rename(&tmp, path.as_path())
         };
         write().map_err(|e| format!("Plan konnte nicht gespeichert werden: {e}"))
@@ -372,11 +397,11 @@ pub fn preview(config: &Config, plans: &[Plan], start: NaiveDateTime, hours: u32
     let mut open: BTreeMap<String, (NaiveDateTime, f64, &'static str)> = BTreeMap::new();
     let mut at = start;
     let flush = |rooms: &mut BTreeMap<String, Vec<Value>>, room: &str, seg: (NaiveDateTime, f64, &'static str), to: NaiveDateTime| {
-        rooms.entry(room.to_string()).or_default().push(json!({"from": seg.0.format(DT_OUT).to_string(), "to": to.format(DT_OUT).to_string(), "celsius": seg.1, "reason": seg.2}));
+        rooms.entry(room.to_string()).or_default().push(json!({"from": seg.0.format(DT_PLAN).to_string(), "to": to.format(DT_PLAN).to_string(), "celsius": seg.1, "reason": seg.2}));
     };
     while at < end {
         for want in crate::rules::desired_planned(at, config, None, &Default::default(), &Default::default(), &Default::default(), None, plans) {
-            let setpoint = want.setpoint.min(if want.reason == "plan" { config.failsafe.boost_max_c } else { config.failsafe.max_c });
+            let setpoint = want.setpoint.min(want.plan.as_ref().filter(|_| want.reason == "plan").map_or(config.failsafe.max_c, |h| h.ceiling(config.failsafe.max_c, config.failsafe.boost_max_c)));
             let want = crate::rules::Desired { setpoint, ..want };
             match open.get(&want.room).copied() {
                 Some(seg) if seg.1 == want.setpoint && seg.2 == want.reason => {}
