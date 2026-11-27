@@ -470,6 +470,8 @@ resubscribe_gap_s = 3600
             failsafe: Default::default(),
             batch_seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             devices: Default::default(),
+            plans: Default::default(),
+            assistant: Default::default(),
         }
     }
 

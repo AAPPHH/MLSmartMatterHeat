@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Weekday;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike, Weekday};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -667,6 +667,7 @@ pub struct Config {
     pub br_watchdog: crate::br_watchdog::BrWatchdogSection,
     pub node_health: crate::node_health::NodeHealthSection,
     pub devices: Vec<crate::devices::DeviceConfig>,
+    pub assistant: crate::assistant::AssistantSection,
 }
 
 impl Default for Config {
@@ -720,6 +721,7 @@ impl Default for Config {
             br_watchdog: Default::default(),
             node_health: Default::default(),
             devices: Vec::new(),
+            assistant: Default::default(),
         }
     }
 }
@@ -813,15 +815,33 @@ impl Schedule {
     }
 
     pub fn weekdays(&self) -> Result<Vec<Weekday>> {
-        let mut out = Vec::new();
-        for day in &self.days {
-            match day.trim().to_ascii_lowercase().as_str() {
-                "weekdays" => out.extend([Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri]),
-                "weekend" => out.extend([Weekday::Sat, Weekday::Sun]),
-                other => out.push(other.parse::<Weekday>().map_err(|_| anyhow!("bad day {day}"))?),
-            }
+        parse_weekdays(&self.days)
+    }
+}
+
+pub(crate) fn parse_weekdays(days: &[String]) -> Result<Vec<Weekday>> {
+    let mut out = Vec::new();
+    for day in days {
+        match day.trim().to_ascii_lowercase().as_str() {
+            "weekdays" => out.extend([Weekday::Mon, Weekday::Tue, Weekday::Wed, Weekday::Thu, Weekday::Fri]),
+            "weekend" => out.extend([Weekday::Sat, Weekday::Sun]),
+            other => out.push(other.parse::<Weekday>().map_err(|_| anyhow!("bad day {day}"))?),
         }
-        Ok(out)
+    }
+    Ok(out)
+}
+
+pub(crate) fn window_start(days: &[Weekday], from: u32, to: u32, now: NaiveDateTime) -> Option<NaiveDate> {
+    let minute = now.hour() * 60 + now.minute();
+    let (today, yesterday) = (now.date(), now.date().pred_opt()?);
+    let on = |d: NaiveDate| days.contains(&d.weekday());
+    if from <= to {
+        return (on(today) && (from == to || (from..to).contains(&minute))).then_some(today);
+    }
+    if on(today) && minute >= from {
+        Some(today)
+    } else {
+        (on(yesterday) && minute < to).then_some(yesterday)
     }
 }
 

@@ -44,6 +44,12 @@ fn valid(state: &AppState, celsius: Option<f64>, hold_min: Option<f64>) -> Resul
     Ok((celsius, hold))
 }
 
+pub fn check(state: &AppState, room: &str, celsius: Option<f64>, hold_min: Option<f64>) -> Result<(), String> {
+    let text = |reply: Reply| reply.body["error"].as_str().unwrap_or("Ungueltig").to_string();
+    target(state, room, None).map_err(text)?;
+    valid(state, celsius, hold_min).map(|_| ()).map_err(text)
+}
+
 pub fn record(state: &AppState, room: &Room, detail: Value) {
     let mut event = lake::Event::now(kind::MANUAL_SETPOINT, "heatd").with_detail(detail);
     event.node = room.nodes.first().copied();

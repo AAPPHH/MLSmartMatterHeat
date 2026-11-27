@@ -654,7 +654,7 @@ fn the_on_setpoint_is_the_boost_bundle_setpoint_when_it_lies_below_the_cap() {
     let want = |on: bool| {
         let mut out = crate::experiment::Out::default();
         out.calls.insert("wohnzimmer".into(), crate::experiment::Call { on, rule: "experiment_takt" });
-        let mut wants = vec![crate::rules::Desired { node: 5, room: "wohnzimmer".into(), setpoint: 20.0, reason: "schedule", rule: "base", base: 20.0, occupancy: "away", source: "", sleep: false, window_open: false, experiment_id: None, comfort_k: 0.0 }];
+        let mut wants = vec![crate::rules::Desired { node: 5, room: "wohnzimmer".into(), setpoint: 20.0, reason: "schedule", rule: "base", base: 20.0, occupancy: "away", source: "", sleep: false, window_open: false, experiment_id: None, comfort_k: 0.0, plan: None }];
         crate::experiment::apply_calls(&e.state, &out, &mut wants, &[]);
         wants[0].setpoint
     };

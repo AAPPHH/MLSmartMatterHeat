@@ -361,7 +361,7 @@ impl Commands {
         if live && hold.explicit() {
             return Some(false);
         }
-        if live && !matches!(want.reason, "window_open" | "away") {
+        if live && !matches!(want.reason, "window_open" | "away") && !want.planned_off() {
             return None;
         }
         self.drop_hold(want.node);
@@ -427,23 +427,19 @@ pub struct Desired {
     pub window_open: bool,
     pub experiment_id: Option<String>,
     pub comfort_k: f64,
+    pub plan: Option<crate::plan::Hit>,
+}
+
+impl Desired {
+    pub fn planned_off(&self) -> bool {
+        self.plan.as_ref().is_some_and(|p| p.off) && self.reason == "plan"
+    }
 }
 
 fn scheduled(room: &Room, now: NaiveDateTime) -> Option<f64> {
-    let minute = now.hour() * 60 + now.minute();
-    let today = now.weekday();
-    let yesterday = today.pred();
     room.schedules.iter().find_map(|s| {
         let (from, to) = s.minutes().ok()?;
-        let days = s.weekdays().ok()?;
-        let hit = if from == to {
-            days.contains(&today)
-        } else if from < to {
-            days.contains(&today) && (from..to).contains(&minute)
-        } else {
-            (days.contains(&today) && minute >= from) || (days.contains(&yesterday) && minute < to)
-        };
-        hit.then_some(s.setpoint)
+        crate::config::window_start(&s.weekdays().ok()?, from, to, now).map(|_| s.setpoint)
     })
 }
 
@@ -466,7 +462,13 @@ pub fn comfort_outdoor(state: &AppState) -> Option<f64> {
     state.status.outdoor_temp_within(lake::now_us(), state.config.comfort.weather.max_age_us())
 }
 
+#[cfg(test)]
 pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>, outdoor_c: Option<f64>) -> Vec<Desired> {
+    desired_planned(now, config, presence, held, window_open, exploring, outdoor_c, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn desired_planned(now: NaiveDateTime, config: &Config, presence: Option<&Presence>, held: &HashSet<String>, window_open: &HashSet<String>, exploring: &HashMap<String, Experiment>, outdoor_c: Option<f64>, plans: &[crate::plan::Plan]) -> Vec<Desired> {
     let offset = config.comfort.weather.offset(outdoor_c);
     let occupancy = presence.map_or(Occupancy::Unknown, |p| p.occupancy(config));
     let (source, sleeping) = presence.map_or(("", false), |p| (p.source, p.sleep));
@@ -484,18 +486,31 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
             };
             let window = window_open.contains(&room.name);
             let experiment = exploring.get(&room.name);
+            let found = crate::plan::resolve(plans, &room.name, now);
+            let (normal, normal_reason, normal_rule) = match held.contains(&room.name) {
+                _ if sleep_here => (base, "sleep", "presence"),
+                true if !(sleeping || night) => (config.occupied_setpoint, "occupied", "presence"),
+                _ => (base, base_reason, "schedule"),
+            };
+            let normal_k = if !(sleeping || night) && matches!(normal_reason, "home" | "occupied" | "schedule" | "default") { offset } else { 0.0 };
+            let mut hit = None;
             let (setpoint, reason, rule) = if window {
                 (config.frost_setpoint, "window_open", "window")
+            } else if let Some(p) = found.frost {
+                hit = Some(p.hit());
+                (config.frost_setpoint, "plan", "plan")
             } else if occupancy == Occupancy::Away {
                 (config.away_setpoint, "away", "presence")
+            } else if let Some(p) = found.away {
+                hit = Some(p.hit());
+                (config.away_setpoint, "plan", "plan")
             } else if let Some(e) = experiment {
                 (e.setpoint.max(config.frost_setpoint), "exploration", "exploration")
+            } else if let Some(p) = found.value {
+                hit = Some(p.hit());
+                (p.value(normal + normal_k, config.frost_setpoint), "plan", "plan")
             } else {
-                match held.contains(&room.name) {
-                    _ if sleep_here => (base, "sleep", "presence"),
-                    true if !(sleeping || night) => (config.occupied_setpoint, "occupied", "presence"),
-                    _ => (base, base_reason, "schedule"),
-                }
+                (normal, normal_reason, normal_rule)
             };
             let comfort_k = if !(sleeping || night) && matches!(reason, "home" | "occupied" | "schedule" | "default") { offset } else { 0.0 };
             let setpoint = setpoint + comfort_k;
@@ -505,7 +520,7 @@ pub fn desired(now: NaiveDateTime, config: &Config, presence: Option<&Presence>,
                 Occupancy::Unknown => "unknown",
             };
             let id = experiment.filter(|_| reason == "exploration").map(|e| e.id.clone());
-            room.nodes.iter().map(move |&node| Desired { node, room: room.name.clone(), setpoint, reason, rule, base, occupancy: label, source, sleep: sleeping, window_open: window, experiment_id: id.clone(), comfort_k })
+            room.nodes.iter().map(move |&node| Desired { node, room: room.name.clone(), setpoint, reason, rule, base, occupancy: label, source, sleep: sleeping, window_open: window, experiment_id: id.clone(), comfort_k, plan: hit.clone() })
         })
         .collect()
 }
@@ -766,6 +781,9 @@ fn proposal_extra(state: &AppState, want: &Desired) -> String {
     if want.comfort_k > 0.0 {
         extra["weather_offset_k"] = json!(want.comfort_k);
     }
+    if let Some(plan) = &want.plan {
+        extra["plan"] = json!({"id": plan.id, "label": plan.label});
+    }
     if let Some(note) = window_note(state, want) {
         extra["note"] = json!(note);
     }
@@ -869,7 +887,7 @@ fn supply_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], no
         log("pi reset event", state.sink.append(event));
     };
     for want in wants.iter_mut() {
-        let blocked = window_busy.contains(&want.room) || exploring.contains_key(&want.room) || matches!(want.reason, "window_open" | "away" | "boost" | "boost_off" | "exploration" | "experiment") || state.commanded.lock().unwrap().holding(&[want.node]);
+        let blocked = window_busy.contains(&want.room) || exploring.contains_key(&want.room) || matches!(want.reason, "window_open" | "away" | "boost" | "boost_off" | "exploration" | "experiment") || want.planned_off() || state.commanded.lock().unwrap().holding(&[want.node]);
         let running = state.commanded.lock().unwrap().resets.get(&want.node).copied();
         if let Some(until) = running {
             if !blocked && now_ms < until {
@@ -937,7 +955,7 @@ fn boost_step(state: &AppState, wants: &mut [Desired], readings: &[Reading], now
             let want = wants.iter().find(|w| w.room == room.name)?;
             let blocked = if window_busy.contains(&room.name) {
                 Some("window_open")
-            } else if away {
+            } else if away || want.planned_off() {
                 Some("away")
             } else if held(room) {
                 Some("manual_hold")
@@ -1047,7 +1065,9 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
     let experiment = crate::experiment::tick(state, now, now_ms, window_busy, presence.as_ref());
     let exploring = {
         let held = |room: &str| state.config.rooms.iter().find(|r| r.name == room).is_some_and(|r| state.commanded.lock().unwrap().holding(&r.nodes));
-        let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away { Some("away") } else if held(room) { Some("manual_hold") } else if state.commanded.lock().unwrap().messfahrt.running_in(room) { Some("experiment") } else { None };
+        let planned = state.plans.list();
+        let plan_off = |room: &str| { let r = crate::plan::resolve(&planned, room, now); r.frost.is_some() || r.away.is_some() };
+        let blocked = |room: &str| if window_busy.contains(room) { Some("window_open") } else if away || plan_off(room) { Some("away") } else if held(room) { Some("manual_hold") } else if state.commanded.lock().unwrap().messfahrt.running_in(room) { Some("experiment") } else { None };
         let base = |room: &Room| base_setpoint(room, &state.config, now);
         let mut explorer = state.explorer.lock().unwrap();
         let no_raise = |room: &str| !state.commanded.lock().unwrap().budget.allows(room, now_ms, state.config.raise_budget_per_hour);
@@ -1066,7 +1086,8 @@ pub async fn control_step(state: &AppState, now: NaiveDateTime, now_ms: i64) -> 
         log("occupancy event", state.sink.append(lake::Event { ts: to * 1000, ..event }));
     }
     let readings = state.latest.all();
-    let mut wants: Vec<Desired> = desired(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring, comfort_outdoor(state)).into_iter().map(|w| Desired { setpoint: clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()), ..w }).collect();
+    state.plans.prune(now);
+    let mut wants: Vec<Desired> = desired_planned(now, &state.config, presence.as_ref(), &step.held, &windows, &exploring, comfort_outdoor(state), &state.plans.list()).into_iter().map(|w| Desired { setpoint: match w.plan.as_ref().filter(|_| w.reason == "plan") { Some(h) if h.once => clamp_boost(&readings, w.node, w.setpoint, state.failsafe.boost_max_c()), _ => clamp_setpoint(&readings, w.node, w.setpoint, state.failsafe.max_c()) }, ..w }).collect();
     boost_step(state, &mut wants, &readings, now, now_ms, window_busy, (presence.is_some(), away, presence.as_ref().is_some_and(|p| p.sleep)), &exploring);
     crate::experiment::apply_calls(state, &experiment, &mut wants, &readings);
     supply_step(state, &mut wants, &readings, now_ms, window_busy, &exploring);
