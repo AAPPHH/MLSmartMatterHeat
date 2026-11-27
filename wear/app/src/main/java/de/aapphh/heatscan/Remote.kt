@@ -118,7 +118,7 @@ data class AssistantResult(val ok: Boolean, val text: String, val pending: Pendi
 object Assistant {
     const val PATH = "/api/assistant"
     const val CONFIRM_PATH = "/api/assistant/confirm"
-    const val TIMEOUT_MS = 30_000
+    const val TIMEOUT_MS = 35_000
     const val WIFI_WAIT_MS = 10_000L
     const val MAX_CHARS = 500
     const val NO_WIFI = "Nur im WLAN zu Hause"
@@ -178,9 +178,10 @@ object Assistant {
 
 object Remote {
     private val io = Executors.newSingleThreadExecutor()
+    private val assistantIo = Executors.newSingleThreadExecutor()
 
-    private fun run(f: () -> Unit) {
-        try { io.execute(f) } catch (e: RejectedExecutionException) { Trace.i("remote_rejected") }
+    private fun run(pool: java.util.concurrent.Executor = io, f: () -> Unit) {
+        try { pool.execute(f) } catch (e: RejectedExecutionException) { Trace.i("remote_rejected") }
     }
 
     fun wifi(): Network? = ScanService.instance?.currentNetwork
@@ -243,7 +244,7 @@ object Remote {
 
     private fun call(c: Context, path: String, body: String, parse: (Int, String) -> AssistantResult, done: (AssistantResult) -> Unit) {
         val store = Store(c.applicationContext)
-        run {
+        run(assistantIo) {
             done(try {
                 val svc = ScanService.instance
                 val reply = svc?.withWifi(Assistant.WIFI_WAIT_MS) { net -> Poster.send(store.server, path, body, net, Assistant.TIMEOUT_MS).let { parse(it.code, it.text) } }

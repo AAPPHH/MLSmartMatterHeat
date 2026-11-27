@@ -108,6 +108,7 @@ class MainActivity : ComponentActivity() {
     private var newIntents by mutableIntStateOf(0)
     private var voice by mutableStateOf(VoiceUi())
     private var listenOnOpen = false
+    private var voiceSeq = 0
     private val speech = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val data = r.data
         if (r.resultCode == RESULT_OK && data != null) {
@@ -117,15 +118,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun ask(text: String) {
+        val seq = ++voiceSeq
         voice = VoiceUi(text, busy = true)
-        Remote.assistant(this, text) { r -> runOnUiThread { voice = VoiceUi(text, false, r.text, !r.ok, r.pending) } }
+        Remote.assistant(this, text) { r -> runOnUiThread { if (seq == voiceSeq) voice = VoiceUi(text, false, r.text, !r.ok, r.pending) } }
     }
 
     private fun answer(accept: Boolean) {
         val p = voice.pending ?: return
         val said = voice.transcript
+        val seq = ++voiceSeq
         voice = VoiceUi(said, busy = true)
-        Remote.confirm(this, p.id, accept) { r -> runOnUiThread { voice = VoiceUi(said, false, r.text, !r.ok, Assistant.retained(p, r)) } }
+        Remote.confirm(this, p.id, accept) { r -> runOnUiThread {
+            if (seq == voiceSeq) voice = VoiceUi(said, false, r.text, !r.ok, Assistant.retained(p, r))
+            if (r.ok) Remote.refresh(this, true)
+        } }
     }
 
     private fun listen() {
@@ -181,6 +187,7 @@ class MainActivity : ComponentActivity() {
         wake()
         newIntents++
         listenOnOpen = intent.getBooleanExtra("voice", false)
+        if (listenOnOpen) { voiceSeq++; voice = VoiceUi() }
         ScanService.instance?.onOpen()
     }
 
@@ -254,7 +261,7 @@ class MainActivity : ComponentActivity() {
             composable(Routes.TECH) { TechRoute(store, ui) { nav.navigate(Routes.DATA) } }
             composable(Routes.DATA) { DataRoute(store) }
             composable(Routes.VOICE) {
-                LaunchedEffect(Unit) { if (listenOnOpen) { listenOnOpen = false; listen() } }
+                LaunchedEffect(newIntents) { if (listenOnOpen) { listenOnOpen = false; listen() } }
                 VoiceScreen(voice, ::listen, { answer(true) }, { answer(false) })
             }
             composable(Routes.ASK) { AskRoute(store, show, leave, ui) }
