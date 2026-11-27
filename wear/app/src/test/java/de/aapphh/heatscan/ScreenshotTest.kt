@@ -185,4 +185,26 @@ class ScreenshotTest {
     @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun ask_45mm() = shot("ask_45mm") { AskScreen(ask) {} }
 
     @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun rooms_45mm() = shot("rooms_45mm") { page { RoomsPage("kueche", "bad") {} } }
+
+    private val pend = Pending("p1", "Bad auf 23 °C bis 18:00 Uhr stellen", 90.0)
+
+    @Test fun voice_idle() = shot("voice_idle") { VoiceScreen(VoiceUi(), {}, {}, {}) }
+
+    @Test fun voice_busy() = shot("voice_busy") { VoiceScreen(VoiceUi("Wie warm ist es im Bad", busy = true), {}, {}, {}) }
+
+    @Test fun voice_reply() = shot("voice_reply") { VoiceScreen(VoiceUi("Wie warm ist es im Bad", line = "Im Bad sind es 22,0 °C, Ziel 22 °C."), {}, {}, {}) }
+
+    @Test fun voice_pending() = shot("voice_pending", swipe = 1, short = true) { VoiceScreen(VoiceUi("Mach das Bad wärmer", line = "Soll ich das tun?", pending = pend), {}, {}, {}) }
+
+    @Test fun voice_error() = shot("voice_error") { VoiceScreen(VoiceUi("Mach das Bad wärmer", line = Assistant.OFF, error = true), {}, {}, {}) }
+
+    @Test fun voice_reply_font_1_3() = shot("voice_reply_font_1_3", 1.3f) { VoiceScreen(VoiceUi("Wie warm ist es im Bad", line = "Im Bad sind es 22,0 °C, Ziel 22 °C."), {}, {}, {}) }
+
+    @Test @Config(qualifiers = "w227dp-h227dp-round-xhdpi") fun voice_pending_45mm() = shot("voice_pending_45mm") { VoiceScreen(VoiceUi("Mach das Bad wärmer", line = "Soll ich das tun?", pending = pend), {}, {}, {}) }
+
+    @Test fun wheel_mic() = shot("wheel_mic") { page { RoomsPage("kueche", null, glance = heating, badge = "2", onMic = {}) {} } }
+
+    @Test fun rooms_screen_mic() = shot("rooms_screen_mic") { RoomsScreen("kueche", "bad", false, null, glance, two, null, true, {}, {}, {}, {}) {} }
+
+    @Test fun rooms_list_mic() = shot("rooms_list_mic", swipe = 1) { RoomsScreen("kueche", "bad", false, null, glance, two, null, true, {}, {}, {}, {}) {} }
 }

@@ -162,7 +162,7 @@ private fun TransformingLazyColumnScope.note(spec: TransformationSpec, text: Str
 @Composable
 internal fun RoomsScreen(
     hot: String?, ringed: String?, locked: Boolean, learn: LearnView?, glance: Glance, alerts: List<Alert>, ask: WindowAsk?, showBadge: Boolean,
-    onDetail: (String) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, onTap: (String) -> Unit
+    onDetail: (String) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, onVoice: (() -> Unit)? = null, onTap: (String) -> Unit
 ) {
     val state = rememberTransformingLazyColumnState()
     val spec = rememberTransformationSpec()
@@ -174,11 +174,12 @@ internal fun RoomsScreen(
                 item {
                     Box(Modifier.fillMaxWidth().height(full - PEEK)) {
                         Box(Modifier.fillMaxWidth().wrapContentHeight(Alignment.Top, unbounded = true).requiredHeight(full)) {
-                            RoomsPage(hot, ringed, locked, learn, glance, RoomView.badge(alerts, ask).takeIf { showBadge }, onAlerts, onDetail, onTap)
+                            RoomsPage(hot, ringed, locked, learn, glance, RoomView.badge(alerts, ask).takeIf { showBadge }, onAlerts, onDetail, onVoice.takeIf { showBadge }, onTap)
                         }
                     }
                 }
                 RoomView.pill(alerts, ask)?.let { label -> action(spec, label, tonal = false, onClick = onAlerts) }
+                onVoice?.let { action(spec, Assistant.ASK, icon = R.drawable.ic_mic, onClick = it) }
                 header(spec, "Räume", RoomView.LEGEND)
                 Defaults.ROOMS.forEach { room ->
                     val g = RoomView.glance(glance, room)
@@ -304,6 +305,27 @@ internal fun AskScreen(ask: WindowAsk, onAnswer: (WindowAnswer) -> Unit) {
         }
     }
 }
+
+@Composable
+internal fun VoiceScreen(ui: VoiceUi, onMic: () -> Unit, onAccept: () -> Unit, onDecline: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    val type = MaterialTheme.typography
+    ListScreen { spec ->
+        header(spec, Assistant.TITLE)
+        if (ui.transcript.isNotEmpty()) note(spec, "„" + ui.transcript + "“", colors.onSurfaceVariant, type.bodyExtraSmall)
+        if (ui.busy) note(spec, Assistant.WAITING, colors.onSurface, type.bodyMedium)
+        else if (ui.line.isEmpty() && ui.pending == null) note(spec, Assistant.PROMPT, colors.onSurface, type.bodyMedium)
+        if (ui.line.isNotEmpty()) note(spec, ui.line, if (ui.error) colors.error else colors.onBackground, type.bodyMedium)
+        ui.pending?.let {
+            note(spec, it.summary, colors.primary, type.bodyMedium)
+            action(spec, Assistant.ACCEPT, tonal = false, onClick = onAccept)
+            action(spec, Assistant.DECLINE, onClick = onDecline)
+        }
+        if (!ui.busy && ui.pending == null) action(spec, if (ui.transcript.isEmpty()) Assistant.SPEAK else Assistant.AGAIN, tonal = ui.transcript.isNotEmpty(), icon = R.drawable.ic_mic, onClick = onMic)
+    }
+}
+
+class VoiceUi(val transcript: String = "", val busy: Boolean = false, val line: String = "", val error: Boolean = false, val pending: Pending? = null)
 
 @Composable
 internal fun SavedPage(text: String, onUndo: () -> Unit, onDone: () -> Unit) {

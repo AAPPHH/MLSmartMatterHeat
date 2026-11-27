@@ -218,6 +218,28 @@ class ScanService : Service() {
         Trace.i("burst_end", "why" to why)
     }
 
+    fun <T> withWifi(waitMs: Long, f: (Network) -> T): T? {
+        currentNetwork?.let { return f(it) }
+        val got = java.util.concurrent.atomic.AtomicReference<Network?>(null)
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(n: Network) { got.set(n); latch.countDown() }
+            override fun onUnavailable() { latch.countDown() }
+        }
+        try {
+            cm.requestNetwork(wifiRequest, cb, handler, waitMs.toInt())
+        } catch (e: Exception) {
+            Trace.w("voice_wifi", e)
+            return null
+        }
+        try {
+            latch.await(waitMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            return got.get()?.let(f)
+        } finally {
+            try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) { Log.w(TAG, "unregister voice", e) }
+        }
+    }
+
     fun onBackground() {
         handler.post { if (burstCallback != null && network != null && !UpdateRules.keepNetwork(updateSince != null, SystemClock.elapsedRealtime() - (updateSince ?: 0L))) endBurst("background") }
     }

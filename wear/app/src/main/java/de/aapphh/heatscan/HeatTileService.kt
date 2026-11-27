@@ -13,6 +13,7 @@ import androidx.wear.protolayout.material3.card
 import androidx.wear.protolayout.material3.materialScope
 import androidx.wear.protolayout.material3.primaryLayout
 import androidx.wear.protolayout.material3.text
+import androidx.wear.protolayout.material3.textEdgeButton
 import androidx.wear.protolayout.types.LayoutColor
 import androidx.wear.protolayout.types.layoutString
 import androidx.wear.tiles.EventBuilders
@@ -54,7 +55,7 @@ class HeatTileService : TileService() {
         val store = Store(this)
         val layout = materialScope(this, requestParams.deviceConfiguration) {
             val lines = GlanceView.lines(store.glance, store.alerts, System.currentTimeMillis(), (store.stayLabel() ?: store.guess)?.takeIf { it in Defaults.ROOMS })
-            primaryLayout(mainSlot = { card(onClick = open(), content = { column(lines) }) }, onClick = open())
+            primaryLayout(mainSlot = { card(onClick = open(), content = { column(lines) }) }, bottomSlot = { textEdgeButton(onClick = open(true), labelContent = { text(Assistant.SPEAK.layoutString) }) }, onClick = open())
         }
         val tile = TileBuilders.Tile.Builder()
             .setResourcesVersion(RES_VERSION)
@@ -66,9 +67,9 @@ class HeatTileService : TileService() {
     override fun onTileResourcesRequest(requestParams: RequestBuilders.ResourcesRequest): ListenableFuture<ResourceBuilders.Resources> =
         ResolvableFuture.create<ResourceBuilders.Resources>().also { it.set(ResourceBuilders.Resources.Builder().setVersion(RES_VERSION).build()) }
 
-    private fun open(): ModifiersBuilders.Clickable = ModifiersBuilders.Clickable.Builder()
-        .setId("open")
-        .setOnClick(ActionBuilders.launchAction(ComponentName(packageName, MainActivity::class.java.name)))
+    private fun open(voice: Boolean = false): ModifiersBuilders.Clickable = ModifiersBuilders.Clickable.Builder()
+        .setId(if (voice) "voice" else "open")
+        .setOnClick(ActionBuilders.launchAction(ComponentName(packageName, MainActivity::class.java.name), if (voice) mapOf("voice" to ActionBuilders.booleanExtra(true)) else emptyMap()))
         .build()
 
     private fun MaterialScope.column(lines: List<GlanceView.Line>): LayoutElementBuilders.LayoutElement {
@@ -86,6 +87,6 @@ class HeatTileService : TileService() {
     }
 
     companion object {
-        private const val RES_VERSION = "7"
+        private const val RES_VERSION = "8"
     }
 }

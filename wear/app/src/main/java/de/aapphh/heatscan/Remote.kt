@@ -5,6 +5,7 @@ import android.net.Network
 import androidx.wear.tiles.TileService
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 
@@ -110,11 +111,77 @@ object Boost {
     fun failed(line: String = "Server nicht erreichbar"): BoostResult = BoostResult(false, line)
 }
 
+data class Pending(val id: String, val summary: String, val expiresS: Double)
+
+data class AssistantResult(val ok: Boolean, val text: String, val pending: Pending? = null, val gone: Boolean = false)
+
+object Assistant {
+    const val PATH = "/api/assistant"
+    const val CONFIRM_PATH = "/api/assistant/confirm"
+    const val TIMEOUT_MS = 35_000
+    const val WIFI_WAIT_MS = 10_000L
+    const val MAX_CHARS = 500
+    const val NO_WIFI = "Nur im WLAN zu Hause"
+    const val OFF = "Assistent ist aus"
+    const val SLOW = "Gemini antwortet nicht"
+    const val ACCEPT = "Ausführen"
+    const val DECLINE = "Abbrechen"
+    const val KEY = "assistant_text"
+    const val LANGUAGE = "de-DE"
+    const val LABEL = "Frage"
+    const val SPEAK_NOW = "Sprich jetzt"
+    const val NO_INPUT = "Keine Spracheingabe verfügbar"
+    const val TITLE = "Assistent"
+    const val ASK = "Assistent fragen"
+    const val SPEAK = "Sprechen"
+    const val AGAIN = "Nochmal sprechen"
+    const val PROMPT = "Tippe auf das Mikrofon und sprich"
+    const val WAITING = "Gemini denkt nach …"
+
+    fun body(text: String): String = JSONObject().put("text", text.trim().take(MAX_CHARS)).toString()
+
+    fun confirmBody(id: String, accept: Boolean): String = JSONObject().put("id", id).put("accept", accept).toString()
+
+    fun error(code: Int): String = when (code) {
+        503 -> OFF
+        504 -> SLOW
+        502 -> "Gemini-Fehler"
+        404 -> "Anfrage abgelaufen"
+        401, 403 -> "Nicht erlaubt"
+        else -> if (code <= 0) "Server nicht erreichbar" else "Fehler ($code)"
+    }
+
+    private fun pending(o: JSONObject): Pending? = o.optJSONObject("pending")?.let { p ->
+        val id = p.optString("id")
+        val summary = p.optString("summary")
+        if (id.isEmpty() || summary.isEmpty()) null else Pending(id, summary, p.optDouble("expires_s", 0.0).takeIf { !it.isNaN() } ?: 0.0)
+    }
+
+    fun result(code: Int, text: String): AssistantResult {
+        if (code !in 200..299) return failed(error(code)).copy(gone = code == 404)
+        return try {
+            val o = JSONObject(text)
+            val reply = o.optString("reply").trim()
+            val p = pending(o)
+            if (reply.isEmpty() && p == null) failed("Leere Antwort") else AssistantResult(true, reply, p)
+        } catch (e: Exception) { failed("Antwort unlesbar ($code)") }
+    }
+
+    fun confirmed(code: Int, text: String): AssistantResult = result(code, text).let { if (it.ok) it.copy(pending = null) else it }
+
+    fun failed(line: String): AssistantResult = AssistantResult(false, line)
+
+    fun retained(previous: Pending?, r: AssistantResult): Pending? = if (r.ok || r.gone) null else previous
+
+    fun transcript(raw: String?): String? = raw?.trim()?.takeIf { it.isNotEmpty() }?.take(MAX_CHARS)
+}
+
 object Remote {
     private val io = Executors.newSingleThreadExecutor()
+    private val assistantIo = Executors.newSingleThreadExecutor()
 
-    private fun run(f: () -> Unit) {
-        try { io.execute(f) } catch (e: RejectedExecutionException) { Trace.i("remote_rejected") }
+    private fun run(pool: java.util.concurrent.Executor = io, f: () -> Unit) {
+        try { pool.execute(f) } catch (e: RejectedExecutionException) { Trace.i("remote_rejected") }
     }
 
     fun wifi(): Network? = ScanService.instance?.currentNetwork
@@ -174,4 +241,24 @@ object Remote {
             })
         }
     }
+
+    private fun call(c: Context, path: String, body: String, parse: (Int, String) -> AssistantResult, done: (AssistantResult) -> Unit) {
+        val store = Store(c.applicationContext)
+        run(assistantIo) {
+            done(try {
+                val svc = ScanService.instance
+                val reply = svc?.withWifi(Assistant.WIFI_WAIT_MS) { net -> Poster.send(store.server, path, body, net, Assistant.TIMEOUT_MS).let { parse(it.code, it.text) } }
+                reply ?: Assistant.failed(Assistant.NO_WIFI)
+            } catch (e: SocketTimeoutException) {
+                Assistant.failed(Assistant.SLOW)
+            } catch (e: Exception) {
+                Trace.w("assistant_failed", e)
+                Assistant.failed(Assistant.error(0))
+            })
+        }
+    }
+
+    fun assistant(c: Context, text: String, done: (AssistantResult) -> Unit) = call(c, Assistant.PATH, Assistant.body(text), Assistant::result, done)
+
+    fun confirm(c: Context, id: String, accept: Boolean, done: (AssistantResult) -> Unit) = call(c, Assistant.CONFIRM_PATH, Assistant.confirmBody(id, accept), Assistant::confirmed, done)
 }

@@ -1,9 +1,13 @@
 package de.aapphh.heatscan
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Paint
 import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.app.RemoteInput
+import androidx.wear.input.RemoteInputIntentHelper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -102,6 +106,47 @@ class MainActivity : ComponentActivity() {
     private var asked = false
     private var askedBackground = false
     private var newIntents by mutableIntStateOf(0)
+    private var voice by mutableStateOf(VoiceUi())
+    private var listenOnOpen = false
+    private var voiceSeq = 0
+    private val speech = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val data = r.data
+        if (r.resultCode == RESULT_OK && data != null) {
+            val said = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull() ?: RemoteInput.getResultsFromIntent(data)?.getCharSequence(Assistant.KEY)?.toString()
+            Assistant.transcript(said)?.let { ask(it) }
+        }
+    }
+
+    private fun ask(text: String) {
+        val seq = ++voiceSeq
+        voice = VoiceUi(text, busy = true)
+        Remote.assistant(this, text) { r -> runOnUiThread { if (seq == voiceSeq) voice = VoiceUi(text, false, r.text, !r.ok, r.pending) } }
+    }
+
+    private fun answer(accept: Boolean) {
+        val p = voice.pending ?: return
+        val said = voice.transcript
+        val seq = ++voiceSeq
+        voice = VoiceUi(said, busy = true)
+        Remote.confirm(this, p.id, accept) { r -> runOnUiThread {
+            if (seq == voiceSeq) voice = VoiceUi(said, false, r.text, !r.ok, Assistant.retained(p, r))
+            if (r.ok) Remote.refresh(this, true)
+        } }
+    }
+
+    private fun listen() {
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, Assistant.LANGUAGE)
+            .putExtra(RecognizerIntent.EXTRA_PROMPT, Assistant.SPEAK_NOW)
+        try { speech.launch(i) } catch (e: ActivityNotFoundException) { type() }
+    }
+
+    private fun type() {
+        val i = RemoteInputIntentHelper.createActionRemoteInputIntent()
+        RemoteInputIntentHelper.putRemoteInputsExtra(i, listOf(RemoteInput.Builder(Assistant.KEY).setLabel(Assistant.LABEL).build()))
+        try { speech.launch(i) } catch (e: ActivityNotFoundException) { voice = VoiceUi(line = Assistant.NO_INPUT, error = true) }
+    }
 
     private fun done() {
         ScanService.instance?.refreshSensors()
@@ -120,6 +165,7 @@ class MainActivity : ComponentActivity() {
 
     private fun route(store: Store): String = when {
         !prompt && windowIntent && WindowEvent.live(store.windowPending, System.currentTimeMillis()) != null -> Routes.ASK
+        !prompt && intent.getBooleanExtra("voice", false) -> Routes.VOICE
         else -> Routes.ROOMS
     }
 
@@ -131,6 +177,7 @@ class MainActivity : ComponentActivity() {
         intent.getStringExtra("device")?.let { store.device = it }
         intent.getStringExtra("home")?.let { store.home = it }
         val start = route(store)
+        listenOnOpen = start == Routes.VOICE
         setContent { HeatTheme { AppScaffold { Nav(store, start) } } }
     }
 
@@ -139,6 +186,8 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         wake()
         newIntents++
+        listenOnOpen = intent.getBooleanExtra("voice", false)
+        if (listenOnOpen) { voiceSeq++; voice = VoiceUi() }
         ScanService.instance?.onOpen()
     }
 
@@ -205,12 +254,16 @@ class MainActivity : ComponentActivity() {
         }
         SwipeDismissableNavHost(nav, startDestination = start) {
             composable(Routes.ROOMS) {
-                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, route != Routes.ROOMS, openDetail, report, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }) { if (prompt) finish() }
+                RoomsRoute(store, prompt, intent.getBooleanExtra("change", false), learnPrompt, route != Routes.ROOMS, openDetail, report, { nav.navigate(Routes.ALERTS) }, { nav.navigate(Routes.TECH) }, { voice = VoiceUi(); nav.navigate(Routes.VOICE) }) { if (prompt) finish() }
             }
             composable(Routes.DETAIL) { DetailRoute(store, detail, boostFirst, report, ui) }
             composable(Routes.ALERTS) { AlertsRoute(store) { nav.navigate(Routes.ASK) } }
             composable(Routes.TECH) { TechRoute(store, ui) { nav.navigate(Routes.DATA) } }
             composable(Routes.DATA) { DataRoute(store) }
+            composable(Routes.VOICE) {
+                LaunchedEffect(newIntents) { if (listenOnOpen) { listenOnOpen = false; listen() } }
+                VoiceScreen(voice, ::listen, { answer(true) }, { answer(false) })
+            }
             composable(Routes.ASK) { AskRoute(store, show, leave, ui) }
             composable(Routes.SAVED) {
                 val s = saved
@@ -336,6 +389,7 @@ internal object Routes {
     const val DATA = "data"
     const val ASK = "ask"
     const val SAVED = "saved"
+    const val VOICE = "voice"
 }
 
 @Composable
@@ -350,7 +404,7 @@ private fun storeVersion(store: Store): Int {
 }
 
 @Composable
-private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, covered: Boolean, onDetail: (String, Boolean) -> Unit, report: (String, Boolean) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, finish: () -> Unit) {
+private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnPrompt: Boolean, covered: Boolean, onDetail: (String, Boolean) -> Unit, report: (String, Boolean) -> Unit, onAlerts: () -> Unit, onTech: () -> Unit, onVoice: () -> Unit, finish: () -> Unit) {
     val ctx = LocalContext.current
     val version = storeVersion(store)
     var tapped by remember { mutableStateOf<String?>(null) }
@@ -417,7 +471,7 @@ private fun RoomsRoute(store: Store, prompt: Boolean, change: Boolean, learnProm
         val glance = version.let { store.glance }
         val alerts = version.let { store.alerts }
         val ask = WindowEvent.live(version.let { store.windowPending }, System.currentTimeMillis())
-        RoomsScreen(hot, ringed, locked, learnView, glance, alerts, ask, !prompt && hint == null, { onDetail(it, false) }, onAlerts, onTech) {
+        RoomsScreen(hot, ringed, locked, learnView, glance, alerts, ask, !prompt && hint == null, { onDetail(it, false) }, onAlerts, onTech, onVoice.takeIf { !prompt }) {
             if (choosing == null && !Tap.locked(store.manual, store.manualUntil, System.currentTimeMillis())) {
                 if (Heat.heatable(it, store.progress)) choosing = it else pick(it, false)
             }
@@ -457,7 +511,7 @@ internal fun palette(): Palette = MaterialTheme.colorScheme.let {
 }
 
 @Composable
-internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: String? = null, onBadge: () -> Unit = {}, onLong: (String) -> Unit = {}, onTap: (String) -> Unit) {
+internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, learn: LearnView? = null, glance: Glance = Glance.EMPTY, badge: String? = null, onBadge: () -> Unit = {}, onLong: (String) -> Unit = {}, onMic: (() -> Unit)? = null, onTap: (String) -> Unit) {
     val pal = palette()
     val current = LocalDensity.current
     CompositionLocalProvider(LocalDensity provides Density(current.density, minOf(current.fontScale, Quarters.MAX_FONT))) {
@@ -465,6 +519,11 @@ internal fun RoomsPage(hot: String?, ringed: String?, locked: Boolean = false, l
             val d = minOf(maxWidth, maxHeight)
             Box(Modifier.align(Alignment.Center).size(d)) {
                 Wheel(hot, ringed, locked, learn, glance, onLong, onTap)
+                onMic?.let { mic ->
+                    Box(Modifier.align(Alignment.Center).offset((-Quarters.BADGE_X * d.value).dp, (Quarters.BADGE_Y * d.value).dp).size(Quarters.MIC_DP.dp).clip(CircleShape).background(pal.selected).clickable(onClickLabel = Assistant.ASK) { mic() }.semantics { contentDescription = Assistant.ASK }, contentAlignment = Alignment.Center) {
+                        Icon(painterResource(R.drawable.ic_mic), null, Modifier.size((Quarters.MIC_DP - 6f).dp), tint = pal.ink)
+                    }
+                }
                 badge?.let {
                     Box(Modifier.align(Alignment.Center).offset((Quarters.BADGE_X * d.value).dp, (Quarters.BADGE_Y * d.value).dp).size(Quarters.BADGE_DP.dp).clip(CircleShape).background(pal.alert).clickable(onClickLabel = "Hinweise") { onBadge() }.semantics { contentDescription = "Hinweise öffnen" }, contentAlignment = Alignment.Center) {
                         Text(it, fontSize = 10.sp, lineHeight = 12.sp, maxLines = 1, color = MaterialTheme.colorScheme.onError)
